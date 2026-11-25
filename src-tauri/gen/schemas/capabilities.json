@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main window. The app has no backend commands yet, so the window is granted nothing; every command and plugin permission is added here once the frontend needs it.","local":true,"windows":["main"],"permissions":[]}}

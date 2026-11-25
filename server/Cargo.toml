@@ -1,0 +1,37 @@
+[package]
+name = "hangar-drive-server"
+version = "0.1.0"
+description = "Sync server of Hangar Drive: distributes changes to every client and keeps versions"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "hangar_drive_server"
+
+[[bin]]
+name = "hangar-drive-server"
+path = "src/main.rs"
+
+[dependencies]
+# The wire types and protocol version shared with the app (this repository, MIT).
+hangar-drive-protocol.workspace = true
+# HTTP routing and JSON replies. tokio-rs, MIT, the most used Rust web framework; only HTTP/1 and
+# JSON for now. The same version as hangar-server, so both servers move together.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+# Async runtime, TCP listener and the SIGTERM and Ctrl+C handlers. tokio-rs, MIT; the same version
+# as hangar-server and already in the app's tree through Tauri.
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# Structured logs to stdout (read by `docker logs`). tokio-rs, MIT; the same versions as
+# hangar-server. Without the `ansi` feature: no color codes in container logs.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
+# Error type of the configuration. MIT/Apache-2.0, see the workspace manifest.
+thiserror.workspace = true
+
+[dev-dependencies]
+# The integration test talks raw HTTP/1.1 over a real socket and checks the JSON reply. Both are
+# already in the tree (tokio's extra features add no crates); MIT and MIT/Apache-2.0.
+tokio = { version = "1.54", features = ["io-util", "time"] }
+serde_json.workspace = true

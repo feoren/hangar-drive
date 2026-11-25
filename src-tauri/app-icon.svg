@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Source of every app icon: `pnpm tauri icon src-tauri/app-icon.svg`. A cloud with a lock. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c222b"/>
+      <stop offset="1" stop-color="#0e1116"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="216" fill="url(#tile)"/>
+  <g fill="#5aa9ff">
+    <circle cx="362" cy="578" r="150"/>
+    <circle cx="540" cy="482" r="200"/>
+    <circle cx="700" cy="600" r="130"/>
+    <rect x="212" y="560" width="620" height="170" rx="85"/>
+  </g>
+  <g fill="#0e1116">
+    <rect x="452" y="560" width="120" height="104" rx="18"/>
+  </g>
+  <path d="M482 566 v-40 a30 30 0 0 1 60 0 v40" fill="none" stroke="#0e1116" stroke-width="22"/>
+</svg>

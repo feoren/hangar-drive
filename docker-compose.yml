@@ -1,0 +1,33 @@
+# Hangar Drive server, built from this repository.
+#
+#   docker compose up -d --build
+#   curl http://localhost:8080/api/v1/health
+#
+# The port is bound to localhost only: the server has no TLS and no sign-in yet, so it must not be
+# reachable from the network. Put a reverse proxy with TLS in front of it before exposing it.
+# HANGAR_DRIVE_HOST_PORT changes the port on the host (default 8080).
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: hangar-drive-server:local
+    restart: unless-stopped
+    environment:
+      HANGAR_DRIVE_PORT: "8080"
+      HANGAR_DRIVE_DATA_DIR: /data
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - drive-data:/data
+    ports:
+      - "127.0.0.1:${HANGAR_DRIVE_HOST_PORT:-8080}:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # docker stop sends SIGTERM; the server finishes open requests and exits well within this.
+    stop_grace_period: 20s
+
+volumes:
+  drive-data:

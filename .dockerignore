@@ -1,0 +1,10 @@
+# Allowlist: only what the server image is built from enters the build context. Everything else
+# (local configuration, build output, node_modules, documentation) stays out.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!server/
+!src-tauri/Cargo.toml
+!src-tauri/src/
+**/target/

@@ -1,0 +1,22 @@
+# One Cargo workspace for every Rust package: one lock file, one `target/` and one check suite
+# (`cargo fmt --all`, `cargo clippy --workspace`, `cargo test --workspace`). The app and the
+# server share the protocol crate by path, so a change to it is built and tested against both.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/hangar-drive-protocol", "server"]
+
+[workspace.package]
+edition = "2021"
+# The same minimum as Hangar's app; CI builds with current stable.
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.dependencies]
+hangar-drive-protocol = { path = "crates/hangar-drive-protocol" }
+# Wire types (JSON). MIT/Apache-2.0, the de facto standard, maintained by serde-rs; already in
+# the app's tree through Tauri.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Error types in modules (project rule). MIT/Apache-2.0, dtolnay; already in Tauri's tree.
+thiserror = "2"
+

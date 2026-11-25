@@ -1,0 +1,29 @@
+# Proposes updates for the commit-pinned actions in .github/workflows, the locked Rust and npm
+# dependencies and the digest-pinned base images of the server image. Weekly with a small number
+# of open pull requests, so updates stay reviewable.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # One Cargo workspace at the root: app, protocol crate and server share one lock file.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2

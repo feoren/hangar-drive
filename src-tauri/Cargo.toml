@@ -1,0 +1,27 @@
+[package]
+name = "hangar-drive"
+version = "0.1.0"
+description = "End-to-end encrypted file sync for your own server"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "hangar_drive_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+# Generates the app context and the permission files of capabilities/ (official Tauri crate,
+# MIT/Apache-2.0).
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+# The desktop shell: window, WebView and the IPC the frontend may use (capabilities/). Official
+# Tauri 2 crate, MIT/Apache-2.0, the same version as Hangar.
+tauri = { version = "2.12", features = [] }
+
+[dev-dependencies]
+# The version test reads tauri.conf.json and package.json. MIT/Apache-2.0, see the workspace
+# manifest; already in the tree through Tauri.
+serde_json.workspace = true

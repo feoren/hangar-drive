@@ -1,0 +1,16 @@
+[package]
+name = "hangar-drive-protocol"
+version = "0.1.0"
+description = "Wire types and the protocol version shared by the Hangar Drive app and server (no I/O)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Wire types (JSON) of the API. Purpose, license and status: see the workspace manifest.
+serde.workspace = true
+
+[dev-dependencies]
+# The tests check the exact JSON on the wire. MIT/Apache-2.0, see the workspace manifest.
+serde_json.workspace = true
