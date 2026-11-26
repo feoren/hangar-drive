@@ -2,7 +2,7 @@
 title: "ADR 0001: Foundation: scope, sync model, server and encryption"
 type: decision
 tags: [scope, sync, server, backup, e2e, crypto, architecture, merge, restore, quota]
-sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]"]
+sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[unix-inode-reuse-measurement]]"]
 status: accepted
 superseded_by:
 created: 2026-11-26
@@ -116,6 +116,18 @@ are reasoned here and are part of the external review (see Consequences).
       sequence per folder.
     - An account change feed returns every account level change after an account cursor,
       using a monotonic sequence per account ("Change feed" below).
+    - **Pairing slots** (conclusion, server security review M2): `PUT /pairing/{id}` reserves
+      a slot under the pairing ID of an offer, with the inviting device's session, at most four
+      open slots per account; `POST /pairing/{id}` without a session fills only a reserved,
+      empty slot, once; `GET /pairing/{id}` reads it, only from the reserving account. Without
+      the reservation anyone could create slots under invented IDs until the server's slot
+      limit refused every real pairing (section 4, "Pairing").
+    - The commit call checks its reference deltas as sets in one transaction (server security
+      review M4), and at most a few commits and record writes, whose bodies are held in
+      memory, are worked on at once (`HANGAR_DRIVE_HEAVY_REQUESTS`, default 4). One account
+      holds at most half of these slots (at least one) and is refused beyond its share at once,
+      so an account that sends its bodies slowly cannot stall every other account's commits
+      (conclusion, re-review of the server fixes).
   - **Push:** SSE that carries only "the account sequence is now N", with polling of the change
     feed every 60 s as fallback. One stream per device session covers the account and all its
     folders.
@@ -398,9 +410,10 @@ primitives the sister app already uses:
       barrier fails "nothing goes back"; one before it that no barrier follows is never taken in.
       A device verifies the whole delta up to the server's sequence (every page) at once, so a
       barrier on a later page counts. Only the removing device, in its removal flow, verifies
-      the delta without this rule to build the barrier on the head it finds. Residual risk: a
-      backdated commit that a malicious server shows the removing device in exactly that moment
-      is covered by its barrier.
+      the delta without this rule to build the barrier on the head it finds; any other device
+      does so only after the rule refused its delta and only with the person's consent ("A
+      resumable job" below). Residual risk: a backdated commit that a malicious server shows the
+      removing device in exactly that moment is covered by its barrier.
     - **Verified chain:** besides the frontier, every device keeps per folder the list of every
       head on the first-parent chain it has verified (commit ID, height, folder sequence), a few
       dozen bytes per head (conclusion). The re-anchor below finds its base in it.
@@ -509,6 +522,10 @@ primitives the sister app already uses:
     the offer bytes. The new device checks it against the inviter's key once it has the log, and
     a device of the account takes server URL and pin from an offer only after this check
     (section 6, "Pin rotation").
+  - **Reserved slot** (conclusion, server security review M2): the inviting device reserves
+    the slot of the offer's pairing ID with its session before it shows the offer
+    (`ApiCall::ReservePairing`); the new device's request is accepted only into that slot
+    (section 3, "Pairing slots"). The offer format does not change.
   - **Added device** (conclusion, finding L6): the append call with the add device entry
     carries exactly one wrapped key, the current epoch's secret for the new device, and no
     rotation happens; the server checks that this wrap names the added device. A new device
@@ -516,10 +533,32 @@ primitives the sister app already uses:
     hold every generation.
 - **Recovery:** a 128 bit recovery code with a printed recovery sheet. There is no password
   recovery.
+  - **Sheet** (conclusion, sync engine review, open point A): the sheet prints the server
+    address, the server ID and the account ID in the clear next to the code. The recovery
+    device's keys and its device ID are derived from the code alone
+    (`RecoveryCode::identity`, `RecoveryCode::device_id`, label
+    `hangar-drive/v1/recovery-device-id`, vector `recovery.device_id`), so nothing else is
+    needed. The sheet's public part is also the link `hangar-drive://recover#<payload>`
+    (base64url of version 1, account ID, server ID and server URL); the link never carries the
+    code, which is always typed. The server ID is learnt before the code is shown, through the
+    session challenge, which the server answers for any account and which writes nothing.
+  - **Flow** (conclusion): the new installation signs in as the recovery device at the
+    sheet's server (server ID checked at the sign-in), checks that the verified log lists that
+    recovery device as current with the derived keys (otherwise the code is unknown or used
+    up), unwraps the current epoch, appends one add device entry for itself with the wrap
+    (`device_wrap`), joins at the log head that append returned, then removes the lost devices
+    the person chose and every recovery device in one removal with its rotation, writes the
+    barriers in every folder of the account (also those it does not sync yet), and adds the
+    recovery device of a new code.
   - **Recovery session** (conclusion): a session of a recovery device may only fetch the device
     log, fetch its own wrapped keys of every epoch, and make exactly one append with one add
     device entry for a regular device and its wrap. The server refuses every other call. The
     protocol crate's session scope type carries the rule, so the server applies one list.
+    "Exactly one append" holds per session, not per recovery device: a recovery device that
+    signs in again gets a new session with its own one append (server security review, info).
+    That is no gain of rights: the recovery code gives the person holding it full access to the
+    account anyway, through the regular device it adds, so counting appends across sessions
+    would protect nothing.
   - **Stuck log** (conclusion, finding M5): while a rotation is due, a recovery device may add
     exactly one regular device. The rotation stays due, and the new device removes the lost
     devices and the recovery device and rotates. Without this exception a log whose regular
@@ -535,6 +574,33 @@ primitives the sister app already uses:
     folder key ring, re-seals every account record under the new epoch (section 3, "Record
     freshness") and writes a barrier commit in every folder ("Removed signers and the barrier
     commit" above).
+  - **A resumable job, completed by any current device** (conclusion, security review N1): the
+    three steps (append, re-seal, barriers) are a job the removing device stores before the
+    append and resumes after a crash or a lost connection; an append whose answer was lost is
+    recognised in the verified log; the resumed job takes its permit from the log entry it
+    signed (`BarrierPermit::of_own_removal`). If the removing device goes away after the
+    append, other current regular devices complete what is really open (conclusion, sync
+    engine security review H1):
+    - **Re-seal:** a removal whose re-seal is missing (a ring's newest generation made before
+      the log's last removal) is re-sealed by the next current regular device that sees it.
+      Records are compare-and-swap per version, so two devices doing it at once are safe.
+    - **Barriers:** no device writes a barrier because its log shows a removal. Only when its
+      own delta check (`FolderView::check_delta`) refuses a folder's delta by the removed signer
+      rule does it get a refusal, and only from that refusal a permit for that one folder
+      (`BarrierPermit::takeover`, bound to the folder ID). With it the device checks the delta
+      without the rule (`verify_delta_before_barrier`). If that would let heads of a removed
+      device in, it writes no barrier: the folder stops (`StopReason::RemovedHeads`) and the app shows the heads and asks the person. Taking them
+      in writes the barrier after them, and the app then offers "Undo a device" for them;
+      leaving the folder stopped takes nothing in. A barrier is a normal commit on the head, so
+      a device that loses the race takes the winner's result.
+    - **Residual risk:** a malicious server can still hide the removing device's barrier from a
+      device that was offline and show it a commit of the removed device instead. That device
+      no longer takes the commit in on its own, as it did before; it only stops the folder.
+      What remains is the person's decision: who takes such heads in without looking adopts
+      what the removed device signed, which "Undo a device" then reverts. A folder stopped this
+      way is a strong sign of a malicious server or a key that leaked, so the window says that a
+      removed device's changes arrived without the removal's confirmation. The removing device
+      itself keeps the residual risk of the barrier rule above.
 - **Exports:** if there are any, they use the age format with its STREAM payload. Neither age
   nor Cryptomator is the core.
 - **Code:** option B.
@@ -553,7 +619,13 @@ primitives the sister app already uses:
   - No client API deletes commits or objects. A client's "empty trash" is only a request.
   - **A commit's tree is kept for the window after the commit is superseded.** A head is
     superseded when the server accepts the next head; a side commit is superseded in the call
-    that uploads it; the last head of a retired folder is superseded at retirement. The newest
+    that uploads it; the last head of a retired folder is superseded at retirement.
+    - **Side commits** (conclusion, server security review H1): a side commit keeps for the
+      window only what it adds to its base, never the base tree itself. The base is a head and
+      stays retained by its own rules (its window, a pin, the minimum count); a side commit is
+      restorable while its base is. Otherwise a device could send a side commit on an old head
+      shortly before each window ends and keep that head's tree stored for ever, outside every
+      budget. The newest
     heads of a folder up to the minimum count, the current head included, are kept regardless of
     age, within the byte cap below.
   - **Byte cap for the minimum count** (conclusion): bytes that only trees held by the minimum
@@ -590,6 +662,21 @@ primitives the sister app already uses:
 - **Anomaly pinning:** a burst of replaced or dropped objects pins the last commit before the
   burst for 90 days, and all devices are told through a feed `notice`. Upload volume per device is
   one of the signals.
+  - **Burst threshold** (conclusion, server security review L4): within the rolling hour, at
+    least `min(500, 30 % of the folder's file objects)` file objects, but never fewer than 20,
+    that make up at least 30 % of the folder's file data. A fixed 500 alone meant a folder with
+    fewer files could never set off a pin. An operator count below 20 is taken as set.
+  - **Retirement** (conclusion, server security review M3): retiring a folder counts as
+    dropping every live object of it and goes through the same burst signal: a retired folder
+    with at least 20 file objects pins its last head and every device is told. A retired
+    folder whose window ended is deleted only once no admitted pin holds it any more; the pin
+    no longer goes with its folder (no `ON DELETE CASCADE`), so it holds for its 90 days or
+    until it lapses under the pin cap or the operator lifts it. Its bytes count against the pin
+    cap like any pinned tree. Before, a compromised device could retire a folder, and after the
+    window the folder went with its pin: retiring was a burst the signal did not see.
+    Bringing back a retired folder whose last head a standing pin holds is a restore of a
+    pinned tree: its bytes go through the pin restore allowance before the budgets (conclusion,
+    re-review of the server fixes), so undoing a harmful retirement does not wait for a budget.
   - **Pin cap, a lasting invariant** (conclusion): the bytes that only admitted pins retain
     (class 3 in "Retention classes" below) never exceed the pin cap P of the account: its quota
     plus the headroom, `Q + H`, because one pinned tree was live and can therefore reach that
@@ -739,6 +826,13 @@ primitives the sister app already uses:
       upload fits in one day. It is needed because a compromised device can add devices to the
       account log, each with its own device budget, so device budgets alone bound nothing
       (conclusion).
+    - **Side commits count** (conclusion, server security review H1): objects a side commit
+      adds that a commit declared before and that are not live are retained again for the
+      window, so they count as revived at the commit, like the head's revived objects, and the
+      pin restore allowance below applies to them in the same way. Before, a device could
+      upload garbage once, declare it in a side commit, and declare it again in a new side
+      commit just before each window ended, keeping it stored for ever while paying the budget
+      only once; the disk bound under "Disk sizing" did not hold.
     - **Pin restore allowance** (conclusion): retained bytes that a commit makes live again and
       that lie in the tree of an admitted pin cost neither device budget nor account budget, up
       to an allowance of P (the pin cap, `Q + H`) per account in any rolling W days; beyond it
@@ -772,7 +866,13 @@ primitives the sister app already uses:
     once) and, if needed, an operator purge through the server CLI.
   - **Disk reserve:** below a configured free disk reserve the server refuses all new uploads
     and warns the operator. This is the only case in which honest devices are blocked, and it
-    means the disk is too small for the configured quotas.
+    means the disk is too small for the configured quotas. Bytes that uploads in flight have
+    announced but not written count as used, the reserve is checked again before an upload is
+    stored, and each account has at most a few uploads in flight (server security review M5).
+  - **Records** (conclusion, server security review L3): the sealed account records of an
+    account are capped at R bytes in all (operator-set, default 64 MiB), and the server checks
+    each record's signature with the sender's key from the verified log before it stores it,
+    so only bytes a current device of the account signed take that room.
 - **Client guards:**
   - A root marker file: when it is missing, the folder pauses instead of deleting.
   - A prompt above 100 deletions in one run (Nextcloud's default; OneDrive uses 200).
@@ -830,6 +930,13 @@ primitives the sister app already uses:
   server.
 - **Device sign-in:** an Ed25519 challenge proof bound to the server ID, the account and the
   protocol version. Sessions use short-lived bearer tokens that the server stores only as hashes.
+  - **Stateless challenge** (conclusion, server security review M1): the 32 challenge bytes
+    are `expiry (u64, ms) || nonce (8) || the first 16 bytes of HMAC-SHA-256(server secret,
+    label || server || account || device || expiry || nonce)`. The server secret is 32 random
+    bytes made at the first start in the data folder (`server.secret`). A challenge request
+    writes nothing; the proof checks the tag and the expiry, and only a challenge whose proof
+    verified is remembered until it expires, so it is accepted once. The device signs the 32
+    bytes as before; the wire format is unchanged.
 - **Sessions:** a token lives about one hour, is renewed by a new proof and is revoked at once
   when the device log removes the device. Tokens never appear in URLs or logs.
   - **Scope:** the server sets a session's scope at sign-in from the verified log. A regular
@@ -837,9 +944,22 @@ primitives the sister app already uses:
     (section 4, "Recovery session").
 - **Rate limits:** per IP and per account on the challenge, proof, invite, pairing and upload
   endpoints.
+  - **Shape** (conclusion, server security review M1, M6): the limits are checked before a
+    body is read. Each public endpoint is limited per address (IPv4, IPv6 /64) and, with four
+    times the limit, per network (IPv4 /16, IPv6 /48). Sign-in is limited per account only by
+    failed proofs, keyed by account and device and only for devices the log lists, so nobody
+    can fill the table with invented accounts or lock an account out with challenges. A full
+    table evicts the entries whose window ended, oldest first. A public body must arrive
+    within 10 seconds; connections per address are capped in the accept loop, except for
+    trusted proxies, which limit per client themselves.
 - **Client IPs:** taken from `X-Forwarded-For` only when the operator has marked the proxy as
-  trusted.
-- **Docker defaults:** the image runs as non-root, and Compose binds to `127.0.0.1` by default.
+  trusted. No proxy is trusted by default, and the self-hosting guide names the exact proxy
+  address to trust, never a whole private range (server security review L1).
+- **Docker defaults:** the image runs as non-root, and Compose binds to `127.0.0.1` by default,
+  with a memory and a process limit (server security review M4, L7).
+- **Admin commands** (conclusion, server security review L5, L6): `gc` and `purge` refuse
+  while the server runs on the same data folder, which it holds locked (`server.lock`); a
+  folder purge is confirmed by typing the folder ID.
 
 ### 7. Cross-platform name policy
 
@@ -872,6 +992,26 @@ primitives the sister app already uses:
 - Locked files (sharing violations from Office, antivirus, the indexer) are retried with backoff
   and never block the whole run.
 - Downloads go to a temporary file and are renamed atomically.
+- **File IDs on Unix** (conclusion, acceptance review): device and inode alone do not identify
+  a file, because Linux gives a freed inode number to the next new file at once (9,998 of
+  10,000 delete and create cycles on ext4 below overlayfs, [[unix-inode-reuse-measurement]]). A
+  file another program deleted and created again with the same size and mtime would then pass
+  the replace check (L3). The file ID on Linux and macOS therefore mixes the birth time
+  (`stx_btime` from `statx`, `st_birthtime`) into device and inode; it is set once per inode and
+  survives writes, renames, time and mode changes, so a move keeps its ID. `st_ctime` is not a
+  fallback: it changes with every rename and every time or mode change (same measurement), so
+  moves would lose their ID, a directory would get a new ID with every entry added to it, and
+  the engine's own `set_meta` would read as a replace. Code: `crates/hangar-drive-sync/src/localfs.rs`
+  (`unix_id`).
+  - **Residual risk:** where the file system reports no birth time (ext4 with 128 byte inodes,
+    ext3, 9p, NFSv3, many FUSE file systems, and musl builds, whose std does not call `statx`),
+    the ID stays device and inode. There, a file another program deleted and created again
+    with the same size and mtime (to the tolerance) on the same inode is taken for the expected
+    one: an incoming replace overwrites the other program's file instead of keeping it as a
+    conflict copy, and an incoming delete moves it to the trash. The same holds for two files that get the same inode
+    within one timestamp tick on a file system with coarse timestamps. The inode generation
+    (`FS_IOC_GETVERSION`) would close part of it, at the cost of opening every file during a
+    scan; open point.
 - mtime counts only together with a hash, with a 2 s tolerance on FAT and exFAT.
 - Alternate data streams and atime are not synced.
 
@@ -921,14 +1061,46 @@ and atime. Everything in this subsection is a conclusion of this ADR.
 - **`notify`:** the change watcher, CC0-1.0. CC0 is outside the MIT, Apache-2.0 and BSD policy.
   - It is accepted as a documented exception, as the sister app already does, because CC0 waives
     all rights and is more permissive than MIT.
-  - The Linux backend's `inotify` (ISC, equivalent to MIT) gets the same exception when Linux
-    ships.
+  - The Linux backend's `inotify` (ISC, equivalent to MIT) needs no exception: ISC is on the
+    license allowlist below.
   - The workspace MSRV goes to 1.91 together with the first change that adds `notify` 9.
 - **`sqlx` (server metadata):** MIT or Apache-2.0, same stack as the sister relay server.
 - **Not adopted:** `fastcdc` (no CDC in version 1) and `blake3` (HMAC-SHA-256 keeps the review
   surface at the primitives the sister app already uses).
 - **`unicode-normalization` (NFC names):** `(MIT OR Apache-2.0) AND Unicode-3.0`. The Unicode
   data license is permissive.
+- **License allowlist:** `deny.toml` in the project root enforces this section; the CI job
+  `licenses` runs `cargo deny check licenses sources` on every push and pull request.
+  - Allowed for every crate: MIT, Apache-2.0 (also `WITH LLVM-exception`), BSD-3-Clause, ISC,
+    Zlib and Unicode-3.0. ISC and Zlib are permissive licenses equivalent to MIT; Unicode-3.0 is
+    the data license above. This also covers `inotify` (ISC) and `ring` (`Apache-2.0 AND ISC`)
+    without a crate exception.
+  - Every other license is allowed only for the named crate, as an exception below.
+  - Paths and licenses measured with `cargo tree -i <crate> --workspace` and `cargo deny list`
+    against `Cargo.lock` of 2026-11-26.
+- **`option-ext` 0.2 (MPL-2.0):** pulled only by `dirs-sys` 0.5 through `dirs` 7, which
+  `hangar-drive-sync` uses directly and `tauri` and `tauri-build` use as well.
+  - MPL-2.0 is a file-level copyleft: its obligations cover only the MPL files themselves. The
+    crate is used unmodified from crates.io, so no project file falls under the MPL.
+  - Shipping a binary keeps one duty: recipients must learn where the source of the MPL files is
+    (MPL-2.0 section 3.2). The unmodified crates.io source satisfies it; the release's
+    third-party notices name it.
+  - Alternative: replacing `dirs` in `hangar-drive-sync` (for example with `etcetera`, MIT or
+    Apache-2.0) would not remove the crate, because `tauri` pulls `dirs` anyway. Accepted.
+  - The same reasoning applies to the MPL-2.0 crates Tauri pulls for HTML processing
+    (`cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`, through `dom_query` in
+    `tauri-utils` and `wry`); they get the same exception. There is no alternative short of
+    leaving Tauri.
+- **`xxhash-rust` 0.8 (BSL-1.0):** pulled only by `notify` 9 (section 8, `notify`), not used by
+  project code.
+  - The Boost Software License 1.0 is permissive like MIT; it does not even require the notice in
+    binary distributions, only in copies of the source.
+  - Alternative: none short of replacing `notify` with own watchers per platform, which this
+    section rejected. Accepted.
+- **`webpki-root-certs` 1.0 (CDLA-Permissive-2.0):** the Mozilla root certificate data, pulled by
+  `rustls-platform-verifier` in `hangar-drive-sync`. CDLA-Permissive-2.0 is a permissive data
+  license (keep the license text, no copyleft). Accepted as an exception; the alternative would be
+  dropping the platform verifier for TLS.
 
 ## Consequences
 
@@ -947,10 +1119,11 @@ and atime. Everything in this subsection is a conclusion of this ADR.
   or reference deltas once their trees expire. They hold no content, but show the server for as
   long which device wrote how many heads in which order; deleting the folder or an operator
   purge removes them. The commit table grows with the number of heads.
-- **Disk sizing:** with quota Q, headroom H, account budget B per 24 hours, window W days and
-  minimum count cap C, and pin cap `P = Q + H`, the objects one account can keep stored at a
-  time T are bounded by `(Q + H) + B × (W + 1) + P + P + C`, that is
-  `3 × (Q + H) + B × (W + 1) + C` (conclusion, from the rules of section 5). Each stored object
+- **Disk sizing:** with quota Q, headroom H, account budget B per 24 hours, window W days,
+  minimum count cap C, record cap R and pin cap `P = Q + H`, the objects and records one
+  account can keep stored at a time T are bounded by `(Q + H) + B × (W + 1) + P + P + C + R`,
+  that is `3 × (Q + H) + B × (W + 1) + C + R` (conclusion, from the rules of section 5; R and
+  the side commit rules since the server security review, H1 and L3). Each stored object
   is in exactly one retention class (section 5, "Retention classes"), so the terms below never
   count a byte twice:
   - Classes 1 and 2, live or kept for the window at T: every such object was live at some time
@@ -961,16 +1134,19 @@ and atime. Everything in this subsection is a conclusion of this ADR.
     most `B × (W + 1)`: a revived object at the commit that made it live, a new object at its
     upload. The extra day covers objects uploaded before the window and committed in it, which
     the commit does not count again; an upload without a commit is deleted after 24 hours, so
-    none is older. Or the pin restore allowance revived it free, at most P in the last W days.
+    none is older. A side commit retains only what it adds, for the window after its upload;
+    each such object was uploaded then (counted at upload) or revived then (counted at the
+    commit, H1), and a side commit never extends its base's tree, so side commits add no term. Or the pin restore allowance revived it free, at most P in the last W days.
     That allowance term is the longer retention of pinned bytes: at most P of them, for at most
     W days beyond the end of their pin.
   - Class 3, held only by admitted pins: at most P at every time, because the pin cap is checked
     in every garbage collection step, not only when a pin is made.
   - Class 4, held only by the minimum count: at most C.
+  - Records: at most R per account, outside the object classes.
   - The bound holds after every garbage collection step; between two steps, objects that became
     deletable since the last one come on top.
-  - With the defaults (B = Q, W = 30, C = Q) that is `35 × Q + 3 × H`, plus the commit bodies, a
-    few hundred bytes per head. The self-hosting guide explains this. The earlier bound,
+  - With the defaults (B = Q, W = 30, C = Q, R = 64 MiB) that is `35 × Q + 3 × H + R`, plus the
+    commit bodies, a few hundred bytes per head. The self-hosting guide explains this. The earlier bound,
     `34 × Q + H`, counted the pins as Q and had no allowance term; it also did not hold, because
     the pin cap was checked only when a pin was made.
   - **The pin attack, replayed** (section 5, "The attack it stops"): with the cap checked only
@@ -1015,12 +1191,12 @@ and atime. Everything in this subsection is a conclusion of this ADR.
 - [ ] Protocol crate: item IDs, object and commit types (at most two parents, empty seen
       vector, commit `flags` with the re-anchor bit), directory entry kinds and flags with
       `conflict_of`, change feed entries, ignore list and name policy, with tests.
-- [ ] Server: accounts, invites, device sign-in, object store, commit log with compare-and-swap,
+- [x] Server: accounts, invites, device sign-in, object store, commit log with compare-and-swap,
       change feed, retention with the minimum count cap, the pin cap checked in every garbage
       collection step and the retention classes, quota checked at upload and at commit,
       directory node headroom, device and account upload budgets that also count revived bytes,
       the pin restore allowance, the server key number in the CLI.
-- [ ] Self-hosting guide: check the reverse proxy defaults that affect 4 MiB chunk uploads and
+- [x] Self-hosting guide: check the reverse proxy defaults that affect 4 MiB chunk uploads and
       long-lived SSE connections (nginx `client_max_body_size`, `proxy_read_timeout`); explain
       disk sizing.
 - [ ] Sync core with simulation tests (including the merge rules, the join of a non-empty local
@@ -1070,6 +1246,13 @@ and atime. Everything in this subsection is a conclusion of this ADR.
   sender, the re-seal of every record and a barrier commit per folder (H1, sections 3 and 4);
   the recovery session scope (section 4); the side commit's generation and log head are not
   below its base's (L1); discarded re-anchor heads (L2).
+- **Rule changes from the review of the sync engine** (2026-11-26, conclusions): the removal as
+  a resumable job that any current device completes (N1, section 4, "A resumable job"); the
+  check before a barrier needs a barrier permit of the last removal and reports the heads of
+  removed devices it let in (N2); a name the file system reports as existing although the tree
+  says it is free is marked "cannot sync on this device" (N3); device names in conflict copy
+  names have `/ \ :` and the other characters Windows refuses replaced, and API paths are
+  appended to the base URL's path instead of `Url::join` (N6).
 - **Later:** the shared core stays the goal of option B. When it exists, Drive moves to it only if
   its formats produce the same bytes as `hangar-drive-crypto` under Drive's labels, checked
   against the fixed vectors in `crates/hangar-drive-crypto/testdata/vectors.json`; otherwise

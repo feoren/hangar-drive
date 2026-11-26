@@ -10,14 +10,16 @@ Catalog of all wiki pages. Updated on every ingest.
 - [[0002-version-scheme]]: version scheme X.Y.Z-B of the Hangar family, internal X.Y.Z+B, build number from the commit count, the code carries the upcoming version, changelog and version tests (sources: 2, updated: 2026-11-26)
 
 ## Syntheses
-- [[ux-concept]]: UX concept of the desktop app: setup in three steps, pairing, tray states, main window, problems, restore, devices, settings, accessibility and the full UI copy in German and English (sources: 2, updated: 2026-11-26)
+- [[ux-concept]]: UX concept of the desktop app: setup in three steps, pairing, tray states, main window, problems, restore, devices, settings, accessibility and the full UI copy in German and English (sources: 3, updated: 2026-11-26)
 
 ## Components
 _None yet._
 
 ## Sources
 - [[llm-wiki-pattern]]: Karpathy's LLM Wiki idea file, the pattern this wiki follows (sources: 0, updated: 2026-11-26)
+- [[recycle-bin-measurement]]: own measurement of `IFileOperation` recycling (plain, verbatim and long paths, a subst drive) and of file IDs through `ReplaceFileW` on Windows 11 (sources: 0, updated: 2026-11-26)
 - [[sync-prior-art-research]]: prior art (Syncthing, Seafile, Nextcloud, Dropbox Nucleus and others), `notify`, chunking, placeholders, storage and transport, Windows pitfalls, ransomware protection (sources: 0, updated: 2026-11-26)
 - [[tauri-version-handling-code-reading]]: code reading of Tauri's NSIS file version and the updater's version comparison with build metadata (sources: 0, updated: 2026-11-26)
 - [[threat-model-and-crypto-design]]: threat model per attacker, key hierarchy, object and commit formats, rollback protection, retention, pairing, recovery, reuse options, risks (sources: 0, updated: 2026-11-26)
+- [[unix-inode-reuse-measurement]]: own measurement of inode reuse, birth time and ctime on overlayfs, tmpfs and a 9p bind mount in Docker, and of the replace test with and without the birth time (sources: 0, updated: 2026-11-26)
 - [[version-number-wikipedia]]: German Wikipedia "Versionsnummer": major, minor, revision, build number, reset rules, major version 0 (sources: 0, updated: 2026-11-26)

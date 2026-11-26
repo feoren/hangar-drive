@@ -2,7 +2,7 @@
 title: UX concept of the desktop app
 type: synthesis
 tags: [ux, ui, onboarding, tray, conflicts, restore, devices, settings, accessibility, i18n, plurals, re-anchor]
-sources: ["[[threat-model-and-crypto-design]]", "[[sync-prior-art-research]]"]
+sources: ["[[threat-model-and-crypto-design]]", "[[sync-prior-art-research]]", "[[recycle-bin-measurement]]"]
 created: 2026-11-26
 updated: 2026-11-26
 ---
@@ -686,10 +686,12 @@ which action is the default (focused, primary style).
   device deleted them go to the Windows recycle bin, not into nothing. The activity shows
   "Fotos: 342 Dateien auf Laptop gelöscht" with "Wiederherstellen". [Design]
 
-> [!question] Unverified
-> Moving files to the recycle bin from a Rust service is assumed to work through `IFileOperation`
-> with `FOFX_RECYCLEONDELETE`. Check, including long paths and files on drives without a recycle
-> bin.
+- **Where they go.** [Backend, measured on Windows, [[recycle-bin-measurement]]] Windows:
+  `IFileOperation` with `FOFX_RECYCLEONDELETE`, the plain path (the shell refuses `\\?\` paths).
+  Where the shell would delete for good instead (a path beyond `MAX_PATH`, a `subst` drive, a
+  drive without a recycle bin), the file goes to the folder's quarantine
+  `.hangar-drive/trash/<item ID>/` for 30 days. macOS: the Finder trash
+  (`trashItemAtURL`); Linux: the XDG trash; both untested so far.
 
 ### 8.2 Missing folder
 
