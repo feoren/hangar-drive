@@ -32,7 +32,12 @@ function buildNumber(): number | null {
 // Fixed values that Tauri expects (devUrl in src-tauri/tauri.conf.json).
 export default defineConfig({
   plugins: [react()],
-  define: { __HANGAR_DRIVE_BUILD__: JSON.stringify(buildNumber()) },
+  define: {
+    __HANGAR_DRIVE_BUILD__: JSON.stringify(buildNumber()),
+    // Which backend the window uses (src/backend/index.ts): "tauri", "mock" or "auto" (default:
+    // Tauri inside the app, the mock in a plain browser).
+    __HANGAR_DRIVE_BACKEND__: JSON.stringify(process.env.HANGAR_DRIVE_BACKEND ?? "auto"),
+  },
   clearScreen: false,
   server: {
     port: 1420,

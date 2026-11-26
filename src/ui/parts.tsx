@@ -1,0 +1,183 @@
+// Small building blocks shared by many views.
+
+import { useEffect, useState, type ReactNode } from "react";
+
+import type { NumberRows as Rows, QrMatrix } from "../backend/types";
+import { spellOut } from "../domain/codes";
+import { useT } from "../i18n";
+
+/** How long a number check's confirm button holds back clicks (UX 5, ADR 6). */
+export const ARM_DELAY_MS = 1000;
+
+/**
+ * A confirm button that takes no click for one second after it appears or `armKey` changes, so a
+ * click meant for what was there before cannot confirm a number check. It looks disabled during
+ * that second but keeps its name and its place in the tab order.
+ */
+export function ArmedButton({
+  armKey,
+  className = "button primary",
+  onClick,
+  children,
+  autoFocus,
+}: {
+  readonly armKey: string;
+  readonly className?: string;
+  readonly onClick: () => void;
+  readonly children: ReactNode;
+  readonly autoFocus?: boolean;
+}) {
+  const [armedFor, setArmedFor] = useState<string | null>(null);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setArmedFor(armKey);
+    }, ARM_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [armKey]);
+  const armed = armedFor === armKey;
+  return (
+    <button
+      type="button"
+      className={armed ? className : `${className} arming`}
+      aria-disabled={!armed}
+      data-autofocus={autoFocus ? true : undefined}
+      onClick={() => {
+        if (armed) onClick();
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** A line of feedback next to the control that caused it (UX: feedback where it happened). */
+export function Feedback({
+  tone = "ok",
+  children,
+  action,
+}: {
+  readonly tone?: "ok" | "error" | "info";
+  readonly children: ReactNode;
+  readonly action?: ReactNode;
+}) {
+  return (
+    <p className={`feedback feedback-${tone}`} role={tone === "error" ? "alert" : "status"}>
+      <span>{children}</span>
+      {action}
+    </p>
+  );
+}
+
+/** Six groups of five digits, laid out three by two so the eye compares group by group. */
+export function NumberRows({ rows, label }: { readonly rows: Rows; readonly label: string }) {
+  const t = useT();
+  return (
+    <div className="number-rows" role="group" aria-label={label}>
+      {rows.groups.map((group, index) => (
+        <span
+          key={index}
+          className="number-group"
+          role="img"
+          aria-label={t("safety.group", { index: index + 1, digits: spellOut(group) })}
+        >
+          {group}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** The recovery code: eight groups of four, large and selectable, read group by group. */
+export function CodeGroups({
+  groups,
+  label,
+}: {
+  readonly groups: readonly string[];
+  readonly label: string;
+}) {
+  const t = useT();
+  return (
+    <div className="code-groups" role="group" aria-label={label}>
+      {groups.map((group, index) => (
+        <span
+          key={index}
+          className="code-group"
+          role="img"
+          aria-label={t("recovery.groupLabel", { index: index + 1, chars: spellOut(group) })}
+        >
+          {group}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A path truncated in the middle: the start gives way, the last part (the folder's own name)
+ * stays. The full path is the tooltip; screen readers get it from the row's name.
+ */
+export function PathText({
+  path,
+  className,
+}: {
+  readonly path: string;
+  readonly className?: string;
+}) {
+  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  const head = cut >= 0 ? path.slice(0, cut + 1) : "";
+  const tail = cut >= 0 ? path.slice(cut + 1) : path;
+  return (
+    <span className={className ? `path ${className}` : "path"} title={path}>
+      <span className="path-head">{head}</span>
+      <span className="path-tail">{tail}</span>
+    </span>
+  );
+}
+
+/** A QR code from the backend's module matrix, drawn as one path with crisp edges. */
+export function QrCode({
+  matrix,
+  label,
+  size = 168,
+}: {
+  readonly matrix: QrMatrix;
+  readonly label: string;
+  readonly size?: number;
+}) {
+  const quiet = 2;
+  const full = matrix.size + quiet * 2;
+  let d = "";
+  for (let y = 0; y < matrix.size; y += 1) {
+    for (let x = 0; x < matrix.size; x += 1) {
+      if (matrix.modules[y * matrix.size + x] === "1") {
+        d += `M${String(x + quiet)} ${String(y + quiet)}h1v1h-1z`;
+      }
+    }
+  }
+  return (
+    <svg
+      className="qr"
+      width={size}
+      height={size}
+      viewBox={`0 0 ${String(full)} ${String(full)}`}
+      role="img"
+      aria-label={label}
+      shapeRendering="crispEdges"
+    >
+      <rect width={full} height={full} fill="#fff" />
+      <path d={d} fill="#000" />
+    </svg>
+  );
+}
+
+/** A small, calm busy indicator for loading lists; screen readers hear the label once. */
+export function Loading() {
+  const t = useT();
+  return (
+    <p className="loading" role="status">
+      {t("common.loading")}
+    </p>
+  );
+}

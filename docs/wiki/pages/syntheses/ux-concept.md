@@ -248,7 +248,7 @@ then, after "Ich habe ihn gesichert":
   [ADR 2], a drive root, a system folder (Windows, Program Files, the user profile itself), a
   folder inside or around another synced folder, the app's own data folder. [Design]
 - **An existing, non-empty folder** is accepted; the line below changes to "Der Ordner enthält
-  schon {count} Dateien. Sie werden hochgeladen." (`folder.setup.existing`, plural forms per
+  schon {count} Dateien, die hochgeladen werden." (`folder.setup.existing`, plural forms per
   section 13). Nothing is on the server yet, so nothing can clash. [Design] A non-empty folder
   for a folder that already has files on the server is a different case: section 6.5.
 - **"Fertig"** creates the folder, writes the root marker [ADR 5], shows a short done screen
@@ -1227,6 +1227,10 @@ German is the source and uses "du"; English is the fallback. The other ten langu
 the i18n module [project rules]. Placeholders in braces are identical in all languages. The
 existing keys `empty.title` and `empty.body` are replaced by `main.empty.*`; `app.name` stays.
 
+The tables match `src/i18n.ts` for German and English (aligned on 2026-11-26). Keys marked
+"backend" below are printed or written by the Rust side and are not part of the window's
+i18n module yet.
+
 ### Plural forms
 
 Every text with a number in it exists in the plural forms of each language, because "1 Dateien"
@@ -1290,30 +1294,36 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `recovery.check.wrong` | Das passt nicht. Schau noch mal auf dein Blatt oder in deine Datei. | That does not match. Check your sheet or your file again. |
 | `recovery.check.showAgain` | Code noch mal ansehen | Show the code again |
 | `recovery.groupLabel` | Gruppe {index}: {chars} | Group {index}: {chars} |
-| `recovery.sheet.heading` | {app}: Wiederherstellungsblatt | {app}: recovery sheet |
-| `recovery.sheet.what` | Mit diesem Code bekommst du deine Dateien zurück, wenn du kein Gerät mehr hast. | This code gets your files back when you have no device left. |
-| `recovery.sheet.risk` | Wer diesen Code hat, kann deine Dateien lesen. Bewahre das Blatt sicher auf. | Whoever has this code can read your files. Keep this sheet safe. |
-| `recovery.sheet.loss` | Ohne diesen Code und ohne eines deiner Geräte sind deine Dateien nicht mehr zu öffnen. | Without this code and without one of your devices, your files cannot be opened again. |
-| `recovery.sheet.server` | Server: {host} | Server: {host} |
-| `recovery.sheet.ids` | Server-ID: {server} · Konto-ID: {account} | Server ID: {server} · Account ID: {account} |
-| `recovery.sheet.created` | Erstellt am {date} auf „{device}“ | Created on {date} on “{device}” |
+| `recovery.sheet.heading` (backend) | {app}: Wiederherstellungsblatt | {app}: recovery sheet |
+| `recovery.sheet.what` (backend) | Mit diesem Code bekommst du deine Dateien zurück, wenn du kein Gerät mehr hast. | This code gets your files back when you have no device left. |
+| `recovery.sheet.risk` (backend) | Wer diesen Code hat, kann deine Dateien lesen. Bewahre das Blatt sicher auf. | Whoever has this code can read your files. Keep this sheet safe. |
+| `recovery.sheet.loss` (backend) | Ohne diesen Code und ohne eines deiner Geräte sind deine Dateien nicht mehr zu öffnen. | Without this code and without one of your devices, your files cannot be opened again. |
+| `recovery.sheet.server` (backend) | Server: {host} | Server: {host} |
+| `recovery.sheet.ids` (backend) | Server-ID: {server} · Konto-ID: {account} | Server ID: {server} · Account ID: {account} |
+| `recovery.sheet.created` (backend) | Erstellt am {date} auf „{device}“ | Created on {date} on “{device}” |
 | `folder.setup.title` | Wo sollen deine Dateien liegen? | Where should your files live? |
 | `folder.setup.body` | Alles, was du in diesen Ordner legst, ist auch auf deinen anderen Geräten. Weitere Ordner kannst du später hinzufügen. | Everything you put in this folder is on your other devices too. You can add more folders later. |
-| `folder.setup.defaultName` | Hangar Drive | Hangar Drive |
+| `folder.setup.defaultName` (backend) | Hangar Drive | Hangar Drive |
 | `folder.setup.change` | Ändern | Change |
-| `folder.setup.existing.one` | Der Ordner enthält schon {count} Datei. Sie wird hochgeladen. | The folder already contains {count} file. It will be uploaded. |
-| `folder.setup.existing.other` | Der Ordner enthält schon {count} Dateien. Sie werden hochgeladen. | The folder already contains {count} files. They will be uploaded. |
+| `folder.setup.existing.one` | Der Ordner enthält schon {count} Datei, die hochgeladen wird. | The folder already contains {count} file. It will be uploaded. |
+| `folder.setup.existing.other` | Der Ordner enthält schon {count} Dateien, die hochgeladen werden. | The folder already contains {count} files. They will be uploaded. |
 | `merge.title.one` | In diesem Ordner liegt schon {count} Datei | This folder already holds {count} file |
 | `merge.title.other` | In diesem Ordner liegen schon {count} Dateien | This folder already holds {count} files |
-| `merge.body.one` | Sie kommt zu „{folder}“ dazu. Ist sie anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten. | It is added to “{folder}”. If it differs from the one on your other devices, both versions are kept. |
-| `merge.body.other` | Sie kommen zu „{folder}“ dazu. Ist eine Datei anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten. | They are added to “{folder}”. If a file differs from the one on your other devices, both versions are kept. |
+| `merge.body.one` | Die Datei kommt zu „{folder}“ dazu. Ist sie anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten. | It is added to “{folder}”. If it differs from the one on your other devices, both versions are kept. |
+| `merge.body.other` | Die Dateien kommen zu „{folder}“ dazu. Ist eine Datei anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten. | They are added to “{folder}”. If a file differs from the one on your other devices, both versions are kept. |
 | `merge.counting` | Dateien werden gezählt … | Counting files … |
 | `merge.confirm` | Zusammenführen | Merge |
-| `merge.other` | Anderen Ordner wählen | Choose another folder |
+| `merge.chooseOther` | Anderen Ordner wählen | Choose another folder |
 | `setup.ready.title` | Alles bereit | All set |
 | `setup.ready.body` | Leg Dateien in deinen Ordner, den Rest erledigt {app}. | Put files in your folder, {app} does the rest. |
 | `setup.ready.open` | Ordner öffnen | Open folder |
 | `setup.ready.trayHint` | {app} läuft im Infobereich unten rechts. Zieh das Symbol in die Taskleiste, dann ist es immer zu sehen. | {app} runs in the notification area at the bottom right. Drag its icon onto the taskbar to keep it in view. |
+| `app.name` | Hangar Drive | Hangar Drive |
+| `name.blank` | Der Name ist leer. Gib einen Namen mit sichtbaren Zeichen ein. | The name is empty. Enter a name with visible characters. |
+| `name.edgeWhitespace` | Der Name darf nicht mit einem Leerzeichen beginnen oder enden. | The name cannot start or end with a space. |
+| `setup.pasteEmpty` | In der Zwischenablage ist gerade kein Text. | There is no text on the clipboard right now. |
+| `recovery.codeLabel` | Wiederherstellungscode, 8 Gruppen | Recovery code, 8 groups |
+| `setup.ready.continue` | Zum Fenster | Go to the window |
 
 ### 13.2 Pairing
 
@@ -1353,6 +1363,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `pair.joined` | Gekoppelt. Gleich geht es weiter. | Paired. Just a moment. |
 | `safety.label` | Sicherheitsnummer | Safety number |
 | `safety.group` | Gruppe {index}: {digits} | Group {index}: {digits} |
+| `pair.new.linkInstead` | Doch lieber den Link einfügen | Paste the link after all |
+| `pair.new.connect` | Koppeln | Pair |
+| `pair.folders.none` | Wähle mindestens einen Ordner. | Choose at least one folder. |
+| `pair.add.qrLabel` | QR-Code mit dem Kopplungslink | QR code with the pairing link |
+| `pair.add.codeServer` | Serveradresse: {host} | Server address: {host} |
 
 ### 13.3 Recovery with the sheet
 
@@ -1364,6 +1379,8 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `recover.cleanup.title` | Alte Geräte entfernen | Remove old devices |
 | `recover.cleanup.body` | Diese Geräte gehören noch zu deinem Konto. Entferne die, die du nicht mehr hast. | These devices still belong to your account. Remove the ones you no longer have. |
 | `recover.newCode` | Der alte Code ist jetzt verbraucht. Hier ist dein neuer. | The old code is used up now. Here is your new one. |
+| `recover.name.title` | Wie soll dieses Gerät heißen? | What should this device be called? |
+| `recover.cleanup.remove` | „{device}“ entfernen | Remove “{device}” |
 
 ### 13.4 Tray
 
@@ -1454,6 +1471,20 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `common.retry` | Jetzt versuchen | Try now |
 | `common.copyReport` | Fehlerbericht kopieren | Copy error report |
 | `common.reportCopied` | Fehlerbericht kopiert. Schick ihn dem Betreiber deines Servers. | Error report copied. Send it to the person who runs your server. |
+| `main.status.attention` | Sieh dir den Hinweis unten an. | Take a look at the notice below. |
+| `main.addFolder.new` | Anderen Ordner wählen … | Choose another folder … |
+| `main.addFolder.bring` | Hierher holen | Bring here |
+| `main.rowMenu` | Aktionen für „{name}“ | Actions for “{name}” |
+| `folder.reason.missing` | Ordner nicht gefunden | folder not found |
+| `folder.reason.olderState` | älterer Stand auf dem Server | older state on the server |
+| `folder.number.title` | Ordnernummer von „{folder}“ | Folder number of “{folder}” |
+| `folder.number.body` | Vergleiche diese Zahlen mit der Ordnernummer auf deinem anderen Gerät. Sind sie gleich, sehen beide Geräte denselben Stand. | Compare these numbers with the folder number on your other device. If they are the same, both devices see the same state. |
+| `folder.deleted.daysLeft.one` | noch {days} Tag | {days} day left |
+| `folder.deleted.daysLeft.other` | noch {days} Tage | {days} days left |
+| `common.undone` | Rückgängig gemacht. | Undone. |
+| `common.save` | Speichern | Save |
+| `common.saved` | Gespeichert: {path} | Saved: {path} |
+| `common.loading` | Wird geladen … | Loading … |
 
 ### 13.6 Conflicts and names
 
@@ -1489,6 +1520,12 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `names.notSynced.system` | Systemdateien werden nicht synchronisiert. | System files are not synced. |
 | `names.ignore` | Ignorieren | Ignore |
 | `names.ignoreHelp` | Die Datei bleibt auf deinen anderen Geräten und auf dem Server. | The file stays on your other devices and on the server. |
+| `conflict.title` | Dateien in zwei Fassungen | Files in two versions |
+| `conflict.keptBoth` | Erledigt. Beide Dateien bleiben, wie sie sind. | Done. Both files stay as they are. |
+| `conflict.allDone` | Alles aufgeräumt. | All tidied up. |
+| `names.title` | Dateien, die hier nicht gespeichert werden können | Files that cannot be stored here |
+| `names.newName` | Neuer Name | New name |
+| `names.renamed` | Umbenannt in „{name}“. | Renamed to “{name}”. |
 
 ### 13.7 Problems
 
@@ -1530,8 +1567,8 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `quota.body` | Neue Änderungen bleiben auf diesem Gerät, bis wieder Platz ist. Lösch Dateien, die du nicht mehr brauchst, oder frag den Betreiber nach mehr Platz. Frühere Versionen und der Papierkorb zählen nicht mit. | New changes stay on this device until there is room again. Delete files you no longer need, or ask the operator for more space. Earlier versions and the trash do not count. |
 | `quotaFull.title` | Dein Speicher auf dem Server ist ganz voll | Your storage on the server is completely full |
 | `quotaFull.body` | Auch Löschen geht gerade nicht mehr, weil dafür kein Platz frei ist. Nur der Betreiber kann jetzt Platz schaffen. Schick ihm den Fehlerbericht. Deine Dateien hier bleiben, wie sie sind. | Even deleting does not work right now, because there is no room left for it. Only the operator can make room now. Send them the error report. Your files here stay as they are. |
-| `budget.line.one` | {count} Datei wartet, weil heute schon sehr viel hochgeladen wurde. Sie geht spätestens morgen raus. | {count} file is waiting because a lot was uploaded today. It goes out by tomorrow at the latest. |
-| `budget.line.other` | {count} Dateien warten, weil heute schon sehr viel hochgeladen wurde. Sie gehen spätestens morgen raus. | {count} files are waiting because a lot was uploaded today. They go out by tomorrow at the latest. |
+| `budget.line.one` | {count} Datei wartet, weil heute schon sehr viel hochgeladen wurde. Die Datei geht spätestens morgen raus. | {count} file is waiting because a lot was uploaded today. It goes out by tomorrow at the latest. |
+| `budget.line.other` | {count} Dateien warten, weil heute schon sehr viel hochgeladen wurde. Die Dateien gehen spätestens morgen raus. | {count} files are waiting because a lot was uploaded today. They go out by tomorrow at the latest. |
 | `notice.retained` | Alte Versionen belegen auf deinem Server gerade viel Platz. Der Betreiber weiß Bescheid. Du musst nichts tun. | Old versions take up a lot of space on your server right now. The operator has been told. You do not need to do anything. |
 | `notice.budgetDevice` | „{device}“ hat heute sehr viel hochgeladen. Warst du das nicht, schau unter Geräte nach. | “{device}” uploaded a lot today. If that was not you, check under Devices. |
 | `notice.minCount.one` | Dein Server hebt alte Versionen jetzt nur noch {days} Tag auf, auch in Ordnern, die sich selten ändern. Der Betreiber weiß Bescheid. | Your server now keeps old versions for {days} day only, also in folders that rarely change. The operator has been told. |
@@ -1573,6 +1610,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `update.body` | {app} braucht ein Update, um weiter zu synchronisieren. | {app} needs an update to keep syncing. |
 | `update.now` | Jetzt aktualisieren | Update now |
 | `refused.body` | Dein Server lässt dieses Gerät nicht mehr herein. | Your server no longer lets this device in. |
+| `deletes.decide` | Entscheiden | Decide |
+| `deletes.done.one` | {count} Datei ist jetzt auch auf deinen anderen Geräten gelöscht. | {count} file is now deleted on your other devices too. |
+| `deletes.done.other` | {count} Dateien sind jetzt auch auf deinen anderen Geräten gelöscht. | {count} files are now deleted on your other devices too. |
+| `server.fix.apply` | Verbinden | Connect |
+| `older.stillOlder` | Der Server zeigt noch den älteren Stand. | The server still shows the older state. |
 
 ### 13.8 Restore
 
@@ -1646,6 +1688,22 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `suspect.step2` | Prüfe das Gerät mit deinem Virenschutz. | Check that device with your antivirus. |
 | `suspect.step3` | Hol den Stand von davor zurück. | Bring back the state from before. |
 | `suspect.view` | Stand vor den Änderungen ansehen | View the state before the changes |
+| `restore.list` | Versionen, neueste zuerst | Versions, newest first |
+| `restore.whenToday` | heute, {time} | today, {time} |
+| `restore.whenYesterday` | gestern, {time} | yesterday, {time} |
+| `restore.whenDate` | {date}, {time} | {date}, {time} |
+| `restore.diffNone` | Gegenüber jetzt: keine Unterschiede | Compared to now: no differences |
+| `restore.file.historyOf` | Nur Versionen von „{name}“ | Only versions of “{name}” |
+| `restore.file.historyAll` | Alle Versionen zeigen | Show all versions |
+| `restore.file.copied` | Gespeichert als „{name}“. | Saved as “{name}”. |
+| `restore.none` | Noch keine früheren Versionen. | No earlier versions yet. |
+| `restore.noDiff` | Keine Unterschiede zu jetzt. | No differences to now. |
+| `restore.beforeDevice.find` | Stand suchen | Find state |
+| `restore.beforeDevice.none` | In dieser Zeit hat das Gerät hier nichts geändert. | That device changed nothing here in that time. |
+| `trash.restoreSelected.one` | {count} Datei wiederherstellen | Restore {count} file |
+| `trash.restoreSelected.other` | {count} Dateien wiederherstellen | Restore {count} files |
+| `trash.select` | „{name}“ auswählen | Select “{name}” |
+| `trash.noMatch` | Nichts gefunden für „{query}“. | Nothing found for “{query}”. |
 
 ### 13.9 Devices
 
@@ -1674,6 +1732,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `devices.recovery.created` | erstellt am {date} | created on {date} |
 | `devices.recovery.renew` | Neu erzeugen | Create new |
 | `devices.recovery.renewBody` | Der neue Code ersetzt den alten. Der alte funktioniert danach nicht mehr. Wirf das alte Blatt weg. | The new code replaces the old one. The old one stops working. Throw the old sheet away. |
+| `devices.rename.title` | „{device}“ umbenennen | Rename “{device}” |
+| `devices.rename.label` | Name | Name |
+| `devices.safety.title` | Sicherheitsnummer von „{device}“ | Safety number of “{device}” |
+| `devices.safety.body` | Auf dem Gerät selbst steht dieselbe Zahlenreihe unter Geräte, Dieses Gerät. | The device itself shows the same numbers under Devices, This device. |
+| `devices.recovery.renewed` | Neuer Code gilt. Der alte funktioniert nicht mehr. | The new code is active. The old one no longer works. |
 
 ### 13.10 Settings
 
@@ -1694,6 +1757,20 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `settings.reportHelp` | Enthält Versionen, Zustände und Fehlercodes. Keine Dateinamen, keine Inhalte, keine Schlüssel. | Contains versions, states and error codes. No file names, no contents, no keys. |
 | `settings.localNote` | Deine Dateien liegen auf diesem Computer unverschlüsselt. Schalte die Laufwerksverschlüsselung deines Systems ein. | Your files are stored unencrypted on this computer. Turn on your system’s drive encryption. |
 | `settings.serverNote` | Auf dem Server sind deine Dateien verschlüsselt. Der Betreiber sieht weder Namen noch Inhalte. | On the server your files are encrypted. The operator sees neither names nor contents. |
+| `settings.versionBuild` | Version {version}, Build {build} | Version {version}, build {build} |
+| `settings.reportPreview` | Das steht im Fehlerbericht | What the error report contains |
+| `help.title` | Hilfe | Help |
+| `help.body` | {app} hält deine Ordner auf allen deinen Geräten gleich. Wenn etwas deine Entscheidung braucht, steht es oben im Fenster. | {app} keeps your folders the same on all your devices. When something needs your decision, it shows at the top of the window. |
+| `help.keys` | Tastenkürzel | Keyboard shortcuts |
+| `help.key.help` | Diese Hilfe öffnen | Open this help |
+| `help.key.settings` | Einstellungen öffnen | Open settings |
+| `help.key.devices` | Geräte öffnen | Open devices |
+| `help.key.close` | Dialog schließen | Close a dialog |
+| `help.key.menu` | Aktionen einer Zeile öffnen | Open the actions of a row |
+| `keys.ctrl` | Strg | Ctrl |
+| `keys.shift` | Umschalt | Shift |
+| `keys.alt` | Alt | Alt |
+| `keys.escape` | Esc | Esc |
 
 ### 13.11 Error texts
 
@@ -1728,6 +1805,9 @@ Each says what happened and what to do; the technical cause goes into the error 
 | `error.locked` | {name} ist gerade in einem anderen Programm geöffnet. {app} versucht es gleich wieder. | {name} is open in another program right now. {app} will try again shortly. |
 | `error.busy` | Gerade beschäftigt. Versuch es gleich noch mal. | Busy right now. Try again in a moment. |
 | `error.unexpected` | Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen. Speichere einen Fehlerbericht unter Einstellungen. | Something went wrong. Your files are not affected. Save an error report under Settings. |
+| `error.server.unreachable` | Der Server antwortet nicht. Prüfe deine Internetverbindung oder frag den Betreiber. | The server does not answer. Check your internet connection or ask the operator. |
+| `error.rename.empty` | Gib einen Namen ein. | Enter a name. |
+| `error.notReady` | Das kann diese Version von {app} noch nicht. | This version of {app} cannot do that yet. |
 
 ## 14. Open questions
 

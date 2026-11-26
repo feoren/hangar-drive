@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "Hangar Drive",
-        "width": 1024,
-        "height": 700,
+        "width": 720,
+        "height": 520,
         "minWidth": 640,
         "minHeight": 420
       }
