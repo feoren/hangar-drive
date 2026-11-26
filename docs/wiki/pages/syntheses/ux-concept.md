@@ -559,35 +559,55 @@ The tray shows one state for the whole app, the most urgent across all folders. 
 
 ```text
 +------------------------------------------------------------------+
-| Hangar Drive                            [Geräte] [Einstellungen] |
+| [≡] (logo) Hangar Drive                    (check) Alles aktuell |
 +------------------------------------------------------------------+
-|  (check) Alles aktuell                                           |
-|          Zuletzt synchronisiert um 14:31                         |
-|                                                                  |
 |  (banner area, only when there is something to decide)           |
 |                                                                  |
-|  Ordner                                                          |
+|  Ordner                                              [list|grid] |
 |  [folder] Hangar Drive    %USERPROFILE%\Hangar Drive   Aktuell [...] |
+|                                                         2,4 GB   |
 |  [folder] Fotos           D:\Fotos         120 Dateien hoch... [...] |
+|                                                        86,3 GB   |
 |  + Ordner hinzufügen                                             |
-|                                                                  |
-|  Letzte Aktivitäten                                              |
-|  Bericht.docx        Hangar Drive   geändert          vor 2 Min. |
-|  Urlaub 014.jpg      Fotos          von Laptop        vor 1 Std. |
-|  Notizen.txt         Hangar Drive   gelöscht          gestern    |
 |                                                                  |
 |  {used} von {quota} auf deinem Server belegt  (only above 80 %)  |
 +------------------------------------------------------------------+
 ```
 
-- **Status first.** [Design] One sentence at the top, the same as the tray tooltip, with one
-  muted line below (time of the last sync, bytes left, or the pause end).
+- **Header.** [Design, owner 2026-11-26] Only three things: the main menu button ("≡", `main.menu`)
+  before the logo (the folded D of `src-tauri/app-icon.svg`, in its own colors in both themes)
+  and the app's name, and on the right the compact status. The menu (`role="menu"`, arrow keys,
+  Escape returns the focus to the button, no shortcut of its own) holds "Ordner hinzufügen",
+  "Letzte Aktivitäten", "Geräte", "Einstellungen" and "Hilfe"; F1, Ctrl+, and Ctrl+Shift+D still
+  open help, settings and devices. No version in the header: the window learns it only through
+  `getAbout`, and the settings show it.
+- **Status.** [Design] The tray's state mark (same shape as the tray icon, tinted green when up to
+  date, red when something needs the person) and the state in words, the same as the tray tooltip;
+  offline shows the one word `main.status.offline`. The sentence is the button's name, the muted
+  line (time of the last sync, bytes left, why files wait) its tooltip and description. Clicking
+  it opens a small panel with the sentence, the line and the state's action ("Fortsetzen",
+  "Jetzt versuchen", "Jetzt synchronisieren"); Escape closes it. Long words end in an ellipsis,
+  below 480 px only the mark stays; the words remain the name and tooltip. For screen readers the sentence is also the page's `h1`
+  at the start of the content, and the live region announces state changes.
 - **Banner area.** [Design] At most one banner at a time, the most urgent; further problems are
   counted on it ("Noch 2 weitere Hinweise"). A banner has a title, one sentence and one or two
   buttons. Banners are the only place where problems appear in the window, so the person never
   has to search.
 - **Folder rows.** [Design] Name, full path (muted, truncated in the middle, full path as tooltip
-  and accessible name), status in words, and a row menu:
+  and accessible name), status in words with the folder's size on this disk below it ("2,4 GB",
+  decimal units through `formatSize`, also at the end of the accessible name; nothing before the
+  first scan, so a new folder never reads "0 B"), and a row menu. The size is the sum of the file
+  sizes in the engine's local tree, the one the scan already holds (`FolderSync::local_bytes`), so
+  the disk is not walked again; it counts files only, not the folder's own marker. A file count is
+  left out on purpose: during a sync the status already counts files, and two counts in one row
+  read as noise. The state is also a color, never alone: the folder icon and the status are green
+  (`--ok`) when the folder is up to date and the server answers, red (`--error`) when it stopped
+  (every reason of `folder.reason.*`), neutral while syncing, paused or offline. A segmented
+  switch next to "Ordner" (`main.view`, "Liste" and "Kacheln", `aria-pressed`) shows the same rows
+  as cards: icon, name (wrapping, never cut off), status and size, the path as tooltip, the row
+  menu in the corner, and "Ordner hinzufügen" as a dashed card; the grid reflows from one column at
+  the minimum width. The choice is kept in the shell's `settings.json` (`folderView`,
+  `set_folder_view`). The row menu:
   - Im Explorer öffnen (also on double click and Enter)
   - Frühere Versionen
   - Papierkorb
@@ -610,7 +630,9 @@ The tray shows one state for the whole app, the most urgent across all folders. 
   "„{folder}“ ist gelöscht." followed by `folder.delete.body` (the folder disappears from all
   devices and can be brought back for {days} days). Deleted folders appear in "Ordner hinzufügen"
   under "Gelöschte Ordner" with "Zurückholen" until the window has passed. [Design]
-- **Activity list.** [Design] The last 50 events of this device, newest first: file name, folder,
+- **Activity list.** [Design] Since 2026-11-26 not in the window but its own view from the main
+  menu ("Letzte Aktivitäten", a dialog like "Geräte" with "Schließen"). The last 50 events of this
+  device, newest first: file name, folder,
   what happened (geändert, neu, gelöscht, umbenannt, von {device}, wiederhergestellt, zwei
   Fassungen), relative time. Many events of one run are grouped ("Fotos: 120 neue Dateien").
   Enter or double click shows the file in Explorer; the row menu has "Frühere Versionen".
@@ -1315,8 +1337,8 @@ Deliberately left out, with the default that replaces them: [Design]
 - **Text scaling.** Layout holds at the Windows text size setting of 200 %; spacing uses the
   `--space-*` tokens, sizes are in `rem` against the 13 px root. [Design]
 - **Keyboard.** [Design]
-  - Tab order follows reading order: status, banner, folder list, activity list, header buttons
-    last (they are the least used).
+  - Tab order follows reading order: banner, folder view switch, folder list, then the header
+    (menu button, status) last (they are the least used).
   - Lists are single tab stops with arrow keys inside (roving tabindex); Enter opens, Shift+F10 or
     the context menu key opens the row menu.
   - Every dialog traps focus, Escape closes it without deciding, focus returns to the element that
@@ -1329,25 +1351,34 @@ Deliberately left out, with the default that replaces them: [Design]
 > Win+B focusing the notification area, and the tray icon opening its menu with the context menu
 > key, are assumed for Windows 10 1809 and 11. Check with Narrator on both.
 - **Screen reader.** [Design]
-  - The status sentence is a `role="status"` region; it announces only state changes (up to
-    date, syncing, paused, offline, needs you), never per file progress.
+  - The status sentence is the page's heading and a `role="status"` region; it announces only
+    state changes (up to date, syncing, paused, offline, needs you), never per file progress.
   - Banners that need a decision use `role="alert"`; informational banners use `role="status"`.
   - Folder and activity rows have one accessible name each: "Fotos, D:\Fotos, 120 Dateien werden
     hochgeladen".
   - Codes are read group by group ("Gruppe 3: 9 H 4 T"); the code box has a "Vorlesen" pattern
     through `aria-label` with spaced characters.
   - The tray tooltip always contains the state in words.
-- **Contrast** of the existing tokens, measured with the WCAG formula on 2026-11-26 [Design]:
+- **Colors.** [Design, owner 2026-11-26] The accent is the green of the logo (`#4fd1a5`); in light
+  mode the same hue at OKLCH lightness 0.50 (`#097559`) for 4.5 : 1. "Done" (`--ok`) and the
+  primary buttons use the same green (dark text on it in dark mode, white in light mode). The
+  error red has the green's OKLCH lightness at the full chroma of that lightness, so both marks
+  weigh the same and differ only in hue: `#ff9491` dark, `#bb022a` light. The tray's "needs you"
+  glyph uses the same red (src-tauri/build.rs, a test keeps both equal); the tray never used the
+  accent, its other glyphs stay neutral. Syncing (`tone-active`) is no longer accent colored but
+  `--text`, so green keeps its one meaning. `src/styles.test.ts` checks all of this.
+- **Contrast** of the tokens, measured with the WCAG formula on 2026-11-26 (accent, ok, error and
+  primary again after the switch to the logo green) [Design]:
 
 | Pair | Dark | Light |
 | --- | --- | --- |
 | `--text` on `--bg` / `--panel` / `--panel-raised` | 13.8 / 12.8 / 11.7 | 15.8 / 14.5 / 15.8 |
 | `--muted` on the same | 6.0 / 5.5 / 5.1 | 6.1 / 5.6 / 6.1 |
-| `--accent` on the same | 7.7 / 7.1 / 6.5 | 5.2 / 4.8 / 5.2 |
-| `--ok` on the same | 6.6 / 6.1 / 5.6 | 5.1 / 4.7 / 5.1 |
+| `--accent` and `--ok` on the same | 9.9 / 9.2 / 8.4 | 5.7 / 5.2 / 5.7 |
 | `--warn` on the same | 6.7 / 6.2 / 5.7 | 4.9 / **4.5 (4.46)** / 4.9 |
-| `--error` on the same | 6.6 / 6.1 / 5.6 | 5.4 / 4.9 / 5.4 |
-| `--on-primary` on `--primary` | 5.2 | 5.2 |
+| `--error` on the same | 8.9 / 8.2 / 7.5 | 6.7 / 6.1 / 6.7 |
+| `--on-primary` on `--primary` (hover) | 9.9 (11.4) | 5.7 (6.8) |
+| tray "needs you" on a dark / light taskbar (#202020 / #f3f3f3) | 7.7 | 6.0 |
 | white on `--danger` | 5.9 | 5.4 |
 | `--border` on `--bg` | 1.4 | 1.5 |
 
@@ -1602,6 +1633,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `main.addFolder` | Ordner hinzufügen | Add folder |
 | `main.addFolder.remote` | Auf deinen anderen Geräten gibt es noch: | Your other devices also have: |
 | `main.activity` | Letzte Aktivitäten | Recent activity |
+| `main.menu` | Menü | Menu |
+| `main.status.offline` | Offline | Offline |
+| `main.view` | Ansicht | View |
+| `main.view.list` | Liste | List |
+| `main.view.grid` | Kacheln | Grid |
 | `main.moreNotices.one` | Noch {count} weiterer Hinweis | {count} more notice |
 | `main.moreNotices.other` | Noch {count} weitere Hinweise | {count} more notices |
 | `main.storage` | {used} von {quota} auf deinem Server belegt | {used} of {quota} used on your server |
