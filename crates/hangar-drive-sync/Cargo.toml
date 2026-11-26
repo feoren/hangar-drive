@@ -71,13 +71,17 @@ dirs = "7"
 
 [target.'cfg(windows)'.dependencies]
 # GetLongPathNameW (8.3 short names from watcher events, ADR 0001, section 7),
-# GetVolumeInformationW (FAT and exFAT get a 2 s mtime tolerance), CreateFileW with
-# FILE_FLAG_OPEN_REPARSE_POINT for the file IDs of path components (security review L1),
-# MoveFileExW without MOVEFILE_REPLACE_EXISTING (L2), ReplaceFileW with a backup (L3) and
-# RegGetValueW for OneDrive's folders (M4). MIT OR Apache-2.0, Microsoft; already in the tree
-# through Tauri and notify, the same version. (The NTFS file IDs come from CreateFileW and
-# GetFileInformationByHandleEx here as well, so the `file-id` crate is no longer needed.)
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
+# GetVolumeInformationW (FAT and exFAT get a 2 s mtime tolerance), RegGetValueW for OneDrive's
+# folders (M4), and every file operation of the sync root relative to directory handles
+# (security review L1, `src/localfs/windows.rs`): NtCreateFile with OBJECT_ATTRIBUTES.RootDirectory
+# and FILE_OPEN_REPARSE_POINT for each directory on the way and for the target, and
+# SetFileInformationByHandle with FileRenameInfo (RootDirectory, no replace for L2) and
+# FileDispositionInfoEx. `Wdk_Foundation`, `Wdk_Storage_FileSystem` and `Win32_System_IO` are the
+# features NtCreateFile needs (OBJECT_ATTRIBUTES, IO_STATUS_BLOCK); NtCreateFile is documented by
+# Microsoft for user mode and exported by ntdll. MIT OR Apache-2.0, Microsoft; already in the tree
+# through Tauri and notify, the same version, so only features are added. (The NTFS file IDs come
+# from GetFileInformationByHandleEx here as well, so the `file-id` crate is not needed.)
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Registry"] }
 # The recycle bin for files that other devices deleted (security review M2): `IFileOperation`
 # with `FOFX_RECYCLEONDELETE` is the shell's own way to recycle, the one Explorer uses, and it
 # reports per item whether the item went to the recycle bin, so a drive without one is detected
@@ -86,7 +90,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # Apache-2.0, Microsoft; already in the tree through Tauri (wry, tao), the same version, so only
 # features are added. `SHFileOperationW` was not taken: Microsoft documents `IFileOperation` as
 # its replacement, and it gives no per item result.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+# `Win32_Globalization` for CompareStringOrdinal: the path the shell resolves an item to must
+# equal the checked path, compared as the file system compares names (security review of the
+# Windows handles, M1).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Com", "Win32_UI_Shell"] }
 # The `implement` macro for the progress sink of `IFileOperation` expands to paths of this crate,
 # so it is named directly. MIT OR Apache-2.0, Microsoft; the version `windows` 0.62 uses.
 windows-core = "0.62"
@@ -98,12 +105,22 @@ windows-core = "0.62"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL"] }
 
 [target.'cfg(unix)'.dependencies]
-# renameat2(RENAME_NOREPLACE) on Linux and renamex_np(RENAME_EXCL) on macOS: a rename that never
-# replaces an existing name, in one system call (security review L2), and O_NOFOLLOW. MIT OR
-# Apache-2.0, the Rust project; already in the tree through getrandom, ring, notify and others.
-# Chosen over `rustix` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT), which is not in
-# the lock file and would add a crate for the same two calls.
+# `statfs` for the mtime tolerance of FAT, exFAT and 9p volumes and `getuid` for the Linux trash.
+# MIT OR Apache-2.0, the Rust project; already in the tree through getrandom, ring, notify and
+# others.
 libc = "0.2"
+# Every file operation of the sync root relative to directory handles (security review L1,
+# `src/localfs/unix.rs`): `openat` with O_NOFOLLOW | O_DIRECTORY for each directory on the way,
+# `statx`/`fstatat`, `mkdirat`, `unlinkat`, `linkat`, `renameat2` with RENAME_NOREPLACE and
+# RENAME_EXCHANGE on Linux, `renameatx_np` with RENAME_EXCL and RENAME_SWAP on macOS, and
+# `fdopendir`. Safe wrappers, so the module needs no unsafe code. Alternatives: the same calls
+# through `libc` would need about fifteen unsafe blocks and a hand-written directory reader;
+# `nix` (MIT, in the lock file as well) has `renameat2` for Linux only and no wrapper of
+# macOS's `renameatx_np`. Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT, the Bytecode
+# Alliance; already in the lock file through tempfile, polling and others, so no crate is added.
+# `fs` for the file calls, `std` for the conversion of its errors into `std::io::Error`. Uses the
+# raw Linux system calls there and libc on macOS.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 # The crate itself with its test doubles, for the integration tests and the simulation under

@@ -623,25 +623,31 @@ fn opening_a_root_empties_the_temporary_directory() {
     assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
 }
 
+/// Security review L1: the cleaning of the quarantine walks by handles; a link or junction put
+/// into the quarantine (as an entry or inside one) is removed itself and never followed, so
+/// nothing outside the root is deleted.
 #[test]
-fn quarantined_files_expire_after_thirty_days() {
-    let dir = tmp("quarantine");
+fn the_quarantine_cleaning_never_follows_a_link() {
+    let dir = tmp("quarantine-link");
+    let outside = tmp("quarantine-link-outside");
+    std::fs::write(outside.join("keep.txt"), b"marker").unwrap();
+    let fs = LocalFs::new(&dir).unwrap();
     let q = dir.join(".hangar-drive").join("trash");
-    std::fs::create_dir_all(q.join("00112233445566778899aabbccddeeff")).unwrap();
-    std::fs::write(
-        q.join("00112233445566778899aabbccddeeff").join("x.txt"),
-        b"marker",
-    )
-    .unwrap();
-    let now = std::time::SystemTime::now();
-    hangar_drive_sync::trash::clean_quarantine(&q, now + Duration::from_secs(29 * 86_400));
-    assert_eq!(std::fs::read_dir(&q).unwrap().count(), 1, "kept for now");
-    hangar_drive_sync::trash::clean_quarantine(&q, now + Duration::from_secs(31 * 86_400));
-    assert_eq!(
-        std::fs::read_dir(&q).unwrap().count(),
-        0,
-        "gone after 30 days"
-    );
+    let item = q.join("00112233445566778899aabbccddeeff");
+    std::fs::create_dir_all(&item).unwrap();
+    std::fs::write(item.join("x.txt"), b"marker").unwrap();
+    link_dir(&item.join("inner-link"), &outside);
+    link_dir(&q.join("ffeeddccbbaa99887766554433221100"), &outside);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    fs.housekeeping(now_ms + 29 * 86_400_000);
+    assert_eq!(std::fs::read_dir(&q).unwrap().count(), 2, "kept for now");
+    assert!(item.join("x.txt").exists());
+    fs.housekeeping(now_ms + 31 * 86_400_000);
+    assert_eq!(std::fs::read_dir(&q).unwrap().count(), 0, "all expired");
+    assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"marker");
 }
 
 /// Security review, info: the quarantine is also cleaned while the root stays open (the hourly

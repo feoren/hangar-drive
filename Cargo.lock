@@ -2098,6 +2098,7 @@ dependencies = [
  "objc2-foundation",
  "reqwest",
  "rusqlite",
+ "rustix",
  "rustls",
  "rustls-platform-verifier",
  "rustls-webpki",

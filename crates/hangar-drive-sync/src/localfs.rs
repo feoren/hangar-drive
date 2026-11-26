@@ -11,11 +11,20 @@
 //!   directory (no symbolic link, junction or other reparse point); where the index knows the
 //!   directory's file ID ([`FileSystem::expect_directories`]), the ID on disk must be the same.
 //!   Otherwise the operation fails with [`FsError::Changed`] and the next scan sees what
-//!   happened. On Windows the IDs come from a handle opened with
-//!   `FILE_FLAG_OPEN_REPARSE_POINT`, so a junction put in place of a directory reports itself
-//!   instead of its target. Unix opens the last component with `O_NOFOLLOW`; between the check
-//!   of a directory and the operation a swap is still possible there (a walk with `openat` on
-//!   directory handles would close it, open point).
+//!   happened.
+//!   - **Unix** walks by handles ([`unix`]): every directory is opened with `openat` relative to
+//!     the one above it with `O_DIRECTORY | O_NOFOLLOW`, and the operation is relative to the
+//!     handle of the directory that holds the target (`openat`, `unlinkat`, `mkdirat`,
+//!     `renameat2`, `renameatx_np`). What was checked is the handle the operation uses, so a
+//!     directory swapped for a link after the check changes nothing outside the root.
+//!   - **Windows** walks by handles as well ([`windows`]): every directory is opened with
+//!     `NtCreateFile` relative to the handle of the one above it with `FILE_DIRECTORY_FILE |
+//!     FILE_OPEN_REPARSE_POINT`, a junction or other reparse point on the way is refused by its
+//!     attributes, and the operation is relative to the handle of the directory that holds the
+//!     target (`NtCreateFile`, `NtSetInformationFile` with `FileRenameInformation`,
+//!     `SetFileInformationByHandle` with `FileDispositionInfoEx`). For the recycle bin, which takes a path, the directories on the
+//!     way are held open without `FILE_SHARE_DELETE`, so none of them can be swapped while the
+//!     shell works ([`windows::pin`]).
 //! - **Long paths:** on Windows the root is the verbatim (`\\?\`) form from `canonicalize`, so
 //!   every path built on it works beyond `MAX_PATH` without the `LongPathsEnabled` registry value.
 //! - **Atomic writes:** content goes to a temporary file with a random name in the reserved
@@ -26,10 +35,11 @@
 //!     `renamex_np(RENAME_EXCL)`), no placeholder; a name that appeared meanwhile is
 //!     [`FsError::Exists`];
 //!   - a replace first checks size, modification time and file ID ([`Expect`]), then swaps in
-//!     one step that keeps the old file (`ReplaceFileW` with a backup on Windows,
-//!     `RENAME_EXCHANGE` on Linux, `RENAME_SWAP` on macOS). If the old file no longer matches
-//!     (the person saved it between the check and the swap), it is kept next to the target as a
-//!     conflict copy instead of being lost.
+//!     a way that keeps the old file (`RENAME_EXCHANGE` on Linux, `RENAME_SWAP` on macOS; on
+//!     Windows two renames by handle that never replace: the old file into the reserved `tmp`
+//!     directory, the new one onto the freed name). If the old file no longer matches (the person
+//!     saved it between the check and the swap), it is kept next to the target as a conflict copy
+//!     instead of being lost.
 //!   - the reserved `tmp` directory is emptied when the root is opened, and an existing
 //!     temporary name is never reported as the target's "already exists".
 //! - **Incoming deletes** go to the system's recycle bin or the quarantine
@@ -46,7 +56,8 @@
 //!   unix-inode-reuse-measurement.md`). Other volumes and platforms have none.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -54,11 +65,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hangar_drive_crypto::{Entropy, OsEntropy};
 use hangar_drive_protocol::ids::ItemId;
-use hangar_drive_protocol::name::{check_name, RESERVED_ROOT_DIR};
+use hangar_drive_protocol::name::check_name;
 
 use crate::names::{conflict_copy_name, date_label, LabelWords};
 use crate::ports::{EntryType, Expect, FileSystem, FsError, ListEntry, Stat};
 use crate::trash::{Trashed, QUARANTINE_DIR};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+// The platform side: places bound to directory handles on both. Both offer the same `Spot` (an
+// entry: its directory and its name), `Folder` (an opened directory) and free functions, so the
+// logic of `LocalFs` below is written once.
+#[cfg(unix)]
+use self::unix as plat;
+#[cfg(windows)]
+use self::windows as plat;
 
 /// Attempts for an operation on a locked file before [`FsError::Locked`].
 const LOCK_ATTEMPTS: u32 = 4;
@@ -66,6 +89,18 @@ const LOCK_ATTEMPTS: u32 = 4;
 const LOCK_BACKOFF: Duration = Duration::from_millis(40);
 /// The temporary directory inside the reserved directory.
 pub const TEMP_DIR: &str = "tmp";
+/// The ending of the name under which a replace keeps the old file in [`TEMP_DIR`] until it is
+/// settled (security review L3). The cleaning at start recovers such files into
+/// [`RECOVERED_DIR`] instead of deleting them, so a crash in between loses no edit.
+const BACKUP_SUFFIX: &str = ".bak";
+/// The directory in the quarantine that takes the backups a crash left in [`TEMP_DIR`]; it
+/// expires like every quarantine entry (30 days after the last file moved in).
+const RECOVERED_DIR: &str = "recovered";
+
+/// Whether `name` in [`TEMP_DIR`] is a backup of a replace ([`BACKUP_SUFFIX`]).
+fn is_backup(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.ends_with(BACKUP_SUFFIX))
+}
 /// The device word in the name of a conflict copy this module keeps (a replace that found the
 /// file changed at the last moment).
 const LOCAL_DEVICE_LABEL: &str = "local";
@@ -187,41 +222,11 @@ impl LocalFs {
         Ok(me)
     }
 
-    fn reserved(&self) -> PathBuf {
-        self.root.join(RESERVED_ROOT_DIR)
-    }
-
+    /// Empties `tmp` and removes expired quarantine entries; both walk by handles and enter
+    /// only plain directories, so a link or junction at any level removes nothing outside.
     fn clean_reserved(&self) {
-        let reserved = self.reserved();
-        // Only a plain reserved directory is touched.
-        let plain = |p: &Path| {
-            fs::symlink_metadata(p)
-                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink() && !is_reparse(&m))
-        };
-        if !plain(&reserved) {
-            return;
-        }
-        let temp = reserved.join(TEMP_DIR);
-        if plain(&temp) {
-            if let Ok(entries) = fs::read_dir(&temp) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    match fs::symlink_metadata(&path) {
-                        Ok(m) if m.is_dir() && !m.file_type().is_symlink() && !is_reparse(&m) => {
-                            let _ = fs::remove_dir_all(&path);
-                        }
-                        Ok(_) => {
-                            let _ = fs::remove_file(&path);
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
-        let quarantine = reserved.join(QUARANTINE_DIR);
-        if plain(&quarantine) {
-            crate::trash::clean_quarantine(&quarantine, SystemTime::now());
-        }
+        plat::clean_temp(&self.root);
+        plat::clean_quarantine(&self.root, SystemTime::now());
     }
 
     /// The root as an absolute (on Windows verbatim) path.
@@ -241,38 +246,35 @@ impl LocalFs {
         Ok(out)
     }
 
-    /// [`LocalFs::full_path`] after the check of every directory on the way (module docs, L1).
-    /// A component that does not exist ends the check: the operation then fails on it.
-    fn checked_path(&self, path: &[String]) -> Result<PathBuf, FsError> {
+    /// The file IDs of the directories below the root as the index knows them (L1).
+    fn expected(&self) -> BTreeMap<Vec<String>, u128> {
+        self.dirs.lock().map(|d| d.clone()).unwrap_or_default()
+    }
+
+    /// The place of `path` after the name checks and the check of every directory on the way
+    /// (module docs, L1). `None` on Unix when a directory on the way does not exist; on Windows
+    /// a component that does not exist ends the check and the operation then fails on it.
+    fn locate(&self, path: &[String]) -> Result<Option<plat::Spot>, FsError> {
         let full = self.full_path(path)?;
-        let expected = self.dirs.lock().map(|d| d.clone()).unwrap_or_default();
-        let mut current = self.root.clone();
-        let check = |at: &Path, rel: Option<&[String]>| -> Result<bool, FsError> {
-            match dir_info(at) {
-                Ok(Some(id)) => {
-                    if let Some(want) = rel.and_then(|r| expected.get(r)) {
-                        if *want != id {
-                            return Err(FsError::Changed);
-                        }
-                    }
-                    Ok(true)
-                }
-                Ok(None) => Err(FsError::Changed),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-                Err(e) => Err(io_error(&e)),
-            }
-        };
-        if !check(&current, None)? {
-            return Err(FsError::NotFound);
-        }
-        let parents = path.len().saturating_sub(1);
-        for i in 0..parents {
-            current.push(&path[i]);
-            if !check(&current, Some(&path[..=i]))? {
-                break;
-            }
-        }
-        Ok(full)
+        let spot = plat::locate(&self.root, full, path, &self.expected())?;
+        #[cfg(test)]
+        race::after_check(path);
+        Ok(spot)
+    }
+
+    /// [`LocalFs::locate`] for an operation that needs the directory on the way.
+    fn spot(&self, path: &[String]) -> Result<plat::Spot, FsError> {
+        self.locate(path)?.ok_or(FsError::NotFound)
+    }
+
+    /// The directory `path` itself (the root for an empty path), after the same checks; a link,
+    /// a junction or a file in its place is [`FsError::Changed`].
+    fn folder(&self, path: &[String]) -> Result<plat::Folder, FsError> {
+        let full = self.full_path(path)?;
+        let folder = plat::open_folder(&self.root, full, path, &self.expected())?;
+        #[cfg(test)]
+        race::after_check(path);
+        Ok(folder)
     }
 
     /// The path below the root of an absolute path from a watcher event, with 8.3 short names
@@ -288,45 +290,23 @@ impl LocalFs {
             .collect()
     }
 
-    fn temp_dir(&self) -> Result<PathBuf, FsError> {
-        self.reserved_dir(&[TEMP_DIR])
-    }
-
     /// `.hangar-drive/<parts>` below the root, created one level at a time, with every level
     /// checked to be a plain directory (no symbolic link, junction or other reparse point,
     /// read without following it, security review N5). A link at any level, `.hangar-drive`
     /// itself included, would let a temporary write or a quarantined file land outside the
     /// root; `create_dir_all` alone follows it.
-    fn reserved_dir(&self, parts: &[&str]) -> Result<PathBuf, FsError> {
-        let mut dir = self.root.clone();
-        for part in std::iter::once(RESERVED_ROOT_DIR).chain(parts.iter().copied()) {
-            dir.push(part);
-            match fs::create_dir(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(io_error(&e)),
-            }
-            match dir_info(&dir) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return Err(FsError::CannotSync(
-                        "the reserved directory is not a plain directory".into(),
-                    ))
-                }
-                Err(e) => return Err(io_error(&e)),
-            }
-        }
-        Ok(dir)
+    fn reserved_dir(&self, parts: &[&str]) -> Result<plat::Folder, FsError> {
+        plat::reserved_dir(&self.root, parts)
     }
 
     /// A new temporary file with a random name (L4). A name that exists is drawn again; it is
     /// never the target's "already exists".
-    fn create_temp(&self, suffix: &str) -> Result<(PathBuf, File), FsError> {
-        let dir = self.temp_dir()?;
+    fn create_temp(&self, suffix: &str) -> Result<(plat::Spot, File), FsError> {
+        let dir = self.reserved_dir(&[TEMP_DIR])?;
         for _ in 0..8 {
-            let path = dir.join(random_name(suffix)?);
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((path, file)),
+            let spot = dir.child(OsStr::new(&random_name(suffix)?));
+            match spot.create_new() {
+                Ok(file) => return Ok((spot, file)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     return Err(match io_error(&e) {
@@ -339,15 +319,6 @@ impl LocalFs {
         Err(FsError::Io("no free temporary name".into()))
     }
 
-    fn stat_path(&self, full: &Path) -> Result<Option<Stat>, FsError> {
-        let meta = match fs::symlink_metadata(full) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io_error(&e)),
-        };
-        Ok(Some(stat_of(full, &meta)))
-    }
-
     fn stat_matches(&self, s: &Stat, expect: Expect) -> bool {
         s.kind == EntryType::File
             && s.size == expect.size
@@ -358,25 +329,19 @@ impl LocalFs {
             }
     }
 
-    fn matches(&self, full: &Path, expect: Expect) -> Result<bool, FsError> {
-        Ok(self
-            .stat_path(full)?
-            .is_some_and(|s| self.stat_matches(&s, expect)))
+    fn matches(&self, spot: &plat::Spot, expect: Expect) -> Result<bool, FsError> {
+        Ok(spot.stat()?.is_some_and(|s| self.stat_matches(&s, expect)))
     }
 
     /// Puts a file that a replace pushed out, and that the person changed, next to the target
     /// as a conflict copy (L3).
-    fn keep_as_conflict(&self, old: &Path, full: &Path) -> Result<(), FsError> {
-        let parent = full.parent().ok_or(FsError::NotFound)?;
-        let name = full
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or(FsError::NotFound)?;
+    fn keep_as_conflict(&self, old: &plat::Spot, target: &plat::Spot) -> Result<(), FsError> {
+        let name = target.name().to_str().ok_or(FsError::NotFound)?;
         let date = date_label(millis(SystemTime::now()), 0);
         let words = LabelWords::default();
         for n in 0..20u32 {
             let base = conflict_copy_name(name, &words, LOCAL_DEVICE_LABEL, &date, &|candidate| {
-                parent.join(candidate).exists()
+                matches!(target.sibling(candidate).stat(), Ok(Some(_)))
             });
             let candidate = if n == 0 {
                 base
@@ -384,7 +349,7 @@ impl LocalFs {
                 let (stem, ext) = crate::names::split_extension(&base);
                 format!("{stem} {n}{ext}")
             };
-            match sys::rename_noreplace(old, &parent.join(&candidate)) {
+            match old.rename_noreplace(&target.sibling(&candidate)) {
                 Ok(()) => return Ok(()),
                 Err(e) if io_error(&e) == FsError::Exists => continue,
                 Err(e) => return Err(io_error(&e)),
@@ -393,46 +358,100 @@ impl LocalFs {
         Err(FsError::Io("no free name for a conflict copy".into()))
     }
 
-    /// Replaces `full` with `temp` and keeps the old file when it changed after the check
+    /// Replaces `target` with `temp` and keeps the old file when it changed after the check
     /// (module docs, L3).
-    fn replace_checked(&self, temp: &Path, full: &Path, expect: Expect) -> Result<(), FsError> {
+    fn replace_checked(
+        &self,
+        temp: &plat::Spot,
+        target: &plat::Spot,
+        expect: Expect,
+    ) -> Result<(), FsError> {
         #[cfg(windows)]
         {
-            let (backup, file) = self.create_temp(".bak")?;
-            drop(file);
-            let replaced = with_lock_retry(|| sys::replace_file(full, temp, &backup));
-            if let Err(e) = replaced {
-                let _ = fs::remove_file(&backup);
-                return Err(e);
+            // Windows has no swap of two names by handle (`ReplaceFileW` takes paths), so the
+            // swap is two renames by handle, neither of which replaces: the old file moves into
+            // `tmp`, then the new one takes the freed name. Nothing is lost in between; for that
+            // moment the name is free.
+            temp.inherit_from(target);
+            let aside = self.reserved_dir(&[TEMP_DIR])?;
+            let backup = self.move_aside(target, &aside)?;
+            #[cfg(test)]
+            race::after_check(&[race::REPLACE_SWAPPED.to_owned()]);
+            if let Err(e) = with_lock_retry(|| temp.rename_noreplace(target)) {
+                // Someone took the name in that moment: the old file goes back or, if that fails
+                // too, next to it as a conflict copy, never left in `tmp` (emptied at start).
+                if with_lock_retry(|| backup.rename_noreplace(target)).is_err() {
+                    self.keep_as_conflict(&backup, target)?;
+                }
+                return Err(match e {
+                    FsError::Exists => FsError::Changed,
+                    other => other,
+                });
             }
-            self.settle_old(&backup, full, expect)
+            self.settle_old(&backup, target, expect)
         }
         #[cfg(not(windows))]
         {
-            match with_lock_retry(|| sys::exchange(temp, full))? {
-                // `temp` now holds the old file.
-                true => self.settle_old(temp, full, expect),
-                false => with_lock_retry(|| fs::rename(temp, full)),
+            // The new file first takes a backup name in `tmp`, so the name that holds the old
+            // file after the exchange is one the cleaning at start recovers instead of deleting
+            // (L3).
+            let backup = temp.sibling(&random_name(BACKUP_SUFFIX)?);
+            with_lock_retry(|| temp.rename_noreplace(&backup))?;
+            let result = match with_lock_retry(|| backup.exchange(target)) {
+                // `backup` now holds the old file.
+                Ok(true) => {
+                    #[cfg(test)]
+                    race::after_check(&[race::REPLACE_SWAPPED.to_owned()]);
+                    return self.settle_old(&backup, target, expect);
+                }
+                Ok(false) => with_lock_retry(|| backup.rename(target)),
+                Err(e) => Err(e),
+            };
+            if result.is_err() {
+                // Still the new content: nothing to keep.
+                let _ = backup.remove_file();
             }
+            result
         }
     }
 
     /// The old file after a swap: removed when it still was what the index expected, else
     /// kept as a conflict copy.
-    fn settle_old(&self, old: &Path, full: &Path, expect: Expect) -> Result<(), FsError> {
-        // The pushed-out file keeps its file ID through the swap (measured for `ReplaceFileW`,
-        // `docs/wiki/raw/2026-11-26-recycle-bin-measurement.md`; a rename exchange moves names,
-        // not files), so the whole expectation applies.
-        let unchanged = match self.stat_path(old)? {
+    fn settle_old(
+        &self,
+        old: &plat::Spot,
+        target: &plat::Spot,
+        expect: Expect,
+    ) -> Result<(), FsError> {
+        // The pushed-out file keeps its file ID through the swap (a rename exchange and the two
+        // renames on Windows move names, not files), so the whole expectation applies.
+        let unchanged = match old.stat()? {
             None => true,
             Some(s) => self.stat_matches(&s, expect),
         };
         if unchanged {
-            let _ = fs::remove_file(old);
+            let _ = old.remove_file();
             Ok(())
         } else {
-            self.keep_as_conflict(old, full)
+            self.keep_as_conflict(old, target)
         }
+    }
+
+    /// Moves the file at `target` into `aside` under a new random name and returns its place
+    /// there (the replace on Windows, [`LocalFs::replace_checked`]).
+    #[cfg(windows)]
+    fn move_aside(&self, target: &plat::Spot, aside: &plat::Folder) -> Result<plat::Spot, FsError> {
+        for _ in 0..8 {
+            let backup = aside.child(OsStr::new(&random_name(BACKUP_SUFFIX)?));
+            match with_lock_retry(|| target.rename_file_noreplace(&backup)) {
+                Ok(()) => return Ok(backup),
+                Err(FsError::Exists) => continue,
+                // The file went away after the check.
+                Err(FsError::NotFound) => return Err(FsError::Changed),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(FsError::Io("no free temporary name".into()))
     }
 
     fn move_dir_ids(&self, from: &[String], to: &[String]) {
@@ -451,16 +470,17 @@ impl LocalFs {
         }
     }
 
-    fn quarantine(&self, item: &ItemId, full: &Path) -> Result<(), FsError> {
+    fn quarantine(&self, item: &ItemId, spot: &plat::Spot) -> Result<(), FsError> {
         let item = item.to_hex();
         let dir = self.reserved_dir(&[QUARANTINE_DIR, &item])?;
-        let name = full.file_name().ok_or(FsError::NotFound)?;
-        let mut target = dir.join(name);
+        let name = spot.name().to_owned();
+        let mut target = dir.child(&name);
         for n in 1..100u32 {
-            match with_lock_retry(|| sys::rename_noreplace(full, &target)) {
+            match with_lock_retry(|| spot.rename_noreplace(&target)) {
                 Ok(()) => return Ok(()),
                 Err(FsError::Exists) => {
-                    target = dir.join(format!("{} ({n})", name.to_string_lossy()));
+                    let numbered = format!("{} ({n})", name.to_string_lossy());
+                    target = dir.child(OsStr::new(&numbered));
                 }
                 Err(e) => return Err(e),
             }
@@ -488,119 +508,6 @@ fn is_reparse(_meta: &fs::Metadata) -> bool {
     false
 }
 
-#[cfg(windows)]
-fn is_system(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & 0x4 != 0
-}
-
-#[cfg(not(windows))]
-fn is_system(_meta: &fs::Metadata) -> bool {
-    false
-}
-
-/// The file ID of a plain directory at `path`, `Ok(None)` if it is something else (a link, a
-/// junction, a file), read without following links (L1).
-fn dir_info(path: &Path) -> io::Result<Option<u128>> {
-    #[cfg(windows)]
-    {
-        let (attributes, id) = sys::handle_info(path)?;
-        let directory = attributes & 0x10 != 0;
-        let reparse = attributes & 0x400 != 0;
-        Ok((directory && !reparse).then_some(id))
-    }
-    #[cfg(unix)]
-    {
-        let meta = fs::symlink_metadata(path)?;
-        Ok((meta.is_dir() && !meta.file_type().is_symlink()).then(|| unix_id(&meta)))
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let meta = fs::symlink_metadata(path)?;
-        Ok((meta.is_dir() && !meta.file_type().is_symlink()).then_some(0))
-    }
-}
-
-#[cfg(unix)]
-fn file_id(_full: &Path, meta: &fs::Metadata) -> Option<u128> {
-    Some(unix_id(meta))
-}
-
-/// The file ID of a file or directory on Unix: device and inode, with the birth time mixed in
-/// where the file system reports one (L1, L3).
-///
-/// Device and inode alone do not identify a file: Linux hands a freed inode number to the next
-/// file created on the same file system at once (measured on ext4 below overlayfs:
-/// `docs/wiki/raw/2026-11-26-unix-inode-reuse-measurement.md`), so a file another program
-/// deleted and created again with the same size and mtime would pass the replace check. The
-/// birth time is set once when the inode is made and never changes afterwards, not on a write, a
-/// rename, a time or mode change or a new hard link, so a move still keeps its file ID and an
-/// operation of the engine itself never looks like a replace.
-///
-/// [`fs::Metadata::created`] is `stx_btime` from the `statx` call std already makes on Linux with
-/// glibc (std asks for `STATX_BTIME` and reports it only when the file system sets it in
-/// `stx_mask`) and `st_birthtime` on macOS, so the birth time costs no extra system call and no
-/// unsafe code here.
-///
-/// `st_ctime` is deliberately not the fallback: it changes with every rename, time change and
-/// mode change (measured, same record), so a move would lose its file ID, a directory would get a
-/// new ID with every entry added to it (failing the L1 check of every later operation in it), and
-/// every `set_meta` would read as a replace by someone else. Where no birth time is reported
-/// (ext4 with 128 byte inodes, 9p, NFSv3, many FUSE file systems, musl builds whose std does not
-/// call `statx`), the ID stays device and inode, the residual risk named in ADR 0001, section 7.
-#[cfg(unix)]
-fn unix_id(meta: &fs::Metadata) -> u128 {
-    use std::os::unix::fs::MetadataExt;
-    let base = (u128::from(meta.dev()) << 64) | u128::from(meta.ino());
-    match birth_nanos(meta) {
-        // The inode stays in the low half, so two files on one device never share an ID. A
-        // reused inode differs in the high half, because `mix` is a bijection: different birth
-        // times give different values. Mixing keeps device and time bits from cancelling out
-        // between two devices.
-        Some(birth) => base ^ (u128::from(mix(birth)) << 64),
-        None => base,
-    }
-}
-
-/// Nanoseconds since the Unix epoch of the birth time, `None` where the file system reports
-/// none (std returns an error, macOS reports 0 on a volume without birth times).
-#[cfg(unix)]
-fn birth_nanos(meta: &fs::Metadata) -> Option<u64> {
-    let since = meta.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
-    u64::try_from(since.as_nanos())
-        .ok()
-        .filter(|nanos| *nanos != 0)
-}
-
-/// The SplitMix64 finalizer: a bijection on `u64` that spreads every input bit over the output.
-#[cfg(unix)]
-fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-#[cfg(windows)]
-fn file_id(full: &Path, _meta: &fs::Metadata) -> Option<u128> {
-    sys::handle_info(full).ok().map(|(_, id)| id)
-}
-
-#[cfg(not(any(windows, unix)))]
-fn file_id(_full: &Path, _meta: &fs::Metadata) -> Option<u128> {
-    None
-}
-
-#[cfg(unix)]
-fn executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o100 != 0
-}
-
-#[cfg(not(unix))]
-fn executable(_meta: &fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(unix)]
 fn set_executable(file: &File, on: bool) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -613,253 +520,6 @@ fn set_executable(file: &File, on: bool) -> io::Result<()> {
 #[cfg(not(unix))]
 fn set_executable(_file: &File, _on: bool) -> io::Result<()> {
     Ok(())
-}
-
-/// Opens an existing file for reading without following a link in its last component.
-///
-/// On Windows `FILE_FLAG_OPEN_REPARSE_POINT` opens a symbolic link, junction or cloud
-/// placeholder that someone put in place of the file as itself, never what it points at, and
-/// the open is refused when the handle is a reparse point (security review N6), as `O_NOFOLLOW`
-/// does on Unix. The check is on the opened handle, so it holds for exactly the file that is
-/// read. The components above the last one are checked by `checked_path` before the open; a
-/// program that may write in the sync root can still swap one of them between that check and
-/// the open (ADR 0001, section 7, "Residual risk").
-fn open_read(full: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(full)?;
-    if is_reparse(&file.metadata()?) {
-        return Err(io::Error::other("the file is a reparse point"));
-    }
-    Ok(file)
-}
-
-fn stat_of(full: &Path, meta: &fs::Metadata) -> Stat {
-    let file_type = meta.file_type();
-    let kind = if file_type.is_symlink() {
-        EntryType::Symlink
-    } else if is_reparse(meta) {
-        EntryType::Reparse
-    } else if file_type.is_dir() {
-        EntryType::Directory
-    } else if file_type.is_file() {
-        if is_system(meta) {
-            EntryType::System
-        } else {
-            EntryType::File
-        }
-    } else {
-        EntryType::Other
-    };
-    let regular = matches!(kind, EntryType::File | EntryType::Directory);
-    Stat {
-        kind,
-        size: if kind == EntryType::File {
-            meta.len()
-        } else {
-            0
-        },
-        mtime_ms: meta.modified().map(millis).unwrap_or(0),
-        file_id: if regular { file_id(full, meta) } else { None },
-        executable: kind == EntryType::File && executable(meta),
-    }
-}
-
-/// Platform calls: the file ID from a handle that does not follow reparse points, the rename
-/// that never replaces, and the swap of a replace.
-#[cfg(windows)]
-mod sys {
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
-
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
-        ReplaceFileW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, MOVEFILE_WRITE_THROUGH,
-        REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS,
-    };
-
-    /// `FILE_READ_ATTRIBUTES`.
-    const READ_ATTRIBUTES: u32 = 0x80;
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
-    }
-
-    /// Attributes and file ID of `path` itself, a reparse point included (not its target).
-    /// The ID is the 128-bit NTFS ID with the volume serial number where the volume has one
-    /// (`FileIdInfo`), else the 64-bit file index, in the same form the index always stored.
-    pub(super) fn handle_info(path: &Path) -> io::Result<(u32, u128)> {
-        let file = std::fs::OpenOptions::new()
-            .access_mode(READ_ATTRIBUTES)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let handle = file.as_raw_handle() as HANDLE;
-        // SAFETY: `handle` is a valid open handle for the length of `file`; both structures
-        // are plain data written by the calls, with their sizes passed.
-        unsafe {
-            let mut basic: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-            if GetFileInformationByHandle(handle, &mut basic) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut info: FILE_ID_INFO = std::mem::zeroed();
-            let ok = GetFileInformationByHandleEx(
-                handle,
-                FileIdInfo,
-                (&mut info as *mut FILE_ID_INFO).cast(),
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            );
-            let id = if ok != 0 {
-                u128::from(info.VolumeSerialNumber).rotate_left(64)
-                    ^ u128::from_le_bytes(info.FileId.Identifier)
-            } else {
-                (u128::from(basic.dwVolumeSerialNumber) << 64)
-                    | (u128::from(basic.nFileIndexHigh) << 32)
-                    | u128::from(basic.nFileIndexLow)
-            };
-            Ok((basic.dwFileAttributes, id))
-        }
-    }
-
-    /// A rename that fails with "already exists" instead of replacing (L2).
-    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-        let (from, to) = (wide(from), wide(to));
-        // SAFETY: both paths are NUL-terminated and live across the call. Without
-        // MOVEFILE_REPLACE_EXISTING the call fails if `to` exists.
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// `ReplaceFileW`: `replacement` takes the place of `replaced`, whose old file becomes
-    /// `backup` (L3).
-    pub(super) fn replace_file(
-        replaced: &Path,
-        replacement: &Path,
-        backup: &Path,
-    ) -> io::Result<()> {
-        let (a, b, c) = (wide(replaced), wide(replacement), wide(backup));
-        // SAFETY: all three paths are NUL-terminated and live across the call; the two reserved
-        // pointers are null as documented.
-        let ok = unsafe {
-            ReplaceFileW(
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_ptr(),
-                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-mod sys {
-    use std::ffi::CString;
-    use std::io;
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
-
-    fn c(path: &Path) -> io::Result<CString> {
-        CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path"))
-    }
-
-    /// One of the two atomic rename variants; `Ok(false)` when the file system or the kernel
-    /// does not offer it.
-    fn rename_with(from: &Path, to: &Path, exchange: bool) -> io::Result<bool> {
-        let (from, to) = (c(from)?, c(to)?);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        // SAFETY: both paths are NUL-terminated and live across the call; AT_FDCWD makes them
-        // relative to the working directory, and they are absolute anyway.
-        let result = unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                if exchange {
-                    libc::RENAME_EXCHANGE
-                } else {
-                    libc::RENAME_NOREPLACE
-                },
-            )
-        };
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        // SAFETY: both paths are NUL-terminated and live across the call.
-        let result = unsafe {
-            libc::renamex_np(
-                from.as_ptr(),
-                to.as_ptr(),
-                if exchange {
-                    libc::RENAME_SWAP
-                } else {
-                    libc::RENAME_EXCL
-                },
-            )
-        };
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "ios"
-        )))]
-        let result: libc::c_int = {
-            let _ = (&from, &to, exchange);
-            return Ok(false);
-        };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => Ok(false),
-            _ => Err(error),
-        }
-    }
-
-    /// A rename that fails with "already exists" instead of replacing (L2). Where the atomic
-    /// variant is missing, a hard link (which never replaces) and an unlink move a file; a
-    /// directory falls back to a check before the rename.
-    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-        if rename_with(from, to, false)? {
-            return Ok(());
-        }
-        let meta = std::fs::symlink_metadata(from)?;
-        if meta.is_dir() {
-            if std::fs::symlink_metadata(to).is_ok() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            return std::fs::rename(from, to);
-        }
-        std::fs::hard_link(from, to)?;
-        std::fs::remove_file(from)
-    }
-
-    /// Swaps two names in one step; `Ok(false)` where that is not offered.
-    pub(super) fn exchange(a: &Path, b: &Path) -> io::Result<bool> {
-        rename_with(a, b, true)
-    }
 }
 
 /// The long form of a path whose components may be 8.3 short names (Windows); other platforms
@@ -988,50 +648,24 @@ fn volume_is_fat(path: &Path) -> bool {
 
 impl FileSystem for LocalFs {
     fn stat(&self, path: &[String]) -> Result<Option<Stat>, FsError> {
-        let full = self.checked_path(path)?;
-        self.stat_path(&full)
+        if path.is_empty() {
+            return self.folder(path)?.stat();
+        }
+        match self.locate(path)? {
+            Some(spot) => spot.stat(),
+            // A directory on the way does not exist, so neither does the entry.
+            None => Ok(None),
+        }
     }
 
     fn list(&self, path: &[String]) -> Result<Vec<ListEntry>, FsError> {
-        let full = self.checked_path(path)?;
-        if !path.is_empty() && dir_info(&full).map_err(|e| io_error(&e))?.is_none() {
-            // The directory itself is a link or a junction now.
-            return Err(FsError::Changed);
-        }
-        let reader = fs::read_dir(&full).map_err(|e| io_error(&e))?;
-        let mut out = Vec::new();
-        for entry in reader {
-            let entry = entry.map_err(|e| io_error(&e))?;
-            let os_name = entry.file_name();
-            let display = os_name.to_string_lossy().into_owned();
-            let name = os_name.into_string().ok();
-            let entry_path = entry.path();
-            let meta = match fs::symlink_metadata(&entry_path) {
-                Ok(m) => m,
-                // Gone between the listing and the stat: the next scan sees it.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(io_error(&e)),
-            };
-            let mut stat = stat_of(&entry_path, &meta);
-            // A name this device could not have created (only possible through other tools),
-            // or one the platform rules refuse, is listed but never synced (L10).
-            if name.as_deref().is_some_and(|n| name_problem(n).is_some()) {
-                stat.kind = EntryType::Other;
-                stat.file_id = None;
-            }
-            out.push(ListEntry {
-                name,
-                display,
-                stat,
-            });
-        }
-        Ok(out)
+        self.folder(path)?.list()
     }
 
     fn read_at(&self, path: &[String], offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let full = self.checked_path(path)?;
+        let spot = self.spot(path)?;
         with_lock_retry(|| {
-            let mut file = open_read(&full)?;
+            let mut file = spot.open_read()?;
             file.seek(SeekFrom::Start(offset))?;
             let mut filled = 0;
             while filled < buf.len() {
@@ -1046,9 +680,9 @@ impl FileSystem for LocalFs {
     }
 
     fn create_dir(&self, path: &[String]) -> Result<(), FsError> {
-        let full = self.checked_path(path)?;
-        fs::create_dir(&full).map_err(|e| io_error(&e))?;
-        if let Ok(Some(id)) = dir_info(&full) {
+        let spot = self.spot(path)?;
+        spot.create_dir().map_err(|e| io_error(&e))?;
+        if let Some(id) = spot.dir_id() {
             if let Ok(mut dirs) = self.dirs.lock() {
                 dirs.insert(path.to_vec(), id);
             }
@@ -1064,7 +698,14 @@ impl FileSystem for LocalFs {
         executable: bool,
         replace: Option<Expect>,
     ) -> Result<Stat, FsError> {
-        let full = self.checked_path(path)?;
+        // A directory on the way that is gone: a replace no longer finds what it expects, a new
+        // file has nowhere to go.
+        let missing = if replace.is_some() {
+            FsError::Changed
+        } else {
+            FsError::NotFound
+        };
+        let target = self.locate(path)?.ok_or(missing)?;
         let (temp, file) = self.create_temp(".part")?;
         let result = (|| {
             let mut writer = io::BufWriter::new(file);
@@ -1077,46 +718,57 @@ impl FileSystem for LocalFs {
             drop(file);
             match replace {
                 Some(expect) => {
-                    if !self.matches(&full, expect)? {
+                    if !self.matches(&target, expect)? {
                         return Err(FsError::Changed);
                     }
-                    self.replace_checked(&temp, &full, expect)?;
+                    self.replace_checked(&temp, &target, expect)?;
                 }
                 // No placeholder: the rename itself claims the name or reports it taken
                 // (security review N3, L2).
-                None => with_lock_retry(|| sys::rename_noreplace(&temp, &full))?,
+                None => with_lock_retry(|| temp.rename_noreplace(&target))?,
             }
-            self.stat_path(&full)?.ok_or(FsError::NotFound)
+            target.stat()?.ok_or(FsError::NotFound)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp);
+            let _ = temp.remove_file();
         }
         result
     }
 
     fn rename(&self, from: &[String], to: &[String]) -> Result<(), FsError> {
-        let (from_full, to_full) = (self.checked_path(from)?, self.checked_path(to)?);
-        if let Some(existing) = self.stat_path(&to_full)? {
-            // A case-only rename on a case-insensitive volume finds the item itself; a plain
-            // rename is the only way to change the case of a name there.
-            let source = self.stat_path(&from_full)?.ok_or(FsError::NotFound)?;
-            if existing.file_id.is_none() || existing.file_id != source.file_id {
+        let (source, target) = (self.spot(from)?, self.spot(to)?);
+        if let Some(existing) = target.stat()? {
+            // A case-only rename on a case-insensitive volume finds the item itself.
+            let current = source.stat()?.ok_or(FsError::NotFound)?;
+            if existing.file_id.is_none() || existing.file_id != current.file_id {
                 return Err(FsError::Exists);
             }
-            with_lock_retry(|| fs::rename(&from_full, &to_full))?;
+            #[cfg(test)]
+            race::after_check(&[race::SAME_FILE_RENAME.to_owned()]);
+            // Windows: a rename without replace changes the case of the same entry (NTFS takes
+            // it, test `a_rename_onto_the_same_file_never_replaces_another_one`), and a file put
+            // under the target name after the check is "already exists" instead of being
+            // replaced for good (security review L5). Linux and macOS keep the plain rename: on a
+            // case-insensitive APFS volume `RENAME_EXCL` may refuse the case change of the same
+            // entry (not measured), and two names of one inode make `rename` a no-op.
+            #[cfg(windows)]
+            with_lock_retry(|| source.rename_noreplace(&target))?;
+            #[cfg(not(windows))]
+            with_lock_retry(|| source.rename(&target))?;
         } else {
-            with_lock_retry(|| sys::rename_noreplace(&from_full, &to_full))?;
+            with_lock_retry(|| source.rename_noreplace(&target))?;
         }
         self.move_dir_ids(from, to);
         Ok(())
     }
 
     fn remove_file(&self, path: &[String], expect: Expect) -> Result<(), FsError> {
-        let full = self.checked_path(path)?;
-        if !self.matches(&full, expect)? {
+        // A directory on the way that is gone: the file is not what the index expects.
+        let spot = self.locate(path)?.ok_or(FsError::Changed)?;
+        if !self.matches(&spot, expect)? {
             return Err(FsError::Changed);
         }
-        with_lock_retry(|| fs::remove_file(&full))
+        with_lock_retry(|| spot.remove_file())
     }
 
     fn trash_file(
@@ -1125,14 +777,40 @@ impl FileSystem for LocalFs {
         path: &[String],
         expect: Expect,
     ) -> Result<Trashed, FsError> {
-        let full = self.checked_path(path)?;
-        if !self.matches(&full, expect)? {
+        let spot = self.locate(path)?.ok_or(FsError::Changed)?;
+        if !self.matches(&spot, expect)? {
             return Err(FsError::Changed);
         }
-        match crate::trash::to_recycle_bin(&full) {
+        // The platform trash takes a path. On Windows the directories on the way are walked
+        // again and held without FILE_SHARE_DELETE until the shell is done, so the file
+        // system meaning of the path stays the one checked here; the shell's own namespace
+        // (folder shortcuts) is checked by `trash::to_recycle_bin`, which refuses an item the
+        // shell resolves elsewhere (ADR 0001, amendment "Directory handles on Windows"). On
+        // Linux and macOS a swap in that window is the open point named there. The quarantine
+        // below goes through the handles.
+        #[cfg(windows)]
+        let pin = {
+            let pin = plat::pin(&self.root, path, &self.expected(), &spot)?;
+            if !self.matches(pin.spot(), expect)? {
+                return Err(FsError::Changed);
+            }
+            pin
+        };
+        let recycled = crate::trash::to_recycle_bin(spot.full());
+        #[cfg(windows)]
+        drop(pin);
+        match recycled {
+            // The platform reported success, yet the checked file is still in place: it
+            // recycled something else (a path it resolved elsewhere; security review of the
+            // Windows handles, M1). The checked file goes to the quarantine, never reported as
+            // recycled.
+            Ok(()) if self.matches(&spot, expect).unwrap_or(false) => {
+                self.quarantine(item, &spot)?;
+                Ok(Trashed::Quarantine)
+            }
             Ok(()) => Ok(Trashed::RecycleBin),
-            Err(_) if full.exists() => {
-                self.quarantine(item, &full)?;
+            Err(_) if matches!(spot.stat(), Ok(Some(_))) => {
+                self.quarantine(item, &spot)?;
                 Ok(Trashed::Quarantine)
             }
             // The platform reported a failure, yet the file is gone: it went somewhere the
@@ -1142,11 +820,8 @@ impl FileSystem for LocalFs {
     }
 
     fn remove_dir(&self, path: &[String]) -> Result<(), FsError> {
-        let full = self.checked_path(path)?;
-        if dir_info(&full).map_err(|e| io_error(&e))?.is_none() {
-            return Err(FsError::Changed);
-        }
-        with_lock_retry(|| fs::remove_dir(&full))?;
+        let spot = self.spot(path)?;
+        spot.remove_dir()?;
         if let Ok(mut dirs) = self.dirs.lock() {
             dirs.retain(|k, _| !k.starts_with(path));
         }
@@ -1160,19 +835,12 @@ impl FileSystem for LocalFs {
         executable: bool,
         expect: Expect,
     ) -> Result<(), FsError> {
-        let full = self.checked_path(path)?;
-        if !self.matches(&full, expect)? {
+        let spot = self.locate(path)?.ok_or(FsError::Changed)?;
+        if !self.matches(&spot, expect)? {
             return Err(FsError::Changed);
         }
         with_lock_retry(|| {
-            let mut options = OpenOptions::new();
-            options.write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            let file = options.open(&full)?;
+            let file = spot.open_write()?;
             file.set_modified(system_time(mtime_ms))?;
             set_executable(&file, executable)
         })
@@ -1188,17 +856,20 @@ impl FileSystem for LocalFs {
         self.tolerance_ms
     }
 
+    fn free_bytes(&self) -> Option<u64> {
+        crate::space::free_bytes(&self.root)
+    }
+
+    fn volume_bytes(&self) -> Option<u64> {
+        crate::space::volume_bytes(&self.root)
+    }
+
     fn exec_supported(&self) -> bool {
         cfg!(unix)
     }
     fn housekeeping(&self, now_ms: i64) {
-        let quarantine = self.reserved().join(QUARANTINE_DIR);
-        // Only a plain directory is touched, as when the root is opened.
-        let plain = fs::symlink_metadata(&quarantine)
-            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink() && !is_reparse(&m));
-        if plain {
-            crate::trash::clean_quarantine(&quarantine, system_time(now_ms));
-        }
+        // Through handles, as when the root is opened.
+        plat::clean_quarantine(&self.root, system_time(now_ms));
     }
 }
 
@@ -1267,10 +938,9 @@ mod tests {
             mtime_ms: 0,
             file_id: None,
         };
-        local
-            .settle_old(&old, &local.root().join("plan.txt"), expect)
-            .unwrap();
-        assert!(!old.exists());
+        let target = local.spot(&["plan.txt".to_owned()]).unwrap();
+        local.settle_old(&old, &target, expect).unwrap();
+        assert!(!old.full().exists());
         let copies: Vec<String> = fs::read_dir(local.root())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1284,11 +954,741 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn scratch_root(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join(".tmp")
+            .join(format!("sync-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The files in `.hangar-drive/trash/recovered` with their content.
+    fn recovered(local: &LocalFs) -> Vec<Vec<u8>> {
+        let dir = local
+            .root()
+            .join(hangar_drive_protocol::name::RESERVED_ROOT_DIR)
+            .join(QUARANTINE_DIR)
+            .join(RECOVERED_DIR);
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Vec<u8>> = entries
+            .map(|e| fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Security review L3: the old file a replace pushed out waits in `tmp` under a backup
+    /// name until it is settled. Left there by a crash, it is recovered into the quarantine at
+    /// the next start instead of being deleted; a half written download is still removed.
+    #[test]
+    fn a_backup_left_in_tmp_is_recovered_at_start() {
+        let dir = scratch_root("recover");
+        let local = LocalFs::new(&dir).unwrap();
+        let temp = local
+            .root()
+            .join(hangar_drive_protocol::name::RESERVED_ROOT_DIR)
+            .join(TEMP_DIR);
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join(format!("00ff{BACKUP_SUFFIX}")),
+            b"the person's edit",
+        )
+        .unwrap();
+        fs::write(temp.join("11ee.part"), b"half a download").unwrap();
+        let local = LocalFs::new(&dir).unwrap();
+        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0);
+        assert_eq!(recovered(&local), [b"the person's edit".to_vec()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a crash right after the swap of a replace, before the old file was
+    /// settled: the old content survives the next start.
+    #[test]
+    fn a_crash_after_the_swap_of_a_replace_loses_no_old_file() {
+        let dir = scratch_root("crash");
+        let local = LocalFs::new(&dir).unwrap();
+        fs::write(local.root().join("plan.txt"), b"old").unwrap();
+        let stat = local.stat(&["plan.txt".to_owned()]).unwrap().unwrap();
+        let expect = Expect {
+            size: stat.size,
+            mtime_ms: stat.mtime_ms,
+            file_id: stat.file_id,
+        };
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _hook = race::arm(|path| {
+                if path == [race::REPLACE_SWAPPED] {
+                    panic!("simulated crash after the swap");
+                }
+            });
+            let mut fill = |w: &mut dyn Write| w.write_all(b"new").map_err(|e| io_error(&e));
+            let _ = local.write_atomic(&["plan.txt".to_owned()], &mut fill, 0, false, Some(expect));
+        }));
+        assert!(crashed.is_err(), "the hook ran");
+        let local = LocalFs::new(&dir).unwrap();
+        assert_eq!(recovered(&local), [b"old".to_vec()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn temporary_names_are_random() {
         let a = random_name(".part").unwrap();
         let b = random_name(".part").unwrap();
         assert_ne!(a, b);
         assert_eq!(a.len(), 32 + 5);
+    }
+}
+
+/// A hook that runs right after the check of the directories on the way and before the
+/// operation, so a test can swap a directory exactly in that window (security review L1). Per
+/// thread, so tests that run in parallel do not see each other's hook.
+#[cfg(test)]
+mod race {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut(&[String])>;
+
+    /// The path the hook sees right after the swap of a replace, before the old file is
+    /// settled (Windows: after the old file moved aside; Linux and macOS: after the exchange).
+    pub(super) const REPLACE_SWAPPED: &str = ":replace-swapped";
+
+    /// The path the hook sees between the file ID check of a rename onto the same file (a
+    /// case-only rename) and the rename itself; no real name holds a colon.
+    pub(super) const SAME_FILE_RENAME: &str = ":same-file-rename";
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the hook when dropped.
+    pub(super) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    /// Runs `hook` with the path of every following check on this thread until the guard drops.
+    pub(super) fn arm(hook: impl FnMut(&[String]) + 'static) -> Armed {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Armed
+    }
+
+    pub(super) fn after_check(path: &[String]) {
+        // Taken out while it runs, so a hook that touches the file system cannot re-enter.
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(path);
+            HOOK.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(hook);
+                }
+            });
+        }
+    }
+}
+
+/// The attack of security review L1: a program that may write in the sync root replaces a
+/// directory with a link to a directory outside the root (a symbolic link on Unix, a junction or
+/// a directory symbolic link on Windows), before the call or between the check of the
+/// directories and the operation. Nothing outside the root may change.
+#[cfg(test)]
+mod link_swap_tests {
+    use super::*;
+    use hangar_drive_protocol::name::RESERVED_ROOT_DIR;
+
+    /// The kinds of directory link an attacker can put in place of a directory.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Link {
+        /// A symbolic link to a directory (Windows: needs developer mode or the privilege).
+        Symlink,
+        /// A junction (Windows only; any user may create one).
+        #[cfg(windows)]
+        Junction,
+    }
+
+    /// Makes `link` a link of `kind` to the directory `target`; `false` when this kind cannot be
+    /// made here (a directory symbolic link on Windows without developer mode).
+    fn make_link(kind: Link, target: &Path, link: &Path) -> bool {
+        match kind {
+            #[cfg(unix)]
+            Link::Symlink => {
+                std::os::unix::fs::symlink(target, link).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            Link::Symlink => match std::os::windows::fs::symlink_dir(target, link) {
+                Ok(()) => true,
+                // ERROR_PRIVILEGE_NOT_HELD: no developer mode and no elevation.
+                Err(e) if e.raw_os_error() == Some(1314) => false,
+                Err(e) => panic!("symlink_dir: {e}"),
+            },
+            #[cfg(windows)]
+            Link::Junction => {
+                // `mklink` is a built-in of cmd; the arguments go as an argv array, and cmd gets
+                // the plain form of the verbatim paths.
+                let made = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(crate::trash::plain_path(link))
+                    .arg(crate::trash::plain_path(target))
+                    .output()
+                    .unwrap();
+                assert!(made.status.success(), "{made:?}");
+                true
+            }
+        }
+    }
+
+    /// The link kinds this machine can make; a kind that cannot be made is skipped with a note.
+    fn kinds() -> Vec<Link> {
+        #[cfg(unix)]
+        let all = vec![Link::Symlink];
+        #[cfg(windows)]
+        let all = vec![Link::Junction, Link::Symlink];
+        let probe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join(".tmp")
+            .join(format!("sync-l1-probe-{:?}", std::thread::current().id()))
+            .join(std::process::id().to_string());
+        let _ = fs::remove_dir_all(&probe);
+        fs::create_dir_all(probe.join("target")).unwrap();
+        let probe = fs::canonicalize(probe).unwrap();
+        let mut out = Vec::new();
+        for (n, kind) in all.into_iter().enumerate() {
+            if make_link(kind, &probe.join("target"), &probe.join(format!("link{n}"))) {
+                out.push(kind);
+            } else {
+                eprintln!("skipped: {kind:?} links cannot be made here (no developer mode)");
+            }
+        }
+        let _ = fs::remove_dir_all(&probe);
+        out
+    }
+
+    /// A sync root with `a/f`, `a/sub/` and `b0` next to a directory `outside` with the same
+    /// names, all below `tests/.tmp/`.
+    struct Scene {
+        base: PathBuf,
+        root: PathBuf,
+        outside: PathBuf,
+        kind: Link,
+        fs: LocalFs,
+    }
+
+    impl Scene {
+        fn new(tag: &str, kind: Link) -> Scene {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("tests")
+                .join(".tmp")
+                .join(format!("sync-l1-{tag}-{kind:?}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            let base = fs::canonicalize(base).unwrap();
+            let (root, outside) = (base.join("root"), base.join("outside"));
+            for dir in [&root, &outside] {
+                fs::create_dir_all(dir.join("a").join("sub")).unwrap();
+            }
+            fs::write(root.join("a").join("f"), b"inside").unwrap();
+            fs::write(root.join("b0"), b"b0").unwrap();
+            // The outside twin of `a`: what a link in its place points at.
+            fs::remove_dir(outside.join("a").join("sub")).unwrap();
+            fs::remove_dir(outside.join("a")).unwrap();
+            fs::create_dir(outside.join("sub")).unwrap();
+            fs::write(outside.join("f"), b"outside").unwrap();
+            let fs = LocalFs::new(&root).unwrap();
+            Scene {
+                base,
+                root,
+                outside,
+                kind,
+                fs,
+            }
+        }
+
+        /// Replaces `a` with a link to `outside`; the real `a` lives on as `a.moved`.
+        fn swap(root: &Path, outside: &Path, kind: Link) {
+            fs::rename(root.join("a"), root.join("a.moved")).unwrap();
+            assert!(make_link(kind, outside, &root.join("a")));
+        }
+
+        fn swap_now(&self) {
+            Scene::swap(&self.root, &self.outside, self.kind);
+        }
+
+        /// Arms the race hook: `a` is swapped right after the check of `target`, once.
+        fn swap_after_check_of(&self, target: &[&str]) -> race::Armed {
+            let target: Vec<String> = target.iter().map(|s| (*s).to_owned()).collect();
+            let (root, outside, kind) = (self.root.clone(), self.outside.clone(), self.kind);
+            let mut done = false;
+            race::arm(move |path| {
+                if !done && path == target.as_slice() {
+                    done = true;
+                    Scene::swap(&root, &outside, kind);
+                }
+            })
+        }
+
+        /// Every entry below `outside` with its content (files) and modification time.
+        fn outside_state(&self) -> Vec<(PathBuf, Option<Vec<u8>>, SystemTime)> {
+            fn walk(dir: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>, SystemTime)>) {
+                let mut entries: Vec<_> = fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                entries.sort();
+                for path in entries {
+                    let meta = fs::symlink_metadata(&path).unwrap();
+                    let modified = meta.modified().unwrap();
+                    if meta.is_dir() {
+                        out.push((path.clone(), None, modified));
+                        walk(&path, out);
+                    } else {
+                        out.push((path.clone(), Some(fs::read(&path).unwrap()), modified));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.outside, &mut out);
+            out
+        }
+
+        fn expect_f(&self) -> Expect {
+            let stat = self.fs.stat(&p(&["a", "f"])).unwrap().unwrap();
+            Expect {
+                size: stat.size,
+                mtime_ms: stat.mtime_ms,
+                file_id: stat.file_id,
+            }
+        }
+
+        fn moved(&self, name: &str) -> PathBuf {
+            self.root.join("a.moved").join(name)
+        }
+    }
+
+    impl Drop for Scene {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn p(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn write(
+        fs: &LocalFs,
+        path: &[&str],
+        bytes: &[u8],
+        replace: Option<Expect>,
+    ) -> Result<Stat, FsError> {
+        let mut fill = |w: &mut dyn Write| w.write_all(bytes).map_err(|e| io_error(&e));
+        fs.write_atomic(&p(path), &mut fill, 1_700_000_000_000, false, replace)
+    }
+
+    fn item() -> ItemId {
+        ItemId::from_bytes([7; 16])
+    }
+
+    #[test]
+    fn a_directory_already_swapped_for_a_link_is_refused() {
+        for kind in kinds() {
+            let scene = Scene::new("before", kind);
+            let expect = scene.expect_f();
+            scene.swap_now();
+            let before = scene.outside_state();
+            let fs = &scene.fs;
+
+            assert_eq!(write(fs, &["a", "new"], b"x", None), Err(FsError::Changed));
+            assert_eq!(
+                write(fs, &["a", "f"], b"x", Some(expect)),
+                Err(FsError::Changed)
+            );
+            assert_eq!(
+                fs.remove_file(&p(&["a", "f"]), expect),
+                Err(FsError::Changed)
+            );
+            assert_eq!(
+                fs.trash_file(&item(), &p(&["a", "f"]), expect),
+                Err(FsError::Changed)
+            );
+            assert_eq!(
+                fs.rename(&p(&["a", "f"]), &p(&["g"])),
+                Err(FsError::Changed)
+            );
+            assert_eq!(
+                fs.rename(&p(&["b0"]), &p(&["a", "g"])),
+                Err(FsError::Changed)
+            );
+            assert_eq!(fs.create_dir(&p(&["a", "d"])), Err(FsError::Changed));
+            assert_eq!(fs.remove_dir(&p(&["a", "sub"])), Err(FsError::Changed));
+            assert_eq!(
+                fs.set_meta(&p(&["a", "f"]), 0, true, expect),
+                Err(FsError::Changed)
+            );
+            let mut buf = [0u8; 16];
+            assert_eq!(
+                fs.read_at(&p(&["a", "f"]), 0, &mut buf),
+                Err(FsError::Changed)
+            );
+            assert_eq!(fs.stat(&p(&["a", "f"])), Err(FsError::Changed));
+            assert_eq!(fs.list(&p(&["a"])), Err(FsError::Changed));
+
+            assert_eq!(scene.outside_state(), before);
+            assert!(scene.root.join("b0").exists());
+        }
+    }
+
+    #[test]
+    fn a_new_file_after_the_swap_lands_in_the_checked_directory() {
+        for kind in kinds() {
+            let scene = Scene::new("write-new", kind);
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "new"]);
+            write(&scene.fs, &["a", "new"], b"fresh", None).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(fs::read(scene.moved("new")).unwrap(), b"fresh");
+        }
+    }
+
+    #[test]
+    fn a_replace_after_the_swap_lands_in_the_checked_directory() {
+        for kind in kinds() {
+            let scene = Scene::new("write-replace", kind);
+            let expect = scene.expect_f();
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "f"]);
+            write(&scene.fs, &["a", "f"], b"replaced", Some(expect)).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(fs::read(scene.moved("f")).unwrap(), b"replaced");
+        }
+    }
+
+    #[test]
+    fn a_delete_after_the_swap_removes_nothing_outside() {
+        for kind in kinds() {
+            let scene = Scene::new("remove", kind);
+            let expect = scene.expect_f();
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "f"]);
+            scene.fs.remove_file(&p(&["a", "f"]), expect).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert!(!scene.moved("f").exists());
+        }
+    }
+
+    #[test]
+    fn a_directory_delete_after_the_swap_removes_nothing_outside() {
+        for kind in kinds() {
+            let scene = Scene::new("rmdir", kind);
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "sub"]);
+            scene.fs.remove_dir(&p(&["a", "sub"])).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert!(!scene.moved("sub").exists());
+        }
+    }
+
+    #[test]
+    fn a_rename_out_of_the_swapped_directory_takes_nothing_from_outside() {
+        for kind in kinds() {
+            let scene = Scene::new("rename-from", kind);
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["g"]);
+            scene.fs.rename(&p(&["a", "f"]), &p(&["g"])).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(fs::read(scene.root.join("g")).unwrap(), b"inside");
+        }
+    }
+
+    #[test]
+    fn a_rename_into_the_swapped_directory_puts_nothing_outside() {
+        for kind in kinds() {
+            let scene = Scene::new("rename-to", kind);
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "g"]);
+            scene.fs.rename(&p(&["b0"]), &p(&["a", "g"])).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(fs::read(scene.moved("g")).unwrap(), b"b0");
+        }
+    }
+
+    #[test]
+    fn a_new_directory_after_the_swap_lands_in_the_checked_directory() {
+        for kind in kinds() {
+            let scene = Scene::new("mkdir", kind);
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "d"]);
+            scene.fs.create_dir(&p(&["a", "d"])).unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert!(scene.moved("d").is_dir());
+        }
+    }
+
+    #[test]
+    fn metadata_after_the_swap_change_nothing_outside() {
+        for kind in kinds() {
+            let scene = Scene::new("meta", kind);
+            let expect = scene.expect_f();
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "f"]);
+            scene
+                .fs
+                .set_meta(&p(&["a", "f"]), 1_000_000_000_000, true, expect)
+                .unwrap();
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(
+                millis(fs::metadata(scene.moved("f")).unwrap().modified().unwrap()),
+                1_000_000_000_000
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_after_the_swap_reads_the_checked_file() {
+        for kind in kinds() {
+            let scene = Scene::new("read", kind);
+            let _hook = scene.swap_after_check_of(&["a", "f"]);
+            let mut buf = [0u8; 16];
+            let n = scene.fs.read_at(&p(&["a", "f"]), 0, &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"inside");
+        }
+    }
+
+    #[test]
+    fn a_listing_after_the_swap_lists_the_checked_directory() {
+        for kind in kinds() {
+            let scene = Scene::new("list", kind);
+            let _hook = scene.swap_after_check_of(&["a"]);
+            let listed = scene.fs.list(&p(&["a"])).unwrap();
+            let mut names: Vec<String> = listed.iter().filter_map(|e| e.name.clone()).collect();
+            names.sort();
+            assert_eq!(names, ["f", "sub"]);
+            // The outside twin has the same names; its `f` holds "outside", the checked one
+            // "inside".
+            let f = listed.iter().find(|e| e.name.as_deref() == Some("f"));
+            assert_eq!(f.map(|e| e.stat.size), Some(6));
+        }
+    }
+
+    /// Windows: the recycle bin takes a path, so after the check the directories are walked
+    /// again and pinned; a swap in between is refused before the shell resolves the path. The
+    /// outside twin of `f` has the same size and time and the expectation no file ID, so only
+    /// the pin stops the shell from recycling the file outside the root.
+    #[cfg(windows)]
+    #[test]
+    fn a_trash_after_the_swap_hands_the_shell_no_path_through_the_link() {
+        for kind in kinds() {
+            let scene = Scene::new("trash", kind);
+            let inside = scene.root.join("a").join("f");
+            fs::write(scene.outside.join("f"), b"inside").unwrap();
+            let mtime = fs::metadata(&inside).unwrap().modified().unwrap();
+            File::options()
+                .write(true)
+                .open(scene.outside.join("f"))
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            let expect = Expect {
+                file_id: None,
+                ..scene.expect_f()
+            };
+            let before = scene.outside_state();
+            let _hook = scene.swap_after_check_of(&["a", "f"]);
+            assert_eq!(
+                scene.fs.trash_file(&item(), &p(&["a", "f"]), expect),
+                Err(FsError::Changed)
+            );
+            assert_eq!(scene.outside_state(), before);
+            assert_eq!(fs::read(scene.moved("f")).unwrap(), b"inside");
+        }
+    }
+
+    /// Security review L5: a rename onto a name that holds the same file (a case-only rename,
+    /// or a second hard link) never replaces. Here the other name is swapped for another file
+    /// between the file ID check and the rename; that file must survive.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_onto_the_same_file_never_replaces_another_one() {
+        let scene = Scene::new("same-file", Link::Junction);
+        let root = scene.root.clone();
+        fs::write(root.join("a.txt"), b"mine").unwrap();
+        // A case-only rename works.
+        scene.fs.rename(&p(&["a.txt"]), &p(&["A.txt"])).unwrap();
+        let names: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"A.txt".to_owned()), "{names:?}");
+        // A second link of the same file passes the ID check; then someone puts another file
+        // in its place.
+        fs::hard_link(root.join("A.txt"), root.join("b.txt")).unwrap();
+        let other = root.clone();
+        let _hook = race::arm(move |path| {
+            if path == [race::SAME_FILE_RENAME] {
+                fs::remove_file(other.join("b.txt")).unwrap();
+                fs::write(other.join("b.txt"), b"theirs").unwrap();
+            }
+        });
+        assert_eq!(
+            scene.fs.rename(&p(&["A.txt"]), &p(&["b.txt"])),
+            Err(FsError::Exists)
+        );
+        assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"theirs");
+        assert_eq!(fs::read(root.join("A.txt")).unwrap(), b"mine");
+    }
+
+    /// `CLSID_FolderShortcut`: a folder the Explorer shell follows through its `target.lnk`.
+    #[cfg(windows)]
+    const FOLDER_SHORTCUT: &str = "{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+
+    /// Makes `dir\target.lnk` a shell link to `target` (WScript.Shell through PowerShell, the
+    /// paths passed in the environment, the command as an argv array).
+    #[cfg(windows)]
+    fn shell_link(dir: &Path, target: &Path) {
+        let made = std::process::Command::new("powershell")
+            .env("HD_LNK", crate::trash::plain_path(&dir.join("target.lnk")))
+            .env("HD_TARGET", crate::trash::plain_path(target))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HD_LNK); \
+                 $s.TargetPath = $env:HD_TARGET; $s.Save()",
+            ])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+    }
+
+    /// Security review of the Windows handles, M1, first form: a folder named `x.{CLSID}` with a
+    /// `target.lnk` is a folder shortcut for the shell, so the shell resolves a path through it
+    /// to the link's target outside the root. Such a name cannot sync on Windows, so the engine
+    /// never hands that path to the shell; nothing outside changes. The shell's resolution is
+    /// read without deleting anything.
+    #[cfg(windows)]
+    #[test]
+    fn a_shell_junction_name_never_reaches_the_shell() {
+        let scene = Scene::new("shell-name", Link::Junction);
+        let name = format!("a.{FOLDER_SHORTCUT}");
+        let junction = scene.root.join(&name);
+        fs::create_dir(&junction).unwrap();
+        fs::write(junction.join("f"), b"inside").unwrap();
+        shell_link(&junction, &scene.outside);
+        let resolved = crate::trash::resolved_by_shell(&junction.join("f")).unwrap();
+        assert!(
+            resolved.to_string_lossy().eq_ignore_ascii_case(
+                &crate::trash::plain_path(&scene.outside.join("f")).to_string_lossy()
+            ),
+            "the shell resolves {resolved:?}"
+        );
+        let before = scene.outside_state();
+        let expect = Expect {
+            size: 6,
+            mtime_ms: 0,
+            file_id: None,
+        };
+        assert!(matches!(
+            scene
+                .fs
+                .trash_file(&item(), &[name.clone(), "f".to_owned()], expect),
+            Err(FsError::CannotSync(_))
+        ));
+        assert_eq!(scene.outside_state(), before);
+        assert_eq!(fs::read(junction.join("f")).unwrap(), b"inside");
+    }
+
+    /// M1, second form: a plain folder name, made a folder shortcut by a `desktop.ini` that names
+    /// the CLSID and the read-only attribute. The handles see a plain directory, the shell a
+    /// junction to `outside`. The check of the shell's resolution refuses the recycle bin, and
+    /// the checked file goes to the quarantine; nothing outside changes.
+    #[cfg(windows)]
+    #[test]
+    fn the_recycle_bin_refuses_a_path_the_shell_resolves_elsewhere() {
+        let scene = Scene::new("shell-ini", Link::Junction);
+        let a = scene.root.join("a");
+        fs::write(
+            a.join("desktop.ini"),
+            format!("[.ShellClassInfo]\r\nCLSID2={FOLDER_SHORTCUT}\r\nFlags=2\r\n"),
+        )
+        .unwrap();
+        shell_link(&a, &scene.outside);
+        let mut perms = fs::metadata(&a).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&a, perms.clone()).unwrap();
+        let resolved = crate::trash::resolved_by_shell(&a.join("f")).unwrap();
+        let outside_f = crate::trash::plain_path(&scene.outside.join("f"));
+        let redirected = resolved
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&outside_f.to_string_lossy());
+        assert!(
+            redirected,
+            "the shell resolves {resolved:?}, the attack needs {outside_f:?}"
+        );
+        let expect = scene.expect_f();
+        let before = scene.outside_state();
+        let trashed = scene.fs.trash_file(&item(), &p(&["a", "f"]), expect);
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&a, perms).unwrap();
+        assert_eq!(trashed, Ok(Trashed::Quarantine));
+        assert_eq!(scene.outside_state(), before);
+        assert!(!a.join("f").exists());
+        let kept = scene
+            .root
+            .join(RESERVED_ROOT_DIR)
+            .join(QUARANTINE_DIR)
+            .join(item().to_hex())
+            .join("f");
+        assert_eq!(fs::read(kept).unwrap(), b"inside");
+    }
+
+    #[test]
+    fn a_directory_replaced_by_another_directory_is_refused() {
+        for kind in kinds() {
+            let scene = Scene::new("other-dir", kind);
+            let id = scene.fs.stat(&p(&["a"])).unwrap().unwrap().file_id.unwrap();
+            scene.fs.expect_directories(vec![(p(&["a"]), id)]);
+            fs::rename(scene.root.join("a"), scene.root.join("a.moved")).unwrap();
+            fs::create_dir(scene.root.join("a")).unwrap();
+            fs::write(scene.root.join("a").join("f"), b"inside").unwrap();
+            assert_eq!(
+                write(&scene.fs, &["a", "x"], b"x", None),
+                Err(FsError::Changed)
+            );
+            assert_eq!(scene.fs.stat(&p(&["a", "f"])), Err(FsError::Changed));
+        }
+    }
+
+    #[test]
+    fn a_link_at_the_reserved_directory_is_never_followed() {
+        for kind in kinds() {
+            let scene = Scene::new("reserved", kind);
+            // The outside directory with a `tmp` of its own, which the cleaning must not empty.
+            fs::create_dir(scene.outside.join(TEMP_DIR)).unwrap();
+            fs::write(scene.outside.join(TEMP_DIR).join("keep"), b"keep").unwrap();
+            let before = scene.outside_state();
+            let reserved = scene.root.join(RESERVED_ROOT_DIR);
+            let _ = fs::remove_dir_all(&reserved);
+            assert!(make_link(kind, &scene.outside, &reserved));
+            assert!(matches!(
+                write(&scene.fs, &["new"], b"x", None),
+                Err(FsError::CannotSync(_))
+            ));
+            // Opening the root again cleans `tmp` only through plain directories.
+            let _ = LocalFs::new(&scene.root).unwrap();
+            assert_eq!(scene.outside_state(), before);
+        }
     }
 }

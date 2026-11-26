@@ -12,8 +12,16 @@
 //! When there is no recycle bin or the move fails, the file goes into the quarantine
 //! [`QUARANTINE_DIR`] of the sync root, `.hangar-drive/trash/<item ID>/<name>`, on the same
 //! volume, so the move is a rename. The reserved directory is never scanned
-//! (`hangar_drive_protocol::name::is_ignored`), and [`clean_quarantine`] removes entries older
-//! than [`QUARANTINE_DAYS`] when the sync root is opened.
+//! (`hangar_drive_protocol::name::is_ignored`), and entries older than [`QUARANTINE_DAYS`]
+//! ([`expired`]) are removed when the sync root is opened and at every housekeeping.
+//!
+//! Every platform trash here takes a path and resolves it again. On Windows the sync root holds
+//! the directories on the way open without `FILE_SHARE_DELETE` for the length of the call, so
+//! none of them can be swapped for a junction meanwhile (`crate::localfs`, security review L1),
+//! and the shell item must resolve to exactly the checked path and parent (`SIGDN_FILESYSPATH`),
+//! since the shell's namespace has junctions of its own (folder shortcuts); an item it resolves
+//! elsewhere is refused and the file goes to the quarantine. On Linux and macOS a swap in that
+//! window is still possible (ADR 0001, open point).
 //!
 //! Paths: `std` hands Windows the verbatim form (`\\?\C:\...`) of the root. The shell's parser
 //! does not take every verbatim path (measured, `docs/wiki/raw/2026-11-26-recycle-bin-measurement.md`),
@@ -66,29 +74,21 @@ pub fn to_recycle_bin(path: &Path) -> Result<(), TrashError> {
     platform::to_recycle_bin(path)
 }
 
-/// Removes quarantine entries older than [`QUARANTINE_DAYS`] below `quarantine`. Errors are
-/// ignored: an entry that cannot be removed now is tried again at the next opening.
-pub fn clean_quarantine(quarantine: &Path, now: SystemTime) {
-    let Ok(entries) = std::fs::read_dir(quarantine) else {
-        return;
-    };
+/// The file system path the Windows shell resolves `path` to (tests of the shell namespace
+/// check, nothing is deleted).
+#[cfg(all(test, windows))]
+pub(crate) fn resolved_by_shell(path: &Path) -> Result<PathBuf, TrashError> {
+    platform::resolved_by_shell(path)
+}
+
+/// Whether a quarantine entry whose directory was made at `made` (when the file moved in) is
+/// older than [`QUARANTINE_DAYS`] at `now`. The sync root removes such entries through its
+/// directory handles when it is opened and at every housekeeping (`crate::localfs`), entering
+/// only plain directories, so a link or junction in the quarantine removes nothing outside the
+/// root (ADR 0001, amendment "Directory handles on Windows").
+pub fn expired(made: SystemTime, now: SystemTime) -> bool {
     let max_age = Duration::from_secs(QUARANTINE_DAYS * 24 * 60 * 60);
-    for entry in entries.flatten() {
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        // The entry's directory was made when the file moved in.
-        let Ok(made) = meta.modified() else {
-            continue;
-        };
-        if now.duration_since(made).is_ok_and(|age| age > max_age) {
-            if meta.is_dir() && !meta.file_type().is_symlink() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            } else {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
+    now.duration_since(made).is_ok_and(|age| age > max_age)
 }
 
 #[cfg(windows)]
@@ -100,14 +100,16 @@ mod platform {
 
     use windows::core::{implement, Ref, Result as WinResult, HRESULT, PCWSTR};
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
     use windows::Win32::UI::Shell::{
         FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
         IShellItem, SHCreateItemFromParsingName, COPYENGINE_E_USER_CANCELLED, FOFX_EARLYFAILURE,
-        FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI, SIGDN_FILESYSPATH,
+        TSF_DELETE_RECYCLE_IF_POSSIBLE,
     };
 
     use super::{plain_path, TrashError};
@@ -273,13 +275,97 @@ mod platform {
         }
     }
 
+    fn failed(e: windows::core::Error) -> TrashError {
+        TrashError::Failed(e.message())
+    }
+
+    /// The shell item of `path` (its plain form, NUL-terminated in `wide`).
+    fn parse(wide: &[u16]) -> Result<IShellItem, TrashError> {
+        // SAFETY: `wide` is NUL-terminated and lives across the call; COM is entered by the
+        // caller on this thread.
+        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(failed) }
+    }
+
+    /// The file system path the shell resolves `item` to (`SIGDN_FILESYSPATH`), without the NUL.
+    fn file_system_path(item: &IShellItem) -> Result<Vec<u16>, TrashError> {
+        // SAFETY: `item` is a valid interface; the returned string is NUL-terminated, owned by
+        // the caller, read once and freed with CoTaskMemFree as documented.
+        unsafe {
+            let name = item.GetDisplayName(SIGDN_FILESYSPATH).map_err(failed)?;
+            let out = name.as_wide().to_vec();
+            CoTaskMemFree(Some(name.0 as *const _));
+            Ok(out)
+        }
+    }
+
+    /// Ordinal comparison without regard to case, as the file system compares names.
+    fn same_path(a: &[u16], b: &[u16]) -> bool {
+        // SAFETY: two slices of UTF-16 units, read for the call only.
+        unsafe { CompareStringOrdinal(a, b, true) == CSTR_EQUAL }
+    }
+
+    /// Refuses an item the shell resolves to another place than `path` (security review of the
+    /// Windows handles, M1). The shell parses a path through its own namespace, not the file
+    /// system's: a folder named `x.{CLSID}` or one with a `desktop.ini` that names a CLSID (with
+    /// the read-only or system attribute) is a namespace junction there, and with
+    /// `CLSID_FolderShortcut` and a `target.lnk` inside, `root\x\f` is the item `outside\f`. The
+    /// copy engine deletes what the item is, so the item's file system path must be exactly the
+    /// path that was checked, and so must its parent's (the folder the copy engine works in),
+    /// compared ordinally without regard to case. The pinned directories keep the checked path
+    /// itself stable meanwhile (`crate::localfs`).
+    fn check_resolution(item: &IShellItem, plain: &Path) -> Result<(), TrashError> {
+        let elsewhere = || TrashError::Failed("the shell resolves the path elsewhere".into());
+        let want: Vec<u16> = plain.as_os_str().encode_wide().collect();
+        if !same_path(&file_system_path(item)?, &want) {
+            return Err(elsewhere());
+        }
+        let parent_want: Vec<u16> = plain
+            .parent()
+            .ok_or_else(elsewhere)?
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        // SAFETY: `item` is a valid interface; the parent is a new reference released on drop.
+        let parent = unsafe { item.GetParent() }.map_err(failed)?;
+        let parent_have = file_system_path(&parent)?;
+        // A drive root is reported with its backslash (`C:\`), `Path::parent` drops it.
+        let trimmed = |p: &[u16]| -> Vec<u16> {
+            let mut p = p.to_vec();
+            while p.len() > 3 && p.last() == Some(&u16::from(b'\\')) {
+                p.pop();
+            }
+            p
+        };
+        if !same_path(&trimmed(&parent_have), &trimmed(&parent_want)) {
+            return Err(elsewhere());
+        }
+        Ok(())
+    }
+
+    /// The file system path the shell resolves `path` to, for tests that show a namespace
+    /// junction without deleting anything.
+    #[cfg(test)]
+    pub(super) fn resolved_by_shell(path: &Path) -> Result<std::path::PathBuf, TrashError> {
+        use std::os::windows::ffi::OsStringExt;
+        let _com = Com::enter()?;
+        let wide: Vec<u16> = plain_path(path)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let item = parse(&wide)?;
+        let resolved = file_system_path(&item)?;
+        Ok(std::ffi::OsString::from_wide(&resolved).into())
+    }
+
     pub(super) fn to_recycle_bin(path: &Path) -> Result<(), TrashError> {
         let _com = Com::enter()?;
         let plain = plain_path(path);
         let wide: Vec<u16> = plain.as_os_str().encode_wide().chain(Some(0)).collect();
         let outcome = Rc::new(Outcome::default());
         let sink: IFileOperationProgressSink = Sink(Rc::clone(&outcome)).into();
-        let failed = |e: windows::core::Error| TrashError::Failed(e.message());
+        let item = parse(&wide)?;
+        check_resolution(&item, &plain)?;
         // SAFETY: every call gets valid COM interfaces created here and a NUL-terminated path
         // that lives until the operation finished; the interfaces are released on drop, before
         // `_com` ends COM on this thread.
@@ -290,8 +376,6 @@ mod platform {
                 FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE,
             )
             .map_err(failed)?;
-            let item: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).map_err(failed)?;
             op.DeleteItem(&item, &sink).map_err(failed)?;
             let performed = op.PerformOperations();
             if outcome.refused.get() {
@@ -500,5 +584,16 @@ mod tests {
             PathBuf::from(r"\\srv\share\x")
         );
         assert_eq!(plain_path(Path::new("/x/y")), PathBuf::from("/x/y"));
+    }
+
+    #[test]
+    fn quarantine_entries_expire_after_thirty_days() {
+        let made = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let day = Duration::from_secs(86_400);
+        assert!(!expired(made, made + 29 * day));
+        assert!(!expired(made, made + 30 * day));
+        assert!(expired(made, made + 30 * day + Duration::from_secs(1)));
+        // A time in the future (a clock that went back) never expires.
+        assert!(!expired(made + day, made));
     }
 }
