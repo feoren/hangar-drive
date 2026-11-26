@@ -247,6 +247,17 @@ pub trait FileSystem: Sync {
     /// the hourly full scan: quarantined files past their days go (security review, info), not
     /// only when the root is opened.
     fn housekeeping(&self, _now_ms: i64) {}
+    /// Free bytes for this user on the volume of the sync root, `None` when the platform cannot
+    /// tell. A download checks it before it writes anything (security review M2 of the
+    /// download path: a manifest may name far more bytes than the server stores).
+    fn free_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// The size of the volume of the sync root, `None` when the platform cannot tell. The
+    /// free space a download leaves scales with it (LOW 4 of the follow-up review).
+    fn volume_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
@@ -309,6 +320,12 @@ impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
     }
     fn housekeeping(&self, now_ms: i64) {
         (**self).housekeeping(now_ms)
+    }
+    fn free_bytes(&self) -> Option<u64> {
+        (**self).free_bytes()
+    }
+    fn volume_bytes(&self) -> Option<u64> {
+        (**self).volume_bytes()
     }
 }
 

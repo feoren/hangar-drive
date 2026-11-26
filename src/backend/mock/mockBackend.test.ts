@@ -136,6 +136,10 @@ describe("mock magic inputs", () => {
     expect(await recover(sheet, `0000${code.slice(4)}`)).toEqual({ ok: false, error: "unknown" });
     expect(await recover(sheet, `1111${code.slice(4)}`)).toEqual({ ok: false, error: "used" });
     expect(await recover("drive.example.org", code)).toEqual({ ok: false, error: "unknown" });
+    expect(await recover("hangar-drive://recover#foreign", code)).toEqual({
+      ok: false,
+      error: "wrongSheet",
+    });
     expect(await recover("hangar-drive://recover#offline", code)).toEqual({
       ok: false,
       error: "unreachable",

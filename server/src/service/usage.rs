@@ -5,17 +5,26 @@
 //!   folders that are not retired, kept as counters per folder and account and changed in the
 //!   same transaction as every head. Chunks and file manifests (data) and directory nodes are
 //!   counted apart, because directory nodes may use the headroom.
-//! - **Upload check:** a data object must keep live plus uncommitted data within Q, and every
-//!   object must keep all live plus uncommitted bytes within Q + H. Counting only data against Q
-//!   mirrors the commit check, so an upload never passes that its commit must fail, and deletes
-//!   (new directory nodes only) still succeed at a full quota while the headroom is free.
+//! - **Upload check:** a data object must keep live data plus the uploading device's own
+//!   uncommitted data within Q, and every object must keep all live bytes plus the device's own
+//!   uncommitted bytes within Q + H. Counting only data against Q mirrors the commit check, and
+//!   deletes (new directory nodes only) still succeed at a full quota while the headroom is
+//!   free. Only the device's own uploads count (security review MEDIUM 3): otherwise one
+//!   compromised device could upload a quota of garbage it never commits and lock every honest
+//!   device out for 24 hours. What all devices together leave uncommitted is bounded by the
+//!   account budget, since every upload pays it, and the commit check still holds live bytes to
+//!   the quota. Removing a device deletes its uncommitted uploads at once
+//!   ([`crate::service::objects::drop_uploads_of`]).
 //! - **Commit check:** refused only if it raises data above Q or all live bytes above Q + H.
 //! - **Budgets:** bytes made live per rolling 24 hours, per device and per account: uploads at
-//!   upload, retained objects a commit revives at the commit.
+//!   upload, retained objects a commit revives at the commit. The device budget defaults to half
+//!   the account budget ([`crate::config::Limits::for_quota`]), so one device never uses up the
+//!   budget of the others.
 //! - **Pin restore allowance:** revived objects in the tree of an admitted pin cost no budget up
 //!   to P = Q + H per account in any rolling window W.
 //! - **Running counters** (finding M4): uncommitted uploads are a counter per account, changed
-//!   with every upload and declaration; budgets and the allowance are kept per minute, so no
+//!   with every upload and declaration, and one per device in `device_pending`, kept by triggers
+//!   on `objects` (migration `0004_device_uploads.sql`); budgets and the allowance are kept per minute, so no
 //!   request sums over every upload of a day. A minute counts while it started within the
 //!   window, so a byte leaves a rolling window at most a minute early.
 
@@ -94,6 +103,25 @@ pub async fn pending(conn: &mut sqlx::SqliteConnection, account_pk: i64) -> ApiR
     })
 }
 
+/// Uncommitted uploads of one device of the account (a running counter kept by triggers).
+pub async fn device_pending(
+    conn: &mut sqlx::SqliteConnection,
+    account_pk: i64,
+    device: &DeviceId,
+) -> ApiResult<Bytes> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT data_bytes, dir_bytes FROM device_pending WHERE account_pk = ? AND device = ?",
+    )
+    .bind(account_pk)
+    .bind(device.as_bytes().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map_or_else(Bytes::default, |(data, dir)| Bytes {
+        data: u64_of(data),
+        dir: u64_of(dir),
+    }))
+}
+
 /// Adds (`sign` 1) or removes (`sign` -1) uncommitted bytes.
 pub async fn shift_pending(
     conn: &mut sqlx::SqliteConnection,
@@ -113,9 +141,26 @@ pub async fn shift_pending(
     Ok(())
 }
 
-/// Sets the counter of uncommitted bytes from the objects themselves. The garbage collection
-/// and the purges call it after they delete objects, so the counter never drifts for long.
+/// Sets the counters of uncommitted bytes, per account and per device, from the objects
+/// themselves. The garbage collection, the purges and a device removal call it after they
+/// delete objects, so the counters never drift for long.
 pub async fn recount_pending(conn: &mut sqlx::SqliteConnection, account_pk: i64) -> ApiResult<()> {
+    sqlx::query("DELETE FROM device_pending WHERE account_pk = ?")
+        .bind(account_pk)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "INSERT INTO device_pending (account_pk, device, data_bytes, dir_bytes) \
+         SELECT f.account_pk, o.uploader, \
+                COALESCE(SUM(CASE WHEN o.kind <> 3 THEN o.size ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN o.kind = 3 THEN o.size ELSE 0 END), 0) \
+         FROM objects o JOIN folders f ON f.pk = o.folder_pk \
+         WHERE f.account_pk = ? AND o.declared = 0 AND o.uploader IS NOT NULL \
+         GROUP BY f.account_pk, o.uploader",
+    )
+    .bind(account_pk)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query(
         "UPDATE accounts SET \
            pending_data_bytes = (SELECT COALESCE(SUM(o.size), 0) FROM objects o JOIN folders f ON f.pk = o.folder_pk \
@@ -130,7 +175,7 @@ pub async fn recount_pending(conn: &mut sqlx::SqliteConnection, account_pk: i64)
     Ok(())
 }
 
-/// The upload check (module docs).
+/// The upload check (module docs); `pending` is the uploading device's own uncommitted bytes.
 pub fn upload_fits(limits: &Limits, live: Bytes, pending: Bytes, new: Bytes) -> bool {
     let all = live
         .all()

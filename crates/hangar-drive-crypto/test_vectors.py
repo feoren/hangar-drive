@@ -751,28 +751,39 @@ def compute():
     out["object.root_id"] = root_id.hex()
     out["object.empty_node_id"] = empty_id.hex()
 
-    # Commits: the first commit, then a re-anchor commit on it.
-    def commit(height, parents, counter, flags):
+    # The reference delta digest: mode 0 (diff) or 1 (full), both lists ascending.
+    def delta_digest(full, added, dropped):
+        assert added == sorted(added) and dropped == sorted(dropped)
+        return sha256(framed(
+            label("commit-delta"), bytes([1 if full else 0]), b"".join(added), b"".join(dropped),
+        ))
+
+    # Commits: the first commit, then a re-anchor commit on it. Flags bit 2 marks a full delta.
+    def commit(height, parents, counter, flags, digest):
         body = framed(
             label("commit"), b"\x01", ACCOUNT, FOLDER, u64(height),
             bytes([len(parents)]) + b"".join(parents), root_id, u32(1), DEVICE, u64(2),
-            rotate_hash, u64(counter), u32(flags), b"\x00",
+            rotate_hash, u64(counter), u32(flags), digest, b"\x00",
         )
         cid = sha256(field(label("commit-id")) + body)
         sig = ed25519_sign(sign_seed, field(label("commit-sig")) + body)
         return cid, body + sig
 
-    first_id, first_wire = commit(1, [], 1, 0)
+    first_id, first_wire = commit(1, [], 1, 0, delta_digest(False, [root_id], []))
     out["commit.first_id"] = first_id.hex()
     out["commit.first_wire"] = first_wire.hex()
-    re_id, re_wire = commit(2, [first_id], 2, 1)
+    re_id, re_wire = commit(2, [first_id], 2, 1 | 4, delta_digest(True, [root_id], []))
     out["commit.reanchor_id"] = re_id.hex()
     out["commit.reanchor_wire"] = re_wire.hex()
-    # A side commit (flags bit 1) on the first commit, merged with the re-anchor commit.
-    side_id, side_wire = commit(2, [first_id], 3, 2)
+    # A side commit (flags bit 1) on the first commit, merged with the re-anchor commit. Its
+    # diff adds two objects and drops one.
+    side_added = sorted([bytes([0x11]) * 32, bytes([0xee]) * 32])
+    side_digest = delta_digest(False, side_added, [root_id])
+    out["commit.side_delta_digest"] = side_digest.hex()
+    side_id, side_wire = commit(2, [first_id], 3, 2, side_digest)
     out["commit.side_id"] = side_id.hex()
     out["commit.side_wire"] = side_wire.hex()
-    merge_id, merge_wire = commit(3, [re_id, side_id], 4, 0)
+    merge_id, merge_wire = commit(3, [re_id, side_id], 4, 0, delta_digest(False, [], []))
     out["commit.merge_id"] = merge_id.hex()
     out["commit.merge_wire"] = merge_wire.hex()
     out["identity.folder_safety_number"] = safety_number(
@@ -816,9 +827,12 @@ def compute():
     out["recovery.sign_public"] = ed25519_public(okm[:32]).hex()
     out["recovery.kem_public"] = x25519_public(okm[32:]).hex()
     out["recovery.device_id"] = hkdf(RECOVERY_ENTROPY, framed(label("recovery-device-id")), 16).hex()
-    # Recovery sheet, version 2: account, server, the create entry's hash as the genesis anchor,
-    # the pin flag with the optional SPKI pin, then the URL in the WHATWG serialization.
-    sheet_head = b"\x02" + ACCOUNT + SERVER + create_hash
+    # Recovery sheet, version 3: account, server, the create entry's hash as the genesis anchor,
+    # the anchor tag that binds account and anchor to the code (HKDF of the code's entropy), the
+    # pin flag with the optional SPKI pin, then the URL in the WHATWG serialization.
+    anchor_tag = hkdf(RECOVERY_ENTROPY, framed(label("recovery-anchor"), ACCOUNT, create_hash), 16)
+    out["recovery.anchor_tag"] = anchor_tag.hex()
+    sheet_head = b"\x03" + ACCOUNT + SERVER + create_hash + anchor_tag
     out["recovery.sheet"] = (sheet_head + b"\x01" + SPKI_PIN + b"https://drive.example/").hex()
     out["recovery.sheet_unpinned"] = (sheet_head + b"\x00" + b"https://drive.example/").hex()
 

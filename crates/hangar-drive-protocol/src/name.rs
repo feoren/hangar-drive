@@ -542,6 +542,34 @@ pub enum WindowsNameProblem {
     /// [`is_short_name_alias`].
     #[error("the name looks like a Windows short name")]
     ShortNameAlias,
+    /// A name that ends in `.{GUID}`, which the Explorer shell takes for a namespace junction
+    /// (see [`is_shell_junction`]).
+    #[error("the name makes Windows Explorer treat the entry as a shell junction")]
+    ShellJunction,
+}
+
+/// Whether `name` ends in a dot and a GUID in braces (`Bilder.{0AFACED1-E828-11D1-9187-
+/// B532F1E9575D}`, hex digits in either case), the form the Explorer shell reads as a CLSID
+/// junction: such a folder is shown, and resolved, as the namespace extension the GUID names.
+/// With `CLSID_FolderShortcut` and a `target.lnk` inside, a shell path through the folder
+/// resolves to the shortcut's target, so a file the engine checked inside the sync root would
+/// be a file outside it for every shell call that takes a path (the recycle bin; security
+/// review of the Windows handles, M1). The file system itself never follows such a folder, and
+/// other platforms sync such names as usual; on Windows every name of that form is refused, for
+/// files as well, since the engine cannot know which GUIDs the shell will honour.
+pub fn is_shell_junction(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix('}') else {
+        return false;
+    };
+    let Some((_, guid)) = rest.rsplit_once(".{") else {
+        return false;
+    };
+    let groups: Vec<&str> = guid.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, len)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Whether `name` has the shape of an 8.3 short name alias that NTFS and FAT make for long
@@ -629,6 +657,9 @@ pub fn windows_problem(name: &str) -> Option<WindowsNameProblem> {
     }
     if is_short_name_alias(name) {
         return Some(WindowsNameProblem::ShortNameAlias);
+    }
+    if is_shell_junction(name) {
+        return Some(WindowsNameProblem::ShellJunction);
     }
     None
 }
@@ -960,6 +991,36 @@ mod tests {
             check_display_name("Laptop\n", 128),
             Err(DisplayNameError::Control)
         );
+    }
+
+    // Security review of the Windows handles, M1: a name ending in `.{GUID}` makes the
+    // Explorer shell treat the entry as a namespace junction (a folder shortcut follows its
+    // `target.lnk`), so a path through it can resolve outside the sync root in the shell.
+    #[test]
+    fn shell_junction_names_cannot_sync_on_windows() {
+        for name in [
+            "a.{0AFACED1-E828-11D1-9187-B532F1E9575D}",
+            "Bilder.{0afaced1-e828-11d1-9187-b532f1e9575d}",
+            ".{645FF040-5081-101B-9F08-00AA002F954E}",
+            "x y.{00000000-0000-0000-0000-000000000000}",
+        ] {
+            assert_eq!(
+                windows_problem(name),
+                Some(WindowsNameProblem::ShellJunction),
+                "{name:?}"
+            );
+        }
+        for name in [
+            "a.{0AFACED1-E828-11D1-9187-B532F1E9575}",
+            "a.{0AFACED1-E828-11D1-9187-B532F1E9575DX}",
+            "a.{0AFACED1E82811D19187B532F1E9575D}",
+            "a{0AFACED1-E828-11D1-9187-B532F1E9575D}",
+            "a.{0AFACED1-E828-11D1-9187-B532F1E9575D}.txt",
+            "a.{GAFACED1-E828-11D1-9187-B532F1E9575D}",
+            "notes {draft}",
+        ] {
+            assert_eq!(windows_problem(name), None, "{name:?}");
+        }
     }
 
     // Security review N14: a name of the shape of a short name alias can address another

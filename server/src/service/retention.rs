@@ -595,7 +595,13 @@ async fn remove_files(app: &App, doomed: Doomed) {
             }
         }
     }
-    for key in doomed.objects {
+    remove_object_files(app, doomed.objects).await;
+}
+
+/// Removes the files of deleted object rows, each under the object's stripe lock and only if no
+/// row came back in between (the same object uploaded again after the transaction).
+pub async fn remove_object_files(app: &App, keys: Vec<ObjectKey>) {
+    for key in keys {
         let lock_key = [
             key.folder.as_bytes().as_slice(),
             key.id.as_bytes().as_slice(),

@@ -120,14 +120,19 @@ const warning = union("kind", {
     folderName: str,
     entryId: str,
     days: num,
+    until: num,
+    lapsed: bool,
   },
   conflicts: { id: str, count: num },
   names: { id: str, count: num },
 });
 
 const notice = union("kind", {
+  quota: {},
   retained: {},
   budgetDevice: { device: str },
+  budgetAccount: {},
+  serverDisk: {},
   minCount: { days: num },
   olderAccountState: {},
 });

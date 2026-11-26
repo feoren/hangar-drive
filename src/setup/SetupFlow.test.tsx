@@ -553,9 +553,19 @@ describe("recovery with the sheet", () => {
     await click("Weiter");
     expect(text()).toContain(message);
   });
+
+  // Security review "recovery link as phishing": a link the code was not made for is refused
+  // with a reason and the next step, and the flow stays on the sheet.
+  it("refuses a link that does not belong to the code", async () => {
+    await enterSheet("hangar-drive://recover#foreign");
+    await click("Weiter");
+    expect(text()).toContain("Dieser Link gehört nicht zu deinem Code.");
+    expect(text()).toContain("Hat dir jemand diesen Link geschickt, nutze ihn nicht.");
+    expect(text()).toContain("Schritt 1 von 4");
+  });
 });
 
-describe("recovery sheet, version 2", () => {
+describe("recovery sheet, version 3", () => {
   it("prints and saves the sheet with server, IDs, anchor and link, worded in German", async () => {
     const { mock } = await renderApp("setup");
     await click("Mit Einladungslink starten");

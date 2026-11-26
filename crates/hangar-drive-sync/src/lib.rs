@@ -80,6 +80,7 @@ pub mod ports;
 pub mod recovery;
 pub mod removal;
 pub mod roots;
+pub mod space;
 pub mod trash;
 pub mod tree;
 pub mod watch;

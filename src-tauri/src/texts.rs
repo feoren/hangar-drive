@@ -206,6 +206,7 @@ mod tests {
                 "missing.title",
                 "older.title",
                 "suspect.title",
+                "suspect.titleFolder",
             ] {
                 assert!(
                     TEXTS.iter().any(|(l, k, _)| *l == lang && *k == key),

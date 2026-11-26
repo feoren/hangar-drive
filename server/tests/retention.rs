@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use hangar_drive_crypto::commit::{Commit, CommitContent};
+use hangar_drive_crypto::commit::{Commit, CommitContent, DeltaDigest};
 use hangar_drive_protocol::api::*;
 use hangar_drive_protocol::ids::*;
 use hangar_drive_protocol::object::ObjectType;
@@ -570,6 +570,7 @@ async fn a_side_commit_on_an_expired_base_gets_base_expired() {
         device: device.id,
         log_head: account.head(),
         counter: device.next_counter(),
+        delta: DeltaDigest::of(false, &[], &[]).unwrap(),
     };
     let side = Commit::side(account.id, folder.id, &base, content(&mut b))
         .sign(&b.identity)

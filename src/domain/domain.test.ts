@@ -70,6 +70,16 @@ describe("Windows names", () => {
     expect(windowsNameProblem(`a${String.fromCharCode(7)}b`)).toEqual({ kind: "control" });
   });
 
+  it("finds names Explorer takes for a shell junction", () => {
+    const name = "Bilder.{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+    expect(windowsNameProblem(name)).toEqual({ kind: "reserved", name });
+    expect(windowsNameProblem("a.{0afaced1-e828-11d1-9187-b532f1e9575d}")).not.toBeNull();
+    expect(windowsNameProblem("a.{0AFACED1-E828-11D1-9187-B532F1E9575D}.txt")).toBeNull();
+    expect(windowsNameProblem("notes {draft}")).toBeNull();
+    expect(suggestWindowsName(name)).toBe("Bilder {0AFACED1-E828-11D1-9187-B532F1E9575D}");
+    expect(windowsNameProblem(suggestWindowsName(name))).toBeNull();
+  });
+
   it("accepts ordinary names", () => {
     expect(windowsNameProblem("Bericht (final).docx")).toBeNull();
   });
@@ -98,6 +108,8 @@ describe("warnings", () => {
     folderName: "Fotos",
     entryId: "t",
     days: 30,
+    until: NOW + 90 * 86_400_000,
+    lapsed: false,
   };
 
   it("orders by urgency, a suspected attack first", () => {

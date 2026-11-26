@@ -212,6 +212,13 @@ export type Warning =
       readonly entryId: string;
       /** Retention days the server guarantees at least. */
       readonly days: number;
+      /** When the server's pin of that entry ends (server time). */
+      readonly until: Millis;
+      /**
+       * The pin ended early because the account's pin cap was full: the entry stays only for
+       * the retention window.
+       */
+      readonly lapsed: boolean;
     }
   | { readonly kind: "conflicts"; readonly id: string; readonly count: number }
   | { readonly kind: "names"; readonly id: string; readonly count: number };
@@ -220,8 +227,14 @@ export type WarningKind = Warning["kind"];
 
 /** Quiet notices from the server's change feed: a closed list, the text is the app's own. */
 export type ServerNotice =
+  /** Live bytes are near the quota; the storage line shows them. */
+  | { readonly kind: "quota" }
   | { readonly kind: "retained" }
   | { readonly kind: "budgetDevice"; readonly device: string }
+  /** The account reached its upload budget for the last 24 hours. */
+  | { readonly kind: "budgetAccount" }
+  /** The server is below its free disk reserve and refuses uploads. */
+  | { readonly kind: "serverDisk" }
   | { readonly kind: "minCount"; readonly days: number }
   /**
    * The server's change list was behind this device (an older backup of the server): the device
@@ -444,7 +457,8 @@ export interface FolderChoice {
   readonly token: string;
 }
 
-export type RecoverError = "typo" | "unknown" | "used" | "otherApp" | "unreachable" | "insecure";
+export type RecoverError =
+  "typo" | "unknown" | "used" | "otherApp" | "wrongSheet" | "unreachable" | "insecure";
 
 // ---------------------------------------------------------------------------------------------
 // Conflicts and names

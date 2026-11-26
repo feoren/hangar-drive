@@ -377,9 +377,11 @@ async fn m4_commits_wait_for_a_free_heavy_slot() {
     let account = Account::create(&server, &a, &[]).await;
     let ca = account.sign_in(&server, &a).await;
     let folder = Folder::new();
+    let root = Obj::new(ObjectType::DirectoryNode, 40);
+    assert_eq!(upload(&ca, &folder.id, &root).await.status, 201);
     let held = server.app.heavy.clone().acquire_owned().await.unwrap();
-    let commit = folder.next(&account, &mut a);
-    let request = folder.request(&commit, &[], &[]);
+    let commit = folder.next_with(&account, &mut a, &[&root], &[]);
+    let request = folder.request(&commit, &[&root], &[]);
     let path = commit_path(&folder.id);
     let pending = tokio::spawn(async move { ca.post(&path, &request).await });
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -437,8 +439,10 @@ async fn m4_one_account_cannot_hold_every_heavy_slot() {
         .unwrap();
     assert!(String::from_utf8_lossy(&reply[..n]).starts_with("HTTP/1.1 429"));
     let fb = Folder::new();
-    let commit = fb.next(&account_b, &mut b);
-    let request = fb.request(&commit, &[], &[]);
+    let root = Obj::new(ObjectType::DirectoryNode, 40);
+    assert_eq!(upload(&cb, &fb.id, &root).await.status, 201);
+    let commit = fb.next_with(&account_b, &mut b, &[&root], &[]);
+    let request = fb.request(&commit, &[&root], &[]);
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
         cb.post(&commit_path(&fb.id), &request),
@@ -832,9 +836,10 @@ async fn m4_measure_a_large_delta() {
     .fetch_one(&server.app.db)
     .await
     .unwrap();
-    let ids: Vec<ObjectId> = (0..200_000)
+    let mut ids: Vec<ObjectId> = (0..200_000)
         .map(|_| ObjectId::from_bytes(random()))
         .collect();
+    ids.sort();
     let mut tx = server.app.db.begin().await.unwrap();
     for id in &ids {
         sqlx::query("INSERT INTO objects (folder_pk, object_id, kind, size, uploaded_ms) VALUES (?, ?, 1, 100, 0)")
@@ -845,7 +850,7 @@ async fn m4_measure_a_large_delta() {
             .unwrap();
     }
     tx.commit().await.unwrap();
-    let commit = folder.next(&account, &mut a);
+    let commit = folder.next_adding(&account, &mut a, &ids);
     let mut request = folder.request(&commit, &[], &[]);
     request.head.delta.added = ids;
     let started = std::time::Instant::now();

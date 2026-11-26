@@ -212,6 +212,7 @@ export class TauriBackend implements Backend {
         "unknown",
         "used",
         "otherApp",
+        "wrongSheet",
         "unreachable",
         "insecure",
         "blank",

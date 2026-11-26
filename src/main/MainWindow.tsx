@@ -174,8 +174,9 @@ export function MainWindow({
                   })}
                 </p>
               )}
-              {snapshot.notices.map((notice) => (
-                <p key={notice.kind}>{noticeText(notice, t)}</p>
+              {snapshot.notices.map((notice, index) => (
+                // Two devices can each reach their budget: the kind alone is not unique.
+                <p key={`${notice.kind}-${String(index)}`}>{noticeText(notice, t)}</p>
               ))}
             </footer>
           )}

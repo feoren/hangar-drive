@@ -398,6 +398,12 @@ impl FileSystem for TrackedFs {
     fn exec_supported(&self) -> bool {
         self.inner.exec_supported()
     }
+    fn free_bytes(&self) -> Option<u64> {
+        self.inner.free_bytes()
+    }
+    fn volume_bytes(&self) -> Option<u64> {
+        self.inner.volume_bytes()
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1638,7 +1644,7 @@ fn the_core_flow_works_against_the_real_server() {
     );
     steps.done("8 remove B");
 
-    // -- 9. Recovery: C uses the sheet (version 2) and the code, gets the files, removes the
+    // -- 9. Recovery: C uses the sheet (version 3) and the code, gets the files, removes the
     //       lost devices. -------------------------------------------------------------------
     let expected_c = a.files();
     let mut c = Peer::open(&scratch.0, "c", &clock);
@@ -1648,7 +1654,9 @@ fn the_core_flow_works_against_the_real_server() {
             if *account == offer.account && *host == format!("localhost:{}", server.port())
     ));
     let code_text = code.groups.join("-");
-    let typo = format!("{}X", &code_text[..code_text.len() - 1]);
+    // The code is random: a last character that is already `X` would make no typo (1 in 32).
+    let wrong = if code_text.ends_with('X') { 'Y' } else { 'X' };
+    let typo = format!("{}{wrong}", &code_text[..code_text.len() - 1]);
     assert_eq!(
         c.core
             .recover_account(&code.sheet.link, &typo, "Rescue C")

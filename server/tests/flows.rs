@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use hangar_drive_crypto::commit::{Commit, CommitContent};
+use hangar_drive_crypto::commit::{Commit, CommitContent, DeltaDigest};
 use hangar_drive_crypto::record::RecordCipher;
 use hangar_drive_crypto::OsEntropy;
 use hangar_drive_protocol::api::*;
@@ -476,8 +476,13 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
     assert_eq!(account.add(&ca, &a, &b).await.status, 200);
     let cb = account.sign_in(&server, &b).await;
     let mut folder = Folder::new();
+    let root = Obj::new(ObjectType::DirectoryNode, 40);
+    assert_eq!(upload(&cb, &folder.id, &root).await.status, 201);
     assert_eq!(
-        folder.commit(&cb, &account, &mut b, &[], &[]).await.status,
+        folder
+            .commit(&cb, &account, &mut b, &[&root], &[])
+            .await
+            .status,
         200
     );
     // A commit signed by b before its removal, published later.
@@ -1186,9 +1191,9 @@ async fn commits_compare_and_swap_merge_and_check_their_deltas() {
         (400, ErrorCode::MissingObjects)
     );
     assert_eq!(reply.json::<ErrorBody>().missing, vec![ghost.id]);
-    // Dropping something that is not in the tree.
+    // Dropping something that is not in the tree does not fit the live set.
     let reply = folder.commit(&ca, &account, &mut a, &[&o1], &[&o2]).await;
-    assert_eq!(reply.code(), ErrorCode::CommitRefused);
+    assert_eq!(reply.code(), ErrorCode::DeltaMismatch);
     let reply = folder
         .commit(&ca, &account, &mut a, &[&o1, &o2, &root], &[])
         .await;
@@ -1200,9 +1205,10 @@ async fn commits_compare_and_swap_merge_and_check_their_deltas() {
     );
     let base = folder.entry().unwrap();
     let base_head = folder.head.clone();
-    // Adding what is already live is refused.
+    // Adding what is already live does not fit the live set.
     let reply = folder.commit(&ca, &account, &mut a, &[&o1], &[]).await;
-    assert_eq!(reply.code(), ErrorCode::CommitRefused);
+    assert_eq!(reply.code(), ErrorCode::DeltaMismatch);
+    assert_eq!(reply.json::<ErrorBody>().missing, vec![o1.id]);
 
     // A device publishes only its own commits.
     let by_a = folder.next(&account, &mut a);
@@ -1242,6 +1248,8 @@ async fn commits_compare_and_swap_merge_and_check_their_deltas() {
     );
 
     // b merges: side commit C on the base (marked as side), merge M on H.
+    let o4 = Obj::new(ObjectType::Chunk, 20);
+    assert_eq!(upload(&cb, &folder.id, &o4).await.status, 201);
     let side = Commit::side(
         account.id,
         folder.id,
@@ -1252,6 +1260,7 @@ async fn commits_compare_and_swap_merge_and_check_their_deltas() {
             device: b.id,
             log_head: account.head(),
             counter: b.next_counter(),
+            delta: DeltaDigest::of(false, &[o4.id], &[o2.id]).unwrap(),
         },
     )
     .sign(&b.identity)
@@ -1262,17 +1271,16 @@ async fn commits_compare_and_swap_merge_and_check_their_deltas() {
         &h,
         &side,
         CommitContent {
-            root: ObjectId::from_bytes(random()),
+            root: o4.id,
             generation: Generation(1),
             device: b.id,
             log_head: account.head(),
             counter: b.next_counter(),
+            delta: DeltaDigest::of(false, &[o4.id], &[]).unwrap(),
         },
     )
     .sign(&b.identity)
     .unwrap();
-    let o4 = Obj::new(ObjectType::Chunk, 20);
-    assert_eq!(upload(&cb, &folder.id, &o4).await.status, 201);
     let side_upload = CommitUpload {
         commit: Blob(side.wire.clone()),
         delta: ReferenceDelta {

@@ -4,24 +4,41 @@
 import { useId, useState } from "react";
 
 import type { Warning } from "../backend/types";
-import { useT } from "../i18n";
+import { useT, type Translate } from "../i18n";
 import type { Open } from "../main/openDialog";
-import { useBackend } from "../ui/backendContext";
+import { useBackend, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback } from "../ui/parts";
 import { errorText, useAction } from "../ui/useAsync";
+
+type Suspect = Extract<Warning, { kind: "suspect" }>;
+
+/**
+ * The banner and notification title: the device that wrote the burst, or the folder while this
+ * device cannot tell which device it was (the folder is not synced here, or its newest changes
+ * have not arrived yet).
+ */
+export function suspectTitle(warning: Suspect, t: Translate): string {
+  return warning.deviceName === ""
+    ? t("suspect.titleFolder", { folder: warning.folderName })
+    : t("suspect.title", { device: warning.deviceName });
+}
 
 export function SuspectDialog({
   warning,
   open,
   onClose,
 }: {
-  readonly warning: Extract<Warning, { kind: "suspect" }>;
+  readonly warning: Suspect;
   readonly open: Open;
   readonly onClose: () => void;
 }) {
   const t = useT();
   const backend = useBackend();
+  const snapshot = useSnapshot();
+  // The timeline needs the folder on this device; elsewhere the step names where to do it.
+  const local = snapshot.folders.some((folder) => folder.id === warning.folderId);
+  const known = warning.deviceId !== "";
   const titleId = useId();
   const action = useAction();
   const [removed, setRemoved] = useState(false);
@@ -33,9 +50,22 @@ export function SuspectDialog({
       </h2>
       <ol className="steps">
         <li className={removed ? "step done" : "step"}>
-          <p>{t("suspect.step1", { device: warning.deviceName })}</p>
+          <p>
+            {known ? t("suspect.step1", { device: warning.deviceName }) : t("suspect.step1Unknown")}
+          </p>
           {removed ? (
             <Feedback>{t("devices.removed", { device: warning.deviceName })}</Feedback>
+          ) : !known ? (
+            <button
+              type="button"
+              className="button secondary small"
+              data-autofocus
+              onClick={() => {
+                open({ kind: "devices" });
+              }}
+            >
+              {t("suspect.devices")}
+            </button>
           ) : (
             <button
               type="button"
@@ -58,22 +88,29 @@ export function SuspectDialog({
           <p>{t("suspect.step2")}</p>
         </li>
         <li className="step">
-          <p>{t("suspect.step3")}</p>
-          <button
-            type="button"
-            className={removed ? "button primary small" : "button secondary small"}
-            onClick={() => {
-              open({
-                kind: "restore",
-                folderId: warning.folderId,
-                tab: "versions",
-                entryId: warning.entryId,
-                beforeDevice: warning.deviceName,
-              });
-            }}
-          >
-            {t("suspect.view")}
-          </button>
+          <p>
+            {local
+              ? t("suspect.step3")
+              : t("suspect.step3Elsewhere", { folder: warning.folderName })}
+          </p>
+          {local && (
+            <button
+              type="button"
+              className={removed ? "button primary small" : "button secondary small"}
+              onClick={() => {
+                open({
+                  kind: "restore",
+                  folderId: warning.folderId,
+                  tab: "versions",
+                  entryId: warning.entryId,
+                  // Without a device the entry keeps its plain label.
+                  ...(known ? { beforeDevice: warning.deviceName } : {}),
+                });
+              }}
+            >
+              {t("suspect.view")}
+            </button>
+          )}
         </li>
       </ol>
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}

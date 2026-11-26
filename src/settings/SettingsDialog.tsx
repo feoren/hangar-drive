@@ -110,8 +110,8 @@ export function SettingsDialog({ onClose }: { readonly onClose: () => void }) {
               </p>
             )}
             <p className="info-line">{t("settings.retention", { days: account.retentionDays })}</p>
-            {snapshot.notices.map((notice) => (
-              <p key={notice.kind} className="info-line muted">
+            {snapshot.notices.map((notice, index) => (
+              <p key={`${notice.kind}-${String(index)}`} className="info-line muted">
                 {noticeText(notice, t)}
               </p>
             ))}
@@ -159,10 +159,16 @@ export function noticeText(
   t: ReturnType<typeof useT>,
 ): string {
   switch (notice.kind) {
+    case "quota":
+      return t("notice.quota");
     case "retained":
       return t("notice.retained");
     case "budgetDevice":
       return t("notice.budgetDevice", { device: notice.device });
+    case "budgetAccount":
+      return t("notice.budgetAccount");
+    case "serverDisk":
+      return t("notice.serverDisk");
     case "minCount":
       return t("notice.minCount", { days: notice.days });
     case "olderAccountState":

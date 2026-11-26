@@ -2473,6 +2473,36 @@ mod tests {
             serde_json::to_value(about("0.1.0", off)).unwrap(),
             json!({ "version": "0.1.0", "build": null, "updates": false })
         );
+        // The suspect warning and the server notices, as src/backend/tauri/decoders.ts reads
+        // them (ADR 0001, section 5).
+        let suspect = hangar_drive_sync::api::Warning::Suspect {
+            id: "s".into(),
+            device_id: "d".into(),
+            device_name: "Laptop".into(),
+            folder_id: "f".into(),
+            folder_name: "Docs".into(),
+            entry_id: "e".into(),
+            days: 30,
+            until: 5,
+            lapsed: true,
+        };
+        assert_eq!(
+            serde_json::to_value(suspect).unwrap(),
+            json!({ "kind": "suspect", "id": "s", "deviceId": "d", "deviceName": "Laptop",
+                "folderId": "f", "folderName": "Docs", "entryId": "e", "days": 30, "until": 5,
+                "lapsed": true })
+        );
+        use hangar_drive_sync::api::ServerNotice;
+        for (notice, kind) in [
+            (ServerNotice::Quota, "quota"),
+            (ServerNotice::BudgetAccount, "budgetAccount"),
+            (ServerNotice::ServerDisk, "serverDisk"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(notice).unwrap(),
+                json!({ "kind": kind })
+            );
+        }
         // The outcomes of the two native confirmations, as the window's decoder reads them.
         assert_eq!(
             serde_json::to_value(DeleteOutcome::Deleted).unwrap(),

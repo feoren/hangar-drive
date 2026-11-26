@@ -1,5 +1,6 @@
-// The recovery sheet, version 2 (UX 4.2 step 2, 4.4): the code and, in the clear, everything the
-// sheet's link carries, plus the plain sentences. The window words it in the person's language;
+// The recovery sheet, version 3 (UX 4.2 step 2, 4.4): the code and, in the clear, what the sheet's
+// link carries except the anchor tag (only the link and its QR code hold it; nobody types it),
+// plus the plain sentences. The window words it in the person's language;
 // the backend only lays it out for printing (with a QR code of the link) or writes a text file.
 
 import type { RecoveryCode, RecoverySheetDocument } from "../backend/types";

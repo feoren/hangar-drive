@@ -189,6 +189,31 @@ pub fn encode(
     store: &dyn Store,
     entropy: &mut dyn Entropy,
 ) -> Result<Encoded, CodecError> {
+    encode_with(tree, crypto, store, entropy, false)
+}
+
+/// Encodes `tree` with every directory node and manifest sealed now, also those the store knows
+/// as uploaded, so all of them are in [`Encoded::sealed`] and can be uploaded again. A full
+/// reference delta that repairs the server's live set needs this: the collection may have
+/// deleted objects that the store still lists as on the server (ADR 0001, amendment
+/// "reference deltas bound to the tree"). Objects sealed under the writable generation get the
+/// same IDs again; others get new ones, which only renames them.
+pub fn encode_fresh(
+    tree: &Tree,
+    crypto: &FolderCrypto,
+    store: &dyn Store,
+    entropy: &mut dyn Entropy,
+) -> Result<Encoded, CodecError> {
+    encode_with(tree, crypto, store, entropy, true)
+}
+
+fn encode_with(
+    tree: &Tree,
+    crypto: &FolderCrypto,
+    store: &dyn Store,
+    entropy: &mut dyn Entropy,
+    fresh: bool,
+) -> Result<Encoded, CodecError> {
     let mut out = Encoded {
         root: ObjectId::from_bytes([0; 32]),
         sealed: BTreeMap::new(),
@@ -220,7 +245,8 @@ pub fn encode(
                     conflict_of: node.conflict_of,
                 },
                 NodeKind::File(v) => {
-                    let manifest = encode_manifest(v, crypto, store, &folder, entropy, &mut out)?;
+                    let manifest =
+                        encode_manifest(v, crypto, store, &folder, entropy, fresh, &mut out)?;
                     DirectoryEntry {
                         name: node.name.clone(),
                         item: *child,
@@ -243,6 +269,7 @@ pub fn encode(
             store,
             &folder,
             entropy,
+            fresh,
             &mut out,
         )?;
         if dir == ROOT {
@@ -260,6 +287,7 @@ fn encode_manifest(
     store: &dyn Store,
     folder: &FolderId,
     entropy: &mut dyn Entropy,
+    fresh: bool,
     out: &mut Encoded,
 ) -> Result<ObjectId, CodecError> {
     let chunks = match out.chunks.get(&v.content) {
@@ -287,10 +315,12 @@ fn encode_manifest(
         store,
         folder,
         entropy,
+        fresh,
         out,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn put_object(
     kind: ObjectType,
     plaintext: &[u8],
@@ -298,10 +328,16 @@ fn put_object(
     store: &dyn Store,
     folder: &FolderId,
     entropy: &mut dyn Entropy,
+    fresh: bool,
     out: &mut Encoded,
 ) -> Result<ObjectId, CodecError> {
     let digest = plaintext_digest(kind, plaintext);
-    let id = match store.object_for(folder, &digest)? {
+    let known = if fresh {
+        None
+    } else {
+        store.object_for(folder, &digest)?
+    };
+    let id = match known {
         Some(id) => id,
         None => {
             let sealed = crypto
@@ -432,20 +468,55 @@ pub fn reachable(
     store: &mut dyn Store,
     server: &mut dyn ServerApi,
 ) -> Result<BTreeSet<ObjectId>, CodecError> {
-    let mut out = BTreeSet::new();
+    Ok(reachable_typed(root, crypto, store, server)?.all)
+}
+
+/// The objects reachable from a root, with the directory nodes and manifests among them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reachable {
+    /// Every object: directory nodes, manifests and chunks.
+    pub all: BTreeSet<ObjectId>,
+    /// The directory nodes.
+    pub dirs: BTreeSet<ObjectId>,
+    /// The file manifests.
+    pub manifests: BTreeSet<ObjectId>,
+}
+
+impl Reachable {
+    /// The chunks: everything that is neither a directory node nor a manifest.
+    pub fn chunks(&self) -> impl Iterator<Item = &ObjectId> {
+        self.all
+            .iter()
+            .filter(|id| !self.dirs.contains(id) && !self.manifests.contains(id))
+    }
+}
+
+/// [`reachable`] with the kind of each object known from the walk.
+pub fn reachable_typed(
+    root: &ObjectId,
+    crypto: &FolderCrypto,
+    store: &mut dyn Store,
+    server: &mut dyn ServerApi,
+) -> Result<Reachable, CodecError> {
+    let mut out = Reachable::default();
     let mut stack = vec![*root];
-    out.insert(*root);
+    out.all.insert(*root);
+    out.dirs.insert(*root);
     while let Some(node_id) = stack.pop() {
         let (plain, _) =
             fetch_plaintext(&node_id, ObjectType::DirectoryNode, crypto, store, server)?;
         let node = DirectoryNode::decode(&plain)?;
         for entry in node.entries() {
-            if !out.insert(entry.child) {
+            if !out.all.insert(entry.child) {
                 continue;
             }
             match entry.kind {
-                EntryKind::Directory => stack.push(entry.child),
+                EntryKind::Directory => {
+                    out.dirs.insert(entry.child);
+                    stack.push(entry.child);
+                }
                 EntryKind::File => {
+                    out.manifests.insert(entry.child);
                     let (plain, _) = fetch_plaintext(
                         &entry.child,
                         ObjectType::FileManifest,
@@ -453,10 +524,11 @@ pub fn reachable(
                         store,
                         server,
                     )?;
-                    out.extend(FileManifest::decode(&plain)?.chunks().iter().copied());
+                    out.all
+                        .extend(FileManifest::decode(&plain)?.chunks().iter().copied());
                 }
             }
-            if out.len() > MAX_REACHABLE_OBJECTS {
+            if out.all.len() > MAX_REACHABLE_OBJECTS {
                 return Err(CodecError::Limit);
             }
         }

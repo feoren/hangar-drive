@@ -1,11 +1,16 @@
 //! Account recovery with the recovery sheet (ADR 0001, sections 2.3 and 4, "Recovery";
 //! [ux-concept, 4.4]; open point A).
 //!
-//! The sheet carries the server address, the server ID and the account ID in the clear
-//! ([`crate::links::RecoverySheet`]) and the code, which the person types. The code alone
-//! derives the offline recovery device: its keys (`RecoveryCode::identity`) and its device ID
-//! (`RecoveryCode::device_id`). The steps:
+//! The sheet carries the server address, the server ID, the account ID and the genesis anchor in
+//! the clear ([`crate::links::RecoverySheet`]) and the code, which the person types. The code
+//! alone derives the offline recovery device: its keys (`RecoveryCode::identity`) and its device
+//! ID (`RecoveryCode::device_id`). The steps:
 //!
+//! 0. **Sheet:** the sheet's anchor tag must be the code's tag over the sheet's account and
+//!    genesis anchor (`RecoverySheet::is_for`). A link can come from anyone, and whoever knows
+//!    the account's log could build an account of their own that lists this code's recovery
+//!    device and wraps a secret they know to it; such an account has another genesis, and nobody
+//!    without the code can make the tag for it (security review "recovery link as phishing").
 //! 1. **Recovery session:** the installation signs in as the recovery device, at the server
 //!    the sheet names (the server ID is checked at the sign-in). The session may only read the
 //!    log, fetch the recovery device's wrapped keys and make one append
@@ -27,10 +32,10 @@
 
 use hangar_drive_crypto::devicelog::{AccountState, LogDevice, MAX_LOG_ENTRIES};
 use hangar_drive_crypto::epoch;
-use hangar_drive_crypto::recovery::RecoveryCode;
+use hangar_drive_crypto::recovery::{RecoveryCode, RecoverySheet};
 use hangar_drive_crypto::Entropy;
 use hangar_drive_protocol::api::{LogAppendRequest, WrappedKeyEntry};
-use hangar_drive_protocol::ids::{AccountId, Blob, LogHash, LogHead};
+use hangar_drive_protocol::ids::{AccountId, Blob, LogHead};
 
 use crate::chunker::DynEntropy;
 use crate::error::SyncError;
@@ -39,6 +44,10 @@ use crate::ports::{NetError, ServerApi};
 /// Why the recovery device could not add the new device.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryError {
+    /// The sheet was not made for this code: it names an account or a genesis anchor the code
+    /// does not vouch for (a forged or mixed-up link).
+    #[error("the sheet does not belong to this code")]
+    WrongSheet,
     /// The account's log does not list this code's recovery device at all, or it does not
     /// start with the sheet's genesis anchor.
     #[error("the code does not belong to this account")]
@@ -93,18 +102,22 @@ pub fn fetch_log(
     Err(protocol("the log does not end"))
 }
 
-/// Steps 1 to 3 of the module docs: `server` is signed in as the recovery device of `code`.
-/// Adds `device` to `account`, whose first log entry has the hash `genesis`, and returns the log
-/// head after the append, the anchor the new device joins at.
+/// Steps 0 to 3 of the module docs: `server` is signed in as the recovery device of `code`.
+/// Adds `device` to the account of `sheet` and returns the log head after the append, the anchor
+/// the new device joins at. The sheet is checked against the code before anything is read.
 pub fn add_device_with_code(
     server: &mut dyn ServerApi,
-    account: AccountId,
-    genesis: &LogHash,
+    sheet: &RecoverySheet,
     code: &RecoveryCode,
     device: LogDevice,
     now_ms: u64,
     entropy: &mut dyn Entropy,
 ) -> Result<LogHead, RecoveryError> {
+    if !sheet.is_for(code) {
+        return Err(RecoveryError::WrongSheet);
+    }
+    let account = sheet.account;
+    let genesis = &sheet.genesis;
     let identity = code
         .identity()
         .map_err(|_| SyncError::Invalid("the recovery identity"))?;
@@ -266,11 +279,19 @@ mod tests {
         let identity = DeviceIdentity::generate(&mut hangar_drive_crypto::OsEntropy).unwrap();
         let account = AccountId::from_bytes([1; 16]);
         let device = LogDevice::of(&identity, &account, DeviceId::from_bytes([2; 16]), false);
+        let sheet = RecoverySheet::new(
+            hangar_drive_crypto::pairing::parse_server_url("https://drive.example/").unwrap(),
+            ServerId::from_bytes([4; 16]),
+            account,
+            LogHash::from_bytes([3; 32]),
+            None,
+            &code,
+        )
+        .unwrap();
         let run = |code_answer: ErrorCode| {
             add_device_with_code(
                 &mut Refusing(code_answer),
-                account,
-                &LogHash::from_bytes([3; 32]),
+                &sheet,
                 &code,
                 device,
                 0,

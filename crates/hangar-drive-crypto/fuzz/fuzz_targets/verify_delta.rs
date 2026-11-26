@@ -28,6 +28,7 @@ fn delta(mut data: &[u8]) -> Vec<DeltaCommit> {
             sequence,
             role,
             commit: Blob(rest[..take].to_vec()),
+            server_ms: None,
         });
         data = &rest[take..];
     }

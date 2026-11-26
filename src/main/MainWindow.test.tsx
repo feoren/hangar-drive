@@ -513,6 +513,9 @@ describe("quiet lines", () => {
     expect(text()).toContain("Alte Versionen belegen auf deinem Server gerade viel Platz.");
     expect(text()).toContain("„Büro-PC“ hat heute sehr viel hochgeladen.");
     expect(text()).toContain("nur noch 14 Tage auf");
+    expect(text()).toContain("Dein Speicher auf dem Server ist fast voll.");
+    expect(text()).toContain("Deine Geräte haben heute sehr viel hochgeladen.");
+    expect(text()).toContain("Auf deinem Server wird der Platz knapp.");
   });
 });
 

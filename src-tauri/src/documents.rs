@@ -446,6 +446,7 @@ mod tests {
             account: AccountId::from_bytes([0xac; 16]),
             genesis: LogHash::from_bytes([0x61; 32]),
             pin: None,
+            anchor_tag: [0x7a; 16],
         })
     }
 
@@ -553,6 +554,8 @@ mod tests {
                 folder_name: "Private Docs".into(),
                 entry_id: "e".into(),
                 days: 30,
+                until: 0,
+                lapsed: false,
             }],
             notices: vec![ServerNotice::Retained],
             storage: None,

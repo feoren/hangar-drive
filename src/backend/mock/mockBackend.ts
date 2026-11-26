@@ -702,6 +702,7 @@ export class MockBackend implements Backend {
     if (fragment === "insecure") return { ok: false, error: "insecure" };
     if (fragment === "offline") return { ok: false, error: "unreachable" };
     if (fragment === "damaged") return { ok: false, error: "unknown" };
+    if (fragment === "foreign") return { ok: false, error: "wrongSheet" };
     const nameError = strictNameProblem(deviceName);
     if (nameError) return { ok: false, error: nameError };
     const clean = normalizeCode(code);

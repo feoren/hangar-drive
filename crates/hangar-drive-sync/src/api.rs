@@ -440,6 +440,11 @@ pub enum Warning {
         entry_id: String,
         /// Retention days.
         days: u32,
+        /// When the server's pin of that entry ends (Unix ms, server time).
+        until: i64,
+        /// The pin ended early (the account's pin cap was full): the entry stays only for the
+        /// retention window.
+        lapsed: bool,
     },
     /// Conflict copies exist.
     Conflicts {
@@ -461,6 +466,8 @@ pub enum Warning {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ServerNotice {
+    /// Live bytes are near the quota; the storage line shows them.
+    Quota,
     /// Retained bytes exceed the quota.
     Retained,
     /// A device reached its upload budget.
@@ -468,6 +475,10 @@ pub enum ServerNotice {
         /// Its name.
         device: String,
     },
+    /// The account reached its upload budget.
+    BudgetAccount,
+    /// The server is below its free disk reserve and refuses uploads.
+    ServerDisk,
     /// The minimum count cap was reached.
     MinCount {
         /// Days.
@@ -582,7 +593,8 @@ pub struct RecoveryCodeView {
 
 /// The public part of the recovery sheet: printed in the clear, and as the link
 /// `hangar-drive://recover#...`, which never carries the code (open point A). The link is
-/// what a recovery reads: it also carries the genesis anchor and the optional pin (N1).
+/// what a recovery reads: it also carries the genesis anchor, the optional pin (N1) and the
+/// code's anchor tag over account and anchor, which only the link holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoverySheetView {
@@ -612,6 +624,9 @@ pub enum RecoverError {
     Used,
     /// A code of another app.
     OtherApp,
+    /// The sheet's link was not made for this code (a forged or mixed-up link); checked before
+    /// anything is sent.
+    WrongSheet,
     /// The server cannot be reached.
     Unreachable,
     /// Not secure.

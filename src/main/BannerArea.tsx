@@ -10,6 +10,7 @@ import { useLanguage, useT, type Translate } from "../i18n";
 import { errorCode } from "../backend/errors";
 import type { Backend } from "../backend/types";
 import { headsBody } from "../problems/RemovedHeadsDialog";
+import { suspectTitle } from "../problems/SuspectDialog";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Feedback } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
@@ -55,8 +56,10 @@ function content(
   switch (warning.kind) {
     case "suspect":
       return {
-        title: t("suspect.title", { device: warning.deviceName }),
-        body: t("suspect.body", { days: warning.days }),
+        title: suspectTitle(warning, t),
+        body: warning.lapsed
+          ? `${t("suspect.body", { days: warning.days })} ${t("suspect.lapsed")}`
+          : t("suspect.body", { days: warning.days }),
         buttons: [
           {
             label: t("suspect.what"),

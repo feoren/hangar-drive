@@ -41,6 +41,8 @@ export function recoverErrorText(error: RecoverError, t: Translate): string {
       return t("error.recovery.used");
     case "otherApp":
       return t("error.recovery.otherApp", { app });
+    case "wrongSheet":
+      return t("error.recovery.wrongSheet");
     case "unreachable":
       return t("error.server.unreachable");
     case "insecure":

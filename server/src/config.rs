@@ -28,7 +28,7 @@ pub const HEADROOM_VAR: &str = "HANGAR_DRIVE_HEADROOM";
 pub const MIN_COUNT_CAP_VAR: &str = "HANGAR_DRIVE_MIN_COUNT_CAP";
 /// Bytes an account may make live per rolling 24 hours.
 pub const ACCOUNT_BUDGET_VAR: &str = "HANGAR_DRIVE_ACCOUNT_BUDGET";
-/// Bytes one device may make live per rolling 24 hours.
+/// Bytes one device may make live per rolling 24 hours (default: half the account budget).
 pub const DEVICE_BUDGET_VAR: &str = "HANGAR_DRIVE_DEVICE_BUDGET";
 /// Free disk space below which every upload is refused.
 pub const DISK_RESERVE_VAR: &str = "HANGAR_DRIVE_DISK_RESERVE";
@@ -117,8 +117,8 @@ impl Limits {
     }
 
     /// The defaults for a quota (ADR 0001, section 5): headroom 1% and at least 64 MiB, the
-    /// minimum count cap and the account budget equal to the quota, the device budget equal to
-    /// the account budget.
+    /// minimum count cap and the account budget equal to the quota, the device budget half the
+    /// account budget ([`default_device_budget`]).
     pub fn for_quota(quota: u64) -> Self {
         Self {
             retention_ms: u64::from(DEFAULT_RETENTION_DAYS) * DAY_MS,
@@ -127,7 +127,7 @@ impl Limits {
             headroom: default_headroom(quota),
             min_count_cap: quota,
             account_budget: quota,
-            device_budget: quota,
+            device_budget: default_device_budget(quota),
             disk_reserve: DEFAULT_DISK_RESERVE,
             anomaly_min_objects: DEFAULT_ANOMALY_MIN_OBJECTS,
             anomaly_percent: DEFAULT_ANOMALY_PERCENT,
@@ -153,6 +153,16 @@ impl Limits {
             .max(MIN_BURST_OBJECTS)
             .min(u64::from(self.anomaly_min_objects))
     }
+}
+
+/// Half the account budget (security review MEDIUM 3). With a device budget equal to the
+/// account budget, one compromised device could spend the whole account budget on garbage and
+/// lock every other device of the account out for 24 hours. Half leaves the others at least as
+/// much as it can take, while one device still uploads half a quota a day, and a full quota in
+/// two; an operator who wants a first full upload in one day raises the account budget, which
+/// the disk bound then pays for (`docs/self-hosting.md`, "Disk sizing").
+pub fn default_device_budget(account_budget: u64) -> u64 {
+    account_budget / 2
 }
 
 fn default_headroom(quota: u64) -> u64 {
@@ -338,7 +348,8 @@ impl Config {
         if let Some(budget) = size(ACCOUNT_BUDGET_VAR)? {
             limits.account_budget = budget;
         }
-        limits.device_budget = size(DEVICE_BUDGET_VAR)?.unwrap_or(limits.account_budget);
+        limits.device_budget = size(DEVICE_BUDGET_VAR)?
+            .unwrap_or_else(|| default_device_budget(limits.account_budget));
         if limits.device_budget > limits.account_budget {
             return Err(ConfigError::DeviceBudgetAboveAccount);
         }
@@ -515,7 +526,7 @@ mod tests {
         assert_eq!(l.headroom, DEFAULT_QUOTA / 100);
         assert_eq!(l.min_count_cap, l.quota);
         assert_eq!(l.account_budget, l.quota);
-        assert_eq!(l.device_budget, l.account_budget);
+        assert_eq!(l.device_budget, l.account_budget / 2);
         assert_eq!(l.pin_cap(), l.quota + l.headroom);
         assert!(config.trusted_proxies.is_empty() && config.tls.is_none());
     }
@@ -594,9 +605,16 @@ mod tests {
     }
 
     #[test]
-    fn device_budget_defaults_to_the_account_budget() {
+    fn device_budget_defaults_to_half_the_account_budget() {
         let config = config(&[(ACCOUNT_BUDGET_VAR, "3GiB")]).unwrap();
-        assert_eq!(config.limits.device_budget, 3 * GIB);
+        assert_eq!(config.limits.device_budget, 3 * GIB / 2);
+        assert_eq!(Limits::for_quota(GIB).device_budget, GIB / 2);
+        // The operator may still give one device the whole account budget.
+        let whole = super::Config::from_lookup(|n| match n {
+            ACCOUNT_BUDGET_VAR | DEVICE_BUDGET_VAR => Some("3GiB".into()),
+            _ => None,
+        });
+        assert!(whole.is_ok_and(|c| c.limits.device_budget == 3 * GIB));
         assert_eq!(
             super::Config::from_lookup(|n| match n {
                 ACCOUNT_BUDGET_VAR => Some("1GiB".into()),

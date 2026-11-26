@@ -135,6 +135,7 @@ const TEXT_KEYS: &[&str] = &[
     "missing.title",
     "older.title",
     "suspect.title",
+    "suspect.titleFolder",
     "removedHeads.title",
     "quotaFull.title",
     "serverDisk.title",

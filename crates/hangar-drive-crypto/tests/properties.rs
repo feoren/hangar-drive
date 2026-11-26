@@ -10,7 +10,7 @@
 
 use std::sync::OnceLock;
 
-use hangar_drive_crypto::commit::{ChainEntry, Commit, CommitContent, SignedCommit};
+use hangar_drive_crypto::commit::{ChainEntry, Commit, CommitContent, DeltaDigest, SignedCommit};
 use hangar_drive_crypto::device_names::{DeviceName, DeviceNameList};
 use hangar_drive_crypto::devicelog::{AccountState, EntryKind, LogDevice, LogEntry};
 use hangar_drive_crypto::epoch::{rotate, unwrap, wrap, AccountSecret, EpochCommitment};
@@ -186,6 +186,11 @@ fn content() -> impl Strategy<Value = CommitContent> {
                     hash: LogHash::from_bytes(hash),
                 },
                 counter,
+                // Any digest round-trips; a diff one fits every commit kind.
+                delta: DeltaDigest {
+                    full: false,
+                    hash: root,
+                },
             },
         )
 }

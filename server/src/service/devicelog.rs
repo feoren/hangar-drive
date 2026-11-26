@@ -1,6 +1,7 @@
 //! The device log on the server (ADR 0001, section 4): pages of entries, the atomic append that
 //! `AccountState::admit_batch` and `append_wraps_fit` check, and each device's wrapped epoch
-//! secrets. A removal ends the removed devices' sessions in the same transaction.
+//! secrets. A removal ends the removed devices' sessions and deletes their uncommitted uploads in
+//! the same transaction.
 
 use std::sync::Arc;
 
@@ -12,11 +13,11 @@ use hangar_drive_protocol::api::{
 };
 use hangar_drive_protocol::ids::{Blob, Epoch};
 
-use crate::app::{account_by_pk, App};
+use crate::app::{account_by_pk, App, AppState};
 use crate::db::{begin_write, i64_of, u64_of};
 use crate::error::{ApiError, ApiResult};
-use crate::service::feed;
 use crate::service::sessions::Session;
+use crate::service::{feed, objects, retention};
 
 /// `GET /account/log?after=N`.
 pub async fn page(app: &App, session: &Session, after: u64) -> ApiResult<LogPage> {
@@ -41,7 +42,7 @@ pub async fn page(app: &App, session: &Session, after: u64) -> ApiResult<LogPage
 
 /// `POST /account/log`.
 pub async fn append(
-    app: &App,
+    app: &AppState,
     session: &Session,
     request: LogAppendRequest,
 ) -> ApiResult<LogAppendResponse> {
@@ -107,6 +108,7 @@ pub async fn append(
         .execute(&mut *tx)
         .await?;
     let mut pushed = Vec::new();
+    let mut dropped_files = Vec::new();
     match &batch.shape {
         BatchShape::Rotation { removed, epoch } => {
             for wrap in &request.wraps {
@@ -119,12 +121,17 @@ pub async fn append(
                 )
                 .await?;
             }
+            let now = app.now_ms();
             for device in removed {
                 sqlx::query("DELETE FROM sessions WHERE account_pk = ? AND device = ?")
                     .bind(account.pk)
                     .bind(device.as_bytes().as_slice())
                     .execute(&mut *tx)
                     .await?;
+                // Its uncommitted uploads go now, not 24 hours later (security review MEDIUM 3).
+                let keys =
+                    objects::drop_uploads_of(&mut tx, account.pk, account.id, device, now).await?;
+                dropped_files.extend(keys);
             }
             pushed
                 .push(feed::push(&mut tx, account.pk, &FeedChange::Epoch { epoch: *epoch }).await?);
@@ -150,6 +157,12 @@ pub async fn append(
     tx.commit().await?;
     app.states.put(account.pk, Arc::new(batch.state));
     feed::notify_all(app, &pushed);
+    if !dropped_files.is_empty() {
+        // In the background: a removal can drop many files, and the append is already durable.
+        // Files a shutdown leaves behind have no row and go with the orphan sweep.
+        let app = app.clone();
+        tokio::spawn(async move { retention::remove_object_files(&app, dropped_files).await });
+    }
     Ok(LogAppendResponse { head })
 }
 

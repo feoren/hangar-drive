@@ -122,6 +122,16 @@ fn notice_of(warning: &Warning) -> Option<Notice> {
                 )
             }
         }
+        // Without the device (the folder is not synced here, or its newest changes have not
+        // arrived) the folder is named, as in the window's banner.
+        Warning::Suspect {
+            id,
+            device_name,
+            folder_name,
+            ..
+        } if device_name.trim().is_empty() => {
+            notice("suspect.titleFolder", id, &[("folder", folder_name)])
+        }
         Warning::Suspect {
             id,
             device_name,
@@ -271,6 +281,31 @@ mod tests {
             !body.contains(", Old") && !body.contains("Laptop, "),
             "{body}"
         );
+    }
+
+    // ADR 0001, section 5: every device is told of a suspected attack, also one that cannot
+    // name the device (the folder is not synced there); it names the folder then.
+    #[test]
+    fn a_suspect_warning_without_a_device_names_the_folder() {
+        let suspect = |device: &str| Warning::Suspect {
+            id: format!("suspect-{device}"),
+            device_id: String::new(),
+            device_name: device.into(),
+            folder_id: "1".into(),
+            folder_name: "Photos".into(),
+            entry_id: "e".into(),
+            days: 30,
+            until: 0,
+            lapsed: false,
+        };
+        let mut policy = Policy::default();
+        let told = policy.on_snapshot(&snapshot(vec![suspect(""), suspect("Old Laptop")]), 0);
+        assert_eq!(told[0].key, "suspect.titleFolder");
+        let (_, body) = render("en", &told[0]).unwrap();
+        assert!(body.contains("Photos") && !body.contains('{'), "{body}");
+        assert_eq!(told[1].key, "suspect.title");
+        let (_, body) = render("en", &told[1]).unwrap();
+        assert!(body.contains("Old Laptop"), "{body}");
     }
 
     #[test]

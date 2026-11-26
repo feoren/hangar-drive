@@ -100,9 +100,10 @@ async fn n4_measure_the_heap_peak_of_a_commit_with_the_largest_delta() {
     .await
     .unwrap();
     // The largest delta one commit may carry, every object held, so the call runs to the end.
-    let ids: Vec<ObjectId> = (0..MAX_REFERENCE_DELTA_IDS)
+    let mut ids: Vec<ObjectId> = (0..MAX_REFERENCE_DELTA_IDS)
         .map(|_| ObjectId::from_bytes(random()))
         .collect();
+    ids.sort();
     let mut tx = server.app.db.begin().await.unwrap();
     for page in ids.chunks(10_000) {
         let hex: Vec<String> = page.iter().map(ObjectId::to_hex).collect();
@@ -117,7 +118,7 @@ async fn n4_measure_the_heap_peak_of_a_commit_with_the_largest_delta() {
         .unwrap();
     }
     tx.commit().await.unwrap();
-    let commit = folder.next(&account, &mut a);
+    let commit = folder.next_adding(&account, &mut a, &ids);
     let mut request = folder.request(&commit, &[], &[]);
     request.head.delta.added = ids;
     let body = serde_json::to_vec(&request).unwrap();

@@ -68,6 +68,14 @@ pub const RESTORE_RETRY_MS: i64 = 15 * 60 * 1000;
 /// say it (ADR 0001, section 5: 30 days by default).
 const RETENTION_DAYS: i64 = 30;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// Anomaly pins kept (ADR 0001, section 5): the server pins at most one commit per folder in its
+/// cooldown, so a device sees few; the bound keeps a server that floods the feed with made up
+/// pins from growing the settings file. The oldest fall out first.
+const MAX_PINS: usize = 32;
+/// A pin notice that ends within this much of this device's clock is a pin that lapsed (the
+/// server sends the notice again with the end set to its own now when the pin cap lets it go);
+/// the margin covers clock skew between server and device. A fresh pin lasts far longer.
+const PIN_LAPSE_MARGIN_MS: i64 = 60 * 60 * 1000;
 /// While the server reports this device as removed (security review H2), it signs in again
 /// this often, each time with a fresh challenge and proof, instead of at every pass.
 pub const REMOVAL_PROBE_MS: i64 = 60 * 60 * 1000;
@@ -173,6 +181,52 @@ struct Persisted {
     /// brought back (UX 6, "Gelöschte Ordner").
     #[serde(default)]
     deleted_folders: Vec<(FolderId, String, i64)>,
+    /// Anomaly pins the server told this device about, oldest first, at most [`MAX_PINS`]
+    /// (ADR 0001, section 5; UX 9.4). Kept across restarts: the feed tells each pin only once.
+    #[serde(default)]
+    pins: Vec<PinNotice>,
+}
+
+/// An anomaly pin from the change feed: the server pinned `commit`, the last commit of `folder`
+/// before a burst of replaced or dropped objects, until `until_ms` (server time, Unix ms). The
+/// device that wrote the burst is read from this device's verified history, never from the
+/// server ([`EngineCore::suspect_warnings`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PinNotice {
+    folder: FolderId,
+    commit: CommitId,
+    until_ms: i64,
+    /// The pin ended before its time (the account's pin cap was full); the version then stays
+    /// only for the normal retention window.
+    lapsed: bool,
+}
+
+/// Takes a pin notice in: a new pin is added, a known one updated. A pin that ends at once, or
+/// earlier than this device knew, lapsed.
+fn note_pin(
+    pins: &mut Vec<PinNotice>,
+    folder: FolderId,
+    commit: CommitId,
+    until_ms: i64,
+    now: i64,
+) {
+    let ends_now = until_ms <= now.saturating_add(PIN_LAPSE_MARGIN_MS);
+    if let Some(known) = pins
+        .iter_mut()
+        .find(|p| p.folder == folder && p.commit == commit)
+    {
+        known.lapsed |= ends_now || until_ms < known.until_ms;
+        known.until_ms = until_ms;
+        return;
+    }
+    pins.push(PinNotice {
+        folder,
+        commit,
+        until_ms,
+        lapsed: ends_now,
+    });
+    let over = pins.len().saturating_sub(MAX_PINS);
+    pins.drain(..over);
 }
 
 /// The server's reports that this device was removed that came without a removal this device
@@ -228,6 +282,9 @@ struct LocalFolder {
     /// silently staying at "uploading" (finding E2E-2).
     failed_rounds: u32,
     last_error: Option<crate::error::ErrorKind>,
+    /// Files the last rounds could not write for lack of space, with their sizes: the window
+    /// shows "disk full" with what they need until they are written or the folder is in sync.
+    disk_full: BTreeMap<ItemId, u64>,
 }
 
 /// Failed rounds in a row after which a folder's error is shown: a single failure (a head that
@@ -288,6 +345,8 @@ pub struct EngineCore {
     folders: BTreeMap<FolderId, LocalFolder>,
     activity: VecDeque<ActivityEntry>,
     notices: Vec<ServerNotice>,
+    /// Use and quota from the server's last quota notice; the storage line shows it.
+    storage: Option<Storage>,
     connection: Connection,
     last_ok_ms: i64,
     last_sync: Option<i64>,
@@ -324,23 +383,26 @@ fn name_error(name: &str) -> Option<NameError> {
     }
 }
 
-/// The sheet view of a recovery code's account: its server, its genesis anchor and the pin this
-/// device trusts (N1).
+/// The sheet view of a recovery code's account: its server, its genesis anchor, the pin this
+/// device trusts (N1) and, in the link, the code's anchor tag over account and anchor.
 fn sheet_view(
     url: &str,
     server: ServerId,
     account: AccountId,
     genesis: LogHash,
     pin: Option<[u8; 32]>,
+    code: &RecoveryCode,
 ) -> Result<RecoverySheetView, SyncError> {
-    let sheet = crate::links::RecoverySheet {
-        server_url: hangar_drive_crypto::pairing::parse_server_url(url)
+    let sheet = crate::links::RecoverySheet::new(
+        hangar_drive_crypto::pairing::parse_server_url(url)
             .map_err(|_| SyncError::Invalid("server url"))?,
         server,
         account,
         genesis,
         pin,
-    };
+        code,
+    )
+    .map_err(|_| SyncError::Invalid("recovery anchor tag"))?;
     Ok(RecoverySheetView {
         server_url: sheet.server_url.to_string(),
         server_id: server.to_hex(),
@@ -410,6 +472,7 @@ impl EngineCore {
             folders: BTreeMap::new(),
             activity: VecDeque::new(),
             notices: Vec::new(),
+            storage: None,
             connection: Connection::Online,
             last_ok_ms: now,
             last_sync: None,
@@ -490,6 +553,7 @@ impl EngineCore {
                 last_full_scan: 0,
                 failed_rounds: 0,
                 last_error: None,
+                disk_full: BTreeMap::new(),
             },
         );
         Ok(())
@@ -650,22 +714,63 @@ impl EngineCore {
                 .unwrap_or_default();
             return self.forget_device(Some(by));
         }
+        let mut quiet = Vec::new();
         if refresh.feed_reset {
-            self.notices.push(ServerNotice::OlderAccountState);
+            quiet.push(ServerNotice::OlderAccountState);
         }
+        let pins_before = self.persisted.pins.clone();
         for notice in &refresh.notices {
             match notice {
-                Notice::RetainedOverQuota { .. } => self.notices.push(ServerNotice::Retained),
-                Notice::DeviceBudget { device } => self.notices.push(ServerNotice::BudgetDevice {
+                // ADR 0001, section 5: every device is told; the warning is built from the
+                // stored pin in every snapshot (`suspect_warnings`).
+                Notice::AnomalyPin {
+                    folder,
+                    commit,
+                    until_ms,
+                } => note_pin(
+                    &mut self.persisted.pins,
+                    *folder,
+                    *commit,
+                    i64::try_from(*until_ms).unwrap_or(i64::MAX),
+                    now,
+                ),
+                Notice::QuotaWarning {
+                    live_bytes,
+                    quota_bytes,
+                } => {
+                    self.storage = Some(Storage {
+                        used: *live_bytes,
+                        quota: *quota_bytes,
+                    });
+                    quiet.push(ServerNotice::Quota);
+                }
+                Notice::RetainedOverQuota { .. } => quiet.push(ServerNotice::Retained),
+                Notice::DeviceBudget { device } => quiet.push(ServerNotice::BudgetDevice {
                     device: account.device_display_name(device).unwrap_or_default(),
                 }),
-                Notice::MinimumCountCap { .. } => {
-                    self.notices.push(ServerNotice::MinCount { days: 0 })
-                }
-                _ => {}
+                Notice::AccountBudget => quiet.push(ServerNotice::BudgetAccount),
+                Notice::DiskReserve => quiet.push(ServerNotice::ServerDisk),
+                // The text names the retention window that still holds (UX 6.3).
+                Notice::MinimumCountCap { .. } => quiet.push(ServerNotice::MinCount {
+                    days: RETENTION_DAYS as u32,
+                }),
+                Notice::Unknown => {}
             }
         }
-        self.notices.dedup();
+        // Each notice once: the feed repeats a condition that is raised again, and the list
+        // lives as long as the app runs.
+        for notice in quiet {
+            if !self.notices.contains(&notice) {
+                self.notices.push(notice);
+            }
+        }
+        // Ended pins go once their version is past the retention window as well.
+        self.persisted
+            .pins
+            .retain(|p| now <= p.until_ms.saturating_add(RETENTION_DAYS * DAY_MS));
+        if self.persisted.pins != pins_before {
+            self.save()?;
+        }
         // Open offers: a new device may have answered.
         let offers: Vec<String> = self.offers.keys().cloned().collect();
         for id in offers {
@@ -756,6 +861,7 @@ impl EngineCore {
                 }
             };
             all_in_sync &= report.in_sync;
+            Self::note_disk_full(folder, &report);
             let name = folder.sync.meta().name.clone();
             let folder_id = hex_id(&id);
             if !report.removed_heads.is_empty() {
@@ -1083,6 +1189,18 @@ impl EngineCore {
                 .filter(|i| !self.persisted.ignored_names.contains(&format!("{id}:{i}")))
                 .count() as u64;
         }
+        let needed: u64 = self
+            .folders
+            .values()
+            .flat_map(|f| f.disk_full.values())
+            .fold(0u64, |sum, size| sum.saturating_add(*size));
+        if self.folders.values().any(|f| !f.disk_full.is_empty()) {
+            warnings.push(Warning::DiskFull {
+                id: "diskFull".into(),
+                needed,
+            });
+        }
+        warnings.extend(self.suspect_warnings());
         if self.pin_mismatch {
             warnings.push(Warning::ServerIdentity {
                 id: "serverIdentity".into(),
@@ -1151,7 +1269,7 @@ impl EngineCore {
             activity: self.activity.iter().cloned().collect(),
             warnings,
             notices: self.notices.clone(),
-            storage: None,
+            storage: self.storage,
             account: self.account.as_ref().map(|a| AccountInfo {
                 host: self
                     .persisted
@@ -1270,7 +1388,7 @@ impl EngineCore {
             device,
             Some((&recovery_identity, recovery_id)),
         )?;
-        let sheet = sheet_view(&url, server_id, account, genesis.hash()?, invite.pin)?;
+        let sheet = sheet_view(&url, server_id, account, genesis.hash()?, invite.pin, &code)?;
         self.pending = Some(PendingAccount {
             url,
             invite: invite.token,
@@ -1428,8 +1546,8 @@ impl EngineCore {
             .account
             .as_ref()
             .ok_or(SyncError::NotSetUp("no account"))?;
-        let sheet = self.own_sheet(account, &url)?;
         let code = RecoveryCode::generate(&mut DynEntropy(&mut *self.ports.entropy))?;
+        let sheet = self.own_sheet(account, &url, &code)?;
         let check_group = pick_check_group(&mut *self.ports.entropy)?;
         let groups = group(&code.reveal(), 4);
         self.renewal = Some(Renewal {
@@ -1444,8 +1562,14 @@ impl EngineCore {
         })
     }
 
-    /// The sheet of this device's account: its server, genesis anchor and the pin it trusts.
-    fn own_sheet(&self, account: &Account, url: &str) -> Result<RecoverySheetView, SyncError> {
+    /// The sheet of `code` for this device's account: its server, genesis anchor and the pin it
+    /// trusts.
+    fn own_sheet(
+        &self,
+        account: &Account,
+        url: &str,
+        code: &RecoveryCode,
+    ) -> Result<RecoverySheetView, SyncError> {
         let server_id = account
             .server_id()
             .ok_or(SyncError::NotSetUp("the server ID is not known yet"))?;
@@ -1454,7 +1578,14 @@ impl EngineCore {
             .hash_at(1)
             .copied()
             .ok_or(SyncError::NotSetUp("the account log is empty"))?;
-        sheet_view(url, server_id, *account.id(), genesis, self.persisted.pin)
+        sheet_view(
+            url,
+            server_id,
+            *account.id(),
+            genesis,
+            self.persisted.pin,
+            code,
+        )
     }
 
     /// Account recovery with the recovery sheet (`recoverAccount`, open point A): `sheet` is
@@ -1494,6 +1625,11 @@ impl EngineCore {
             }
             Err(_) => return Ok(ApiResult::Err(RecoverError::Typo)),
         };
+        // A sheet the code was not made for is refused before anything is sent anywhere: a link
+        // can come from anyone (security review "recovery link as phishing").
+        if !sheet.is_for(&code) {
+            return Ok(ApiResult::Err(RecoverError::WrongSheet));
+        }
         let recovery_identity = code
             .identity()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
@@ -1525,8 +1661,7 @@ impl EngineCore {
         let now = u64::try_from(self.now()).unwrap_or(0);
         let anchor = match crate::recovery::add_device_with_code(
             recovery_server.as_mut(),
-            sheet.account,
-            &sheet.genesis,
+            &sheet,
             &code,
             entry,
             now,
@@ -1538,6 +1673,9 @@ impl EngineCore {
             }
             Err(crate::recovery::RecoveryError::Used) => {
                 return Ok(ApiResult::Err(RecoverError::Used))
+            }
+            Err(crate::recovery::RecoveryError::WrongSheet) => {
+                return Ok(ApiResult::Err(RecoverError::WrongSheet))
             }
             Err(crate::recovery::RecoveryError::Sync(SyncError::Net(e))) => {
                 return Ok(ApiResult::Err(net(&e)))
@@ -1669,7 +1807,7 @@ impl EngineCore {
             .account
             .as_ref()
             .ok_or(SyncError::NotSetUp("no account"))?;
-        let sheet = self.own_sheet(account, &url)?;
+        let sheet = self.own_sheet(account, &url, &code)?;
         let check_group = pick_check_group(&mut *self.ports.entropy)?;
         self.recovering = None;
         let groups = group(&code.reveal(), 4);
@@ -2022,6 +2160,7 @@ impl EngineCore {
         self.folders.clear();
         self.activity.clear();
         self.notices.clear();
+        self.storage = None;
         self.pin_mismatch = false;
         self.pending = None;
         self.recovering = None;
@@ -2897,19 +3036,7 @@ impl EngineCore {
                 } else {
                     remote.path_string(&node.parent).unwrap_or_default()
                 };
-                let reason = match windows_problem(&node.name) {
-                    Some(WindowsNameProblem::ForbiddenCharacter(c)) => NameReason::Char {
-                        char: c.to_string(),
-                    },
-                    // A short name alias is reserved on Windows too (security review N14).
-                    Some(WindowsNameProblem::Reserved)
-                    | Some(WindowsNameProblem::ShortNameAlias) => NameReason::Reserved {
-                        name: node.name.clone(),
-                    },
-                    Some(WindowsNameProblem::TrailingDotOrSpace) => NameReason::Trailing,
-                    Some(WindowsNameProblem::ControlCharacter) => NameReason::Control,
-                    _ => NameReason::CannotCreate,
-                };
+                let reason = name_reason(&node.name);
                 out.push(NameIssue {
                     id,
                     folder_id: hex_id(fid),
@@ -3652,6 +3779,68 @@ impl EngineCore {
         })
     }
 
+    /// Keeps the files a round could not write for lack of space (with their sizes) until they
+    /// are written or the folder is in sync; the snapshot shows them as "disk full".
+    fn note_disk_full(folder: &mut LocalFolder, report: &crate::folder::RoundReport) {
+        for (item, error) in &report.failed {
+            if matches!(error, crate::apply::ActionError::DiskFull) {
+                let size = match folder.sync.remote().get(item).map(|n| &n.kind) {
+                    Some(NodeKind::File(v)) => v.size,
+                    _ => 0,
+                };
+                folder.disk_full.insert(*item, size);
+            }
+        }
+        if report.in_sync {
+            folder.disk_full.clear();
+        } else {
+            let written: BTreeSet<ItemId> = report
+                .changes
+                .iter()
+                .filter(|c| c.incoming)
+                .map(|c| c.item)
+                .collect();
+            folder.disk_full.retain(|id, _| !written.contains(id));
+        }
+    }
+
+    /// The "suspect device" warnings of the stored anomaly pins (ADR 0001, section 5; UX 9.4).
+    /// The device is named only when this device's own verified history shows it dropping a
+    /// burst after the pinned commit ([`burst_writer`]): the pin itself comes from the server,
+    /// which could place it before any device's commit, so its position alone names nobody
+    /// (MEDIUM 3 of the follow-up review). Otherwise, for a folder not synced here, or while its
+    /// new commits have not arrived, the device stays empty and the window names the folder
+    /// instead, without "Gerät entfernen".
+    fn suspect_warnings(&self) -> Vec<Warning> {
+        let (Some(account), false) = (&self.account, self.persisted.pins.is_empty()) else {
+            return Vec::new();
+        };
+        let listed = account.folders();
+        self.persisted
+            .pins
+            .iter()
+            .filter_map(|pin| {
+                let local = self.folders.get(&pin.folder);
+                let folder_name = match local {
+                    Some(f) => f.sync.meta().name.clone(),
+                    None => listed.iter().find(|f| f.folder == pin.folder)?.name.clone(),
+                };
+                let device = local.and_then(|f| burst_writer(&f.sync.meta().timeline, &pin.commit));
+                Some(Warning::Suspect {
+                    id: format!("suspect-{}-{}", pin.folder, pin.commit),
+                    device_id: device.map(|d| hex_id(&d)).unwrap_or_default(),
+                    device_name: device.map(|d| self.device_name_of(&d)).unwrap_or_default(),
+                    folder_id: hex_id(&pin.folder),
+                    folder_name,
+                    entry_id: pin.commit.to_hex(),
+                    days: RETENTION_DAYS as u32,
+                    until: pin.until_ms,
+                    lapsed: pin.lapsed,
+                })
+            })
+            .collect()
+    }
+
     fn device_name_of(&self, device: &DeviceId) -> String {
         self.account
             .as_ref()
@@ -3662,6 +3851,74 @@ impl EngineCore {
     /// The about box's version.
     pub fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
+    }
+}
+
+/// File objects a burst drops at least, at most required, and the share of the folder's file
+/// objects in between: the server's default thresholds (ADR 0001, section 5, "Burst
+/// threshold").
+const BURST_MIN_OBJECTS: u64 = 20;
+const BURST_MAX_OBJECTS: u64 = 500;
+const BURST_PERCENT: u64 = 30;
+/// The server's rolling window of the burst signal.
+const BURST_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+/// The device whose verified heads after `pinned` in `timeline` drop a burst (MEDIUM 3 of the
+/// follow-up review): within the hour after the first of them, by this device's own count of
+/// each head's dropped file objects ([`crate::folder::TimelineRec::dropped_files`]), at least
+/// the server's share of the folder's file objects before them and its object count (at most
+/// all of them, for a small folder). A head
+/// whose drop was not counted names nobody, and a full delta counts chunks only, so a barrier
+/// or a repair that keeps the tree never names its writer. `None`: no device drops a burst, or
+/// the pinned commit is not in this device's history.
+fn burst_writer(timeline: &[crate::folder::TimelineRec], pinned: &CommitId) -> Option<DeviceId> {
+    let at = timeline.iter().find(|t| t.commit == *pinned)?.sequence;
+    let mut heads: Vec<&crate::folder::TimelineRec> = timeline
+        .iter()
+        .filter(|t| !t.side && t.sequence > at)
+        .collect();
+    heads.sort_by_key(|t| t.sequence);
+    let first = heads.first()?;
+    let before = first.files_before?;
+    let count = before
+        .saturating_mul(BURST_PERCENT)
+        .div_ceil(100)
+        .clamp(BURST_MIN_OBJECTS, BURST_MAX_OBJECTS)
+        // A folder with fewer file objects than the count: all of them, as an operator count
+        // below the default would allow; never zero.
+        .min(before)
+        .max(1);
+    let until = first.seen_at_ms.saturating_add(BURST_WINDOW_MS);
+    let mut dropped: BTreeMap<DeviceId, u64> = BTreeMap::new();
+    for t in heads.iter().filter(|t| t.seen_at_ms <= until) {
+        let Some(n) = t.dropped_files else {
+            continue;
+        };
+        let sum = dropped.entry(t.device).or_default();
+        *sum = sum.saturating_add(n);
+        if *sum >= count && sum.saturating_mul(100) >= before.saturating_mul(BURST_PERCENT) {
+            return Some(t.device);
+        }
+    }
+    None
+}
+
+/// Why this device cannot hold an entry named `name`, as the window explains it. A short name
+/// alias (security review N14) and a shell junction name (follow-up review of the Windows
+/// handles, M1) are reserved on Windows like a device name.
+fn name_reason(name: &str) -> NameReason {
+    match windows_problem(name) {
+        Some(WindowsNameProblem::ForbiddenCharacter(c)) => NameReason::Char {
+            char: c.to_string(),
+        },
+        Some(WindowsNameProblem::Reserved)
+        | Some(WindowsNameProblem::ShortNameAlias)
+        | Some(WindowsNameProblem::ShellJunction) => NameReason::Reserved {
+            name: name.to_owned(),
+        },
+        Some(WindowsNameProblem::TrailingDotOrSpace) => NameReason::Trailing,
+        Some(WindowsNameProblem::ControlCharacter) => NameReason::Control,
+        Some(WindowsNameProblem::TooLong) | None => NameReason::CannotCreate,
     }
 }
 
@@ -3828,6 +4085,24 @@ impl Engine {
 mod tests {
     use super::*;
 
+    // The window explains each Windows name problem; a shell junction name reads as reserved,
+    // not as "cannot create" (follow-up review of the Windows handles, M1).
+    #[test]
+    fn every_windows_name_problem_has_its_reason() {
+        let reserved = |name: &str| NameReason::Reserved {
+            name: name.to_owned(),
+        };
+        let junction = "Bilder.{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+        assert_eq!(name_reason(junction), reserved(junction));
+        assert_eq!(name_reason("REPORT~2.DOC"), reserved("REPORT~2.DOC"));
+        assert_eq!(name_reason("nul.txt"), reserved("nul.txt"));
+        assert_eq!(name_reason("a:b"), NameReason::Char { char: ":".into() });
+        assert_eq!(name_reason("a."), NameReason::Trailing);
+        assert_eq!(name_reason("a\u{1}b"), NameReason::Control);
+        assert_eq!(name_reason(&"x".repeat(300)), NameReason::CannotCreate);
+        assert_eq!(name_reason("plain.txt"), NameReason::CannotCreate);
+    }
+
     // Follow-up check N-3: the hidden warnings are bounded, the oldest fall out first, and one
     // hidden again counts as the newest.
     #[test]
@@ -3844,6 +4119,121 @@ mod tests {
         assert_eq!(list.first().map(String::as_str), Some("w11"));
     }
 
+    // ADR 0001, section 5: a pin notice is kept once per folder and commit; one that ends at
+    // once, or earlier than known, lapsed; a flood of made up pins stays bounded.
+    #[test]
+    fn pin_notices_are_kept_once_and_a_lapse_is_noticed() {
+        let now = 1_795_651_200_000;
+        let folder = FolderId::from_bytes([1; 16]);
+        let commit = |n: u8| CommitId::from_bytes([n; 32]);
+        let mut pins = Vec::new();
+        note_pin(&mut pins, folder, commit(1), now + 90 * DAY_MS, now);
+        note_pin(&mut pins, folder, commit(1), now + 90 * DAY_MS, now);
+        assert_eq!(pins.len(), 1);
+        assert!(!pins[0].lapsed);
+        // The pin cap let it go: the server sends it again, ending at its own now.
+        note_pin(&mut pins, folder, commit(1), now + 5_000, now);
+        assert_eq!(pins.len(), 1);
+        assert!(pins[0].lapsed);
+        assert_eq!(pins[0].until_ms, now + 5_000);
+        // A device that only sees the lapse (the feed keeps the newest entry per pin).
+        note_pin(&mut pins, folder, commit(2), now - 1_000, now);
+        assert!(pins[1].lapsed);
+        for n in 0..(MAX_PINS as u8 + 5) {
+            note_pin(&mut pins, folder, commit(10 + n), now + DAY_MS, now);
+        }
+        assert_eq!(pins.len(), MAX_PINS);
+        assert_eq!(
+            pins.last().map(|p| p.commit),
+            Some(commit(10 + MAX_PINS as u8 + 4))
+        );
+    }
+
+    fn burst_rec(
+        commit: u8,
+        sequence: u64,
+        device: u8,
+        side: bool,
+        dropped: Option<(u64, u64)>,
+    ) -> crate::folder::TimelineRec {
+        crate::folder::TimelineRec {
+            commit: CommitId::from_bytes([commit; 32]),
+            sequence,
+            device: DeviceId::from_bytes([device; 16]),
+            seen_at_ms: 0,
+            reanchor: false,
+            side,
+            root: hangar_drive_protocol::ids::ObjectId::from_bytes([0; 32]),
+            dropped_files: dropped.map(|d| d.0),
+            files_before: dropped.map(|d| d.1),
+        }
+    }
+
+    // The device of a suspect warning is the one whose verified heads after the pinned commit
+    // drop a burst by this device's own count, side commits aside.
+    #[test]
+    fn the_burst_writer_comes_from_the_timeline() {
+        let timeline = vec![
+            burst_rec(1, 1, 7, false, Some((0, 100))),
+            burst_rec(2, 2, 7, false, Some((0, 100))),
+            burst_rec(4, 3, 8, true, None),
+            burst_rec(3, 3, 9, false, Some((20, 100))),
+            burst_rec(5, 4, 9, false, Some((15, 80))),
+        ];
+        let pinned = CommitId::from_bytes([2; 32]);
+        // 35 of 100 file objects over two heads of device 9.
+        assert_eq!(
+            burst_writer(&timeline, &pinned),
+            Some(DeviceId::from_bytes([9; 16]))
+        );
+        assert_eq!(
+            burst_writer(&timeline, &CommitId::from_bytes([5; 32])),
+            None
+        );
+        assert_eq!(
+            burst_writer(&timeline, &CommitId::from_bytes([6; 32])),
+            None
+        );
+    }
+
+    // MEDIUM 3 (a): a server that places a pin right before a commit of a device that drops
+    // nothing names nobody, and a head whose drop was not counted names nobody either.
+    #[test]
+    fn a_pin_before_a_commit_that_drops_nothing_names_no_device() {
+        let timeline = vec![
+            burst_rec(1, 1, 7, false, Some((0, 100))),
+            burst_rec(2, 2, 8, false, Some((0, 100))),
+            burst_rec(3, 3, 8, false, Some((1, 100))),
+        ];
+        assert_eq!(
+            burst_writer(&timeline, &CommitId::from_bytes([1; 32])),
+            None
+        );
+        let uncounted = vec![
+            burst_rec(1, 1, 7, false, Some((0, 100))),
+            burst_rec(2, 2, 8, false, None),
+        ];
+        assert_eq!(
+            burst_writer(&uncounted, &CommitId::from_bytes([1; 32])),
+            None
+        );
+    }
+
+    // MEDIUM 3 (b): after a removal, the barrier's full delta drops the removed device's
+    // garbage from the server's live set and sets off a pin before it; the barrier keeps the
+    // tree, so it drops no counted file object and its writer is not named.
+    #[test]
+    fn a_barrier_after_a_pin_does_not_name_its_writer() {
+        let timeline = vec![
+            burst_rec(1, 1, 9, false, Some((0, 40))),
+            burst_rec(2, 2, 7, false, Some((0, 40))),
+        ];
+        assert_eq!(
+            burst_writer(&timeline, &CommitId::from_bytes([1; 32])),
+            None
+        );
+    }
+
     // Only "suspect device" may be hidden; every other kind is refused, the removal report
     // above all.
     #[test]
@@ -3856,6 +4246,12 @@ mod tests {
             folder_name: "Docs".into(),
             entry_id: "e".into(),
             days: 30,
+            until: 0,
+            lapsed: false,
+        }));
+        assert!(!dismissible(&Warning::DiskFull {
+            id: "diskFull".into(),
+            needed: 1,
         }));
         assert!(!dismissible(&Warning::RemovalReported {
             id: "removalReported".into(),

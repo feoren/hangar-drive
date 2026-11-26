@@ -339,3 +339,95 @@ fn a_server_that_hides_the_barrier_from_an_offline_device_gets_nothing_in() {
     assert!(again.removed_heads.is_empty() && !again.published);
     assert!(devs[1].fs.read_all(&p(&["evil.txt"])).is_none());
 }
+
+#[test]
+fn content_hashed_before_a_rotation_but_not_uploaded_still_goes_up() {
+    let (mut devs, clock, settings) = world();
+    devs[0].fs.user_write(&p(&["a.txt"]), b"a");
+    for d in devs.iter_mut() {
+        round(d, &clock, &settings).unwrap();
+    }
+    // B writes more files than one round has publish attempts; its round hashes them under
+    // generation 1, then fails at the pull.
+    let names: Vec<String> = (0..8).map(|i| format!("late-{i}.txt")).collect();
+    for name in &names {
+        devs[1].fs.user_write(&p(&[name]), name.as_bytes());
+    }
+    devs[1].server.state().online = false;
+    {
+        let d = &mut devs[1];
+        let mut cx = Ctx {
+            account: &mut d.account,
+            server: &mut d.server,
+            keychain: &mut d.keys,
+            fs: &d.fs,
+            store: &mut d.store,
+            clock: &clock,
+            entropy: &mut d.rng,
+            settings: &settings,
+        };
+        d.folder.request_full_scan();
+        let r = d.folder.round(&mut cx).unwrap();
+        assert!(r.offline && !r.published, "{r:?}");
+    }
+    devs[1].server.state().online = true;
+    // A removes C: the ring gets generation 2 while B's new content is still unpublished.
+    let target = devs[2].id;
+    {
+        let (mut jx, folder, fs) = job(&mut devs[0], &clock, &settings);
+        assert!(
+            remove_devices(&mut jx, &mut [(folder, fs)], &[target])
+                .unwrap()
+                .resealed
+        );
+    }
+    // B's next round publishes the unchanged files under generation 2, all in one round.
+    let r = round(&mut devs[1], &clock, &settings).unwrap();
+    assert!(r.published, "{r:?}");
+    assert_eq!(devs[1].account.newest_generation(&FOLDER).unwrap().0, 2);
+    round(&mut devs[0], &clock, &settings).unwrap();
+    for name in &names {
+        assert_eq!(
+            devs[0].fs.read_all(&p(&[name])).as_deref(),
+            Some(name.as_bytes())
+        );
+    }
+}
+
+#[test]
+fn a_repair_after_a_rotation_uploads_lost_old_chunks_under_the_new_generation() {
+    let (mut devs, clock, settings) = world();
+    devs[0]
+        .fs
+        .user_write(&p(&["a.txt"]), b"sealed under generation 1");
+    for d in devs.iter_mut() {
+        round(d, &clock, &settings).unwrap();
+    }
+    let target = devs[2].id;
+    {
+        let (mut jx, folder, fs) = job(&mut devs[0], &clock, &settings);
+        assert!(
+            remove_devices(&mut jx, &mut [(folder, fs)], &[target])
+                .unwrap()
+                .resealed
+        );
+    }
+    // A broken server view: nothing is live and the collection deleted every object, also
+    // the chunk of a.txt that only generation 1 can name.
+    let all = devs[0].server.state().live_set(&FOLDER);
+    devs[0]
+        .server
+        .state()
+        .set_live(&FOLDER, std::collections::BTreeSet::new());
+    devs[0].server.state().delete_objects(&FOLDER, &all);
+    // A's next publish needs the full repair, which uploads a.txt again under generation 2.
+    devs[0].fs.user_write(&p(&["b.txt"]), b"b");
+    let r = round(&mut devs[0], &clock, &settings).unwrap();
+    assert!(r.published, "{r:?}");
+    round(&mut devs[1], &clock, &settings).unwrap();
+    assert_eq!(
+        devs[1].fs.read_all(&p(&["a.txt"])).unwrap(),
+        b"sealed under generation 1"
+    );
+    assert_eq!(devs[1].fs.read_all(&p(&["b.txt"])).unwrap(), b"b");
+}

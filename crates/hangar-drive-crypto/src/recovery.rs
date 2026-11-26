@@ -34,25 +34,42 @@
 //! wrap. Its only log entry is adding the new installation as a regular device
 //! ([`crate::devicelog`]); it signs no commits and no records.
 //!
-//! # Sheet (version 2)
+//! # Sheet (version 3)
 //!
 //! The public part of the printed recovery sheet, also carried by the link
 //! `hangar-drive://recover#<base64url of sheet>`; it never holds the code:
 //!
 //! ```text
-//! sheet = 0x02 || account ID (16) || server ID (16) || genesis (32)
+//! sheet = 0x03 || account ID (16) || server ID (16) || genesis (32) || anchor tag (16)
 //!         || pin flag (0x00 or 0x01) || SPKI pin (32, only with flag 0x01) || server URL (UTF-8)
+//! anchor tag = HKDF-SHA256(salt none, ikm = entropy,
+//!                          info = field("hangar-drive/v1/recovery-anchor") || field(account ID)
+//!                                 || field(genesis), 16 bytes)
 //! ```
 //!
 //! `genesis` is the hash of the account's first device log entry
 //! ([`crate::devicelog::entry_hash`] at index 1). The recovering installation refuses every log
 //! that does not start with it, so a server cannot hand it another account's log or a log it
 //! made up, and the new device joins exactly the account the sheet was printed for (sync engine
-//! review N1, N6). The pin is the SHA-256 of the server's SubjectPublicKeyInfo for a self-signed
+//! review N1, N6).
+//!
+//! The anchor tag binds the account and its genesis anchor to the code. A sheet arrives as a
+//! link, and a link can come from anyone: whoever knows the account's log (the server's
+//! operator, a copy of its database) could otherwise build an account of their own with the same
+//! account ID and their own genesis entry, list the code's recovery device in it (its public
+//! keys and proof of possession are public in the real log), wrap an epoch secret they know to
+//! its KEM key and send a link to their server. Without the tag the real code passes every check
+//! there and the new device joins an account whose secret the sender knows. The tag is a PRF of
+//! the code's entropy over exactly the account and the genesis anchor, so nobody without the
+//! code can make one for another genesis; the recovering installation checks it
+//! ([`RecoverySheet::is_for`]) right after the code is typed, before it connects anywhere
+//! (security review "recovery link as phishing"). The genesis anchor cannot enter the recovery
+//! device's key derivation instead: entry 1 lists the first recovery device, so its hash
+//! depends on that device's keys. The pin is the SHA-256 of the server's SubjectPublicKeyInfo for a self-signed
 //! server, so the recovery's first connection is pinned as the pairing's is (ADR 0001,
 //! section 6). The URL is stored in the WHATWG serialization; another spelling is refused, so
-//! one sheet has one byte form. Version 1 (without genesis and pin) was never shipped and is
-//! refused.
+//! one sheet has one byte form. Versions 1 (without genesis and pin) and 2 (without the anchor
+//! tag) were never shipped and are refused.
 
 use std::fmt;
 
@@ -69,6 +86,9 @@ use hangar_drive_protocol::ids::{AccountId, DeviceId, LogHash, ServerId};
 const LABEL_CODE: &[u8] = b"hangar-drive/v1/recovery-code";
 const LABEL_IDENTITY: &[u8] = b"hangar-drive/v1/recovery-identity";
 const LABEL_DEVICE_ID: &[u8] = b"hangar-drive/v1/recovery-device-id";
+const LABEL_ANCHOR: &[u8] = b"hangar-drive/v1/recovery-anchor";
+/// The length of a sheet's anchor tag (module docs, "Sheet").
+pub const ANCHOR_TAG_LEN: usize = 16;
 const CODE_VERSION: u8 = 1;
 pub(crate) const ENTROPY_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 1 + ENTROPY_LEN + 3;
@@ -229,11 +249,27 @@ impl RecoveryCode {
             hkdf::<64>(self.0.as_ref(), &framed(&[LABEL_IDENTITY])).ok_or(IdentityError::Key)?;
         DeviceIdentity::from_seeds(&okm)
     }
+
+    /// The anchor tag of the sheet for `account` with the genesis anchor `genesis` (module
+    /// docs, "Sheet"): only who holds the code can make it.
+    pub fn anchor_tag(
+        &self,
+        account: &AccountId,
+        genesis: &LogHash,
+    ) -> Result<[u8; ANCHOR_TAG_LEN], IdentityError> {
+        let okm = hkdf::<ANCHOR_TAG_LEN>(
+            self.0.as_ref(),
+            &framed(&[LABEL_ANCHOR, account.as_bytes(), genesis.as_bytes()]),
+        )
+        .ok_or(IdentityError::Key)?;
+        Ok(*okm)
+    }
 }
 
 /// The format version of [`RecoverySheet`].
-pub const SHEET_VERSION: u8 = 2;
-const SHEET_FIXED_LEN: usize = 1 + 16 + 16 + 32 + 1;
+pub const SHEET_VERSION: u8 = 3;
+const SHEET_FIXED_LEN: usize = 1 + 16 + 16 + 32 + ANCHOR_TAG_LEN + 1;
+const FLAG_AT: usize = SHEET_FIXED_LEN - 1;
 
 /// Why sheet bytes were refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -262,9 +298,38 @@ pub struct RecoverySheet {
     pub genesis: LogHash,
     /// The SPKI pin of a self-signed server.
     pub pin: Option<[u8; 32]>,
+    /// The code's tag over `account` and `genesis` ([`RecoveryCode::anchor_tag`]).
+    pub anchor_tag: [u8; ANCHOR_TAG_LEN],
 }
 
 impl RecoverySheet {
+    /// The sheet of `code` for `account`, whose first log entry has the hash `genesis`.
+    pub fn new(
+        server_url: Url,
+        server: ServerId,
+        account: AccountId,
+        genesis: LogHash,
+        pin: Option<[u8; 32]>,
+        code: &RecoveryCode,
+    ) -> Result<Self, IdentityError> {
+        Ok(Self {
+            anchor_tag: code.anchor_tag(&account, &genesis)?,
+            server_url,
+            server,
+            account,
+            genesis,
+            pin,
+        })
+    }
+
+    /// Whether this sheet was made for `code`: its anchor tag is the code's tag over the
+    /// sheet's account and genesis anchor. A sheet that fails names an account the code was not
+    /// made for, whatever that account's log lists (module docs, "Sheet").
+    pub fn is_for(&self, code: &RecoveryCode) -> bool {
+        code.anchor_tag(&self.account, &self.genesis)
+            .is_ok_and(|tag| constant_time_eq(&tag, &self.anchor_tag))
+    }
+
     /// The sheet bytes (module docs).
     pub fn encode(&self) -> Vec<u8> {
         let url = self.server_url.as_str().as_bytes();
@@ -273,6 +338,7 @@ impl RecoverySheet {
         out.extend_from_slice(self.account.as_bytes());
         out.extend_from_slice(self.server.as_bytes());
         out.extend_from_slice(self.genesis.as_bytes());
+        out.extend_from_slice(&self.anchor_tag);
         match &self.pin {
             Some(pin) => {
                 out.push(1);
@@ -296,14 +362,16 @@ impl RecoverySheet {
         let account = AccountId::from_slice(&bytes[1..17]).ok_or(SheetError::Malformed)?;
         let server = ServerId::from_slice(&bytes[17..33]).ok_or(SheetError::Malformed)?;
         let genesis = LogHash::from_slice(&bytes[33..65]).ok_or(SheetError::Malformed)?;
-        let (pin, rest) = match bytes[65] {
-            0 => (None, &bytes[66..]),
+        let anchor_tag = <[u8; ANCHOR_TAG_LEN]>::try_from(&bytes[65..FLAG_AT])
+            .map_err(|_| SheetError::Malformed)?;
+        let (pin, rest) = match bytes[FLAG_AT] {
+            0 => (None, &bytes[SHEET_FIXED_LEN..]),
             1 => {
                 let pin = bytes
-                    .get(66..98)
+                    .get(SHEET_FIXED_LEN..SHEET_FIXED_LEN + 32)
                     .and_then(|p| <[u8; 32]>::try_from(p).ok())
                     .ok_or(SheetError::Malformed)?;
-                (Some(pin), &bytes[98..])
+                (Some(pin), &bytes[SHEET_FIXED_LEN + 32..])
             }
             _ => return Err(SheetError::Malformed),
         };
@@ -321,6 +389,7 @@ impl RecoverySheet {
             account,
             genesis,
             pin,
+            anchor_tag,
         })
     }
 }
@@ -337,6 +406,7 @@ mod tests {
             account: AccountId::from_bytes([0x10; 16]),
             genesis: LogHash::from_bytes([0x77; 32]),
             pin,
+            anchor_tag: [0x5a; ANCHOR_TAG_LEN],
         }
     }
 
@@ -353,21 +423,26 @@ mod tests {
     #[test]
     fn sheets_are_read_strictly() {
         let bytes = sheet(Some([1; 32])).encode();
-        // Version 1 had no genesis anchor and is refused.
-        let mut old = bytes.clone();
-        old[0] = 1;
-        assert_eq!(RecoverySheet::decode(&old), Err(SheetError::Version(1)));
+        // Version 1 had no genesis anchor, version 2 no anchor tag; both are refused.
+        for version in [1, 2] {
+            let mut old = bytes.clone();
+            old[0] = version;
+            assert_eq!(
+                RecoverySheet::decode(&old),
+                Err(SheetError::Version(version))
+            );
+        }
         assert_eq!(RecoverySheet::decode(&[]), Err(SheetError::Malformed));
         assert_eq!(
             RecoverySheet::decode(&bytes[..SHEET_FIXED_LEN]),
             Err(SheetError::Malformed)
         );
         let mut flag = bytes.clone();
-        flag[65] = 2;
+        flag[FLAG_AT] = 2;
         assert_eq!(RecoverySheet::decode(&flag), Err(SheetError::Malformed));
         // A pin flag without the pin.
         let mut short = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
-        short[65] = 1;
+        short[FLAG_AT] = 1;
         short.extend_from_slice(&[1; 10]);
         assert_eq!(RecoverySheet::decode(&short), Err(SheetError::Malformed));
         let mut insecure = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
@@ -376,6 +451,46 @@ mod tests {
         let mut spelled = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
         spelled.extend_from_slice(b"https://DRIVE.example");
         assert_eq!(RecoverySheet::decode(&spelled), Err(SheetError::Malformed));
+    }
+
+    // The phishing link of the security review: a sheet that names another genesis (or another
+    // account) than the code was made for fails, and its tag cannot be carried over.
+    #[test]
+    fn a_sheet_is_only_for_the_code_it_was_made_with() {
+        let code = RecoveryCode::generate(&mut FixedEntropy::counting(0xd0, 16)).unwrap();
+        let other = RecoveryCode::generate(&mut FixedEntropy::counting(0x30, 16)).unwrap();
+        let base = sheet(None);
+        let real = RecoverySheet::new(
+            base.server_url.clone(),
+            base.server,
+            base.account,
+            base.genesis,
+            None,
+            &code,
+        )
+        .unwrap();
+        assert!(real.is_for(&code));
+        assert!(!real.is_for(&other));
+        assert!(RecoverySheet::decode(&real.encode()).unwrap().is_for(&code));
+        // Another genesis with the real tag, as a forger would send it.
+        let forged = RecoverySheet {
+            genesis: LogHash::from_bytes([0x78; 32]),
+            ..real.clone()
+        };
+        assert!(!forged.is_for(&code));
+        let moved = RecoverySheet {
+            account: AccountId::from_bytes([0x11; 16]),
+            ..real.clone()
+        };
+        assert!(!moved.is_for(&code));
+        // Server address, server ID and pin are not bound: a server may move.
+        let elsewhere = RecoverySheet {
+            server_url: parse_server_url("https://other.example/").unwrap(),
+            server: ServerId::from_bytes([0x41; 16]),
+            pin: Some([2; 32]),
+            ..real
+        };
+        assert!(elsewhere.is_for(&code));
     }
 
     #[test]

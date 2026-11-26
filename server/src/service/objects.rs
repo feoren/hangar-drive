@@ -2,6 +2,7 @@
 //! size, quota, budget and disk reserve checks, and the download. Every object is addressed by
 //! the session's account, the folder and its ID.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use hangar_drive_crypto::object::{blob_len, blob_len_fits, object_header};
@@ -9,7 +10,7 @@ use hangar_drive_protocol::api::Notice;
 use hangar_drive_protocol::api::{
     ErrorCode, MissingObjectsRequest, MissingObjectsResponse, UploadResponse,
 };
-use hangar_drive_protocol::ids::{FolderId, ObjectId};
+use hangar_drive_protocol::ids::{AccountId, DeviceId, FolderId, ObjectId};
 use hangar_drive_protocol::object::{ObjectType, MAX_OBJECT_PLAINTEXT_LEN};
 
 use crate::app::App;
@@ -181,7 +182,7 @@ pub async fn store(
         return Ok(UploadResponse { stored: false });
     }
     let live = usage::live(&mut tx, session.account_pk).await?;
-    let pending = usage::pending(&mut tx, session.account_pk).await?;
+    let pending = usage::device_pending(&mut tx, session.account_pk, &session.device).await?;
     if !usage::upload_fits(&app.limits, live, pending, Bytes::of(kind, size)) {
         return Err(ErrorCode::QuotaExceeded.into());
     }
@@ -205,14 +206,17 @@ pub async fn store(
         drop(tx);
         return Err(disk_reserve_hit(app, session).await);
     }
-    sqlx::query("INSERT INTO objects (folder_pk, object_id, kind, size, uploaded_ms) VALUES (?, ?, ?, ?, ?)")
-        .bind(row.pk)
-        .bind(id.as_bytes().as_slice())
-        .bind(i64::from(kind.to_byte()))
-        .bind(i64_of(size))
-        .bind(i64_of(now))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO objects (folder_pk, object_id, kind, size, uploaded_ms, uploader) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(row.pk)
+    .bind(id.as_bytes().as_slice())
+    .bind(i64::from(kind.to_byte()))
+    .bind(i64_of(size))
+    .bind(i64_of(now))
+    .bind(session.device.as_bytes().as_slice())
+    .execute(&mut *tx)
+    .await?;
     usage::shift_pending(&mut tx, session.account_pk, Bytes::of(kind, size), 1).await?;
     // The file goes in place before the row is committed, so a committed row always has its
     // file. A crash in between leaves a file without a row, which the sweep removes.
@@ -228,6 +232,81 @@ pub async fn store(
         return Err(error.into());
     }
     Ok(UploadResponse { stored: true })
+}
+
+/// Deletes the uncommitted uploads of a removed device, in the transaction that removes it
+/// (security review MEDIUM 3), and gives back the budget they paid. Returns the keys whose files
+/// the caller removes after the commit ([`crate::service::retention::remove_object_files`]); a
+/// crash before that leaves files without rows, which the orphan sweep removes.
+///
+/// No reference or side reference can name an uncommitted object (a commit declares every object
+/// it references), so the rows go without touching any tree. An honest device that skipped its
+/// own upload of the same object because the server held it gets `missing objects` at its commit
+/// and uploads it again, as after the 24 hour deletion.
+///
+/// **Budget:** each deleted byte is taken off the device's minute in which it was paid, so the
+/// account budget the removed device used for garbage is free again at once. Only bytes of
+/// deleted objects are given back: what the device made live stays paid, so removing devices
+/// never lets anything stay stored beyond the budgets.
+pub async fn drop_uploads_of(
+    conn: &mut sqlx::SqliteConnection,
+    account_pk: i64,
+    account: AccountId,
+    device: &DeviceId,
+    now_ms: u64,
+) -> ApiResult<Vec<ObjectKey>> {
+    let rows: Vec<(Vec<u8>, Vec<u8>, i64, i64)> = sqlx::query_as(
+        "SELECT f.id, o.object_id, o.size, o.uploaded_ms FROM objects o JOIN folders f ON f.pk = o.folder_pk \
+         WHERE f.account_pk = ? AND o.declared = 0 AND o.uploader = ?",
+    )
+    .bind(account_pk)
+    .bind(device.as_bytes().as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let since = now_ms.saturating_sub(usage::BUDGET_WINDOW_MS);
+    let mut paid: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut keys = Vec::with_capacity(rows.len());
+    for (folder, id, size, uploaded_ms) in rows {
+        let uploaded_ms = u64_of(uploaded_ms);
+        if uploaded_ms > since {
+            let minute = uploaded_ms - uploaded_ms % usage::MINUTE_MS;
+            let entry = paid.entry(minute).or_default();
+            *entry = entry.saturating_add(u64_of(size));
+        }
+        if let (Some(folder), Some(id)) = (FolderId::from_slice(&folder), ObjectId::from_slice(&id))
+        {
+            keys.push(ObjectKey {
+                account,
+                folder,
+                id,
+            });
+        }
+    }
+    sqlx::query(
+        "DELETE FROM objects WHERE declared = 0 AND uploader = ? \
+         AND folder_pk IN (SELECT pk FROM folders WHERE account_pk = ?)",
+    )
+    .bind(device.as_bytes().as_slice())
+    .bind(account_pk)
+    .execute(&mut *conn)
+    .await?;
+    for (minute, bytes) in paid {
+        sqlx::query(
+            "UPDATE budget_minutes SET bytes = MAX(0, bytes - ?) \
+             WHERE account_pk = ? AND device = ? AND minute_ms = ?",
+        )
+        .bind(i64_of(bytes))
+        .bind(account_pk)
+        .bind(device.as_bytes().as_slice())
+        .bind(i64_of(minute))
+        .execute(&mut *conn)
+        .await?;
+    }
+    usage::recount_pending(conn, account_pk).await?;
+    Ok(keys)
 }
 
 /// `GET /folders/{folder}/objects/{id}`: the open file and its length.

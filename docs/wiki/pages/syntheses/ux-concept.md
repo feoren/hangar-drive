@@ -62,7 +62,7 @@ The interface uses the left column only. Internal terms stay in code and docs.
 | Ordnernummer / folder number | folder safety number over the frontier | [ADR 4]; shown like the safety number (8.6, 8.7) |
 | Servernummer / server number | server key number over the server's SPKI | [ADR 6]; shown like the safety number (8.3), only as a row of numbers to compare |
 | Wiederherstellungscode / recovery code | recovery device secret | same term as the sister app |
-| Wiederherstellungsblatt / recovery sheet | printed sheet with code, server address, server ID, account ID, genesis anchor, optional pin and the link `hangar-drive://recover#...` | [ADR 4]; version 2 (4.4) |
+| Wiederherstellungsblatt / recovery sheet | printed sheet with code, server address, server ID, account ID, genesis anchor, optional pin and the link `hangar-drive://recover#...` (which alone also carries the code's anchor tag) | [ADR 4]; version 3 (4.4) |
 | Version, früherer Stand / version, earlier state | commit | [Design] |
 | Papierkorb / trash | files dropped by retained commits | [ADR 5] |
 | zwei Fassungen / two versions | conflict copy | [Design]; the word "Konflikt" appears only in the file name |
@@ -228,10 +228,10 @@ then, after "Ich habe ihn gesichert":
 - **Format.** [ADR 4] 128 random bits, Crockford base32 with checksum, the sister app's structure:
   32 characters in 8 groups of 4. On screen the groups are separated by spaces and the code is set
   in the monospace token, large (20 px), selectable. [Design]
-- **Print** produces the recovery sheet, version 2 [ADR 4, threat model 2.3]: the code, in the
+- **Print** produces the recovery sheet, version 3 [ADR 4, threat model 2.3]: the code, in the
   clear the server address, server ID, account ID, genesis anchor, the pin when there is one, the
   link `hangar-drive://recover#...`, the date, the device that created it, and four plain
-  sentences (4.4, "The sheet, version 2"). [Design] The QR code on the sheet holds the link only,
+  sentences (4.4, "The sheet, version 3"). [Design] The QR code on the sheet holds the link only,
   never the code, which is always typed. [ADR 4]
 - **Save as file** writes a short text file with the same content. The save dialog proposes the
   Documents folder; choosing a place inside a synced folder is refused with a reason
@@ -400,14 +400,20 @@ Chosen with "Kein Gerät mehr da?". [ADR 4, threat model 2.3]
 Four screens: the name moved onto the first one, where it appears only after the link is read,
 as in 4.2 step 1. Every screen is still one decision. [Design]
 
-**The sheet, version 2.** [ADR 4, Design] Print and "Als Datei speichern" lay out the same
+**The sheet, version 3.** [ADR 4, Design] Print and "Als Datei speichern" lay out the same
 document, worded by the window in the UI language (`sheet.*`, `RecoverySheetDocument`): the
 code, the server address, server ID, account ID, the account's check value (genesis anchor), the
 server's check value (pin, only when there is one), the link to paste, the date and the device
 that made it, then four plain sentences (what the code does, that it is full access together with
 the server, that without it and without a device the data is gone, and how a recovery goes). The
 printed sheet carries a QR code of the link, never of the code. On screen, the code step keeps the
-code in front and folds the rest under "Was noch auf dem Blatt steht".
+code in front and folds the rest under "Was noch auf dem Blatt steht". Since version 3 the link
+also carries the code's anchor tag over account and genesis anchor (ADR 0001, amendment "Recovery
+link bound to the code"); it is not printed as a field of its own, because nobody types it: the
+person pastes or scans the link. A link that the code was not made for (another sheet's link, or
+one somebody sent) is refused with `error.recovery.wrongSheet` ("Dieser Link gehört nicht zu
+deinem Code. Nimm den Link oder QR-Code vom selben Blatt wie den Code. Hat dir jemand diesen Link
+geschickt, nutze ihn nicht."), in all twelve languages.
 
 ## 5. Adding a device, seen from the existing device
 
@@ -885,6 +891,9 @@ disappears when the server stops sending it. [Design]
 | retained bytes above the quota | `notice.retained`: Alte Versionen belegen auf deinem Server gerade viel Platz. Der Betreiber weiß Bescheid. Du musst nichts tun. | old versions do not count against the quota; only the operator's disk is affected |
 | budget of another device | `notice.budgetDevice`: „{device}“ hat heute sehr viel hochgeladen. Warst du das nicht, schau unter Geräte nach. | usually a large first upload; the anomaly pin (9.4) covers the dangerous case |
 | minimum count cap reached | `notice.minCount`: Dein Server hebt alte Versionen jetzt nur noch {days} Tage auf, auch in Ordnern, die sich selten ändern. Der Betreiber weiß Bescheid. | versions within the window are not affected; only very old versions of rarely changed folders expire earlier than before |
+| live bytes at 90 % of the quota | `notice.quota`: Dein Speicher auf dem Server ist fast voll. Lösch Dateien, die du nicht mehr brauchst, oder frag den Betreiber nach mehr Platz. The storage line (6.3) shows the numbers of the notice. | nothing stops yet; a full quota is the `quota` banner |
+| account upload budget reached | `notice.budgetAccount`: Deine Geräte haben heute sehr viel hochgeladen. Weitere Änderungen gehen raus, sobald das Tageslimit deines Servers es zulässt. Warst du das nicht, schau unter Geräte nach. | changes wait and go out by themselves; the anomaly pin (9.4) covers the dangerous case |
+| server below its disk reserve | `notice.serverDisk`: Auf deinem Server wird der Platz knapp. Neue Änderungen bleiben auf deinen Geräten, bis wieder Platz ist. Der Betreiber weiß Bescheid. | the device whose upload was refused shows the `serverDisk` banner; the others only need to know |
 
 The budget of this device is not a notice line; it is `budget.line` (6.1).
 
@@ -1185,6 +1194,21 @@ entry. They are one view with two tabs, so there is one place to learn. [Design]
   Geräten siehst du den Hinweis noch." (`suspect.meDone`). The pin stays on the server until its
   90 days end, it lapses under the pin cap, or the operator lifts it. `{days}` in the banner is the
   retention window the server reports, the minimum it guarantees.
+- **Which device.** [Design, security review MEDIUM 1] The pin notice names only the folder, the
+  pinned commit and the pin's end. The device is the writer of the first commit after the pinned
+  one in this device's own verified history, so the server cannot blame a device of its choice.
+  A device that does not sync the folder (or has not pulled the burst yet) cannot tell: the
+  banner and the notification then name the folder (`suspect.titleFolder`, "In „{folder}“ wurden
+  sehr viele Dateien verändert"), step 1 reads `suspect.step1Unknown` with "Geräte ansehen"
+  (`suspect.devices`, opens the device list), and step 3 reads `suspect.step3Elsewhere` ("Hol
+  den Stand von davor auf einem Gerät zurück, auf dem „{folder}“ synchronisiert wird.") without
+  the timeline button, because the timeline needs the folder on this device.
+- **Lapsed pin.** [ADR 5 "Pin cap, a lasting invariant"] When the pin cap lets a pin go, the
+  server sends the pin notice again with its end set to now. The banner keeps its body and adds
+  `suspect.lapsed`: "Die längere Aufbewahrung ist vorzeitig zu Ende, weil auf deinem Server der
+  Platz dafür voll ist. Hol den Stand bald zurück, wenn du ihn brauchst." A pin is kept on the
+  device (also across restarts) until its end plus the retention window has passed or until
+  "Das war ich"; the feed tells each pin only once.
 - **Manual path** without a server alert [ADR 5 "Undo a device"]: the timeline has an action
   "Stand vor Änderungen von ..." with two fields, the device and "ab" (a date, default the oldest
   retained version). It selects the last version before the first one after that date that
@@ -1732,6 +1756,9 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `budget.line.other` | {count} Dateien warten, weil heute schon sehr viel hochgeladen wurde. Die Dateien gehen spätestens morgen raus. | {count} files are waiting because a lot was uploaded today. They go out by tomorrow at the latest. |
 | `notice.retained` | Alte Versionen belegen auf deinem Server gerade viel Platz. Der Betreiber weiß Bescheid. Du musst nichts tun. | Old versions take up a lot of space on your server right now. The operator has been told. You do not need to do anything. |
 | `notice.budgetDevice` | „{device}“ hat heute sehr viel hochgeladen. Warst du das nicht, schau unter Geräte nach. | “{device}” uploaded a lot today. If that was not you, check under Devices. |
+| `notice.quota` | Dein Speicher auf dem Server ist fast voll. Lösch Dateien, die du nicht mehr brauchst, oder frag den Betreiber nach mehr Platz. | Your storage on the server is almost full. Delete files you no longer need, or ask the operator for more space. |
+| `notice.budgetAccount` | Deine Geräte haben heute sehr viel hochgeladen. Weitere Änderungen gehen raus, sobald das Tageslimit deines Servers es zulässt. Warst du das nicht, schau unter Geräte nach. | Your devices uploaded a lot today. Further changes go out as soon as your server’s daily limit allows. If that was not you, check under Devices. |
+| `notice.serverDisk` | Auf deinem Server wird der Platz knapp. Neue Änderungen bleiben auf deinen Geräten, bis wieder Platz ist. Der Betreiber weiß Bescheid. | Your server is running out of space. New changes stay on your devices until there is room again. The operator has been told. |
 | `notice.minCount.one` | Dein Server hebt alte Versionen jetzt nur noch {days} Tag auf, auch in Ordnern, die sich selten ändern. Der Betreiber weiß Bescheid. | Your server now keeps old versions for {days} day only, also in folders that rarely change. The operator has been told. |
 | `notice.minCount.other` | Dein Server hebt alte Versionen jetzt nur noch {days} Tage auf, auch in Ordnern, die sich selten ändern. Der Betreiber weiß Bescheid. | Your server now keeps old versions for {days} days only, also in folders that rarely change. The operator has been told. |
 | `serverDisk.title` | Dein Server hat keinen Platz mehr | Your server is out of space |
@@ -1866,6 +1893,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `suspect.step2` | Prüfe das Gerät mit deinem Virenschutz. | Check that device with your antivirus. |
 | `suspect.step3` | Hol den Stand von davor zurück. | Bring back the state from before. |
 | `suspect.view` | Stand vor den Änderungen ansehen | View the state before the changes |
+| `suspect.titleFolder` | In „{folder}“ wurden sehr viele Dateien verändert | Very many files were changed in “{folder}” |
+| `suspect.lapsed` | Die längere Aufbewahrung ist vorzeitig zu Ende, weil auf deinem Server der Platz dafür voll ist. Hol den Stand bald zurück, wenn du ihn brauchst. | The longer hold ended early because the space for it on your server is full. Bring the state back soon if you need it. |
+| `suspect.step1Unknown` | Schau unter Geräte nach, welches Gerät das war, und trenne es vom Netz oder entferne es. | Check under Devices which device it was, then disconnect it from the network or remove it. |
+| `suspect.devices` | Geräte ansehen | View devices |
+| `suspect.step3Elsewhere` | Hol den Stand von davor auf einem Gerät zurück, auf dem „{folder}“ synchronisiert wird. | Bring back the state from before on a device that syncs “{folder}”. |
 | `restore.list` | Versionen, neueste zuerst | Versions, newest first |
 | `restore.whenToday` | heute, {time} | today, {time} |
 | `restore.whenYesterday` | gestern, {time} | yesterday, {time} |

@@ -458,6 +458,12 @@ const de = {
     "{count} Dateien warten, weil heute schon sehr viel hochgeladen wurde. Die Dateien gehen spätestens morgen raus.",
   "notice.retained":
     "Alte Versionen belegen auf deinem Server gerade viel Platz. Der Betreiber weiß Bescheid. Du musst nichts tun.",
+  "notice.quota":
+    "Dein Speicher auf dem Server ist fast voll. Lösch Dateien, die du nicht mehr brauchst, oder frag den Betreiber nach mehr Platz.",
+  "notice.budgetAccount":
+    "Deine Geräte haben heute sehr viel hochgeladen. Weitere Änderungen gehen raus, sobald das Tageslimit deines Servers es zulässt. Warst du das nicht, schau unter Geräte nach.",
+  "notice.serverDisk":
+    "Auf deinem Server wird der Platz knapp. Neue Änderungen bleiben auf deinen Geräten, bis wieder Platz ist. Der Betreiber weiß Bescheid.",
   "notice.olderAccountState":
     "Dein Server hatte einen älteren Stand deines Kontos. {app} hat alles neu eingelesen, es fehlt nichts.",
   "notice.budgetDevice":
@@ -650,6 +656,14 @@ const de = {
   "suspect.step2": "Prüfe das Gerät mit deinem Virenschutz.",
   "suspect.step3": "Hol den Stand von davor zurück.",
   "suspect.view": "Stand vor den Änderungen ansehen",
+  "suspect.titleFolder": "In „{folder}“ wurden sehr viele Dateien verändert",
+  "suspect.lapsed":
+    "Die längere Aufbewahrung ist vorzeitig zu Ende, weil auf deinem Server der Platz dafür voll ist. Hol den Stand bald zurück, wenn du ihn brauchst.",
+  "suspect.step1Unknown":
+    "Schau unter Geräte nach, welches Gerät das war, und trenne es vom Netz oder entferne es.",
+  "suspect.devices": "Geräte ansehen",
+  "suspect.step3Elsewhere":
+    "Hol den Stand von davor auf einem Gerät zurück, auf dem „{folder}“ synchronisiert wird.",
 
   // Devices (UX 13.9)
   "devices.title": "Deine Geräte",
@@ -765,6 +779,8 @@ const de = {
     "Dieser Code gehört zu keinem Konto auf diesem Server. Prüfe die Serveradresse auf deinem Blatt.",
   "error.recovery.used": "Dieser Code wurde ersetzt. Nimm das neuere Blatt.",
   "error.recovery.otherApp": "Das ist ein Code für Hangar. Hier gehört der Code für {app} hin.",
+  "error.recovery.wrongSheet":
+    "Dieser Link gehört nicht zu deinem Code. Nimm den Link oder QR-Code vom selben Blatt wie den Code. Hat dir jemand diesen Link geschickt, nutze ihn nicht.",
   "error.recovery.savedInSync":
     "Speichere den Code nicht in einem synchronisierten Ordner, sonst liegt er neben den Dateien, die er öffnet. Wähle einen anderen Ort.",
   "error.recovery.savedInCloud":
@@ -1200,6 +1216,12 @@ const en: Dictionary = {
     "{count} files are waiting because a lot was uploaded today. They go out by tomorrow at the latest.",
   "notice.retained":
     "Old versions take up a lot of space on your server right now. The operator has been told. You do not need to do anything.",
+  "notice.quota":
+    "Your storage on the server is almost full. Delete files you no longer need, or ask the operator for more space.",
+  "notice.budgetAccount":
+    "Your devices uploaded a lot today. Further changes go out as soon as your server’s daily limit allows. If that was not you, check under Devices.",
+  "notice.serverDisk":
+    "Your server is running out of space. New changes stay on your devices until there is room again. The operator has been told.",
   "notice.olderAccountState":
     "Your server had an older state of your account. {app} read everything again; nothing is missing.",
   "notice.budgetDevice":
@@ -1386,6 +1408,13 @@ const en: Dictionary = {
   "suspect.step2": "Check that device with your antivirus.",
   "suspect.step3": "Bring back the state from before.",
   "suspect.view": "View the state before the changes",
+  "suspect.titleFolder": "Very many files were changed in “{folder}”",
+  "suspect.lapsed":
+    "The longer hold ended early because the space for it on your server is full. Bring the state back soon if you need it.",
+  "suspect.step1Unknown":
+    "Check under Devices which device it was, then disconnect it from the network or remove it.",
+  "suspect.devices": "View devices",
+  "suspect.step3Elsewhere": "Bring back the state from before on a device that syncs “{folder}”.",
 
   "devices.title": "Your devices",
   "devices.add": "Add device",
@@ -1492,6 +1521,8 @@ const en: Dictionary = {
     "This code does not belong to any account on this server. Check the server address on your sheet.",
   "error.recovery.used": "This code was replaced. Use the newer sheet.",
   "error.recovery.otherApp": "That is a code for Hangar. This needs the code for {app}.",
+  "error.recovery.wrongSheet":
+    "This link does not belong to your code. Use the link or QR code from the same sheet as the code. If someone sent you this link, do not use it.",
   "error.recovery.savedInSync":
     "Do not save the code in a synced folder, or it sits next to the files it opens. Choose another place.",
   "error.recovery.savedInCloud":
@@ -1905,6 +1936,12 @@ const el: Dictionary = {
     "{count} αρχεία περιμένουν, επειδή σήμερα ανέβηκαν πολλά. Θα σταλούν το αργότερο αύριο.",
   "notice.retained":
     "Οι παλιές εκδόσεις πιάνουν αυτή τη στιγμή πολύ χώρο στον διακομιστή σου. Ο διαχειριστής ενημερώθηκε. Δεν χρειάζεται να κάνεις τίποτα.",
+  "notice.quota":
+    "Ο αποθηκευτικός σου χώρος στον διακομιστή έχει σχεδόν γεμίσει. Διάγραψε αρχεία που δεν χρειάζεσαι πια ή ζήτα περισσότερο χώρο από τον διαχειριστή.",
+  "notice.budgetAccount":
+    "Οι συσκευές σου ανέβασαν πολλά σήμερα. Οι επόμενες αλλαγές θα σταλούν μόλις το επιτρέψει το ημερήσιο όριο του διακομιστή σου. Αν δεν ήσουν εσύ, έλεγξε στις Συσκευές.",
+  "notice.serverDisk":
+    "Ο χώρος στον διακομιστή σου τελειώνει. Οι νέες αλλαγές μένουν στις συσκευές σου μέχρι να υπάρξει ξανά χώρος. Ο διαχειριστής ενημερώθηκε.",
   "notice.olderAccountState":
     "Ο διακομιστής σου είχε μια παλαιότερη κατάσταση του λογαριασμού σου. Το {app} τα διάβασε όλα ξανά· δεν λείπει τίποτα.",
   "notice.budgetDevice":
@@ -2096,6 +2133,14 @@ const el: Dictionary = {
   "suspect.step2": "Έλεγξε εκείνη τη συσκευή με το πρόγραμμα προστασίας από ιούς.",
   "suspect.step3": "Επανάφερε την προηγούμενη κατάσταση.",
   "suspect.view": "Προβολή της κατάστασης πριν από τις αλλαγές",
+  "suspect.titleFolder": "Άλλαξαν πάρα πολλά αρχεία στον φάκελο «{folder}»",
+  "suspect.lapsed":
+    "Η παρατεταμένη φύλαξη έληξε νωρίτερα, επειδή ο χώρος γι’ αυτήν στον διακομιστή σου είναι γεμάτος. Επανάφερε σύντομα την κατάσταση, αν τη χρειάζεσαι.",
+  "suspect.step1Unknown":
+    "Δες στις Συσκευές ποια συσκευή ήταν και αποσύνδεσέ την από το δίκτυο ή αφαίρεσέ την.",
+  "suspect.devices": "Προβολή συσκευών",
+  "suspect.step3Elsewhere":
+    "Επανάφερε την προηγούμενη κατάσταση σε μια συσκευή που συγχρονίζει τον φάκελο «{folder}».",
   "devices.title": "Οι συσκευές σου",
   "devices.add": "Προσθήκη συσκευής",
   "devices.this": "Αυτή η συσκευή",
@@ -2205,6 +2250,8 @@ const el: Dictionary = {
   "error.recovery.used": "Αυτός ο κωδικός αντικαταστάθηκε. Χρησιμοποίησε το νεότερο φύλλο.",
   "error.recovery.otherApp":
     "Αυτός είναι κωδικός για το Hangar. Εδώ χρειάζεται ο κωδικός για το {app}.",
+  "error.recovery.wrongSheet":
+    "Αυτός ο σύνδεσμος δεν ανήκει στον κωδικό σου. Χρησιμοποίησε τον σύνδεσμο ή τον κωδικό QR από το ίδιο φύλλο με τον κωδικό. Αν σου έστειλε κάποιος αυτόν τον σύνδεσμο, μην τον χρησιμοποιήσεις.",
   "error.recovery.savedInSync":
     "Μην αποθηκεύεις τον κωδικό σε φάκελο που συγχρονίζεται, αλλιώς θα βρίσκεται δίπλα στα αρχεία που ξεκλειδώνει. Επίλεξε άλλο σημείο.",
   "error.recovery.savedInCloud":
@@ -2649,6 +2696,12 @@ const es: Dictionary = {
     "{count} archivos están esperando porque hoy se ha subido mucho. Se enviarán como muy tarde mañana.",
   "notice.retained":
     "Las versiones antiguas ocupan ahora mucho espacio en tu servidor. Ya se ha avisado al administrador. No tienes que hacer nada.",
+  "notice.quota":
+    "Tu almacenamiento en el servidor está casi lleno. Elimina los archivos que ya no necesites o pide más espacio al administrador.",
+  "notice.budgetAccount":
+    "Tus dispositivos han subido mucho hoy. Los siguientes cambios se enviarán en cuanto el límite diario de tu servidor lo permita. Si no has sido tú, revísalo en Dispositivos.",
+  "notice.serverDisk":
+    "A tu servidor le queda poco espacio. Los cambios nuevos se quedan en tus dispositivos hasta que vuelva a haber espacio. Ya se ha avisado al administrador.",
   "notice.olderAccountState":
     "Tu servidor tenía un estado anterior de tu cuenta. {app} lo ha leído todo de nuevo; no falta nada.",
   "notice.budgetDevice":
@@ -2856,6 +2909,14 @@ const es: Dictionary = {
   "suspect.step2": "Analiza ese dispositivo con tu antivirus.",
   "suspect.step3": "Recupera el estado anterior.",
   "suspect.view": "Ver el estado anterior a los cambios",
+  "suspect.titleFolder": "Se han cambiado muchísimos archivos en «{folder}»",
+  "suspect.lapsed":
+    "La conservación prolongada ha terminado antes de tiempo porque el espacio para ella en tu servidor está lleno. Recupera pronto el estado si lo necesitas.",
+  "suspect.step1Unknown":
+    "Mira en Dispositivos qué dispositivo fue y desconéctalo de la red o quítalo.",
+  "suspect.devices": "Ver dispositivos",
+  "suspect.step3Elsewhere":
+    "Recupera el estado anterior en un dispositivo que sincronice «{folder}».",
   "devices.title": "Tus dispositivos",
   "devices.add": "Añadir dispositivo",
   "devices.this": "Este dispositivo",
@@ -2961,6 +3022,8 @@ const es: Dictionary = {
     "Este código no pertenece a ninguna cuenta de este servidor. Comprueba la dirección del servidor en tu hoja.",
   "error.recovery.used": "Este código se ha sustituido. Usa la hoja más reciente.",
   "error.recovery.otherApp": "Ese es un código para Hangar. Aquí hace falta el código de {app}.",
+  "error.recovery.wrongSheet":
+    "Este enlace no corresponde a tu código. Usa el enlace o el código QR de la misma hoja que el código. Si alguien te ha enviado este enlace, no lo uses.",
   "error.recovery.savedInSync":
     "No guardes el código en una carpeta sincronizada, o estará junto a los archivos que abre. Elige otro lugar.",
   "error.recovery.savedInCloud":
@@ -3404,6 +3467,12 @@ const fr: Dictionary = {
     "{count} fichiers attendent, car beaucoup de données ont été envoyées aujourd’hui. Ils partiront au plus tard demain.",
   "notice.retained":
     "Les anciennes versions occupent beaucoup de place sur ton serveur en ce moment. L’administrateur a été prévenu. Tu n’as rien à faire.",
+  "notice.quota":
+    "Ton espace sur le serveur est presque plein. Supprime les fichiers dont tu n’as plus besoin ou demande plus d’espace à l’administrateur.",
+  "notice.budgetAccount":
+    "Tes appareils ont beaucoup envoyé aujourd’hui. Les prochaines modifications partiront dès que la limite quotidienne de ton serveur le permettra. Si ce n’était pas toi, vérifie sous Appareils.",
+  "notice.serverDisk":
+    "Ton serveur manque de place. Les nouvelles modifications restent sur tes appareils jusqu’à ce qu’il y ait à nouveau de la place. L’administrateur a été prévenu.",
   "notice.olderAccountState":
     "Ton serveur avait un état plus ancien de ton compte. {app} a tout relu ; rien ne manque.",
   "notice.budgetDevice":
@@ -3614,6 +3683,13 @@ const fr: Dictionary = {
   "suspect.step2": "Analyse cet appareil avec ton antivirus.",
   "suspect.step3": "Récupère l’état d’avant.",
   "suspect.view": "Voir l’état avant les modifications",
+  "suspect.titleFolder": "Énormément de fichiers modifiés dans « {folder} »",
+  "suspect.lapsed":
+    "La conservation prolongée a pris fin plus tôt, car la place prévue pour elle sur ton serveur est pleine. Récupère vite l’état si tu en as besoin.",
+  "suspect.step1Unknown":
+    "Regarde sous Appareils de quel appareil il s’agit, puis déconnecte-le du réseau ou retire-le.",
+  "suspect.devices": "Voir les appareils",
+  "suspect.step3Elsewhere": "Récupère l’état d’avant sur un appareil qui synchronise « {folder} ».",
   "devices.title": "Tes appareils",
   "devices.add": "Ajouter un appareil",
   "devices.this": "Cet appareil",
@@ -3722,6 +3798,8 @@ const fr: Dictionary = {
     "Ce code n’appartient à aucun compte sur ce serveur. Vérifie l’adresse du serveur sur ta feuille.",
   "error.recovery.used": "Ce code a été remplacé. Utilise la feuille la plus récente.",
   "error.recovery.otherApp": "C’est un code pour Hangar. Ici, il faut le code pour {app}.",
+  "error.recovery.wrongSheet":
+    "Ce lien ne correspond pas à ton code. Utilise le lien ou le code QR de la même feuille que le code. Si quelqu’un t’a envoyé ce lien, ne l’utilise pas.",
   "error.recovery.savedInSync":
     "N’enregistre pas le code dans un dossier synchronisé, sinon il se trouve à côté des fichiers qu’il ouvre. Choisis un autre endroit.",
   "error.recovery.savedInCloud":
@@ -4169,6 +4247,12 @@ const it: Dictionary = {
     "{count} file sono in attesa perché oggi è stato caricato molto. Partiranno al più tardi domani.",
   "notice.retained":
     "Le vecchie versioni occupano molto spazio sul tuo server in questo momento. Il gestore è stato avvisato. Non devi fare nulla.",
+  "notice.quota":
+    "Il tuo spazio sul server è quasi pieno. Elimina i file che non ti servono più o chiedi più spazio al gestore.",
+  "notice.budgetAccount":
+    "I tuoi dispositivi hanno caricato molto oggi. Le prossime modifiche partiranno appena il limite giornaliero del tuo server lo consente. Se non sei stato tu, controlla in Dispositivi.",
+  "notice.serverDisk":
+    "Sul tuo server lo spazio sta finendo. Le nuove modifiche restano sui tuoi dispositivi finché non c’è di nuovo spazio. Il gestore è stato avvisato.",
   "notice.olderAccountState":
     "Il tuo server aveva uno stato precedente del tuo account. {app} ha riletto tutto; non manca niente.",
   "notice.budgetDevice":
@@ -4380,6 +4464,14 @@ const it: Dictionary = {
   "suspect.step2": "Controlla quel dispositivo con il tuo antivirus.",
   "suspect.step3": "Recupera lo stato di prima.",
   "suspect.view": "Mostra lo stato prima delle modifiche",
+  "suspect.titleFolder": "Moltissimi file sono stati modificati in «{folder}»",
+  "suspect.lapsed":
+    "La conservazione prolungata è finita in anticipo perché lo spazio riservato sul tuo server è pieno. Recupera presto lo stato se ti serve.",
+  "suspect.step1Unknown":
+    "Guarda in Dispositivi quale dispositivo è stato, poi scollegalo dalla rete o rimuovilo.",
+  "suspect.devices": "Mostra dispositivi",
+  "suspect.step3Elsewhere":
+    "Recupera lo stato di prima su un dispositivo che sincronizza «{folder}».",
 
   "devices.title": "I tuoi dispositivi",
   "devices.add": "Aggiungi dispositivo",
@@ -4490,6 +4582,8 @@ const it: Dictionary = {
     "Questo codice non appartiene a nessun account su questo server. Controlla l’indirizzo del server sul tuo foglio.",
   "error.recovery.used": "Questo codice è stato sostituito. Usa il foglio più recente.",
   "error.recovery.otherApp": "Questo è un codice per Hangar. Qui serve il codice per {app}.",
+  "error.recovery.wrongSheet":
+    "Questo link non corrisponde al tuo codice. Usa il link o il codice QR dello stesso foglio del codice. Se qualcuno ti ha inviato questo link, non usarlo.",
   "error.recovery.savedInSync":
     "Non salvare il codice in una cartella sincronizzata, altrimenti sta accanto ai file che apre. Scegli un altro posto.",
   "error.recovery.savedInCloud":
@@ -4874,6 +4968,12 @@ const ja: Dictionary = {
     "今日は多くのファイルをアップロードしたため、{count} 個のファイルが待機中です。遅くとも明日までに送られます。",
   "notice.retained":
     "現在、古い版がサーバーの容量を多く使っています。管理者には通知済みです。特に操作は必要ありません。",
+  "notice.quota":
+    "サーバーの保存容量がほぼいっぱいです。不要なファイルを削除するか、管理者に容量を増やすよう依頼してください。",
+  "notice.budgetAccount":
+    "今日、デバイスから大量のファイルがアップロードされました。以降の変更は、サーバーの1日の上限に空きができ次第送信されます。心当たりがない場合は「デバイス」を確認してください。",
+  "notice.serverDisk":
+    "サーバーの空き容量が少なくなっています。新しい変更は、空きができるまでデバイスに残ります。管理者には通知済みです。",
   "notice.olderAccountState":
     "サーバーにあったアカウントの状態は古いものでした。{app} はすべてを読み直しました。足りないものはありません。",
   "notice.budgetDevice":
@@ -5044,6 +5144,13 @@ const ja: Dictionary = {
   "suspect.step2": "そのデバイスをウイルス対策ソフトで確認してください。",
   "suspect.step3": "変更前の状態に戻してください。",
   "suspect.view": "変更前の状態を表示",
+  "suspect.titleFolder": "「{folder}」で非常に多くのファイルが変更されました",
+  "suspect.lapsed":
+    "サーバー上の保持用の容量がいっぱいになったため、延長保持が早めに終了しました。必要であれば早めに元の状態に戻してください。",
+  "suspect.step1Unknown":
+    "「デバイス」でどのデバイスだったかを確認し、ネットワークから切断するか削除してください。",
+  "suspect.devices": "デバイスを表示",
+  "suspect.step3Elsewhere": "「{folder}」を同期しているデバイスで、変更前の状態に戻してください。",
 
   "devices.title": "デバイス",
   "devices.add": "デバイスを追加",
@@ -5153,6 +5260,8 @@ const ja: Dictionary = {
     "このコードはこのサーバーのどのアカウントにも属していません。シートに書かれたサーバーのアドレスを確認してください。",
   "error.recovery.used": "このコードは置き換えられています。新しいシートを使ってください。",
   "error.recovery.otherApp": "これは Hangar のコードです。ここでは {app} のコードが必要です。",
+  "error.recovery.wrongSheet":
+    "このリンクはこのコードのものではありません。コードと同じシートのリンクまたは QR コードを使ってください。誰かから送られてきたリンクの場合は、使わないでください。",
   "error.recovery.savedInSync":
     "同期するフォルダーにコードを保存しないでください。開く対象のファイルのすぐ隣に置くことになります。別の場所を選んでください。",
   "error.recovery.savedInCloud":
@@ -5633,6 +5742,12 @@ const pl: Dictionary = {
     "{count} pliku czeka, bo dziś przesłano już bardzo dużo. Zostaną wysłane najpóźniej jutro.",
   "notice.retained":
     "Stare wersje zajmują teraz dużo miejsca na twoim serwerze. Administrator już o tym wie. Nie musisz nic robić.",
+  "notice.quota":
+    "Twoje miejsce na serwerze jest prawie pełne. Usuń pliki, których już nie potrzebujesz, albo poproś administratora o więcej miejsca.",
+  "notice.budgetAccount":
+    "Twoje urządzenia przesłały dziś bardzo dużo. Kolejne zmiany zostaną wysłane, gdy tylko pozwoli na to dzienny limit serwera. Jeśli to nie ty, sprawdź w sekcji Urządzenia.",
+  "notice.serverDisk":
+    "Na twoim serwerze kończy się miejsce. Nowe zmiany zostają na twoich urządzeniach, dopóki znów nie będzie miejsca. Administrator już o tym wie.",
   "notice.olderAccountState":
     "Twój serwer miał starszy stan twojego konta. {app} wczytał wszystko od nowa, niczego nie brakuje.",
   "notice.budgetDevice":
@@ -5859,6 +5974,14 @@ const pl: Dictionary = {
   "suspect.step2": "Sprawdź to urządzenie programem antywirusowym.",
   "suspect.step3": "Przywróć wcześniejszy stan.",
   "suspect.view": "Pokaż stan sprzed zmian",
+  "suspect.titleFolder": "W folderze „{folder}” zmieniono bardzo wiele plików",
+  "suspect.lapsed":
+    "Dłuższe przechowywanie skończyło się wcześniej, bo miejsce na nie na twoim serwerze jest pełne. Przywróć stan szybko, jeśli go potrzebujesz.",
+  "suspect.step1Unknown":
+    "Sprawdź w sekcji Urządzenia, które to było urządzenie, i odłącz je od sieci albo usuń.",
+  "suspect.devices": "Pokaż urządzenia",
+  "suspect.step3Elsewhere":
+    "Przywróć wcześniejszy stan na urządzeniu, które synchronizuje folder „{folder}”.",
 
   "devices.title": "Twoje urządzenia",
   "devices.add": "Dodaj urządzenie",
@@ -5969,6 +6092,8 @@ const pl: Dictionary = {
     "Ten kod nie należy do żadnego konta na tym serwerze. Sprawdź adres serwera na swojej karcie.",
   "error.recovery.used": "Ten kod został zastąpiony. Użyj nowszej karty.",
   "error.recovery.otherApp": "To kod dla aplikacji Hangar. Tutaj potrzebny jest kod dla {app}.",
+  "error.recovery.wrongSheet":
+    "Ten link nie pasuje do twojego kodu. Użyj linku albo kodu QR z tej samej karty co kod. Jeśli ktoś przysłał ci ten link, nie używaj go.",
   "error.recovery.savedInSync":
     "Nie zapisuj kodu w synchronizowanym folderze, bo leżałby obok plików, które otwiera. Wybierz inne miejsce.",
   "error.recovery.savedInCloud":
@@ -6418,6 +6543,12 @@ const pt: Dictionary = {
     "{count} arquivos estão esperando porque muita coisa foi enviada hoje. Eles vão ser enviados até amanhã, no máximo.",
   "notice.retained":
     "Versões antigas estão ocupando muito espaço no seu servidor agora. O administrador já foi avisado. Você não precisa fazer nada.",
+  "notice.quota":
+    "Seu espaço no servidor está quase cheio. Exclua arquivos de que você não precisa mais ou peça mais espaço ao administrador.",
+  "notice.budgetAccount":
+    "Seus dispositivos enviaram muita coisa hoje. As próximas alterações serão enviadas assim que o limite diário do seu servidor permitir. Se não foi você, confira em Dispositivos.",
+  "notice.serverDisk":
+    "O espaço no seu servidor está acabando. As novas alterações ficam nos seus dispositivos até haver espaço de novo. O administrador já foi avisado.",
   "notice.olderAccountState":
     "Seu servidor tinha um estado anterior da sua conta. O {app} leu tudo de novo; não falta nada.",
   "notice.budgetDevice":
@@ -6628,6 +6759,14 @@ const pt: Dictionary = {
   "suspect.step2": "Verifique esse dispositivo com seu antivírus.",
   "suspect.step3": "Traga de volta o estado de antes.",
   "suspect.view": "Ver o estado antes das alterações",
+  "suspect.titleFolder": "Muitos arquivos foram alterados em “{folder}”",
+  "suspect.lapsed":
+    "A retenção estendida terminou antes do previsto porque o espaço para ela no seu servidor está cheio. Traga o estado de volta logo, se precisar dele.",
+  "suspect.step1Unknown":
+    "Veja em Dispositivos qual dispositivo foi e desconecte-o da rede ou remova-o.",
+  "suspect.devices": "Ver dispositivos",
+  "suspect.step3Elsewhere":
+    "Traga de volta o estado de antes em um dispositivo que sincroniza “{folder}”.",
 
   "devices.title": "Seus dispositivos",
   "devices.add": "Adicionar dispositivo",
@@ -6737,6 +6876,8 @@ const pt: Dictionary = {
     "Este código não pertence a nenhuma conta neste servidor. Confira o endereço do servidor na sua folha.",
   "error.recovery.used": "Este código foi substituído. Use a folha mais recente.",
   "error.recovery.otherApp": "Esse é um código do Hangar. Aqui é preciso o código do {app}.",
+  "error.recovery.wrongSheet":
+    "Este link não corresponde ao seu código. Use o link ou o código QR da mesma folha do código. Se alguém enviou este link para você, não o use.",
   "error.recovery.savedInSync":
     "Não salve o código em uma pasta sincronizada, senão ele fica junto dos arquivos que ele abre. Escolha outro lugar.",
   "error.recovery.savedInCloud":
@@ -7213,6 +7354,12 @@ const ru: Dictionary = {
     "{count} файла ждут, потому что сегодня отправлено уже очень много. Они уйдут не позже завтрашнего дня.",
   "notice.retained":
     "Старые версии сейчас занимают много места на твоём сервере. Администратор уже в курсе. Тебе ничего не нужно делать.",
+  "notice.quota":
+    "Твоё место на сервере почти закончилось. Удали файлы, которые больше не нужны, или попроси у администратора больше места.",
+  "notice.budgetAccount":
+    "Твои устройства сегодня отправили очень много. Следующие изменения уйдут, как только позволит дневной лимит сервера. Если это не ты, проверь в разделе Устройства.",
+  "notice.serverDisk":
+    "На твоём сервере заканчивается место. Новые изменения остаются на твоих устройствах, пока снова не появится место. Администратор уже в курсе.",
   "notice.olderAccountState":
     "На твоём сервере было более старое состояние учётной записи. {app} всё перечитал, ничего не пропало.",
   "notice.budgetDevice":
@@ -7439,6 +7586,14 @@ const ru: Dictionary = {
   "suspect.step2": "Проверь это устройство антивирусом.",
   "suspect.step3": "Верни прежнее состояние.",
   "suspect.view": "Посмотреть состояние до изменений",
+  "suspect.titleFolder": "В папке «{folder}» изменено очень много файлов",
+  "suspect.lapsed":
+    "Продлённое хранение закончилось раньше срока, потому что место для него на твоём сервере заполнено. Верни состояние поскорее, если оно тебе нужно.",
+  "suspect.step1Unknown":
+    "Посмотри в разделе Устройства, какое это было устройство, и отключи его от сети или удали.",
+  "suspect.devices": "Показать устройства",
+  "suspect.step3Elsewhere":
+    "Верни прежнее состояние на устройстве, которое синхронизирует папку «{folder}».",
 
   "devices.title": "Твои устройства",
   "devices.add": "Добавить устройство",
@@ -7549,6 +7704,8 @@ const ru: Dictionary = {
     "Этот код не относится ни к одной учётной записи на этом сервере. Проверь адрес сервера на своём листе.",
   "error.recovery.used": "Этот код заменён. Используй более новый лист.",
   "error.recovery.otherApp": "Это код для Hangar. Здесь нужен код для {app}.",
+  "error.recovery.wrongSheet":
+    "Эта ссылка не подходит к твоему коду. Используй ссылку или QR-код с того же листа, что и код. Если эту ссылку тебе кто-то прислал, не используй её.",
   "error.recovery.savedInSync":
     "Не сохраняй код в синхронизируемой папке, иначе он будет лежать рядом с файлами, которые открывает. Выбери другое место.",
   "error.recovery.savedInCloud":
@@ -7959,6 +8116,12 @@ const tr: Dictionary = {
     "Bugün çok şey yüklendiği için {count} dosya bekliyor. En geç yarın gönderilirler.",
   "notice.retained":
     "Eski sürümler şu an sunucunda çok yer kaplıyor. Yöneticiye haber verildi. Senin bir şey yapmana gerek yok.",
+  "notice.quota":
+    "Sunucudaki alanın neredeyse doldu. Artık gerekmeyen dosyaları sil veya yöneticiden daha fazla alan iste.",
+  "notice.budgetAccount":
+    "Cihazların bugün çok şey yükledi. Sonraki değişiklikler, sunucunun günlük sınırı izin verir vermez gönderilir. Bu sen değilsen Cihazlar bölümüne bak.",
+  "notice.serverDisk":
+    "Sunucunda yer azalıyor. Yeniden yer açılana kadar yeni değişiklikler cihazlarında kalır. Yöneticiye haber verildi.",
   "notice.olderAccountState":
     "Sunucunda hesabının daha eski bir durumu vardı. {app} her şeyi yeniden okudu, eksik bir şey yok.",
   "notice.budgetDevice": "“{device}” bugün çok şey yükledi. Bu sen değilsen Cihazlar bölümüne bak.",
@@ -8145,6 +8308,13 @@ const tr: Dictionary = {
   "suspect.step2": "O cihazı virüs programınla tara.",
   "suspect.step3": "Önceki durumu geri getir.",
   "suspect.view": "Değişikliklerden önceki durumu görüntüle",
+  "suspect.titleFolder": "“{folder}” klasöründe çok fazla dosya değiştirildi",
+  "suspect.lapsed":
+    "Uzatılmış saklama erken sona erdi, çünkü sunucunda bunun için ayrılan alan doldu. Gerekiyorsa durumu yakında geri getir.",
+  "suspect.step1Unknown":
+    "Cihazlar bölümünde hangi cihaz olduğuna bak, sonra onun ağ bağlantısını kes veya onu kaldır.",
+  "suspect.devices": "Cihazları görüntüle",
+  "suspect.step3Elsewhere": "Önceki durumu “{folder}” klasörünü eşitleyen bir cihazda geri getir.",
 
   "devices.title": "Cihazların",
   "devices.add": "Cihaz ekle",
@@ -8251,6 +8421,8 @@ const tr: Dictionary = {
     "Bu kod bu sunucudaki hiçbir hesaba ait değil. Kâğıdındaki sunucu adresini kontrol et.",
   "error.recovery.used": "Bu kodun yerine yenisi geldi. Daha yeni kâğıdı kullan.",
   "error.recovery.otherApp": "Bu, Hangar için bir kod. Burada {app} kodu gerekiyor.",
+  "error.recovery.wrongSheet":
+    "Bu bağlantı koduna ait değil. Kodla aynı kâğıttaki bağlantıyı veya QR kodunu kullan. Bu bağlantıyı sana biri gönderdiyse kullanma.",
   "error.recovery.savedInSync":
     "Kodu eşitlenen bir klasöre kaydetme, yoksa açtığı dosyaların hemen yanında durur. Başka bir yer seç.",
   "error.recovery.savedInCloud":
@@ -8603,6 +8775,10 @@ const zh: Dictionary = {
     "由于没有剩余空间，目前连删除也无法进行。现在只有管理员能腾出空间。请把错误报告发给管理员。本机上的文件保持不变。",
   "budget.line.other": "今天上传的内容很多，{count} 个文件正在等待。最迟明天发送。",
   "notice.retained": "旧版本目前占用了服务器上大量空间。已通知管理员，无需进行任何操作。",
+  "notice.quota": "服务器上的存储空间快满了。请删除不再需要的文件，或向管理员申请更多空间。",
+  "notice.budgetAccount":
+    "账户中的设备今天上传了大量内容。之后的更改会在服务器的每日上限允许时发送。如果不是自己操作的，请在“设备”中检查。",
+  "notice.serverDisk": "服务器空间即将用完。新的更改会先留在设备上，直到再次有空间。已通知管理员。",
   "notice.olderAccountState":
     "你的服务器上是账户的较早状态。{app} 已重新读取全部内容，没有缺少任何东西。",
   "notice.budgetDevice": "“{device}”今天上传了大量内容。如果不是自己操作的，请在“设备”中检查。",
@@ -8756,6 +8932,12 @@ const zh: Dictionary = {
   "suspect.step2": "用杀毒软件检查那台设备。",
   "suspect.step3": "恢复到更改之前的状态。",
   "suspect.view": "查看更改之前的状态",
+  "suspect.titleFolder": "“{folder}”中有大量文件被更改",
+  "suspect.lapsed":
+    "由于服务器上用于保留的空间已满，延长保留已提前结束。如有需要，请尽快恢复该状态。",
+  "suspect.step1Unknown": "请在“设备”中查看是哪台设备，然后断开它的网络或将其移除。",
+  "suspect.devices": "查看设备",
+  "suspect.step3Elsewhere": "请在同步“{folder}”的设备上恢复到更改之前的状态。",
 
   "devices.title": "设备",
   "devices.add": "添加设备",
@@ -8845,6 +9027,8 @@ const zh: Dictionary = {
   "error.recovery.unknown": "此恢复码不属于此服务器上的任何账户。请检查恢复单上的服务器地址。",
   "error.recovery.used": "此恢复码已被替换。请使用较新的恢复单。",
   "error.recovery.otherApp": "这是 Hangar 的恢复码。这里需要 {app} 的恢复码。",
+  "error.recovery.wrongSheet":
+    "此链接不属于该恢复码。请使用与恢复码同一张恢复单上的链接或二维码。如果此链接是他人发来的，请勿使用。",
   "error.recovery.savedInSync":
     "不要把恢复码保存在同步的文件夹中，否则它就和它能打开的文件放在了一起。请选择其他位置。",
   "error.recovery.savedInCloud":

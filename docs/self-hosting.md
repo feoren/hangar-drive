@@ -245,7 +245,7 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | `HANGAR_DRIVE_HEADROOM` | 1% of Q, at least 64 MiB | Extra room for directory listings, so deleting works at a full quota (H) |
 | `HANGAR_DRIVE_MIN_COUNT_CAP` | Q | Bytes that only the minimum count keeps, per account (C) |
 | `HANGAR_DRIVE_ACCOUNT_BUDGET` | Q | Bytes an account may make live per 24 hours (B) |
-| `HANGAR_DRIVE_DEVICE_BUDGET` | the account budget | Bytes one device may make live per 24 hours |
+| `HANGAR_DRIVE_DEVICE_BUDGET` | half the account budget | Bytes one device may make live per 24 hours; at most the account budget |
 | `HANGAR_DRIVE_DISK_RESERVE` | `1GiB` | Below this much free disk space, uploads are refused |
 | `HANGAR_DRIVE_TRUSTED_PROXIES` | empty | Comma-separated addresses of reverse proxies (CIDR ranges are accepted; prefer the exact address) |
 | `HANGAR_DRIVE_RECORD_CAP` | `64MiB` | Bytes of encrypted account records (folder keys, folder list, device names) per account (R) |
@@ -267,6 +267,14 @@ retention window. A burst of replaced or dropped files pins the last version bef
 days, and every device shows a warning. The quota, the headroom and the budgets keep such a
 device from filling your disk with garbage. When an account exceeds a limit, the server logs an
 "operator warning" and every device of the account shows a notice.
+
+Such a device also cannot lock the other devices of the account out. Uploads that no commit
+has named yet count against the quota only for the device that sent them, and removing a device
+deletes them at once and gives back the budget they used. The device budget defaults to half the
+account budget, so one device never uses up the budget of the others. One device then uploads at
+most half a quota per day; if a first upload of a full quota from a single device should fit in
+one day, raise `HANGAR_DRIVE_ACCOUNT_BUDGET` (which raises the disk bound below) or set
+`HANGAR_DRIVE_DEVICE_BUDGET` to the account budget (which gives up this protection).
 
 ## Disk sizing
 

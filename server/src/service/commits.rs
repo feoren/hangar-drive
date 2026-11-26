@@ -6,10 +6,20 @@
 //! entry. A refused call writes nothing.
 //!
 //! Reference deltas are checked against the server's own view of the trees: an added object
-//! must be held and not already in the parent's tree, a dropped one must be in it. The server
-//! cannot see inside the trees, but it can hold every device to its own declarations, so the
-//! live set it computes is exactly what the devices declared, and no device can make the server
-//! forget an object by declaring nothing.
+//! must be held and not already in the parent's tree, a dropped one must be in it, and the new
+//! head's root must be live afterwards. The server cannot see inside the trees, but it can hold
+//! every device to its own declarations, so the live set it computes is exactly what the devices
+//! declared, and no device can make the server forget an object by declaring nothing.
+//!
+//! **Binding** (ADR 0001, amendment "reference deltas bound to the tree"): every commit signs a
+//! digest of its delta, and the uploaded delta must match it, so the delta the server applies is
+//! the one every device checks against the trees. A diff that does not fit the live set is
+//! refused with `delta_mismatch` and the IDs that do not fit, never with a plain refusal, so an
+//! honest device whose server view was broken by another device publishes the same tree again
+//! with a **full delta**: the whole reachable set, which replaces the live set (objects not in it
+//! are dropped, objects in it that are not live are added). Missing objects of a full delta are
+//! asked for with `missing_objects` as usual, so a device can upload objects the collection
+//! already deleted.
 //!
 //! The deltas are checked as sets (finding M4): their IDs go into a temporary table, and each
 //! rule is one query over it, so a delta of 2^20 IDs costs a handful of statements instead of
@@ -50,6 +60,8 @@ enum Part {
     HeadDropped = 1,
     SideAdded = 2,
     SideDropped = 3,
+    /// A full delta's list, before it is split into the head's added and dropped parts.
+    HeadFull = 4,
 }
 
 impl Part {
@@ -58,8 +70,9 @@ impl Part {
     }
 }
 
-/// Fills the temporary table `commit_ids` with the call's IDs.
-async fn load_ids(tx: &mut Tx, request: &CommitRequest) -> ApiResult<()> {
+/// Fills the temporary table `commit_ids` with the call's IDs; a full head delta goes to
+/// [`Part::HeadFull`].
+async fn load_ids(tx: &mut Tx, request: &CommitRequest, head_full: bool) -> ApiResult<()> {
     for sql in [
         "CREATE TEMP TABLE IF NOT EXISTS commit_ids (id BLOB NOT NULL, part INTEGER NOT NULL, PRIMARY KEY (part, id)) WITHOUT ROWID",
         "CREATE TEMP TABLE IF NOT EXISTS commit_revived (object_pk INTEGER PRIMARY KEY, size INTEGER NOT NULL)",
@@ -68,8 +81,13 @@ async fn load_ids(tx: &mut Tx, request: &CommitRequest) -> ApiResult<()> {
     ] {
         sqlx::query(sql).execute(&mut **tx).await?;
     }
+    let head_added = if head_full {
+        Part::HeadFull
+    } else {
+        Part::HeadAdded
+    };
     let mut lists: Vec<(Part, &[ObjectId])> = vec![
-        (Part::HeadAdded, &request.head.delta.added),
+        (head_added, &request.head.delta.added),
         (Part::HeadDropped, &request.head.delta.dropped),
     ];
     if let Some(side) = &request.side {
@@ -135,20 +153,76 @@ async fn not_held(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<Vec<Obje
         .collect())
 }
 
-/// How many objects of `part` are in the tree of the head at `seq`.
-async fn count_in_tree(tx: &mut Tx, folder_pk: i64, part: Part, seq: u64) -> ApiResult<u64> {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM commit_ids c JOIN objects o ON o.folder_pk = ? AND o.object_id = c.id \
+/// IDs of `part` that are in the tree of the head at `seq` (`in_tree`), or that are not (held
+/// or not), at most as many as an error lists.
+async fn tree_ids(
+    tx: &mut Tx,
+    folder_pk: i64,
+    part: Part,
+    seq: u64,
+    in_tree: bool,
+) -> ApiResult<Vec<ObjectId>> {
+    let sql = if in_tree {
+        "SELECT c.id FROM commit_ids c JOIN objects o ON o.folder_pk = ? AND o.object_id = c.id \
          WHERE c.part = ? AND EXISTS (SELECT 1 FROM refs r WHERE r.object_pk = o.pk \
-               AND r.added_seq <= ? AND (r.dropped_seq IS NULL OR r.dropped_seq > ?))",
+               AND r.added_seq <= ? AND (r.dropped_seq IS NULL OR r.dropped_seq > ?)) LIMIT ?"
+    } else {
+        "SELECT c.id FROM commit_ids c LEFT JOIN objects o ON o.folder_pk = ? AND o.object_id = c.id \
+         WHERE c.part = ? AND (o.pk IS NULL OR NOT EXISTS (SELECT 1 FROM refs r WHERE r.object_pk = o.pk \
+               AND r.added_seq <= ? AND (r.dropped_seq IS NULL OR r.dropped_seq > ?))) LIMIT ?"
+    };
+    let rows: Vec<Vec<u8>> = sqlx::query_scalar(sql)
+        .bind(folder_pk)
+        .bind(part.code())
+        .bind(i64_of(seq))
+        .bind(i64_of(seq))
+        .bind(i64_of(MAX_MISSING_LISTED as u64))
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|id| ObjectId::from_slice(id))
+        .collect())
+}
+
+/// Whether `id` is live, that is in the tree of the current head.
+async fn is_live(tx: &mut Tx, folder_pk: i64, id: &ObjectId) -> ApiResult<bool> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM objects o JOIN refs r ON r.object_pk = o.pk \
+         WHERE o.folder_pk = ? AND o.object_id = ? AND r.dropped_seq IS NULL LIMIT 1",
     )
     .bind(folder_pk)
-    .bind(part.code())
-    .bind(i64_of(seq))
-    .bind(i64_of(seq))
-    .fetch_one(&mut **tx)
+    .bind(id.as_bytes().as_slice())
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(u64_of(n))
+    Ok(row.is_some())
+}
+
+/// Splits a full head delta ([`Part::HeadFull`]) into what it changes in the live set: its
+/// objects that are not live become [`Part::HeadAdded`], live objects outside it become
+/// [`Part::HeadDropped`]. Everything after this treats the call like a diff.
+async fn split_full(tx: &mut Tx, folder_pk: i64) -> ApiResult<()> {
+    sqlx::query(
+        "INSERT INTO commit_ids (id, part) SELECT c.id, ? FROM commit_ids c WHERE c.part = ? \
+         AND NOT EXISTS (SELECT 1 FROM objects o JOIN refs r ON r.object_pk = o.pk \
+                         WHERE o.folder_pk = ? AND o.object_id = c.id AND r.dropped_seq IS NULL)",
+    )
+    .bind(Part::HeadAdded.code())
+    .bind(Part::HeadFull.code())
+    .bind(folder_pk)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO commit_ids (id, part) SELECT o.object_id, ? FROM refs r \
+         JOIN objects o ON o.pk = r.object_pk WHERE r.folder_pk = ? AND r.dropped_seq IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM commit_ids c WHERE c.part = ? AND c.id = o.object_id)",
+    )
+    .bind(Part::HeadDropped.code())
+    .bind(folder_pk)
+    .bind(Part::HeadFull.code())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Bytes and file object count of `part` (held objects only).
@@ -172,39 +246,63 @@ async fn part_bytes(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<(Bytes
     ))
 }
 
-/// Checks the delta of `added` and `dropped` against the tree of the head at `base` (`None`:
-/// the empty tree).
+/// Checks the diff of `added` and `dropped` against the tree of the head at `base` (`None`:
+/// the empty tree): every added object held (`missing_objects` otherwise) and not in that tree,
+/// every dropped one in it (`delta_mismatch` with the IDs that do not fit otherwise).
 async fn check_delta(
     tx: &mut Tx,
     folder_pk: i64,
-    added: (Part, usize),
-    dropped: (Part, usize),
+    added: Part,
+    dropped: &[ObjectId],
+    dropped_part: Part,
     base: Option<u64>,
 ) -> ApiResult<()> {
-    let missing = not_held(tx, folder_pk, added.0).await?;
+    let missing = not_held(tx, folder_pk, added).await?;
     if !missing.is_empty() {
         return Err(ApiError::missing(missing));
     }
-    if !not_held(tx, folder_pk, dropped.0).await?.is_empty() {
-        return Err(ErrorCode::CommitRefused.into());
-    }
-    match base {
-        None => {
-            if dropped.1 > 0 {
-                return Err(ErrorCode::CommitRefused.into());
-            }
-        }
+    let off = match base {
+        // Nothing can be dropped from the empty tree.
+        None => dropped.iter().take(MAX_MISSING_LISTED).copied().collect(),
         Some(seq) => {
-            if count_in_tree(tx, folder_pk, added.0, seq).await? > 0
-                || count_in_tree(tx, folder_pk, dropped.0, seq).await? != dropped.1 as u64
-            {
-                return Err(ErrorCode::CommitRefused.into());
-            }
+            let mut off = tree_ids(tx, folder_pk, added, seq, true).await?;
+            off.extend(tree_ids(tx, folder_pk, dropped_part, seq, false).await?);
+            off
         }
+    };
+    if !off.is_empty() {
+        return Err(ApiError::delta_mismatch(off));
     }
     Ok(())
 }
 
+/// The new head's root is live after its diff: added, or live now and not dropped. Without
+/// this a head could keep its tree and drop the root with everything below it, and the
+/// collection would delete the tree every device still shows.
+async fn check_root(
+    tx: &mut Tx,
+    folder_pk: i64,
+    root: &ObjectId,
+    added: &[ObjectId],
+    dropped: &[ObjectId],
+    has_parent: bool,
+) -> ApiResult<()> {
+    let live = if added.binary_search(root).is_ok() {
+        true
+    } else if dropped.binary_search(root).is_ok() || !has_parent {
+        false
+    } else {
+        is_live(tx, folder_pk, root).await?
+    };
+    if live {
+        Ok(())
+    } else {
+        Err(ApiError::delta_mismatch(vec![*root]))
+    }
+}
+
+/// Decodes and verifies one commit of the call, with its uploaded delta against the signed
+/// delta digest: a delta the signer did not sign is a refused commit.
 fn decode(
     upload: &hangar_drive_protocol::api::CommitUpload,
     state: &AccountState,
@@ -214,6 +312,9 @@ fn decode(
         .map_err(|_| ApiError::new(ErrorCode::CommitRefused))?;
     commit
         .verify_for_server(state, folder)
+        .map_err(|_| ApiError::new(ErrorCode::CommitRefused))?;
+    commit
+        .check_delta(&upload.delta.added, &upload.delta.dropped)
         .map_err(|_| ApiError::new(ErrorCode::CommitRefused))?;
     Ok(commit)
 }
@@ -254,11 +355,19 @@ pub struct Drops {
 
 /// Bytes the call makes reachable again that a commit declared before (module docs): written
 /// to `commit_revived` and summed, `(all, of them in the tree of an admitted pin)`.
+///
+/// The second sum also holds the bytes whose last drop came from a head of a device the log has
+/// removed since (MEDIUM 2 of the follow-up review): bringing back what a removed device
+/// dropped is the repair after it, and the barrier or repair that does it must not wait for a
+/// budget the removed device's damage used up. Those bytes go through the pin restore
+/// allowance, not around every bound: a device that could add and remove devices at will would
+/// otherwise keep garbage stored for free by dropping it from a device it then removes.
 async fn revived(
     tx: &mut Tx,
     folder_pk: i64,
     current_seq: Option<u64>,
     now: u64,
+    state: &AccountState,
 ) -> ApiResult<(u64, u64)> {
     sqlx::query(
         "INSERT OR IGNORE INTO commit_revived (object_pk, size) SELECT o.pk, o.size FROM commit_ids c \
@@ -283,18 +392,36 @@ async fn revived(
     .bind(i64_of(current_seq.unwrap_or(0)))
     .execute(&mut **tx)
     .await?;
-    let (all, pinned): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(v.size), 0), COALESCE(SUM(CASE WHEN EXISTS ( \
-             SELECT 1 FROM pins p JOIN refs r ON r.object_pk = v.object_pk \
-             WHERE p.folder_pk = ? AND p.lapsed_ms IS NULL AND p.until_ms > ? \
-               AND r.added_seq <= p.seq AND (r.dropped_seq IS NULL OR r.dropped_seq > p.seq)) \
-           THEN v.size ELSE 0 END), 0) FROM commit_revived v",
+    // Per device that dropped the objects last (NULL: unknown, for example after the dropping
+    // commit expired): all bytes, and those in the tree of an admitted pin.
+    let rows: Vec<(Option<Vec<u8>>, i64, i64)> = sqlx::query_as(
+        "SELECT d.dropper, COALESCE(SUM(d.size), 0), COALESCE(SUM(d.pinned), 0) FROM ( \
+           SELECT v.size AS size, CASE WHEN EXISTS ( \
+               SELECT 1 FROM pins p JOIN refs r ON r.object_pk = v.object_pk \
+               WHERE p.folder_pk = ? AND p.lapsed_ms IS NULL AND p.until_ms > ? \
+                 AND r.added_seq <= p.seq AND (r.dropped_seq IS NULL OR r.dropped_seq > p.seq)) \
+             THEN v.size ELSE 0 END AS pinned, \
+             (SELECT c.device FROM refs r JOIN commits c ON c.folder_pk = r.folder_pk \
+                AND c.seq = r.dropped_seq AND c.role = 'head' \
+              WHERE r.object_pk = v.object_pk AND r.dropped_seq IS NOT NULL \
+              ORDER BY r.dropped_seq DESC LIMIT 1) AS dropper \
+           FROM commit_revived v) d GROUP BY d.dropper",
     )
     .bind(folder_pk)
     .bind(i64_of(now))
-    .fetch_one(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok((u64_of(all), u64_of(pinned)))
+    let (mut all, mut eligible) = (0u64, 0u64);
+    for (dropper, bytes, pinned) in rows {
+        let removed = dropper
+            .as_deref()
+            .and_then(DeviceId::from_slice)
+            .and_then(|d| state.device(&d))
+            .is_some_and(|d| !d.is_current());
+        all = all.saturating_add(u64_of(bytes));
+        eligible = eligible.saturating_add(u64_of(if removed { bytes } else { pinned }));
+    }
+    Ok((all, eligible))
 }
 
 /// Marks every object of the head's and the side commit's added lists as declared, and takes
@@ -441,22 +568,45 @@ pub async fn commit(
     }
 
     // Reference deltas: the head's against the live set (the tree of the current head), the
-    // side commit's against its base.
-    load_ids(&mut tx, &request).await?;
-    check_delta(
-        &mut tx,
-        row.pk,
-        (Part::HeadAdded, request.head.delta.added.len()),
-        (Part::HeadDropped, request.head.delta.dropped.len()),
-        current.map(|c| c.seq),
-    )
-    .await?;
+    // side commit's against its base; a full head delta replaces the live set.
+    load_ids(&mut tx, &request, h.delta.full).await?;
+    if h.delta.full {
+        let missing = not_held(&mut tx, row.pk, Part::HeadFull).await?;
+        if !missing.is_empty() {
+            return Err(ApiError::missing(missing));
+        }
+        // A full delta that leaves out its own root is no tree's reachable set.
+        if request.head.delta.added.binary_search(&h.root).is_err() {
+            return Err(ErrorCode::CommitRefused.into());
+        }
+        split_full(&mut tx, row.pk).await?;
+    } else {
+        check_delta(
+            &mut tx,
+            row.pk,
+            Part::HeadAdded,
+            &request.head.delta.dropped,
+            Part::HeadDropped,
+            current.map(|c| c.seq),
+        )
+        .await?;
+        check_root(
+            &mut tx,
+            row.pk,
+            &h.root,
+            &request.head.delta.added,
+            &request.head.delta.dropped,
+            current.is_some(),
+        )
+        .await?;
+    }
     if let (Some((_, base)), Some(upload)) = (&side_info, &request.side) {
         check_delta(
             &mut tx,
             row.pk,
-            (Part::SideAdded, upload.delta.added.len()),
-            (Part::SideDropped, upload.delta.dropped.len()),
+            Part::SideAdded,
+            &upload.delta.dropped,
+            Part::SideDropped,
             Some(base.seq),
         )
         .await?;
@@ -481,7 +631,8 @@ pub async fn commit(
     }
 
     // Budgets: retained objects this call holds again (module docs).
-    let (revived_all, in_pin) = revived(&mut tx, row.pk, current.map(|c| c.seq), now).await?;
+    let (revived_all, in_pin) =
+        revived(&mut tx, row.pk, current.map(|c| c.seq), now, &state).await?;
     let mut revived_paid = revived_all - in_pin;
     if in_pin > 0 {
         let revived_free =
@@ -622,6 +773,7 @@ pub async fn commit(
     .execute(&mut *tx)
     .await?;
 
+    let live_before = row.live.data;
     let mut pushed: Vec<Pushed> = Vec::new();
     if current.is_none() {
         pushed.push(feed::push(&mut tx, account.pk, &FeedChange::FolderCreated { folder }).await?);
@@ -653,7 +805,7 @@ pub async fn commit(
             files_after,
             device: session.device,
         };
-        if let Some(p) = detect_burst(app, &mut tx, &burst, &drops, now).await? {
+        if let Some(p) = detect_burst_from(app, &mut tx, &burst, &drops, live_before, now).await? {
             pushed.push(p);
         }
     }
@@ -712,6 +864,12 @@ pub struct Burst {
 /// file data; or a device that has used up its upload budget drops file data. The pin holds the
 /// last commit before the burst: the parent of the oldest change in the window. A retirement
 /// counts as dropping every live object (finding M3).
+///
+/// **Share** (finding LOW 1): the dropped bytes of the window count against the folder's live
+/// file data just before the change, and also against the live file data at the start of the
+/// window (before the window's first change), whichever share is larger. Against the first
+/// alone a device could dilute the signal: add garbage, then drop every real file, and the
+/// garbage kept the share below the threshold.
 pub async fn detect_burst(
     app: &App,
     tx: &mut Tx,
@@ -719,20 +877,45 @@ pub async fn detect_burst(
     drops: &Drops,
     now: u64,
 ) -> ApiResult<Option<Pushed>> {
-    if drops.objects == 0 {
-        return Ok(None);
-    }
-    sqlx::query("INSERT INTO drop_events (folder_pk, at_ms, parent_seq, objects, bytes) VALUES (?, ?, ?, ?, ?)")
+    let live_before = burst.live_after.data.saturating_add(drops.bytes);
+    detect_burst_from(app, tx, burst, drops, live_before, now).await
+}
+
+/// [`detect_burst`] with the folder's live file data before the change, `live_before`. Every
+/// change is recorded, also one that drops nothing, so the window knows its starting size.
+async fn detect_burst_from(
+    app: &App,
+    tx: &mut Tx,
+    burst: &Burst,
+    drops: &Drops,
+    live_before: u64,
+    now: u64,
+) -> ApiResult<Option<Pushed>> {
+    sqlx::query("INSERT INTO drop_events (folder_pk, at_ms, parent_seq, objects, bytes, live_before) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(burst.folder_pk)
         .bind(i64_of(now))
         .bind(i64_of(burst.parent_seq))
         .bind(i64_of(drops.objects))
         .bind(i64_of(drops.bytes))
+        .bind(i64_of(live_before))
         .execute(&mut **tx)
         .await?;
+    if drops.objects == 0 {
+        return Ok(None);
+    }
     let since = i64_of(now.saturating_sub(BURST_WINDOW_MS));
     let (objects, bytes, first_parent): (i64, i64, Option<i64>) = sqlx::query_as(
-        "SELECT COALESCE(SUM(objects), 0), COALESCE(SUM(bytes), 0), MIN(parent_seq) FROM drop_events WHERE folder_pk = ? AND at_ms > ?",
+        "SELECT COALESCE(SUM(objects), 0), COALESCE(SUM(bytes), 0), MIN(CASE WHEN objects > 0 THEN parent_seq END) \
+         FROM drop_events WHERE folder_pk = ? AND at_ms > ?",
+    )
+    .bind(burst.folder_pk)
+    .bind(since)
+    .fetch_one(&mut **tx)
+    .await?;
+    // The live file data before the window's first change (0 for rows from before migration
+    // 0005, which then add nothing).
+    let window_start: i64 = sqlx::query_scalar(
+        "SELECT live_before FROM drop_events WHERE folder_pk = ? AND at_ms > ? ORDER BY at_ms, rowid LIMIT 1",
     )
     .bind(burst.folder_pk)
     .bind(since)
@@ -740,9 +923,11 @@ pub async fn detect_burst(
     .await?;
     let (objects, bytes) = (u64_of(objects), u64_of(bytes));
     let limits = &app.limits;
+    let share_of = |base: u64| {
+        base > 0 && u128::from(bytes) * 100 >= u128::from(base) * u128::from(limits.anomaly_percent)
+    };
     let base = burst.live_after.data.saturating_add(bytes).max(1);
-    let share_hit =
-        u128::from(bytes) * 100 >= u128::from(base) * u128::from(limits.anomaly_percent);
+    let share_hit = share_of(base) || share_of(u64_of(window_start));
     let files_before = burst.files_after.saturating_add(objects);
     let mass = objects >= limits.burst_objects(files_before) && share_hit;
     let (device_used, _) = usage::budget_used(tx, burst.account_pk, &burst.device, now).await?;
@@ -827,8 +1012,8 @@ pub async fn delta(
     };
     // Up to half a page of sequences: each has a head and at most one side commit.
     let limit = (MAX_DELTA_PAGE / 2) as u64;
-    let rows: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
-        "SELECT seq, role, body FROM commits WHERE folder_pk = ? AND seq > ? AND seq <= ? ORDER BY seq, role DESC",
+    let rows: Vec<(i64, String, Vec<u8>, Option<i64>)> = sqlx::query_as(
+        "SELECT seq, role, body, server_ms FROM commits WHERE folder_pk = ? AND seq > ? AND seq <= ? ORDER BY seq, role DESC",
     )
     .bind(row.pk)
     .bind(i64_of(after))
@@ -836,7 +1021,7 @@ pub async fn delta(
     .fetch_all(&mut *conn)
     .await?;
     let mut commits = Vec::with_capacity(rows.len());
-    for (seq, role, body) in rows {
+    for (seq, role, body, server_ms) in rows {
         commits.push(DeltaCommit {
             sequence: u64_of(seq),
             role: if role == "side" {
@@ -845,6 +1030,8 @@ pub async fn delta(
                 CommitRole::Head
             },
             commit: Blob(body),
+            // Dropped when the commit expires (ADR 0001, section 5).
+            server_ms: server_ms.map(u64_of),
         });
     }
     Ok(DeltaPage {

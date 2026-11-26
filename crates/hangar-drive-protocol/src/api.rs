@@ -640,24 +640,47 @@ pub struct UploadResponse {
     pub stored: bool,
 }
 
-/// Object IDs a commit adds and drops relative to its first parent, in the clear, for
-/// retention and garbage collection.
+/// Object IDs a commit adds and drops, in the clear, for retention and garbage collection.
+///
+/// The signed commit carries a digest of this delta and its mode (ADR 0001, amendment
+/// "reference deltas bound to the tree"): a diff relative to the first parent's tree (a side
+/// commit's base), or a full delta that lists every reachable object as added and drops
+/// nothing. Both lists are strictly ascending, so the digest has one spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceDelta {
-    /// Objects reachable now that were not from the first parent.
+    /// Objects reachable now that were not from the first parent (full: every reachable one).
     pub added: Vec<ObjectId>,
-    /// Objects reachable from the first parent that are not now.
+    /// Objects reachable from the first parent that are not now (full: empty).
     pub dropped: Vec<ObjectId>,
 }
 
 impl ReferenceDelta {
-    /// Counts, duplicates, and no ID both added and dropped.
+    /// Counts, both lists strictly ascending (so no duplicates), and no ID both added and
+    /// dropped.
     pub fn validate(&self) -> Result<(), RequestError> {
         if self.added.len().saturating_add(self.dropped.len()) > MAX_REFERENCE_DELTA_IDS {
             return Err(RequestError::TooMany);
         }
-        unique(self.added.iter().chain(self.dropped.iter()))
+        for list in [&self.added, &self.dropped] {
+            if list.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(RequestError::Invalid);
+            }
+        }
+        // Both lists are sorted: one merge walk finds an ID in both without a set.
+        let (mut a, mut d) = (self.added.iter().peekable(), self.dropped.iter().peekable());
+        while let (Some(x), Some(y)) = (a.peek(), d.peek()) {
+            match x.cmp(y) {
+                std::cmp::Ordering::Less => {
+                    a.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    d.next();
+                }
+                std::cmp::Ordering::Equal => return Err(RequestError::Duplicate),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -724,6 +747,12 @@ pub struct DeltaCommit {
     pub role: CommitRole,
     /// The commit's wire bytes.
     pub commit: Blob,
+    /// When the server accepted the call (Unix ms), unsigned; absent once the commit expired
+    /// and the server dropped its time (ADR 0001, section 5). A device uses it only to tell
+    /// whether a tree it cannot read may already have left the retention window (amendment
+    /// "reference deltas bound to the tree"), a decision the server controls anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ms: Option<u64>,
 }
 
 /// Commits after a folder cursor, in sequence order.
@@ -911,6 +940,12 @@ pub enum ErrorCode {
     /// A reference delta names objects the server does not hold; [`ErrorBody::missing`] lists
     /// some.
     MissingObjects,
+    /// A diff reference delta does not fit the server's live set of the parent: it adds an
+    /// object that is live already, drops one that is not, or leaves the new root out of the
+    /// live set. [`ErrorBody::missing`] lists some of those IDs. The device publishes the
+    /// same tree again with a full delta, which resets the live set (ADR 0001, amendment
+    /// "reference deltas bound to the tree").
+    DeltaMismatch,
     /// The folder is retired.
     FolderRetired,
     /// The upload would exceed the account quota.
@@ -938,6 +973,7 @@ impl ErrorCode {
             | ErrorCode::LogEntryRefused
             | ErrorCode::CommitRefused
             | ErrorCode::MissingObjects => 400,
+            ErrorCode::DeltaMismatch => 409,
             ErrorCode::Unauthorized | ErrorCode::ChallengeInvalid | ErrorCode::ProofInvalid => 401,
             ErrorCode::Forbidden | ErrorCode::InviteInvalid | ErrorCode::DeviceRemoved => 403,
             ErrorCode::NotFound => 404,
@@ -962,7 +998,8 @@ pub struct ErrorBody {
     /// With [`ErrorCode::HeadMoved`]: the current head (`None`: the folder has none yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_head: Option<CommitId>,
-    /// With [`ErrorCode::MissingObjects`]: some of the missing IDs.
+    /// With [`ErrorCode::MissingObjects`]: some of the missing IDs. With
+    /// [`ErrorCode::DeltaMismatch`]: some of the IDs that do not fit the live set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<ObjectId>,
     /// With [`ErrorCode::DeviceRemoved`], only as the answer to the proof: the device log
@@ -1092,7 +1129,16 @@ mod tests {
                 dropped: vec![],
             },
         });
-        assert_eq!(side.validate(), Err(RequestError::Duplicate));
+        // An ID twice in one list is out of the strict order the delta digest needs.
+        assert_eq!(side.validate(), Err(RequestError::Invalid));
+        let mut unsorted = request.clone();
+        unsorted.head.delta.added = vec![ObjectId::from_bytes([2; 32]), id];
+        assert_eq!(unsorted.validate(), Err(RequestError::Invalid));
+        let mut sorted = request.clone();
+        sorted.head.delta.added = vec![id, ObjectId::from_bytes([2; 32])];
+        sorted.head.delta.dropped = vec![ObjectId::from_bytes([0; 32])];
+        assert_eq!(sorted.validate(), Ok(()));
+        assert_eq!(ErrorCode::DeltaMismatch.http_status(), 409);
     }
 
     #[test]

@@ -5,13 +5,13 @@
 //! | Invite | `https://<server>[/<base>]/join#<invite>` | the server address, the invite token, optionally the server ID and the SPKI pin |
 //! | Invite, deep link | `hangar-drive://join#<invite>@<server URL>` | the same; the server's `/join` page opens it |
 //! | Pairing | `hangar-drive://pair#<offer>` | the signed pairing offer, base64url |
-//! | Recovery | `hangar-drive://recover#<sheet>` | the recovery sheet's server address, server ID and account ID, never the code |
+//! | Recovery | `hangar-drive://recover#<sheet>` | the recovery sheet's server address, server ID, account ID, genesis anchor and anchor tag, never the code |
 //!
 //! `<invite>` is `<token>[.<server ID>[.<pin>]]`: the 16 byte token in base64url (22
 //! characters), the server ID in lowercase hex (32), the SHA-256 of the server's
 //! SubjectPublicKeyInfo in base64url (43). `<sheet>` is base64url of the recovery sheet's bytes,
-//! version 2 (`hangar_drive_crypto::recovery::RecoverySheet`: account ID, server ID, the genesis
-//! anchor, the optional SPKI pin and the server URL).
+//! version 3 (`hangar_drive_crypto::recovery::RecoverySheet`: account ID, server ID, the genesis
+//! anchor, the code's anchor tag over both, the optional SPKI pin and the server URL).
 //!
 //! Every parser is strict: surrounding white space is trimmed and nothing else is forgiven.
 //! No query, no user info, no white space or second `#` inside, canonical base64url and hex
@@ -343,15 +343,17 @@ mod tests {
                 account: AccountId::from_bytes([0xac; 16]),
                 genesis: LogHash::from_bytes([0x61; 32]),
                 pin,
+                anchor_tag: [0x7a; 16],
             };
             let link = recovery_link(&sheet);
             assert!(link.starts_with("hangar-drive://recover#"));
             assert_eq!(parse_recovery_link(&link).unwrap(), sheet);
         }
-        let mut bytes = vec![2u8];
+        let mut bytes = vec![3u8];
         bytes.extend_from_slice(&[0xac; 16]);
         bytes.extend_from_slice(&[0x5e; 16]);
         bytes.extend_from_slice(&[0x61; 32]);
+        bytes.extend_from_slice(&[0x7a; 16]);
         bytes.push(0);
         let link = |b: &[u8]| format!("hangar-drive://recover#{}", base64url(b));
         let mut insecure = bytes.clone();
@@ -360,11 +362,14 @@ mod tests {
             parse_recovery_link(&link(&insecure)),
             Err(LinkError::Insecure)
         );
-        // Version 1, without the genesis anchor, and a short payload.
-        let mut old = bytes.clone();
-        old[0] = 1;
-        old.extend_from_slice(b"https://drive.example.org/");
-        assert_eq!(parse_recovery_link(&link(&old)), Err(LinkError::Malformed));
+        // Version 1, without the genesis anchor, version 2, without the anchor tag, and a short
+        // payload.
+        for version in [1, 2] {
+            let mut old = bytes.clone();
+            old[0] = version;
+            old.extend_from_slice(b"https://drive.example.org/");
+            assert_eq!(parse_recovery_link(&link(&old)), Err(LinkError::Malformed));
+        }
         assert_eq!(
             parse_recovery_link(&link(&bytes[..33])),
             Err(LinkError::Malformed)

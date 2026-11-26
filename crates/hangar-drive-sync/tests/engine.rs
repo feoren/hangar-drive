@@ -480,17 +480,168 @@ fn a_sheet_with_another_genesis_is_refused() {
         sheet.server,
         ServerId::from_hex(&code.sheet.server_id).unwrap()
     );
-    // The same code with another anchor: the log does not start there.
+    // Another anchor with the sheet's tag: the code does not vouch for it, and nothing is sent.
     let mut forged = sheet.clone();
     forged.genesis = LogHash::from_bytes([0x42; 32]);
     let mut c = core(&shared, &disks, &clock, 22);
     let text = code.groups.join("-");
+    let calls = shared.borrow().calls;
+    assert_eq!(
+        c.recover_account(&recovery_link(&forged), &text, "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::WrongSheet)
+    );
+    assert_eq!(shared.borrow().calls, calls);
+    // Another anchor that the code does vouch for: the server's log does not start there (N1).
+    let typed = hangar_drive_crypto::recovery::RecoveryCode::parse(&text).unwrap();
+    forged.anchor_tag = typed.anchor_tag(&forged.account, &forged.genesis).unwrap();
     assert_eq!(
         c.recover_account(&recovery_link(&forged), &text, "Neu")
             .unwrap(),
         ApiResult::Err(RecoverError::Unknown)
     );
     // With the real sheet it works.
+    assert_eq!(
+        c.recover_account(&code.sheet.link, &text, "Neu").unwrap(),
+        ApiResult::Ok(())
+    );
+}
+
+/// Security review "recovery link as phishing": whoever knows the account's log (the server's
+/// operator, a copy of its database) builds an account of their own with the same account ID and
+/// their own entry 1, lists the code's recovery device in it (public keys and proof of
+/// possession copied from the real log), wraps an epoch secret they hold to its KEM key and sends
+/// a recovery link to their server. The sheet's anchor tag, which only the code makes, stops it
+/// before anything is sent; without it the real code would pass every other check there.
+#[test]
+fn a_forged_account_that_lists_the_recovery_device_cannot_take_the_code() {
+    use hangar_drive_crypto::devicelog::{EntryKind as LogKind, LogEntry};
+    use hangar_drive_crypto::recovery::{RecoveryCode, RecoverySheet};
+    use hangar_drive_sync::account::{Account, Genesis};
+    use hangar_drive_sync::api::RecoverError;
+    use hangar_drive_sync::links::{parse_recovery_link, recovery_link};
+    use hangar_drive_sync::recovery::{add_device_with_code, RecoveryError};
+
+    let real = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&real, &disks, &clock, 31);
+    let code = set_up(&mut a);
+    let text = code.groups.join("-");
+    let real_sheet = parse_recovery_link(&code.sheet.link).unwrap();
+
+    // What the attacker reads from the real log: entry 1 with the recovery device and its proof.
+    let page = MemServer::connect(&real, DeviceId::from_bytes([0; 16]))
+        .log(0)
+        .unwrap();
+    let LogKind::Create { devices } = LogEntry::decode(page.entries[0].as_bytes()).unwrap().kind
+    else {
+        panic!("entry 1 creates the account");
+    };
+    let recovery_device = devices.into_iter().find(|d| d.recovery).unwrap();
+
+    // The attacker's account on their own server: the same account ID, their own entry 1 and
+    // device, an epoch secret they hold, and the recovery device added with that secret wrapped
+    // to its KEM key.
+    let evil = MemServer::new_shared();
+    let mut entropy = SeededRandom::new(666);
+    let mut keychain = MemKeychain::default();
+    let mut store = MemStore::new();
+    let attacker = DeviceId::from_bytes([0xe1; 16]);
+    let genesis = Genesis::new(&mut entropy, 1, real_sheet.account, attacker, None).unwrap();
+    let evil_genesis = genesis.hash().unwrap();
+    assert_ne!(evil_genesis, real_sheet.genesis);
+    let mut server = MemServer::connect(&evil, attacker);
+    let mut account = Account::create_from(
+        &mut server,
+        &mut keychain,
+        &mut store,
+        InviteToken::from_bytes([9; 16]),
+        &genesis,
+        "Attacker",
+    )
+    .unwrap();
+    account
+        .finish_setup(&mut server, &mut keychain, &mut store, &mut entropy, 2)
+        .unwrap();
+    account
+        .add_recovery_device(&mut server, &mut store, recovery_device, 3, &mut entropy)
+        .unwrap();
+    let listed = evil
+        .borrow()
+        .account_state()
+        .unwrap()
+        .device(&recovery_device.id)
+        .cloned();
+    assert!(listed.is_some_and(|d| d.recovery && d.is_current()));
+
+    // The phishing link: the attacker's genesis, everything else as on the real sheet. The tag
+    // can only be the real sheet's one (or a guess); it does not cover this genesis.
+    let phishing = RecoverySheet {
+        genesis: evil_genesis,
+        ..real_sheet.clone()
+    };
+    let mut victim = core(&evil, &disks, &clock, 32);
+    let calls = evil.borrow().calls;
+    let log_length = evil.borrow().account_state().unwrap().len();
+    assert_eq!(
+        victim
+            .recover_account(&recovery_link(&phishing), &text, "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::WrongSheet)
+    );
+    // Refused before the recovery device signed in anywhere: the attacker's server saw nothing.
+    assert_eq!(evil.borrow().calls, calls);
+    assert_eq!(evil.borrow().account_state().unwrap().len(), log_length);
+    assert!(victim.list_devices().is_err(), "no account on the victim");
+    // The engine's recovery step refuses it on its own as well.
+    let typed = RecoveryCode::parse(&text).unwrap();
+    let mut session = MemServer::connect(&evil, typed.device_id().unwrap());
+    let joiner = hangar_drive_crypto::identity::DeviceIdentity::generate(
+        &mut hangar_drive_crypto::entropy::OsEntropy,
+    )
+    .unwrap();
+    let joiner = hangar_drive_crypto::devicelog::LogDevice::of(
+        &joiner,
+        &real_sheet.account,
+        DeviceId::from_bytes([0xe2; 16]),
+        false,
+    );
+    assert_eq!(
+        add_device_with_code(
+            &mut session,
+            &phishing,
+            &typed,
+            joiner,
+            4,
+            &mut hangar_drive_crypto::entropy::OsEntropy,
+        ),
+        Err(RecoveryError::WrongSheet)
+    );
+    assert_eq!(evil.borrow().calls, calls);
+
+    // Only the code holder can make the tag for the attacker's genesis. Made here, it shows that
+    // the tag is what stops the attack: every other check passes on the attacker's server, and
+    // the new device would join an account whose epoch secret the attacker holds.
+    let vouched = RecoverySheet::new(
+        phishing.server_url.clone(),
+        phishing.server,
+        phishing.account,
+        evil_genesis,
+        phishing.pin,
+        &typed,
+    )
+    .unwrap();
+    let mut fooled = core(&evil, &disks, &clock, 33);
+    assert_eq!(
+        fooled
+            .recover_account(&recovery_link(&vouched), &text, "Neu")
+            .unwrap(),
+        ApiResult::Ok(())
+    );
+
+    // The real sheet with the same code works on the real server.
+    let mut c = core(&real, &disks, &clock, 34);
     assert_eq!(
         c.recover_account(&code.sheet.link, &text, "Neu").unwrap(),
         ApiResult::Ok(())
@@ -516,10 +667,24 @@ fn a_renewed_code_replaces_the_old_one_after_the_group_check() {
     // Shown, then abandoned: the old code still works.
     let abandoned = a.renew_recovery_code().unwrap();
     assert_ne!(abandoned.groups, old.groups);
+    // The sheet names the same account, server and anchor; its link differs only in the anchor
+    // tag, which each code makes for itself.
     assert_eq!(
-        abandoned.sheet.link, old.sheet.link,
+        (
+            &abandoned.sheet.server_url,
+            &abandoned.sheet.server_id,
+            &abandoned.sheet.account_id,
+            &abandoned.sheet.genesis_anchor
+        ),
+        (
+            &old.sheet.server_url,
+            &old.sheet.server_id,
+            &old.sheet.account_id,
+            &old.sheet.genesis_anchor
+        ),
         "the sheet's public part stays"
     );
+    assert_ne!(abandoned.sheet.link, old.sheet.link);
     assert!(!a.confirm_recovery_group("0000").unwrap());
 
     let renewed = a.renew_recovery_code().unwrap();
@@ -537,6 +702,12 @@ fn a_renewed_code_replaces_the_old_one_after_the_group_check() {
         c.recover_account(&abandoned.sheet.link, &abandoned.groups.join(""), "Neu")
             .unwrap(),
         ApiResult::Err(RecoverError::Unknown)
+    );
+    // The new code with the old sheet's link: the link was not made for it.
+    assert_eq!(
+        c.recover_account(&old.sheet.link, &renewed.groups.join(""), "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::WrongSheet)
     );
     assert_eq!(
         c.recover_account(&renewed.sheet.link, &renewed.groups.join(""), "Neu")

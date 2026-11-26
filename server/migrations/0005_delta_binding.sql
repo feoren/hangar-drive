@@ -1,0 +1,12 @@
+-- Reference deltas bound to the tree (security review 2026-11-26, finding HIGH, with LOW 1 of
+-- the same file). sqlx records applied migrations, so this file runs once per database; SQLite
+-- has no ADD COLUMN IF NOT EXISTS, as in 0002 to 0004.
+--
+-- The burst signal measured the dropped bytes of the rolling hour only against the folder's live
+-- file data just before each change. A compromised device could dilute it: add garbage first,
+-- then drop every real file, and the garbage kept the share below the threshold. Every head
+-- commit now records an event, also one that drops nothing, with the folder's live file data
+-- before the change, and the share is measured against the window's starting size as well
+-- (service/commits.rs, `detect_burst_from`). Rows from before this migration carry 0, which the
+-- check ignores; they leave the rolling hour within an hour anyway.
+ALTER TABLE drop_events ADD COLUMN live_before INTEGER NOT NULL DEFAULT 0;

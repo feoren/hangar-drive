@@ -16,6 +16,8 @@ pub const MAX_MISSING_LISTED: usize = 64;
 pub struct ApiError {
     pub code: ErrorCode,
     pub current_head: Option<CommitId>,
+    /// With `missing_objects`: the missing IDs; with `delta_mismatch`: the IDs of the diff that
+    /// do not fit the server's live set (the protocol's one list for both).
     pub missing: Vec<ObjectId>,
     /// With `device_removed`: the device log up to the removal (security review H2).
     pub removal_log: Option<LogPage>,
@@ -54,6 +56,15 @@ impl ApiError {
         Self {
             missing: ids,
             ..Self::new(ErrorCode::MissingObjects)
+        }
+    }
+
+    /// `delta_mismatch` with some of the IDs that do not fit the live set.
+    pub fn delta_mismatch(mut ids: Vec<ObjectId>) -> Self {
+        ids.truncate(MAX_MISSING_LISTED);
+        Self {
+            missing: ids,
+            ..Self::new(ErrorCode::DeltaMismatch)
         }
     }
 

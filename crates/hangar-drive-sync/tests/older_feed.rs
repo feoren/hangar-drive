@@ -271,6 +271,7 @@ fn inspect_link_names_a_punycode_host_of_an_offer_and_a_sheet() {
         account: AccountId::from_bytes([2; 16]),
         genesis: LogHash::from_bytes([3; 32]),
         pin: None,
+        anchor_tag: [4; 16],
     });
     assert!(matches!(
         b.inspect_link(&sheet),

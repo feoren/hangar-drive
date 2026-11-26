@@ -86,6 +86,7 @@ export const SCENARIOS = [
   { id: "updateOff", label: "Update required, updates off" },
   { id: "refused", label: "Server refuses this device" },
   { id: "suspect", label: "Suspected ransomware" },
+  { id: "suspectElsewhere", label: "Suspected ransomware, folder not here" },
   { id: "removedHeads", label: "Changes from a removed device" },
   { id: "removedHeadsMany", label: "Changes from two removed devices" },
   { id: "deepLinkInvite", label: "Setup opened by an invite link" },
@@ -194,7 +195,7 @@ const warn = {
     folderId: "f-main",
     folderName: "Hangar Drive",
   }),
-  suspect: (): Warning => ({
+  suspect: (now: Millis): Extract<Warning, { kind: "suspect" }> => ({
     kind: "suspect",
     id: "w-suspect",
     deviceId: "d-office",
@@ -203,6 +204,8 @@ const warn = {
     folderName: "Hangar Drive",
     entryId: "t4",
     days: 30,
+    until: now + 90 * fx.DAY,
+    lapsed: false,
   }),
 };
 
@@ -265,8 +268,11 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
     case "storage":
       state.storage = { used: 86_400_000_000, quota: 100_000_000_000 };
       state.notices = [
+        { kind: "quota" },
         { kind: "retained" },
         { kind: "budgetDevice", device: fx.OTHER_DEVICE },
+        { kind: "budgetAccount" },
+        { kind: "serverDisk" },
         { kind: "minCount", days: 14 },
       ];
       break;
@@ -343,7 +349,20 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
       state.warnings = [{ kind: "refused", id: "w-refused" }];
       break;
     case "suspect":
-      state.warnings = [warn.suspect()];
+      state.warnings = [warn.suspect(now)];
+      break;
+    case "suspectElsewhere":
+      // A folder not synced here, its pin lapsed under the pin cap: the device is unknown.
+      state.warnings = [
+        {
+          ...warn.suspect(now),
+          deviceId: "",
+          deviceName: "",
+          folderId: "f-elsewhere",
+          folderName: "Fotos",
+          lapsed: true,
+        },
+      ];
       break;
     case "removedHeads":
       removedHeadsState(state, [fx.REMOVED_DEVICE]);

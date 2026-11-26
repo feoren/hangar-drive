@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hangar_drive_crypto::commit::{ChainEntry, Commit, CommitContent, SignedCommit};
+use hangar_drive_crypto::commit::{ChainEntry, Commit, CommitContent, DeltaDigest, SignedCommit};
 use hangar_drive_crypto::devicelog::{AccountState, EntryKind, LogDevice};
 use hangar_drive_crypto::epoch::{self, AccountSecret};
 use hangar_drive_crypto::identity::DeviceIdentity;
@@ -276,9 +276,26 @@ pub async fn raw(
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
+    // A server that refuses early (413 on a body above the limit) answers and closes before the
+    // whole body is sent. The body therefore goes out while the answer is read: a read that
+    // waited for the write would find the answer discarded by the reset that the rest of the
+    // body causes (Windows drops received data on a reset), and the write itself may be aborted
+    // (WSAECONNABORTED). Whatever answer arrived is the result.
+    let (mut reader, mut writer) = stream.into_split();
+    let body = body.to_vec();
+    let sender = tokio::spawn(async move {
+        let _ = writer.write_all(&body).await;
+        writer
+    });
     let mut reply = Vec::new();
-    stream.read_to_end(&mut reply).await.unwrap();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+        }
+    }
+    let _ = sender.await;
     let split = reply
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -661,14 +678,68 @@ impl Folder {
         })
     }
 
-    /// The next normal commit by `device` (first commit if there is no head).
+    /// The next normal commit by `device` (first commit if there is no head) with an empty
+    /// delta.
     pub fn next(&self, account: &Account, device: &mut Device) -> SignedCommit {
-        let content = CommitContent {
-            root: ObjectId::from_bytes(random()),
+        self.next_with(account, device, &[], &[])
+    }
+
+    /// The content of a commit with the diff `added`, `dropped` (ADR 0001, amendment "reference
+    /// deltas bound to the tree"): its delta digest, and a root that is live after the diff, the
+    /// head's root unless the diff drops it, else the first added object (the server sees no
+    /// tree, so any live object stands for the root).
+    pub fn content(
+        &self,
+        account: &Account,
+        device: &mut Device,
+        added: &[&Obj],
+        dropped: &[&Obj],
+    ) -> CommitContent {
+        let (added, dropped) = (sorted(added), sorted(dropped));
+        let root = self
+            .head
+            .as_ref()
+            .map(|(c, _)| c.commit.root)
+            .filter(|r| !dropped.contains(r))
+            .or_else(|| added.first().copied())
+            .unwrap_or_else(|| ObjectId::from_bytes(random()));
+        CommitContent {
+            root,
             generation: Generation(1),
             device: device.id,
             log_head: account.head(),
             counter: device.next_counter(),
+            delta: DeltaDigest::of(false, &added, &dropped).unwrap(),
+        }
+    }
+
+    /// The next normal commit by `device` with the diff `added`, `dropped`.
+    pub fn next_with(
+        &self,
+        account: &Account,
+        device: &mut Device,
+        added: &[&Obj],
+        dropped: &[&Obj],
+    ) -> SignedCommit {
+        let content = self.content(account, device, added, dropped);
+        let commit = match self.entry() {
+            None => Commit::first(account.id, self.id, content),
+            Some(entry) => Commit::on(account.id, self.id, &entry, content),
+        };
+        commit.sign(&device.identity).unwrap()
+    }
+
+    /// The next normal commit by `device` that adds `ids` (ascending), its root the first.
+    pub fn next_adding(
+        &self,
+        account: &Account,
+        device: &mut Device,
+        ids: &[ObjectId],
+    ) -> SignedCommit {
+        let content = CommitContent {
+            root: ids[0],
+            delta: DeltaDigest::of(false, ids, &[]).unwrap(),
+            ..self.content(account, device, &[], &[])
         };
         let commit = match self.entry() {
             None => Commit::first(account.id, self.id, content),
@@ -688,8 +759,8 @@ impl Folder {
             head: CommitUpload {
                 commit: Blob(commit.wire.clone()),
                 delta: ReferenceDelta {
-                    added: added.iter().map(|o| o.id).collect(),
-                    dropped: dropped.iter().map(|o| o.id).collect(),
+                    added: sorted(added),
+                    dropped: sorted(dropped),
                 },
             },
             side: None,
@@ -709,25 +780,23 @@ impl Folder {
         added: &[&Obj],
         dropped: &[&Obj],
     ) -> Reply {
-        let content = |device: &mut Device| CommitContent {
+        let side_content = CommitContent {
             root: ObjectId::from_bytes(random()),
-            generation: Generation(1),
-            device: device.id,
-            log_head: account.head(),
-            counter: device.next_counter(),
+            ..self.content(account, device, side_added, &[])
         };
-        let side = Commit::side(account.id, self.id, base, content(device))
+        let side = Commit::side(account.id, self.id, base, side_content)
             .sign(&device.identity)
             .unwrap();
         let head = self.entry().expect("a merge needs a head");
-        let merge = Commit::merge(account.id, self.id, &head, &side, content(device))
+        let merge_content = self.content(account, device, added, dropped);
+        let merge = Commit::merge(account.id, self.id, &head, &side, merge_content)
             .sign(&device.identity)
             .unwrap();
         let mut request = self.request(&merge, added, dropped);
         request.side = Some(CommitUpload {
             commit: Blob(side.wire.clone()),
             delta: ReferenceDelta {
-                added: side_added.iter().map(|o| o.id).collect(),
+                added: sorted(side_added),
                 dropped: Vec::new(),
             },
         });
@@ -748,8 +817,21 @@ impl Folder {
         added: &[&Obj],
         dropped: &[&Obj],
     ) -> Reply {
-        let commit = self.next(account, device);
-        let request = self.request(&commit, added, dropped);
+        // A diff that leaves no live root (it drops the head's root and adds nothing) gets a new
+        // directory node as its root, as a real tree would.
+        let fresh_root;
+        let mut added: Vec<&Obj> = added.to_vec();
+        let keeps_root = self
+            .head
+            .as_ref()
+            .is_some_and(|(c, _)| !dropped.iter().any(|o| o.id == c.commit.root));
+        if !keeps_root && added.is_empty() {
+            fresh_root = Obj::new(ObjectType::DirectoryNode, 1);
+            upload(client, &self.id, &fresh_root).await;
+            added.push(&fresh_root);
+        }
+        let commit = self.next_with(account, device, &added, dropped);
+        let request = self.request(&commit, &added, dropped);
         let reply = client.post(&commit_path(&self.id), &request).await;
         if reply.status == 200 {
             let response: CommitResponse = reply.json();
@@ -757,6 +839,13 @@ impl Folder {
         }
         reply
     }
+}
+
+/// The IDs of `objects` in ascending order, as a reference delta lists them.
+pub fn sorted(objects: &[&Obj]) -> Vec<ObjectId> {
+    let mut ids: Vec<ObjectId> = objects.iter().map(|o| o.id).collect();
+    ids.sort();
+    ids
 }
 
 /// The feed entries after `after`.

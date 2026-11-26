@@ -17,7 +17,7 @@ use hangar_drive_protocol::name::{
 use hangar_drive_protocol::object::{EntryFlags, EntryKind, ObjectType};
 use zeroize::Zeroizing;
 
-use crate::commit::{ChainEntry, Commit, CommitContent, SignedCommit};
+use crate::commit::{ChainEntry, Commit, CommitContent, DeltaDigest, SignedCommit};
 use crate::device_names::{seal_device_names, DeviceName, DeviceNameList};
 use crate::devicelog::{AccountState, EntryKind as LogKind, LogDevice};
 use crate::entropy::FixedEntropy;
@@ -307,14 +307,19 @@ fn compute() -> BTreeMap<String, String> {
 
     // Commits: the first commit, a re-anchor commit on it, a side commit on it and the merge of
     // the re-anchor commit (as the server head) with the side commit.
-    let content = |counter| CommitContent {
+    // Flags bit 2 marks a full delta; the side commit's diff adds two objects and drops one.
+    let content = |counter, delta| CommitContent {
         root,
         generation: G1,
         device,
         log_head: head,
         counter,
+        delta,
     };
-    let first = Commit::first(account, folder, content(1))
+    let digest = |full, added: &[ObjectId], dropped: &[ObjectId]| {
+        DeltaDigest::of(full, added, dropped).unwrap()
+    };
+    let first = Commit::first(account, folder, content(1, digest(false, &[root], &[])))
         .sign(&identity)
         .unwrap();
     put("commit.first_id", hex(first.id.as_bytes()));
@@ -326,12 +331,23 @@ fn compute() -> BTreeMap<String, String> {
         generation: G1,
         log_index: 2,
     };
-    let reanchor = Commit::reanchor(account, folder, &base, content(2))
-        .sign(&identity)
-        .unwrap();
+    let reanchor = Commit::reanchor(
+        account,
+        folder,
+        &base,
+        content(2, digest(true, &[root], &[])),
+    )
+    .sign(&identity)
+    .unwrap();
     put("commit.reanchor_id", hex(reanchor.id.as_bytes()));
     put("commit.reanchor_wire", hex(&reanchor.wire));
-    let side = Commit::side(account, folder, &base, content(3))
+    let side_added = [
+        ObjectId::from_bytes([0x11; 32]),
+        ObjectId::from_bytes([0xee; 32]),
+    ];
+    let side_digest = digest(false, &side_added, &[root]);
+    put("commit.side_delta_digest", hex(&side_digest.hash));
+    let side = Commit::side(account, folder, &base, content(3, side_digest))
         .sign(&identity)
         .unwrap();
     put("commit.side_id", hex(side.id.as_bytes()));
@@ -343,9 +359,15 @@ fn compute() -> BTreeMap<String, String> {
         generation: G1,
         log_index: 2,
     };
-    let merge = Commit::merge(account, folder, &server_head, &side, content(4))
-        .sign(&identity)
-        .unwrap();
+    let merge = Commit::merge(
+        account,
+        folder,
+        &server_head,
+        &side,
+        content(4, digest(false, &[], &[])),
+    )
+    .sign(&identity)
+    .unwrap();
     put("commit.merge_id", hex(merge.id.as_bytes()));
     put("commit.merge_wire", hex(&merge.wire));
     put(
@@ -432,14 +454,18 @@ fn compute() -> BTreeMap<String, String> {
     put("recovery.sign_public", hex(recovery.sign.as_bytes()));
     put("recovery.kem_public", hex(recovery.kem.as_bytes()));
     put("recovery.device_id", code.device_id().unwrap().to_hex());
-    // The recovery sheet (version 2): anchored at the create entry, with and without a pin.
-    let sheet = RecoverySheet {
-        server_url: parse_server_url("https://drive.example").unwrap(),
+    // The recovery sheet (version 3): anchored at the create entry and bound to the code by its
+    // anchor tag, with and without a pin.
+    let sheet = RecoverySheet::new(
+        parse_server_url("https://drive.example").unwrap(),
         server,
         account,
-        genesis: create_head.hash,
-        pin: Some(array(0xf0)),
-    };
+        create_head.hash,
+        Some(array(0xf0)),
+        &code,
+    )
+    .unwrap();
+    put("recovery.anchor_tag", hex(&sheet.anchor_tag));
     put("recovery.sheet", hex(&sheet.encode()));
     let plain = RecoverySheet { pin: None, ..sheet };
     put("recovery.sheet_unpinned", hex(&plain.encode()));
@@ -566,8 +592,17 @@ fn the_vectors_open_and_verify() {
     first.verify_signer(&state, &folder).unwrap();
     let reanchor = SignedCommit::decode(&unhex("commit.reanchor_wire")).unwrap();
     assert!(reanchor.commit.reanchor);
+    assert!(reanchor.commit.delta.full);
+    let root = ObjectId::from_bytes(unhex("object.root_id").try_into().unwrap());
+    assert_eq!(reanchor.check_delta(&[root], &[]), Ok(()));
     let side = SignedCommit::decode(&unhex("commit.side_wire")).unwrap();
     assert!(side.commit.side);
+    let side_added = [
+        ObjectId::from_bytes([0x11; 32]),
+        ObjectId::from_bytes([0xee; 32]),
+    ];
+    assert_eq!(side.check_delta(&side_added, &[root]), Ok(()));
+    assert!(side.check_delta(&side_added, &[]).is_err());
     side.verify_signer(&state, &folder).unwrap();
     let merge = SignedCommit::decode(&unhex("commit.merge_wire")).unwrap();
     assert_eq!(merge.commit.parents, vec![reanchor.id, side.id]);

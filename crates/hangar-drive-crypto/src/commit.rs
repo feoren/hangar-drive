@@ -8,8 +8,11 @@
 //!        || field(height, u64) || field(parents: count (u8) || count x commit id)
 //!        || field(root directory node id) || field(generation, u32) || field(device)
 //!        || field(log head index, u64) || field(log head hash) || field(counter, u64)
-//!        || field(flags, u32; bit 0: re-anchor, bit 1: side commit)
+//!        || field(flags, u32; bit 0: re-anchor, bit 1: side commit, bit 2: full delta)
+//!        || field(delta digest, 32 bytes)
 //!        || field(seen: count (u8) || count x (device (16) || commit id (32)))
+//! delta digest = SHA-256( field("hangar-drive/v1/commit-delta") || field(mode, u8: 0 diff, 1 full)
+//!                || field(added ids, ascending) || field(dropped ids, ascending) )
 //! commit id = SHA-256( field("hangar-drive/v1/commit-id") || body )
 //! wire      = body || Ed25519 signature of the device over field("hangar-drive/v1/commit-sig") || body
 //! ```
@@ -23,6 +26,24 @@
 //! - bit 1, the side commit mark: set on every side commit and on nothing else, inside the
 //!   signed body, so a server can neither present a side commit as a head nor a head as a side
 //!   commit. A side commit has exactly one parent and no re-anchor bit.
+//! - bit 2, the full delta mark: the commit's reference delta lists every object reachable from
+//!   its tree as added and nothing as dropped, and the server takes that list as the folder's
+//!   live set ([`DeltaDigest`]). Never on a side commit.
+//!
+//! # Reference delta binding
+//!
+//! The delta digest binds the signer to the reference delta it uploads (ADR 0001, amendment
+//! "reference deltas bound to the tree"). The server checks the uploaded delta against it
+//! ([`SignedCommit::check_delta`]), and every device that verifies the commit recomputes the
+//! delta from the trees and compares the digest, so a delta that does not match the tree is a
+//! refused commit on every honest device, like a bad signature.
+//!
+//! - **diff** (mode 0): `added = reachable(tree) \ reachable(first parent's tree)` and
+//!   `dropped = reachable(first parent's tree) \ reachable(tree)`; for a first commit the
+//!   parent's set is empty, for a side commit the parent is its base, for a merge commit the
+//!   current server head (its first parent).
+//! - **full** (mode 1): `added = reachable(tree)`, `dropped` empty. Re-anchors, barriers and the
+//!   repair of a server view that no longer matches the tree use it.
 //!
 //! The first commit of a folder has no parent and height 1; every other commit's height is one
 //! more than the highest height of its parents.
@@ -103,12 +124,13 @@ use hangar_drive_protocol::ids::{
 use thiserror::Error;
 
 use crate::devicelog::AccountState;
-use crate::encoding::{sha256, Reader, Writer};
+use crate::encoding::{length_prefix, sha256, Reader, Writer};
 use crate::identity::{verify, DeviceIdentity};
 
 const LABEL_COMMIT: &[u8] = b"hangar-drive/v1/commit";
 const LABEL_COMMIT_ID: &[u8] = b"hangar-drive/v1/commit-id";
 const LABEL_COMMIT_SIG: &[u8] = b"hangar-drive/v1/commit-sig";
+const LABEL_COMMIT_DELTA: &[u8] = b"hangar-drive/v1/commit-delta";
 const COMMIT_VERSION: u8 = 1;
 /// Parents the format can hold.
 pub const FORMAT_MAX_PARENTS: usize = 8;
@@ -121,7 +143,9 @@ const SIGNATURE_LEN: usize = 64;
 const FLAG_REANCHOR: u32 = 1;
 /// `flags` bit 1 of a commit: a side commit.
 const FLAG_SIDE: u32 = 1 << 1;
-const FLAGS_KNOWN: u32 = FLAG_REANCHOR | FLAG_SIDE;
+/// `flags` bit 2 of a commit: a full reference delta.
+const FLAG_FULL_DELTA: u32 = 1 << 2;
+const FLAGS_KNOWN: u32 = FLAG_REANCHOR | FLAG_SIDE | FLAG_FULL_DELTA;
 
 /// Why a commit was refused on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -177,6 +201,71 @@ pub enum CommitError {
     /// The signature does not verify.
     #[error("the commit's signature does not verify")]
     Signature,
+    /// The reference delta does not match the commit's delta digest, is not in ascending order,
+    /// or a full delta drops something.
+    #[error("the reference delta does not match the commit")]
+    DeltaMismatch,
+}
+
+/// The digest of a commit's reference delta (module docs, "Reference delta binding").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeltaDigest {
+    /// Mode 1: the delta lists the whole reachable set as added.
+    pub full: bool,
+    /// SHA-256 over the mode and both lists.
+    pub hash: [u8; 32],
+}
+
+impl DeltaDigest {
+    /// The digest of `added` and `dropped`; `None` when a list is not strictly ascending or a
+    /// full delta drops something.
+    pub fn of(full: bool, added: &[ObjectId], dropped: &[ObjectId]) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        if full && !dropped.is_empty() {
+            return None;
+        }
+        let mut sha = Sha256::new();
+        sha.update(length_prefix(LABEL_COMMIT_DELTA.len()));
+        sha.update(LABEL_COMMIT_DELTA);
+        sha.update(length_prefix(1));
+        sha.update([u8::from(full)]);
+        for list in [added, dropped] {
+            if list.windows(2).any(|w| w[0] >= w[1]) {
+                return None;
+            }
+            sha.update(length_prefix(list.len().checked_mul(ObjectId::LEN)?));
+            for id in list {
+                sha.update(id.as_bytes());
+            }
+        }
+        Some(Self {
+            full,
+            hash: sha.finalize().into(),
+        })
+    }
+
+    /// The diff digest of two reachable sets: what `after` adds to and drops from `before`.
+    pub fn diff(before: &BTreeSet<ObjectId>, after: &BTreeSet<ObjectId>) -> Self {
+        let added: Vec<ObjectId> = after.difference(before).copied().collect();
+        let dropped: Vec<ObjectId> = before.difference(after).copied().collect();
+        Self::of_sets(false, &added, &dropped)
+    }
+
+    /// The full digest of a reachable set.
+    pub fn full(all: &BTreeSet<ObjectId>) -> Self {
+        let added: Vec<ObjectId> = all.iter().copied().collect();
+        Self::of_sets(true, &added, &[])
+    }
+
+    /// The digest of lists taken from ordered sets in order. They are strictly ascending by
+    /// construction, so [`Self::of`] cannot refuse them; the fallback is never reached and
+    /// would only make the commit refused everywhere, never accepted wrongly.
+    fn of_sets(full: bool, added: &[ObjectId], dropped: &[ObjectId]) -> Self {
+        Self::of(full, added, dropped).unwrap_or(Self {
+            full,
+            hash: [0; 32],
+        })
+    }
 }
 
 /// A commit's content.
@@ -205,6 +294,8 @@ pub struct Commit {
     pub reanchor: bool,
     /// `flags` bit 1: a side commit (exactly one parent, never a head).
     pub side: bool,
+    /// The reference delta's digest; its mode is `flags` bit 2.
+    pub delta: DeltaDigest,
 }
 
 /// What every commit a device writes names besides its parents and height.
@@ -220,6 +311,8 @@ pub struct CommitContent {
     pub log_head: LogHead,
     /// The next number of its [`CommitCounter`].
     pub counter: u64,
+    /// The digest of the reference delta uploaded with the commit.
+    pub delta: DeltaDigest,
 }
 
 impl Commit {
@@ -242,6 +335,7 @@ impl Commit {
             counter: content.counter,
             reanchor: false,
             side: false,
+            delta: content.delta,
         }
     }
 
@@ -267,7 +361,8 @@ impl Commit {
     /// The barrier commit after a removal (module docs): a normal commit on the verified head
     /// `head` at `sequence` with the same tree, written by the removing device once the removal
     /// and its rotation are accepted, naming the new log head and the new generation
-    /// ([`crate::folder_keys::reseal_after_removal`] made it).
+    /// ([`crate::folder_keys::reseal_after_removal`] made it). Its reference delta `delta` is
+    /// full when the tree fits one delta, so the barrier also resets the server's live set.
     pub fn barrier(
         head: &SignedCommit,
         sequence: u64,
@@ -275,6 +370,7 @@ impl Commit {
         device: DeviceId,
         log_head: LogHead,
         counter: u64,
+        delta: DeltaDigest,
     ) -> Self {
         let c = &head.commit;
         Self::on(
@@ -287,6 +383,7 @@ impl Commit {
                 device,
                 log_head,
                 counter,
+                delta,
             },
         )
     }
@@ -351,7 +448,7 @@ impl Commit {
         if self.reanchor && (self.parents.len() != 1 || self.side) {
             return Err(CommitError::ReanchorFlag);
         }
-        if self.side && self.parents.len() != 1 {
+        if self.side && (self.parents.len() != 1 || self.delta.full) {
             return Err(CommitError::SideFlag);
         }
         if self.generation.0 == 0 || self.counter == 0 || self.log_head.index == 0 {
@@ -367,6 +464,9 @@ impl Commit {
         }
         if self.side {
             flags |= FLAG_SIDE;
+        }
+        if self.delta.full {
+            flags |= FLAG_FULL_DELTA;
         }
         flags
     }
@@ -391,6 +491,7 @@ impl Commit {
             .field(self.log_head.hash.as_bytes())
             .field_u64(self.counter)
             .field_u32(self.flags())
+            .field(&self.delta.hash)
             .field(&[0]);
         w.into_bytes()
     }
@@ -470,6 +571,15 @@ impl SignedCommit {
 
     fn body(&self) -> &[u8] {
         &self.wire[..self.wire.len() - SIGNATURE_LEN]
+    }
+
+    /// Checks an uploaded reference delta against the commit's delta digest: the same mode,
+    /// both lists strictly ascending, nothing dropped by a full delta, and the same hash.
+    pub fn check_delta(&self, added: &[ObjectId], dropped: &[ObjectId]) -> Result<(), CommitError> {
+        match DeltaDigest::of(self.commit.delta.full, added, dropped) {
+            Some(d) if d == self.commit.delta => Ok(()),
+            _ => Err(CommitError::DeltaMismatch),
+        }
     }
 
     /// Checks account, folder, log head and signature against the verified log (module docs).
@@ -560,6 +670,7 @@ fn read_commit(r: &mut Reader<'_>) -> Result<Commit, CommitError> {
     if flags & !FLAGS_KNOWN != 0 {
         return Err(CommitError::Flags(flags & !FLAGS_KNOWN));
     }
+    let delta_hash: [u8; 32] = r.field_fixed().ok_or_else(m)?;
     let mut seen = Reader::new(r.field().ok_or_else(m)?);
     let count = usize::from(seen.u8().ok_or_else(m)?);
     if count > FORMAT_MAX_SEEN || seen.remaining() != 48 * count {
@@ -580,6 +691,10 @@ fn read_commit(r: &mut Reader<'_>) -> Result<Commit, CommitError> {
         counter,
         reanchor: flags & FLAG_REANCHOR != 0,
         side: flags & FLAG_SIDE != 0,
+        delta: DeltaDigest {
+            full: flags & FLAG_FULL_DELTA != 0,
+            hash: delta_hash,
+        },
     })
 }
 
@@ -1184,12 +1299,14 @@ impl FolderView {
                 sequence,
                 role: CommitRole::Side,
                 commit: side.wire.clone().into(),
+                server_ms: None,
             });
         }
         delta.push(DeltaCommit {
             sequence,
             role: CommitRole::Head,
             commit: head.wire.clone().into(),
+            server_ms: None,
         });
         Ok(self.verify_delta(state, newest_generation, &delta)?.view)
     }
@@ -1408,6 +1525,7 @@ mod tests {
                 device,
                 log_head: self.state.head().unwrap(),
                 counter: *counter,
+                delta: DeltaDigest::diff(&BTreeSet::new(), &BTreeSet::new()),
             }
         }
     }
@@ -1417,6 +1535,7 @@ mod tests {
             sequence,
             role: CommitRole::Head,
             commit: Blob(c.wire.clone()),
+            server_ms: None,
         }
     }
 
@@ -1425,6 +1544,7 @@ mod tests {
             sequence,
             role: CommitRole::Side,
             commit: Blob(c.wire.clone()),
+            server_ms: None,
         }
     }
 
@@ -1489,6 +1609,7 @@ mod tests {
             .field(log_head.hash.as_bytes())
             .field_u64(1)
             .field_u32(flags)
+            .field(&DeltaDigest::diff(&BTreeSet::new(), &BTreeSet::new()).hash)
             .field(seen);
         let body = b.into_bytes();
         let mut wire = body.clone();
@@ -1563,6 +1684,7 @@ mod tests {
                 device: w.a.id,
                 log_head: w.state.head().unwrap(),
                 counter: 1,
+                delta: DeltaDigest::diff(&BTreeSet::new(), &BTreeSet::new()),
             },
         );
         too_many.parents = vec![p(1), p(2), p(3)];
@@ -1598,7 +1720,8 @@ mod tests {
         // A flipped root after signing.
         let mut tampered = signed.wire.clone();
         let root_at =
-            tampered.len() - 64 - 4 - 1 - 4 - 8 - 4 - 32 - 4 - 8 - 4 - 16 - 4 - 4 - 4 - 32 + 4;
+            tampered.len() - 64 - 4 - 1 - 4 - 32 - 4 - 8 - 4 - 32 - 4 - 8 - 4 - 16 - 4 - 4 - 4 - 32
+                + 4;
         tampered[root_at] ^= 1;
         let tampered = SignedCommit::decode(&tampered).unwrap();
         assert_eq!(
@@ -1759,6 +1882,7 @@ mod tests {
             sequence: 5,
             role: CommitRole::Head,
             commit: Blob(bad),
+            server_ms: None,
         };
         assert!(view
             .verify_delta(&w.state, G1, &[head(&c4, 4), broken])
@@ -2248,8 +2372,13 @@ mod tests {
         let p = |byte| CommitId::from_bytes([byte; 32]);
         // Unknown bits, and the mark on a first or merge commit, are refused when decoding.
         assert_eq!(
-            SignedCommit::decode(&hand_made_flags(&w, &[p(1)], 2, 4, &[0])),
-            Err(CommitError::Flags(4))
+            SignedCommit::decode(&hand_made_flags(&w, &[p(1)], 2, 8, &[0])),
+            Err(CommitError::Flags(8))
+        );
+        // A full delta never marks a side commit.
+        assert_eq!(
+            SignedCommit::decode(&hand_made_flags(&w, &[p(1)], 2, 2 | 4, &[0])),
+            Err(CommitError::SideFlag)
         );
         assert_eq!(
             SignedCommit::decode(&hand_made_flags(&w, &[], 1, 1, &[0])),
@@ -2624,9 +2753,17 @@ mod tests {
             }]
         );
         let counter = w.content(a, 0, g2).counter;
-        let barrier = Commit::barrier(&c4, 4, g2, a, w.state.head().unwrap(), counter)
-            .sign(&w.a.identity)
-            .unwrap();
+        let barrier = Commit::barrier(
+            &c4,
+            4,
+            g2,
+            a,
+            w.state.head().unwrap(),
+            counter,
+            DeltaDigest::full(&BTreeSet::new()),
+        )
+        .sign(&w.a.identity)
+        .unwrap();
         assert_eq!(barrier.commit.root, c4.commit.root);
         assert_eq!(barrier.commit.parents, vec![c4.id]);
         assert_eq!(barrier.commit.log_head.index, 5);
@@ -2718,5 +2855,46 @@ mod tests {
         assert_eq!(counter.take(), Some(6));
         assert_eq!(counter.last(), 6);
         assert_eq!(CommitCounter::resume(u64::MAX).take(), None);
+    }
+
+    #[test]
+    fn the_delta_digest_binds_mode_order_and_both_lists() {
+        let mut w = world();
+        let a = w.a.id;
+        let id = |b| ObjectId::from_bytes([b; 32]);
+        let (x, y, z) = (id(1), id(2), id(3));
+        let before: BTreeSet<ObjectId> = [x, y].into_iter().collect();
+        let after: BTreeSet<ObjectId> = [y, z].into_iter().collect();
+        let diff = DeltaDigest::diff(&before, &after);
+        assert_eq!(DeltaDigest::of(false, &[z], &[x]), Some(diff));
+        // Order, duplicates, a moved ID, the other mode and a full delta that drops are refused.
+        assert_eq!(DeltaDigest::of(false, &[z, y], &[]), None);
+        assert_eq!(DeltaDigest::of(false, &[y, y], &[]), None);
+        assert_eq!(DeltaDigest::of(true, &[z], &[x]), None);
+        assert_ne!(DeltaDigest::of(false, &[z, x], &[]), Some(diff));
+        assert_ne!(DeltaDigest::of(false, &[], &[x, z]), Some(diff));
+        assert_ne!(DeltaDigest::full(&after), diff);
+        let mut content = w.content(a, 1, G1);
+        content.delta = diff;
+        let c = Commit::first(ACCOUNT, FOLDER, content)
+            .sign(&w.a.identity)
+            .unwrap();
+        assert_eq!(SignedCommit::decode(&c.wire).unwrap().commit.delta, diff);
+        assert_eq!(c.check_delta(&[z], &[x]), Ok(()));
+        assert_eq!(c.check_delta(&[z], &[]), Err(CommitError::DeltaMismatch));
+        assert_eq!(
+            c.check_delta(&[y, z], &[x]),
+            Err(CommitError::DeltaMismatch)
+        );
+        // A flipped digest byte after signing breaks the signature.
+        let mut tampered = c.wire.clone();
+        let digest_at = tampered.len() - 64 - 4 - 1 - 32;
+        assert_eq!(&tampered[digest_at..digest_at + 32], &diff.hash);
+        tampered[digest_at] ^= 1;
+        let tampered = SignedCommit::decode(&tampered).unwrap();
+        assert_eq!(
+            tampered.verify_signer(&w.state, &FOLDER),
+            Err(CommitError::Signature)
+        );
     }
 }

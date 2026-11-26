@@ -190,6 +190,11 @@ struct MemFsState {
     tick: i64,
     locked: BTreeSet<Vec<String>>,
     full: bool,
+    /// What [`FileSystem::free_bytes`] reports; `None` like a platform that cannot tell. A
+    /// write takes its bytes off and a remove gives them back, as on a disk.
+    free: Option<u64>,
+    /// What [`FileSystem::volume_bytes`] reports.
+    volume: Option<u64>,
     /// Paths changed since the last [`MemFs::take_events`], as a watcher would report them.
     events: Vec<Vec<String>>,
 }
@@ -207,6 +212,9 @@ impl MemFs {
         Self {
             state: Mutex::new(MemFsState {
                 tick: 1_700_000_000_000,
+                // Plenty of room on a volume of unknown size: a download needs a known free
+                // space (LOW 4 of the follow-up review).
+                free: Some(1 << 40),
                 ..MemFsState::default()
             }),
             case_insensitive,
@@ -326,6 +334,16 @@ impl MemFs {
     /// Makes every write fail with [`FsError::DiskFull`].
     pub fn set_full(&self, full: bool) {
         self.lock().full = full;
+    }
+
+    /// Sets the free space the root reports (`None`: unknown; the default is 1 TiB).
+    pub fn set_free_bytes(&self, free: Option<u64>) {
+        self.lock().free = free;
+    }
+
+    /// Sets the volume size the root reports (`None`: unknown, the default).
+    pub fn set_volume_bytes(&self, volume: Option<u64>) {
+        self.lock().volume = volume;
     }
 
     /// Every file and directory with its content, by the actual path (for the invariants).
@@ -491,7 +509,11 @@ impl FileSystem for MemFs {
             executable,
         };
         let stat = Self::stat_of(&entry);
-        s.entries.insert(key, entry);
+        let written = entry.data.len() as u64;
+        if let Some(old) = s.entries.insert(key, entry) {
+            s.free = s.free.map(|f| f.saturating_add(old.data.len() as u64));
+        }
+        s.free = s.free.map(|f| f.saturating_sub(written));
         s.events.push(path.to_vec());
         Ok(stat)
     }
@@ -546,7 +568,9 @@ impl FileSystem for MemFs {
             None => Err(FsError::NotFound),
             Some(e) if !Self::matches(e, expect) => Err(FsError::Changed),
             Some(_) => {
-                s.entries.remove(&key);
+                if let Some(old) = s.entries.remove(&key) {
+                    s.free = s.free.map(|f| f.saturating_add(old.data.len() as u64));
+                }
                 s.events.push(path.to_vec());
                 Ok(())
             }
@@ -589,6 +613,14 @@ impl FileSystem for MemFs {
                 Ok(())
             }
         }
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        self.lock().free
+    }
+
+    fn volume_bytes(&self) -> Option<u64> {
+        self.lock().volume
     }
 }
 
@@ -770,6 +802,11 @@ struct MemFolder {
     sequence: u64,
     retired: bool,
     marks: BTreeMap<DeviceId, u64>,
+    /// The live set the reference deltas declared, as the real server keeps it.
+    live: BTreeSet<ObjectId>,
+    /// The live set after each head, so a side commit's diff is checked against its base as the
+    /// real server does.
+    live_at: BTreeMap<CommitId, BTreeSet<ObjectId>>,
 }
 
 /// The state of the in-memory server, shared by every device's [`MemServer`].
@@ -793,6 +830,9 @@ pub struct ServerState {
     /// from the length it last named up to its removal, as the real server answers its proof
     /// (security review H2). Off by default, so tests can let a removed device read on.
     pub refuse_removed: bool,
+    /// The server time it stamps on accepted calls and reports in the delta pull (`None`: no
+    /// time, like a commit whose time expired).
+    pub server_time_ms: Option<u64>,
     server: ServerId,
     account: Option<AccountId>,
     log: Vec<Vec<u8>>,
@@ -805,6 +845,8 @@ pub struct ServerState {
     pairing: BTreeMap<PairingId, Option<PairingRequest>>,
     /// Calls served, for the tests.
     pub calls: u64,
+    /// How often `get_object` served each object, for the tests.
+    pub object_gets: BTreeMap<ObjectId, u64>,
 }
 
 impl ServerState {
@@ -817,6 +859,7 @@ impl ServerState {
             refuse_commits: None,
             presented_pin: None,
             refuse_removed: false,
+            server_time_ms: None,
             server: ServerId::from_bytes([0x5e; 16]),
             account: None,
             log: Vec::new(),
@@ -828,6 +871,7 @@ impl ServerState {
             folders: BTreeMap::new(),
             pairing: BTreeMap::new(),
             calls: 0,
+            object_gets: BTreeMap::new(),
         }
     }
 
@@ -837,6 +881,12 @@ impl ServerState {
             sequence: self.sequence,
             change,
         });
+    }
+
+    /// Puts a notice into the change feed, as the real server does after an anomaly pin or a
+    /// budget, quota or disk condition (this server detects none of them itself).
+    pub fn push_notice(&mut self, notice: hangar_drive_protocol::api::Notice) {
+        self.push_feed(FeedChange::Notice { notice });
     }
 
     /// The current head of a folder.
@@ -867,6 +917,28 @@ impl ServerState {
             .rev()
             .find(|c| c.role == CommitRole::Head)
             .map(|c| c.commit.0.clone())
+    }
+
+    /// The live set of a folder: what the heads' reference deltas declared reachable.
+    pub fn live_set(&self, folder: &FolderId) -> BTreeSet<ObjectId> {
+        self.folders
+            .get(folder)
+            .map(|f| f.live.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replaces the live set of a folder: a server view another device broke before the
+    /// reference deltas were bound to the tree, or a test of the repair.
+    pub fn set_live(&mut self, folder: &FolderId, live: BTreeSet<ObjectId>) {
+        self.folders.entry(*folder).or_default().live = live;
+    }
+
+    /// Deletes objects of a folder, as the collection does with objects no retained tree
+    /// declares.
+    pub fn delete_objects(&mut self, folder: &FolderId, ids: &BTreeSet<ObjectId>) {
+        if let Some(f) = self.folders.get_mut(folder) {
+            f.objects.retain(|id, _| !ids.contains(id));
+        }
     }
 
     /// The stored commits of a folder, for a test that plays a malicious server.
@@ -1255,7 +1327,8 @@ impl ServerApi for MemServer {
     }
 
     fn get_object(&mut self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError> {
-        let s = self.enter()?;
+        let mut s = self.enter()?;
+        *s.object_gets.entry(*id).or_default() += 1;
         s.folders
             .get(folder)
             .and_then(|f| f.objects.get(id))
@@ -1274,6 +1347,7 @@ impl ServerApi for MemServer {
             .map_err(|_| refuse(ErrorCode::BadRequest))?;
         let state = s.state.clone().ok_or(refuse(ErrorCode::NotFound))?;
         let expire_bases = s.expire_bases;
+        let server_ms = s.server_time_ms;
         if let Some(code) = s.refuse_commits {
             return Err(refuse(code));
         }
@@ -1285,13 +1359,14 @@ impl ServerApi for MemServer {
             return Err(NetError::Server(ErrorBody {
                 code: ErrorCode::HeadMoved,
                 current_head: f.head,
-                missing: Vec::new(),
-                removal_log: None,
+                ..ErrorBody::new(ErrorCode::HeadMoved)
             }));
         }
         let head = SignedCommit::decode(request.head.commit.as_bytes())
             .map_err(|_| refuse(ErrorCode::CommitRefused))?;
         head.verify_for_server(&state, folder)
+            .map_err(|_| refuse(ErrorCode::CommitRefused))?;
+        head.check_delta(&request.head.delta.added, &request.head.delta.dropped)
             .map_err(|_| refuse(ErrorCode::CommitRefused))?;
         let c = &head.commit;
         if c.side || c.parents.first().copied() != f.head {
@@ -1308,6 +1383,8 @@ impl ServerApi for MemServer {
                 let side = SignedCommit::decode(upload.commit.as_bytes())
                     .map_err(|_| refuse(ErrorCode::CommitRefused))?;
                 side.verify_for_server(&state, folder)
+                    .map_err(|_| refuse(ErrorCode::CommitRefused))?;
+                side.check_delta(&upload.delta.added, &upload.delta.dropped)
                     .map_err(|_| refuse(ErrorCode::CommitRefused))?;
                 let sc = &side.commit;
                 let base_known = sc.parents.first().is_some_and(|p| f.heads.contains(p));
@@ -1345,12 +1422,67 @@ impl ServerApi for MemServer {
         if !missing.is_empty() {
             missing.truncate(64);
             return Err(NetError::Server(ErrorBody {
-                code: ErrorCode::MissingObjects,
-                current_head: None,
                 missing,
-                removal_log: None,
+                ..ErrorBody::new(ErrorCode::MissingObjects)
             }));
         }
+        // The side commit's diff against the live set of its base.
+        if let Some((sc, upload)) = &side {
+            let base = sc.commit.parents.first().and_then(|p| f.live_at.get(p));
+            let empty = BTreeSet::new();
+            let base = base.unwrap_or(&empty);
+            let mut off: Vec<ObjectId> = upload
+                .delta
+                .added
+                .iter()
+                .filter(|id| base.contains(id))
+                .chain(upload.delta.dropped.iter().filter(|id| !base.contains(id)))
+                .copied()
+                .collect();
+            if !off.is_empty() {
+                off.truncate(64);
+                return Err(NetError::Server(ErrorBody {
+                    missing: off,
+                    ..ErrorBody::new(ErrorCode::DeltaMismatch)
+                }));
+            }
+        }
+        // The head's delta against the live set, as the real server checks it: a full delta
+        // replaces the set and must hold its root; a diff must fit the set and leave the root
+        // live.
+        let delta = &request.head.delta;
+        let live = if c.delta.full {
+            if delta.added.binary_search(&c.root).is_err() {
+                return Err(refuse(ErrorCode::CommitRefused));
+            }
+            delta.added.iter().copied().collect()
+        } else {
+            let mut off: Vec<ObjectId> = delta
+                .added
+                .iter()
+                .filter(|id| f.live.contains(id))
+                .chain(delta.dropped.iter().filter(|id| !f.live.contains(id)))
+                .copied()
+                .collect();
+            let mut live = f.live.clone();
+            live.extend(delta.added.iter().copied());
+            for id in &delta.dropped {
+                live.remove(id);
+            }
+            if !live.contains(&c.root) {
+                off.push(c.root);
+            }
+            if !off.is_empty() {
+                off.truncate(64);
+                return Err(NetError::Server(ErrorBody {
+                    missing: off,
+                    ..ErrorBody::new(ErrorCode::DeltaMismatch)
+                }));
+            }
+            live
+        };
+        f.live_at.insert(head.id, live.clone());
+        f.live = live;
         f.sequence += 1;
         let sequence = f.sequence;
         if let Some((side, _)) = &side {
@@ -1358,12 +1490,14 @@ impl ServerApi for MemServer {
                 sequence,
                 role: CommitRole::Side,
                 commit: Blob(side.wire.clone()),
+                server_ms,
             });
         }
         f.commits.push(DeltaCommit {
             sequence,
             role: CommitRole::Head,
             commit: Blob(head.wire.clone()),
+            server_ms,
         });
         f.head = Some(head.id);
         f.heads.insert(head.id);

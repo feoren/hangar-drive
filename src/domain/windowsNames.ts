@@ -9,6 +9,9 @@ const FORBIDDEN = /[<>:"/\\|?*]/;
 const CONTROL = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(31)}]`);
 const CONTROL_ALL = new RegExp(CONTROL.source, "g");
 const RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+// A name ending in ".{GUID}" is a shell junction for Explorer (ADR 7): a folder of that name can
+// lead the shell outside the sync folder, so the sync core refuses it on Windows.
+const SHELL_JUNCTION = /\.(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})$/i;
 
 function stem(name: string): string {
   const dot = name.indexOf(".");
@@ -22,6 +25,7 @@ export function windowsNameProblem(name: string): NameReason | null {
   if (CONTROL.test(name)) return { kind: "control" };
   if (/[. ]$/.test(name)) return { kind: "trailing" };
   if (RESERVED.test(stem(name).trimEnd())) return { kind: "reserved", name: stem(name) };
+  if (SHELL_JUNCTION.test(name)) return { kind: "reserved", name };
   return null;
 }
 
@@ -37,5 +41,6 @@ export function suggestWindowsName(name: string): string {
     const dot = result.indexOf(".");
     result = dot === -1 ? `${result}_` : `${result.slice(0, dot)}_${result.slice(dot)}`;
   }
+  result = result.replace(SHELL_JUNCTION, " $1");
   return result === "" ? "_" : result;
 }

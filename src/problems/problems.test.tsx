@@ -13,6 +13,7 @@ import {
   dialogTitle,
   field,
   flush,
+  maybeButton,
   renderApp,
   text,
   type,
@@ -226,5 +227,25 @@ describe("suspected ransomware (UX 9.4)", () => {
     expect(document.querySelector('[role="option"][aria-selected="true"]')?.textContent).toContain(
       "Büro-PC",
     );
+  });
+
+  // ADR 0001, section 5: every device is told, also one that does not sync the folder. Without
+  // the device the banner names the folder and the steps lead to the device list and to a
+  // device that has the folder; a pin that lapsed says so. "That was me" stays available.
+  it("names the folder when the device is unknown and tells a lapsed pin", async () => {
+    await renderApp("suspectElsewhere");
+    expect(text()).toContain("In „Fotos“ wurden sehr viele Dateien verändert");
+    expect(text()).toContain("Die längere Aufbewahrung ist vorzeitig zu Ende");
+    expect(maybeButton("Das war ich")).toBeDefined();
+    await click("Was jetzt?");
+    expect(all(".steps .step").map((step) => step.querySelector("p")?.textContent)).toEqual([
+      "Schau unter Geräte nach, welches Gerät das war, und trenne es vom Netz oder entferne es.",
+      "Prüfe das Gerät mit deinem Virenschutz.",
+      "Hol den Stand von davor auf einem Gerät zurück, auf dem „Fotos“ synchronisiert wird.",
+    ]);
+    expect(maybeButton("Stand vor den Änderungen ansehen")).toBeUndefined();
+    expect(maybeButton("Entfernen")).toBeUndefined();
+    await click("Geräte ansehen");
+    expect(dialogTitle()).toBe("Deine Geräte");
   });
 });

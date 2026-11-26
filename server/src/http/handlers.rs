@@ -224,13 +224,14 @@ pub const KEEPALIVE: Duration = Duration::from_secs(25);
 const SESSION_CHECK: Duration = Duration::from_secs(30);
 
 /// `GET /account/events`: one event with the current sequence, then one per change. Ends when
-/// the session ends (expiry or removal of the device) or the server shuts down; the client
+/// the session ends (expiry or removal of the device), a newer stream of the same device
+/// replaces it ([`crate::events::MAX_STREAMS_PER_DEVICE`]) or the server shuts down; the client
 /// reconnects with a fresh token and pulls the feed meanwhile.
 pub async fn events(State(app): State<AppState>, Authed(s): Authed) -> ApiResult<Response> {
     let current = feed::current(&app, s.account_pk).await?;
     let slot = app
         .events
-        .subscribe(s.account_pk, current)
+        .subscribe(s.account_pk, s.device, current)
         .ok_or(ErrorCode::RateLimited)?;
     struct StreamState {
         app: AppState,
@@ -270,6 +271,8 @@ pub async fn events(State(app): State<AppState>, Authed(s): Authed) -> ApiResult
                     return event(seq).ok().map(|e| (Ok(e), st));
                 }
                 _ = st.shutdown.changed() => return None,
+                // A newer stream of the same device took this one's slot.
+                _ = st.slot.closed.changed() => return None,
                 _ = tokio::time::sleep(SESSION_CHECK) => {
                     if !sessions::still_valid(&st.app, &st.session.token_hash).await.unwrap_or(false) {
                         return None;

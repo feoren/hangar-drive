@@ -22,8 +22,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hangar_drive_crypto::commit::{
-    ChainEntry, Commit, CommitContent, DeltaCheck, DeltaOutcome, FolderView, RemovedHead,
-    SignedCommit,
+    ChainEntry, Commit, CommitContent, DeltaCheck, DeltaDigest, DeltaOutcome, FolderView,
+    RemovedHead, SignedCommit,
 };
 use hangar_drive_crypto::epoch::BarrierPermit;
 use hangar_drive_crypto::Entropy;
@@ -224,6 +224,15 @@ pub struct TimelineRec {
     pub side: bool,
     /// The root directory node.
     pub root: ObjectId,
+    /// File objects (manifests and chunks; of a full delta, chunks only) the commit dropped
+    /// from its first parent's tree, as this device's check of its delta counted them (ADR
+    /// 0001, amendment "reference deltas bound to the tree"); `None` when not counted. "Undo a
+    /// device" names the writer of a burst only from these counts.
+    #[serde(default)]
+    pub dropped_files: Option<u64>,
+    /// File objects of the first parent's tree, counted with [`Self::dropped_files`].
+    #[serde(default)]
+    pub files_before: Option<u64>,
 }
 
 /// The base of a side commit: the newest head whose tree the disk fully held.
@@ -274,6 +283,12 @@ pub struct FolderMeta {
     /// ([`StopReason::RemovedHeads`]).
     #[serde(default)]
     pub removed_heads: Vec<RemovedHeadRec>,
+    /// The next commit of this device carries a full reference delta, because the server's
+    /// live set may not match the tree: the server refused a diff as not fitting it, a pulled
+    /// commit's delta could not be checked, or a mismatching head of a removed device came in
+    /// behind a barrier (ADR 0001, amendment "reference deltas bound to the tree").
+    #[serde(default)]
+    pub full_next: bool,
 }
 
 /// A local change propagated or a remote change applied in a round.
@@ -449,6 +464,14 @@ pub struct FolderSync {
     /// What the last commit of a person's action changed ([`FolderSync::publish_tree`]), until
     /// the engine takes it for an undo; not stored.
     last_action: Option<UndoState>,
+    /// Contents whose chunks an upload could not seal under the writable generation; the next
+    /// scan hashes their files again under it, even when size and time are unchanged. Chunk IDs
+    /// are keyed per generation, so a file hashed before a key rotation and not uploaded since
+    /// (or one whose old chunks the server's collection deleted) names IDs that only an older
+    /// generation produces. Uploads never use older keys, since a removed device knows them, so
+    /// without this every publish ended in [`PublishFailure::LocalChanged`]. Not stored: after a
+    /// restart the next failed upload finds the contents again.
+    rehash: BTreeSet<ContentKey>,
 }
 
 /// What the next scan reads from the disk.
@@ -495,6 +518,51 @@ fn action_error(e: FsError) -> ActionError {
     }
 }
 
+/// Free space a download leaves on the sync root's volume at least, on top of the file itself:
+/// room for the operating system, the local index and other programs, so a burst of files from
+/// another device never fills this device's disk (security review M2 of the download path).
+/// 256 MiB is about what Windows keeps before it warns about low space.
+const DISK_RESERVE_MIN: u64 = 256 * 1024 * 1024;
+/// The share of the volume, in percent, a download leaves free (LOW 4 of the follow-up
+/// review): 256 MiB alone is nothing on a large disk, where system updates, swap and the
+/// recycle bin need gigabytes, and a full disk breaks every program, not only this one.
+const DISK_RESERVE_PERCENT: u64 = 5;
+/// The reserve at most: 5 % of a 4 TB disk would hold back 200 GB the person paid for. 10 GiB
+/// covers a system feature update and a working swap file.
+const DISK_RESERVE_MAX: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The free space a download leaves on a volume of `volume` bytes: 5 % of it, between 256 MiB
+/// and 10 GiB, or 256 MiB when the size is unknown.
+pub fn disk_reserve(volume: Option<u64>) -> u64 {
+    volume.map_or(DISK_RESERVE_MIN, |v| {
+        (v / 100)
+            .saturating_mul(DISK_RESERVE_PERCENT)
+            .clamp(DISK_RESERVE_MIN, DISK_RESERVE_MAX)
+    })
+}
+
+/// Whether a file of `size` bytes may be written with `free` bytes free on a volume of
+/// `volume` bytes. Unknown free space is no room: a manifest may name the same chunk up to its
+/// limit, so a file can be far larger than what the server stores, and without a reading this
+/// device cannot bound what it writes. Every supported platform reports the space; `None`
+/// means the call failed, and the file waits for the next round (backoff) as on a full disk.
+pub fn room_for(size: u64, free: Option<u64>, volume: Option<u64>) -> bool {
+    free.is_some_and(|f| f >= size.saturating_add(disk_reserve(volume)))
+}
+
+/// Bytes one apply run fetches at most; a file that would go beyond waits for the next round.
+/// The first file of a run is always taken, so a single file larger than this still comes.
+/// It is a bound on network traffic per round, not on the disk: it limits what one round
+/// downloads before the next round checks the head and local changes again (1 GiB is about
+/// 90 s at 100 Mbit/s). The disk is guarded per file by [`room_for`], against the free space
+/// read right before that file.
+const ROUND_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Plaintext a write keeps of chunks its manifest names again later, so a repeated chunk ID is
+/// fetched and opened once while memory stays bounded (16 chunks of 4 MiB); beyond it, the chunk
+/// is fetched again.
+const CHUNK_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The executor's disk: the sync root plus the content from the server.
 struct FsDisk<'a> {
     fs: &'a dyn FileSystem,
@@ -503,6 +571,8 @@ struct FsDisk<'a> {
     crypto: &'a FolderCrypto,
     file_ids: &'a mut BTreeMap<ItemId, u128>,
     dirty: &'a mut BTreeMap<ItemId, Option<u128>>,
+    /// Bytes fetched in this apply run ([`ROUND_DOWNLOAD_BYTES`]).
+    downloaded: u64,
 }
 
 impl FsDisk<'_> {
@@ -547,25 +617,55 @@ impl DiskActions for FsDisk<'_> {
         {
             return Err(ActionError::Unavailable);
         }
+        let size = version.size;
+        // Checked before anything is fetched: a manifest may name the same chunk up to its
+        // limit, so the file can be far larger than what the server stores and the quota
+        // counts. Without room the file waits (the caller backs off) and nothing is written.
+        if !room_for(size, self.fs.free_bytes(), self.fs.volume_bytes()) {
+            return Err(ActionError::DiskFull);
+        }
+        if self.downloaded > 0 && self.downloaded.saturating_add(size) > ROUND_DOWNLOAD_BYTES {
+            return Err(ActionError::Unavailable);
+        }
+        // How often each chunk is still to come, so a repeated one is kept until its last use.
+        let mut left: BTreeMap<ObjectId, u64> = BTreeMap::new();
+        for id in &list.chunks {
+            *left.entry(*id).or_default() += 1;
+        }
         let mut failure: Option<ActionError> = None;
         let crypto = self.crypto;
         let server = &mut *self.server;
-        let size = version.size;
+        let downloaded = &mut self.downloaded;
         let mut fill = |out: &mut dyn std::io::Write| -> Result<(), FsError> {
             let mut written = 0u64;
+            let mut cache: BTreeMap<ObjectId, zeroize::Zeroizing<Vec<u8>>> = BTreeMap::new();
+            let mut cached = 0u64;
             for (index, id) in list.chunks.iter().enumerate() {
-                let blob = match server.get_object(&folder, id) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        failure = Some(ActionError::Unavailable);
-                        return Err(FsError::Io("content unavailable".into()));
+                let remaining = left.get_mut(id).map_or(0, |n| {
+                    *n = n.saturating_sub(1);
+                    *n
+                });
+                let plain = match cache.remove(id) {
+                    Some(p) => {
+                        cached = cached.saturating_sub(p.len() as u64);
+                        p
                     }
-                };
-                let plain = match crypto.open(id, ObjectType::Chunk, &blob) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        failure = Some(ActionError::Unavailable);
-                        return Err(FsError::Io("content does not open".into()));
+                    None => {
+                        let blob = match server.get_object(&folder, id) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                failure = Some(ActionError::Unavailable);
+                                return Err(FsError::Io("content unavailable".into()));
+                            }
+                        };
+                        *downloaded = downloaded.saturating_add(blob.len() as u64);
+                        match crypto.open(id, ObjectType::Chunk, &blob) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                failure = Some(ActionError::Unavailable);
+                                return Err(FsError::Io("content does not open".into()));
+                            }
+                        }
                     }
                 };
                 let expected = (size - index as u64 * hangar_drive_protocol::object::CHUNK_SIZE)
@@ -577,6 +677,10 @@ impl DiskActions for FsDisk<'_> {
                 out.write_all(&plain)
                     .map_err(|e| FsError::Io(e.to_string()))?;
                 written += plain.len() as u64;
+                if remaining > 0 && cached.saturating_add(plain.len() as u64) <= CHUNK_CACHE_BYTES {
+                    cached += plain.len() as u64;
+                    cache.insert(*id, plain);
+                }
             }
             if written != size {
                 failure = Some(ActionError::Unavailable);
@@ -710,6 +814,7 @@ impl FolderSync {
             scan_scope: ScanScope::Full,
             too_large_at: None,
             last_action: None,
+            rehash: BTreeSet::new(),
         }
     }
 
@@ -743,6 +848,7 @@ impl FolderSync {
             scan_scope: ScanScope::Full,
             too_large_at: None,
             last_action: None,
+            rehash: BTreeSet::new(),
         }))
     }
 
@@ -944,6 +1050,22 @@ impl FolderSync {
             report.removed_heads = self.meta.removed_heads.clone();
             self.save(cx.store)?;
             return Ok(report);
+        }
+        // A delta this device could not check, or a barrier that kept the empty diff: the
+        // server's live set may not match the tree, so it is repaired now with the same tree
+        // and a full delta, without waiting for a local change (ADR 0001, amendment "reference
+        // deltas bound to the tree").
+        if self.meta.full_next && self.meta.state == FolderState::Active {
+            match self.repair(cx) {
+                Ok(()) => report.published = true,
+                Err(PublishFailure::Error(e)) if e.is_offline() => {
+                    report.offline = true;
+                    self.save(cx.store)?;
+                    return Ok(report);
+                }
+                // Stays due: the next round or publish tries again.
+                Err(_) => {}
+            }
         }
         self.save(cx.store)?;
         let attempts = cx.settings.max_publish_attempts.max(1);
@@ -1362,7 +1484,9 @@ impl FolderSync {
             items.push((item, path.clone(), *stat));
         }
 
-        // 3. Which files need hashing.
+        // 3. Which files need hashing. An unchanged file whose chunks an upload could not seal
+        // ([`FolderSync::rehash`]) is hashed again under the newest generation.
+        let rehash_contents = std::mem::take(&mut self.rehash);
         let mut jobs = Vec::new();
         let mut job_items = Vec::new();
         let mut versions: BTreeMap<ItemId, FileVersion> = BTreeMap::new();
@@ -1377,7 +1501,15 @@ impl FolderSync {
             if let Some(v) = prev {
                 if v.size == stat.size && (v.mtime_ms - stat.mtime_ms).abs() <= tolerance && same_id
                 {
-                    versions.insert(*item, v);
+                    if !rehash_contents.contains(&v.content) {
+                        versions.insert(*item, v);
+                        continue;
+                    }
+                    jobs.push(HashJob {
+                        path: path.clone(),
+                        generation: newest,
+                    });
+                    job_items.push((*item, prev, *stat));
                     continue;
                 }
             }
@@ -1645,14 +1777,24 @@ impl FolderSync {
         let Some(head) = outcome.heads.last().cloned() else {
             return Ok(0);
         };
+        let checked = self.verify_tree_deltas(cx, &outcome, &delta)?;
         let reader = cx.account.folder_reader(&self.folder)?;
-        let tree = match codec::decode(&head.commit.root, &reader, cx.store, cx.server) {
+        let decoded = if checked.limit {
+            // A head on the way is beyond the limits: its delta could not be checked, and the
+            // folder stops as for a head beyond the limits (HIGH 1 of the follow-up review).
+            Err(codec::CodecError::Limit)
+        } else {
+            codec::decode(&head.commit.root, &reader, cx.store, cx.server)
+        };
+        let tree = match decoded {
             Ok(tree) => tree,
             Err(codec::CodecError::Limit) => {
                 // The commits verified, so they are the folder's chain and its history; only
                 // the head's tree stays out (security review M3). The remote tree keeps the last
-                // one taken in, and the folder waits for a restore.
+                // one taken in, and the folder waits for a restore, which carries a full delta.
                 self.record_timeline(&outcome, &delta, cx.clock.now_ms());
+                self.annotate_timeline(&checked.drops);
+                self.meta.full_next = true;
                 let n = outcome.heads.len();
                 self.view = outcome.view;
                 self.meta.remote_root = Some(head.commit.root);
@@ -1664,12 +1806,185 @@ impl FolderSync {
             Err(e) => return Err(e.into()),
         };
         self.record_timeline(&outcome, &delta, cx.clock.now_ms());
+        self.annotate_timeline(&checked.drops);
         let n = outcome.heads.len();
         self.view = outcome.view;
         self.set_remote(tree);
         self.meta.remote_root = Some(head.commit.root);
         self.meta.frontier_wire = Some(Blob(head.wire.clone()));
         Ok(n)
+    }
+
+    /// Checks every head and side commit of an accepted delta against the trees (ADR 0001,
+    /// amendment "reference deltas bound to the tree"): the delta digest it signed must be the
+    /// digest of `reachable(tree)` against `reachable(first parent's tree)` (a side commit's:
+    /// its base), or of `reachable(tree)` alone for a full delta. The server applied exactly that
+    /// delta to its live set, so a commit whose delta does not fit its tree would let the
+    /// collection delete live data or keep garbage live: it is refused like a commit with a bad
+    /// signature, and the folder stops until the person removes the device that wrote it.
+    ///
+    /// - A mismatching commit of a device the verified log has removed since is let through:
+    ///   such commits come in only behind a barrier that the removing device or the person
+    ///   accepted.
+    /// - A tree the server no longer holds (an object is gone) is accepted as unreadable only
+    ///   for a commit whose call is older than [`UNREADABLE_AFTER_MS`] by the server's unsigned
+    ///   time, or whose time the server already dropped because it expired: only then may the
+    ///   collection have taken its trees. For a younger commit of a current device it is a
+    ///   mismatch, so a device cannot hide a forged delta behind a tree it never uploaded
+    ///   (HIGH 1 of the follow-up review). The server decides retention anyway, so trusting its
+    ///   time here gives it nothing it lacks.
+    /// - A tree beyond the limits stops the folder as [`StopReason::TreeLimit`] does
+    ///   ([`TreeCheck::limit`]).
+    ///
+    /// Whatever is let through or cannot be checked sets [`FolderMeta::full_next`], and the
+    /// round then writes a repair commit at once ([`Self::repair`]), which resets the server's
+    /// live set to the tree whatever happened before.
+    fn verify_tree_deltas(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        outcome: &DeltaOutcome,
+        delta: &[DeltaCommit],
+    ) -> Result<TreeCheck, SyncError> {
+        let mut check = TreeCheck::default();
+        if outcome.heads.is_empty() && outcome.sides.is_empty() {
+            return Ok(check);
+        }
+        let now = u64::try_from(cx.clock.now_ms()).unwrap_or(0);
+        let times: BTreeMap<CommitId, Option<u64>> = delta
+            .iter()
+            .filter_map(|d| {
+                SignedCommit::decode(d.commit.as_bytes())
+                    .ok()
+                    .map(|c| (c.id, d.server_ms))
+            })
+            .collect();
+        let old_enough = |id: &CommitId| match times.get(id).copied().flatten() {
+            None => true,
+            Some(at) => now.saturating_sub(at) > UNREADABLE_AFTER_MS,
+        };
+        let reader = cx.account.folder_reader(&self.folder)?;
+        let mut roots: BTreeMap<CommitId, ObjectId> = self
+            .meta
+            .timeline
+            .iter()
+            .map(|t| (t.commit, t.root))
+            .collect();
+        if let (Some(frontier), Some(root)) = (self.view.frontier(), self.meta.remote_root) {
+            roots.insert(frontier.commit, root);
+        }
+        for head in &outcome.heads {
+            roots.insert(head.id, head.commit.root);
+        }
+        let mut sets: BTreeMap<ObjectId, Readable> = BTreeMap::new();
+        let empty = Readable::Set(codec::Reachable::default());
+        for c in outcome.heads.iter().chain(outcome.sides.iter()) {
+            let after = readable_set(&c.commit.root, &reader, cx, &mut sets)?;
+            let before = match c.commit.parents.first() {
+                None => empty.clone(),
+                Some(parent) => match roots.get(parent).copied() {
+                    None => Readable::Gone,
+                    Some(root) => readable_set(&root, &reader, cx, &mut sets)?,
+                },
+            };
+            let verdict = match (&after, &before) {
+                (Readable::Limit, _) | (_, Readable::Limit) => {
+                    check.limit = true;
+                    Verdict::Unchecked
+                }
+                (Readable::Set(after), _) if c.commit.delta.full => {
+                    Verdict::of(DeltaDigest::full(&after.all) == c.commit.delta)
+                }
+                (Readable::Set(after), Readable::Set(before)) => {
+                    let fits = DeltaDigest::diff(&before.all, &after.all) == c.commit.delta;
+                    if fits && !c.commit.side {
+                        check
+                            .drops
+                            .insert(c.id, DropCount::of(before, after, false));
+                    }
+                    Verdict::of(fits)
+                }
+                // A tree the server no longer holds: only an old enough commit may have lost it.
+                _ if old_enough(&c.id) => Verdict::Unchecked,
+                _ => Verdict::Mismatch,
+            };
+            if c.commit.delta.full && !c.commit.side {
+                if let (Readable::Set(before), Readable::Set(after)) = (&before, &after) {
+                    if verdict == Verdict::Fits {
+                        check.drops.insert(c.id, DropCount::of(before, after, true));
+                    }
+                }
+            }
+            match verdict {
+                Verdict::Fits => {}
+                Verdict::Unchecked => self.meta.full_next = true,
+                Verdict::Mismatch => {
+                    let current = cx
+                        .account
+                        .state()
+                        .device(&c.commit.device)
+                        .is_some_and(|d| d.is_current());
+                    if current {
+                        return Err(SyncError::Chain(
+                            hangar_drive_crypto::commit::ChainError::Commit(
+                                hangar_drive_crypto::commit::CommitError::DeltaMismatch,
+                            ),
+                        ));
+                    }
+                    self.meta.full_next = true;
+                }
+            }
+        }
+        Ok(check)
+    }
+
+    /// Writes what [`Self::verify_tree_deltas`] counted into the timeline records just added.
+    fn annotate_timeline(&mut self, drops: &BTreeMap<CommitId, DropCount>) {
+        for rec in self
+            .meta
+            .timeline
+            .iter_mut()
+            .rev()
+            .take(drops.len().max(1) * 2 + 2)
+        {
+            if let Some(d) = drops.get(&rec.commit) {
+                rec.dropped_files = Some(d.dropped);
+                rec.files_before = Some(d.before);
+            }
+        }
+    }
+
+    /// The repair commit: the remote tree once more on the frontier, with a full delta, so the
+    /// server's live set is the tree again (ADR 0001, amendment "reference deltas bound to the
+    /// tree"). Every directory node and manifest is sealed again and every object the server
+    /// lacks is uploaded first, also one the collection deleted; chunks come from the disk.
+    fn repair(&mut self, cx: &mut Ctx<'_>) -> Result<(), PublishFailure> {
+        let Some(frontier) = self.view.frontier().copied() else {
+            self.meta.full_next = false;
+            return Ok(());
+        };
+        let crypto = cx
+            .account
+            .folder_crypto(&self.folder, Some(frontier.generation))?;
+        let tree = self.remote.clone();
+        let fresh = codec::encode_fresh(&tree, &crypto, cx.store, cx.entropy)?;
+        let (delta, digest) = full_delta(&fresh.reachable, cx.settings.max_delta_ids)
+            .ok_or(SyncError::Invalid("too many objects for one commit"))?;
+        let disk = self.local.clone();
+        self.upload(cx, &crypto, &fresh, &fresh.reachable, &disk)?;
+        codec::remember_uploaded(&fresh, &self.folder, cx.store).map_err(SyncError::from)?;
+        self.send(
+            cx,
+            &crypto,
+            fresh.root,
+            Some(frontier),
+            None,
+            &delta,
+            digest,
+        )?;
+        self.meta.full_next = false;
+        self.meta.remote_root = Some(fresh.root);
+        self.save(cx.store)?;
+        Ok(())
     }
 
     /// Adds the heads and side commits of an accepted delta to the timeline.
@@ -1696,6 +2011,8 @@ impl FolderSync {
                 reanchor: c.commit.reanchor,
                 side: c.commit.side,
                 root: c.commit.root,
+                dropped_files: None,
+                files_before: None,
             });
         }
     }
@@ -1767,9 +2084,10 @@ impl FolderSync {
     }
 
     /// Uploads every object of `encoded` the server lacks: sealed nodes and manifests, and
-    /// chunks read from the disk.
+    /// chunks read from the disk. A chunk that does not seal to its ID marks its content for
+    /// the next scan to hash again ([`FolderSync::rehash`]).
     fn upload(
-        &self,
+        &mut self,
         cx: &mut Ctx<'_>,
         crypto: &FolderCrypto,
         encoded: &Encoded,
@@ -1785,7 +2103,7 @@ impl FolderSync {
             return Ok(());
         }
         // Where each chunk of the new tree lives on disk.
-        let mut sources: BTreeMap<ObjectId, (Vec<String>, u64)> = BTreeMap::new();
+        let mut sources: BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)> = BTreeMap::new();
         for (item, node) in disk.iter() {
             let Some(v) = node.kind.file() else {
                 continue;
@@ -1799,15 +2117,15 @@ impl FolderSync {
             for (index, chunk) in chunks.iter().enumerate() {
                 sources
                     .entry(*chunk)
-                    .or_insert_with(|| (path.clone(), index as u64));
+                    .or_insert_with(|| (path.clone(), index as u64, v.content));
             }
         }
-        for id in missing {
-            if let Some(blob) = encoded.sealed.get(&id) {
-                cx.server.put_object(&self.folder, &id, blob)?;
+        for id in &missing {
+            if let Some(blob) = encoded.sealed.get(id) {
+                cx.server.put_object(&self.folder, id, blob)?;
                 continue;
             }
-            let Some((path, index)) = sources.get(&id) else {
+            let Some((path, index, content)) = sources.get(id) else {
                 // A chunk this device cannot produce: the disk changed, scan again.
                 return Err(PublishFailure::LocalChanged);
             };
@@ -1815,15 +2133,57 @@ impl FolderSync {
                 cx.fs,
                 path,
                 *index,
-                &id,
+                id,
                 crypto.writable().map_err(SyncError::from)?,
                 cx.entropy,
             ) {
                 Ok(s) => s,
-                Err(_) => return Err(PublishFailure::LocalChanged),
+                Err(_) => {
+                    self.mark_rehash(cx, crypto, *content, &missing, &sources)?;
+                    return Err(PublishFailure::LocalChanged);
+                }
             };
-            cx.server.put_object(&self.folder, &id, &sealed.blob)?;
+            cx.server.put_object(&self.folder, id, &sealed.blob)?;
         }
+        Ok(())
+    }
+
+    /// Marks `failed` for the next scan to hash again. When its chunks were hashed under an
+    /// older generation than the writable one, every other content with chunks the server lacks
+    /// and an older generation is marked as well, so a rotation costs one failed publish, not
+    /// one per pending file. A file that merely changed marks only itself: the others still
+    /// seal and are not read twice.
+    fn mark_rehash(
+        &mut self,
+        cx: &Ctx<'_>,
+        crypto: &FolderCrypto,
+        failed: ContentKey,
+        missing: &[ObjectId],
+        sources: &BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)>,
+    ) -> Result<(), SyncError> {
+        self.rehash.insert(failed);
+        let writable = crypto.writable_generation().0;
+        let older = |content: &ContentKey| -> Result<bool, SyncError> {
+            Ok(cx
+                .store
+                .chunk_list(&self.folder, content)?
+                .and_then(|l| l.generation)
+                .is_some_and(|g| g != writable))
+        };
+        if !older(&failed)? {
+            return Ok(());
+        }
+        let pending: BTreeSet<ContentKey> = missing
+            .iter()
+            .filter_map(|id| sources.get(id).map(|(_, _, c)| *c))
+            .collect();
+        let mut stale = Vec::new();
+        for content in pending {
+            if older(&content)? {
+                stale.push(content);
+            }
+        }
+        self.rehash.extend(stale);
         Ok(())
     }
 
@@ -1832,6 +2192,7 @@ impl FolderSync {
         cx: &mut Ctx<'_>,
         crypto: &FolderCrypto,
         root: ObjectId,
+        delta: DeltaDigest,
     ) -> Result<CommitContent, SyncError> {
         let counter = cx.account.next_counter(cx.store)?;
         Ok(CommitContent {
@@ -1840,7 +2201,66 @@ impl FolderSync {
             device: *cx.account.device(),
             log_head: cx.account.log_head()?,
             counter,
+            delta,
         })
+    }
+
+    /// Uploads what the encoded `tree` needs and commits it on `frontier`, with `side` if given
+    /// (ADR 0001, amendment "reference deltas bound to the tree"); returns the committed root.
+    /// The head's delta is a diff against `parent`, the first parent's reachable set, or the
+    /// full set when the diff does not fit one commit or [`FolderMeta::full_next`] asks for it.
+    ///
+    /// - The server no longer retains the side commit's base: the merge alone, with one parent.
+    /// - The server's live set does not fit the diff (`delta_mismatch`): another device broke
+    ///   it. The same tree goes out again with a full delta and without the side commit, every
+    ///   directory node and manifest sealed again ([`codec::encode_fresh`]), and every object of
+    ///   the tree the server lacks, also one the collection deleted, uploaded first. That
+    ///   repairs the live set, so an honest device is never locked out of a folder.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_encoded(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        tree: &Tree,
+        encoded: &Encoded,
+        parent: &BTreeSet<ObjectId>,
+        frontier: Option<ChainEntry>,
+        side: Option<&(SignedCommit, ReferenceDelta)>,
+        disk: &Tree,
+    ) -> Result<ObjectId, PublishFailure> {
+        let limit = cx.settings.max_delta_ids;
+        let wants_full = self.meta.full_next && full_delta(&encoded.reachable, limit).is_some();
+        if !wants_full {
+            let (delta, digest) = head_delta(parent, &encoded.reachable, limit, false)?;
+            if !digest.full {
+                let added: BTreeSet<ObjectId> = delta.added.iter().copied().collect();
+                self.upload(cx, crypto, encoded, &added, disk)?;
+                codec::remember_uploaded(encoded, &self.folder, cx.store)
+                    .map_err(SyncError::from)?;
+                let code = |r: &Result<(), PublishFailure>| match r {
+                    Err(PublishFailure::Error(SyncError::Net(e))) => e.code(),
+                    _ => None,
+                };
+                let mut result =
+                    self.send(cx, crypto, encoded.root, frontier, side, &delta, digest);
+                if side.is_some() && code(&result) == Some(ErrorCode::BaseExpired) {
+                    result = self.send(cx, crypto, encoded.root, frontier, None, &delta, digest);
+                }
+                if code(&result) != Some(ErrorCode::DeltaMismatch) {
+                    result?;
+                    return Ok(encoded.root);
+                }
+                self.meta.full_next = true;
+            }
+        }
+        let fresh = codec::encode_fresh(tree, crypto, cx.store, cx.entropy)?;
+        let (delta, digest) = full_delta(&fresh.reachable, limit)
+            .ok_or(SyncError::Invalid("too many objects for one commit"))?;
+        self.upload(cx, crypto, &fresh, &fresh.reachable, disk)?;
+        codec::remember_uploaded(&fresh, &self.folder, cx.store).map_err(SyncError::from)?;
+        self.send(cx, crypto, fresh.root, frontier, None, &delta, digest)?;
+        self.meta.full_next = false;
+        Ok(fresh.root)
     }
 
     /// Publishes `tree` as a normal commit on the frontier, without a side commit: one stage of
@@ -1854,21 +2274,11 @@ impl FolderSync {
     ) -> Result<(), PublishFailure> {
         let encoded = codec::encode(tree, crypto, cx.store, cx.entropy)?;
         let parent = self.reachable_of(self.meta.remote_root, crypto, cx)?;
-        let added: BTreeSet<ObjectId> = encoded.reachable.difference(&parent).copied().collect();
-        let dropped: Vec<ObjectId> = parent.difference(&encoded.reachable).copied().collect();
-        self.upload(cx, crypto, &encoded, &added, disk)?;
-        codec::remember_uploaded(&encoded, &self.folder, cx.store).map_err(SyncError::from)?;
-        let delta = fit_delta(
-            ReferenceDelta {
-                added: added.into_iter().collect(),
-                dropped,
-            },
-            cx.settings.max_delta_ids,
-        )?;
         let frontier = self.view.frontier().copied();
-        self.send(cx, crypto, encoded.root, frontier, None, &delta)?;
+        let root =
+            self.commit_encoded(cx, crypto, tree, &encoded, &parent, frontier, None, disk)?;
         self.set_remote(tree.clone());
-        self.meta.remote_root = Some(encoded.root);
+        self.meta.remote_root = Some(root);
         self.save(cx.store)?;
         Ok(())
     }
@@ -1876,23 +2286,21 @@ impl FolderSync {
     fn publish(&mut self, cx: &mut Ctx<'_>, p: &Plan) -> Result<(), PublishFailure> {
         let chain_generation = self.view.frontier().map(|f| f.generation);
         let crypto = cx.account.folder_crypto(&self.folder, chain_generation)?;
-        let limit = cx.settings.max_delta_ids.max(1);
+        let limit = delta_limit(cx.settings.max_delta_ids);
         let mut encoded = codec::encode(&p.merged, &crypto, cx.store, cx.entropy)?;
         let mut parent = self.reachable_of(self.meta.remote_root, &crypto, cx)?;
-        // Too many new objects for one commit: publish valid intermediate trees first, each
-        // the server's tree plus whole new files and their new directories (open point B).
-        while encoded.reachable.difference(&parent).count() > limit {
+        // Too many changes for one commit, as a diff and as the full set: publish valid
+        // intermediate trees first, each the server's tree plus whole new files and their new
+        // directories (open point B). Half the limit for the new objects leaves room for the
+        // old versions a stage drops.
+        while !fits_one_commit(&parent, &encoded.reachable, limit) {
             let Some(stage) = stage_tree(&self.remote, &p.merged, &encoded, limit / 2) else {
-                return Err(SyncError::Invalid("too many new objects for one commit").into());
+                return Err(SyncError::Invalid("too many changes for one commit").into());
             };
             self.publish_stage(cx, &crypto, &stage, &p.disk)?;
             encoded = codec::encode(&p.merged, &crypto, cx.store, cx.entropy)?;
             parent = self.reachable_of(self.meta.remote_root, &crypto, cx)?;
         }
-        let added: BTreeSet<ObjectId> = encoded.reachable.difference(&parent).copied().collect();
-        let dropped: Vec<ObjectId> = parent.difference(&encoded.reachable).copied().collect();
-        self.upload(cx, &crypto, &encoded, &added, &p.disk)?;
-        codec::remember_uploaded(&encoded, &self.folder, cx.store).map_err(SyncError::from)?;
 
         // A side commit when the server moved on since the last fully synced head.
         let frontier = self.view.frontier().copied();
@@ -1904,57 +2312,40 @@ impl FolderSync {
         if let (Some(base), Some(_)) = (side_base, frontier) {
             if let Ok(side_enc) = codec::encode(&p.disk, &crypto, cx.store, cx.entropy) {
                 let base_reach = self.reachable_of(Some(base.root), &crypto, cx)?;
-                let side_added: BTreeSet<ObjectId> = side_enc
-                    .reachable
-                    .difference(&base_reach)
-                    .copied()
-                    .collect();
-                self.upload(cx, &crypto, &side_enc, &side_added, &p.disk)?;
-                codec::remember_uploaded(&side_enc, &self.folder, cx.store)
-                    .map_err(SyncError::from)?;
-                let content = self.content(cx, &crypto, side_enc.root)?;
-                let commit = Commit::side(
-                    *cx.account.id(),
-                    self.folder,
-                    &ChainEntry::from(&base.entry),
-                    content,
-                );
-                let signed = cx.account.sign(commit)?;
-                // A side commit that would not fit one commit is left out: the merge commit
-                // alone loses nothing, as with an expired base.
-                if let Ok(side_delta) = fit_delta(
-                    ReferenceDelta {
-                        added: side_added.into_iter().collect(),
-                        dropped: base_reach
-                            .difference(&side_enc.reachable)
-                            .copied()
-                            .collect(),
-                    },
-                    limit,
-                ) {
+                // A side commit's delta is always a diff against its base. One that would not
+                // fit one commit is left out: the merge commit alone loses nothing, as with an
+                // expired base.
+                if let Some((side_delta, side_digest)) =
+                    diff_delta(&base_reach, &side_enc.reachable, limit)
+                {
+                    let side_added: BTreeSet<ObjectId> = side_delta.added.iter().copied().collect();
+                    self.upload(cx, &crypto, &side_enc, &side_added, &p.disk)?;
+                    codec::remember_uploaded(&side_enc, &self.folder, cx.store)
+                        .map_err(SyncError::from)?;
+                    let content = self.content(cx, &crypto, side_enc.root, side_digest)?;
+                    let commit = Commit::side(
+                        *cx.account.id(),
+                        self.folder,
+                        &ChainEntry::from(&base.entry),
+                        content,
+                    );
+                    let signed = cx.account.sign(commit)?;
                     side = Some((signed, side_delta));
                 }
             }
         }
-        let delta = fit_delta(
-            ReferenceDelta {
-                added: added.into_iter().collect(),
-                dropped,
-            },
-            limit,
+        let root = self.commit_encoded(
+            cx,
+            &crypto,
+            &p.merged,
+            &encoded,
+            &parent,
+            frontier,
+            side.as_ref(),
+            &p.disk,
         )?;
-        let result = self.send(cx, &crypto, encoded.root, frontier, side.as_ref(), &delta);
-        match result {
-            Err(PublishFailure::Error(SyncError::Net(e)))
-                if e.code() == Some(ErrorCode::BaseExpired) =>
-            {
-                // The server no longer retains the base: the merge alone, with one parent.
-                self.send(cx, &crypto, encoded.root, frontier, None, &delta)
-            }
-            other => other,
-        }?;
         self.set_remote(p.merged.clone());
-        self.meta.remote_root = Some(encoded.root);
+        self.meta.remote_root = Some(root);
         // Rekeys: the local items are known under their merged IDs from now on.
         for rekey in &p.rekeys {
             if let Some(f) = self.file_ids.remove(&rekey.from) {
@@ -1974,6 +2365,7 @@ impl FolderSync {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -1982,8 +2374,9 @@ impl FolderSync {
         frontier: Option<ChainEntry>,
         side: Option<&(SignedCommit, ReferenceDelta)>,
         delta: &ReferenceDelta,
+        digest: DeltaDigest,
     ) -> Result<(), PublishFailure> {
-        let content = self.content(cx, crypto, root)?;
+        let content = self.content(cx, crypto, root, digest)?;
         let account = *cx.account.id();
         let commit = match (frontier, side) {
             (None, _) => Commit::first(account, self.folder, content),
@@ -2035,6 +2428,8 @@ impl FolderSync {
                 reanchor: false,
                 side: true,
                 root: s.commit.root,
+                dropped_files: None,
+                files_before: None,
             });
         }
         self.meta.timeline.push(TimelineRec {
@@ -2045,6 +2440,8 @@ impl FolderSync {
             reanchor: signed.commit.reanchor,
             side: false,
             root: signed.commit.root,
+            dropped_files: None,
+            files_before: None,
         });
         self.meta.frontier_wire = Some(Blob(signed.wire.clone()));
         Ok(())
@@ -2091,6 +2488,7 @@ impl FolderSync {
             crypto: &reader,
             file_ids: &mut self.file_ids,
             dirty: &mut self.file_ids_dirty,
+            downloaded: 0,
         };
         let result = apply(&p.merged, &mut work, &mut self.synced, &skip, &mut disk);
         report.applied = result.done.len();
@@ -2130,6 +2528,14 @@ impl FolderSync {
                     let entry = self.meta.backoff.entry(*id).or_insert((0, 0));
                     entry.0 = entry.0.saturating_add(1);
                     let wait = 1_000i64 << entry.0.min(10);
+                    entry.1 = now + wait;
+                }
+                // Waits for space instead of being tried every round: from one minute,
+                // doubling up to 32 minutes; the wait ends once the file is written.
+                ActionError::DiskFull => {
+                    let entry = self.meta.backoff.entry(*id).or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(1);
+                    let wait = 60_000i64 << entry.0.saturating_sub(1).min(5);
                     entry.1 = now + wait;
                 }
                 _ => {}
@@ -2407,7 +2813,9 @@ impl FolderSync {
         let crypto = cx
             .account
             .folder_crypto(&self.folder, Some(base.head.generation))?;
-        let encoded = codec::encode(&merged.tree, &crypto, cx.store, cx.entropy)?;
+        // Every node sealed again: the server that showed the older state may lack objects the
+        // store lists as uploaded, and the full delta below asks for all of them.
+        let encoded = codec::encode_fresh(&merged.tree, &crypto, cx.store, cx.entropy)?;
         let all = encoded.reachable.clone();
         match self.upload(cx, &crypto, &encoded, &all, &merged.local) {
             Ok(()) => {}
@@ -2415,24 +2823,23 @@ impl FolderSync {
             Err(_) => return Err(SyncError::Invalid("the disk changed")),
         }
         codec::remember_uploaded(&encoded, &self.folder, cx.store)?;
-        let content = self.content(cx, &crypto, encoded.root)?;
+        // A full delta: the server's live set may be anything after the older state, and the
+        // full set replaces it (ADR 0001, amendment "reference deltas bound to the tree").
+        let (delta, digest) = full_delta(&all, cx.settings.max_delta_ids)
+            .ok_or(SyncError::Invalid("too many objects for one commit"))?;
+        let content = self.content(cx, &crypto, encoded.root, digest)?;
         let commit = Commit::reanchor(*cx.account.id(), self.folder, &base.head, content);
         let signed = cx.account.sign(commit)?;
         let request = CommitRequest {
             expected_head: Some(base.head.commit),
             head: CommitUpload {
                 commit: Blob(signed.wire.clone()),
-                delta: fit_delta(
-                    ReferenceDelta {
-                        added: all.into_iter().collect(),
-                        dropped: Vec::new(),
-                    },
-                    cx.settings.max_delta_ids,
-                )?,
+                delta,
             },
             side: None,
         };
         let response = cx.server.commit(&self.folder, &request)?;
+        self.meta.full_next = false;
         self.view = self.view.apply_reanchor(
             cx.account.state(),
             newest,
@@ -2461,6 +2868,8 @@ impl FolderSync {
             reanchor: true,
             side: false,
             root: signed.commit.root,
+            dropped_files: None,
+            files_before: None,
         });
         self.save(cx.store)
     }
@@ -2478,25 +2887,75 @@ impl FolderSync {
     ) -> Result<(), SyncError> {
         let chain_generation = Some(head.commit.generation);
         let crypto = cx.account.folder_crypto(&self.folder, chain_generation)?;
-        let counter = cx.account.next_counter(cx.store)?;
-        let commit = Commit::barrier(
-            head,
-            sequence,
-            crypto.writable_generation(),
-            *cx.account.device(),
-            cx.account.log_head()?,
-            counter,
-        );
-        let signed = cx.account.sign(commit)?;
-        let request = CommitRequest {
-            expected_head: Some(head.id),
-            head: CommitUpload {
-                commit: Blob(signed.wire.clone()),
-                delta: ReferenceDelta::default(),
-            },
-            side: None,
+        // A full delta of the tree when it fits one commit: the removed device may have
+        // broken the server's live set, and the barrier resets it to the tree it keeps (ADR
+        // 0001, amendment "reference deltas bound to the tree"). If the tree cannot be read or
+        // the server lacks some of its objects, the barrier keeps the empty diff and this
+        // device's next publish carries the full delta, with the objects uploaded again.
+        let full = match readable_set(&head.commit.root, &crypto, cx, &mut BTreeMap::new())? {
+            Readable::Set(reach) => full_delta(&reach.all, cx.settings.max_delta_ids),
+            Readable::Gone | Readable::Limit => None,
         };
-        let response = cx.server.commit(&self.folder, &request)?;
+        let mut attempts = Vec::new();
+        attempts.extend(full);
+        attempts.push((
+            ReferenceDelta::default(),
+            DeltaDigest::diff(&BTreeSet::new(), &BTreeSet::new()),
+        ));
+        let mut accepted_response = None;
+        let mut signed_barrier = None;
+        let mut last_error = None;
+        for (delta, digest) in attempts {
+            let counter = cx.account.next_counter(cx.store)?;
+            let commit = Commit::barrier(
+                head,
+                sequence,
+                crypto.writable_generation(),
+                *cx.account.device(),
+                cx.account.log_head()?,
+                counter,
+                digest,
+            );
+            let signed = cx.account.sign(commit)?;
+            let request = CommitRequest {
+                expected_head: Some(head.id),
+                head: CommitUpload {
+                    commit: Blob(signed.wire.clone()),
+                    delta,
+                },
+                side: None,
+            };
+            match cx.server.commit(&self.folder, &request) {
+                Ok(r) => {
+                    self.meta.full_next = !digest.full;
+                    accepted_response = Some(r);
+                    signed_barrier = Some(signed);
+                    break;
+                }
+                // The removal must finish even when the full delta cannot pass now: objects
+                // the server lacks, a live set it does not fit, or bytes it would make live
+                // again beyond the quota or a budget (MEDIUM 2 of the follow-up review). The
+                // empty diff goes out, and the repair follows once it can.
+                Err(e)
+                    if digest.full
+                        && matches!(
+                            e.code(),
+                            Some(
+                                ErrorCode::MissingObjects
+                                    | ErrorCode::DeltaMismatch
+                                    | ErrorCode::BudgetExceeded
+                                    | ErrorCode::QuotaExceeded
+                            )
+                        ) =>
+                {
+                    last_error = Some(e);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let (Some(response), Some(signed)) = (accepted_response, signed_barrier) else {
+            return Err(last_error.map_or(SyncError::Invalid("no barrier sent"), Into::into));
+        };
         let newest = cx
             .account
             .newest_generation(&self.folder)
@@ -2522,7 +2981,15 @@ impl FolderSync {
             reanchor: false,
             side: false,
             root: signed.commit.root,
+            dropped_files: None,
+            files_before: None,
         });
+        if self.meta.full_next {
+            // The barrier kept the empty diff: repair at once where it can (objects the server
+            // lacks are uploaded now); otherwise the flag stays and the next round tries again,
+            // so a failure here never fails the removal.
+            let _ = self.repair(cx);
+        }
         self.save(cx.store)
     }
 
@@ -2550,7 +3017,9 @@ impl FolderSync {
         outcome: DeltaOutcome,
         delta: &[DeltaCommit],
     ) -> Result<(), SyncError> {
+        let checked = self.verify_tree_deltas(cx, &outcome, delta)?;
         self.record_timeline(&outcome, delta, cx.clock.now_ms());
+        self.annotate_timeline(&checked.drops);
         if let Some(head) = outcome.heads.last() {
             let reader = cx.account.folder_reader(&self.folder)?;
             let tree = codec::decode(&head.commit.root, &reader, cx.store, cx.server)?;
@@ -2597,21 +3066,171 @@ impl FolderSync {
     }
 }
 
-/// Fits a reference delta into `limit` IDs per commit (at most
-/// `hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS`).
-///
-/// Dropped IDs go first: they only tell the server earlier which objects a head no longer
-/// needs, and garbage collection never deletes an object because a delta names it as dropped
-/// (ADR 0001, section 5), so leaving some out is always safe. Added IDs must all be declared; a
-/// commit that adds more than the limit is refused here, before anything is signed. A publish
-/// that adds more is split by [`stage_tree`] before it gets here.
-pub fn fit_delta(mut delta: ReferenceDelta, limit: usize) -> Result<ReferenceDelta, SyncError> {
-    let limit = limit.min(hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS);
-    if delta.added.len() > limit {
-        return Err(SyncError::Invalid("too many new objects for one commit"));
+/// The IDs one commit's delta may list: the setting, at least 1 and at most
+/// `hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS`.
+fn delta_limit(setting: usize) -> usize {
+    setting.clamp(1, hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS)
+}
+
+/// The diff from the reachable set `before` to `after`, if it fits `limit` IDs (ADR 0001,
+/// amendment "reference deltas bound to the tree"). A diff is exact: every verifying device
+/// recomputes it from the trees, so no ID may be left out, not even a dropped one.
+pub fn diff_delta(
+    before: &BTreeSet<ObjectId>,
+    after: &BTreeSet<ObjectId>,
+    limit: usize,
+) -> Option<(ReferenceDelta, DeltaDigest)> {
+    let added: Vec<ObjectId> = after.difference(before).copied().collect();
+    let dropped: Vec<ObjectId> = before.difference(after).copied().collect();
+    if added.len().saturating_add(dropped.len()) > delta_limit(limit) {
+        return None;
     }
-    delta.dropped.truncate(limit - delta.added.len());
-    Ok(delta)
+    let digest = DeltaDigest::of(false, &added, &dropped)?;
+    Some((ReferenceDelta { added, dropped }, digest))
+}
+
+/// The full delta of the reachable set `all`, if it fits `limit` IDs.
+pub fn full_delta(all: &BTreeSet<ObjectId>, limit: usize) -> Option<(ReferenceDelta, DeltaDigest)> {
+    if all.len() > delta_limit(limit) {
+        return None;
+    }
+    let added: Vec<ObjectId> = all.iter().copied().collect();
+    let digest = DeltaDigest::of(true, &added, &[])?;
+    Some((
+        ReferenceDelta {
+            added,
+            dropped: Vec::new(),
+        },
+        digest,
+    ))
+}
+
+/// A head's delta from `before` to `after`: the diff, or the full set when the diff does not
+/// fit or `prefer_full` asks for it and the full set fits. Neither fitting is refused here,
+/// before anything is signed; a publish that large is split by [`stage_tree`] first.
+pub fn head_delta(
+    before: &BTreeSet<ObjectId>,
+    after: &BTreeSet<ObjectId>,
+    limit: usize,
+    prefer_full: bool,
+) -> Result<(ReferenceDelta, DeltaDigest), SyncError> {
+    let full = || full_delta(after, limit);
+    let chosen = if prefer_full {
+        full().or_else(|| diff_delta(before, after, limit))
+    } else {
+        diff_delta(before, after, limit).or_else(full)
+    };
+    chosen.ok_or(SyncError::Invalid("too many changes for one commit"))
+}
+
+/// Whether a commit from `before` to `after` fits one delta of `limit` IDs, as a diff or as
+/// the full set.
+fn fits_one_commit(before: &BTreeSet<ObjectId>, after: &BTreeSet<ObjectId>, limit: usize) -> bool {
+    let limit = delta_limit(limit);
+    after.len() <= limit
+        || after
+            .difference(before)
+            .count()
+            .saturating_add(before.difference(after).count())
+            <= limit
+}
+
+/// How old a commit must be, by the server's time of its call, before a device accepts that
+/// the server no longer holds its trees (ADR 0001, amendment "reference deltas bound to the
+/// tree"). One day: the shortest retention an operator can set
+/// (`HANGAR_DRIVE_RETENTION_DAYS` is at least 1), so no honest server's collection takes a
+/// tree any sooner.
+pub const UNREADABLE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// A tree as a delta check reads it.
+#[derive(Debug, Clone)]
+enum Readable {
+    /// The objects, with their kinds.
+    Set(codec::Reachable),
+    /// An object the server no longer holds.
+    Gone,
+    /// Beyond the limits of a folder.
+    Limit,
+}
+
+/// The outcome of checking one commit's delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Fits,
+    Mismatch,
+    Unchecked,
+}
+
+impl Verdict {
+    fn of(fits: bool) -> Self {
+        if fits {
+            Verdict::Fits
+        } else {
+            Verdict::Mismatch
+        }
+    }
+}
+
+/// File objects a head dropped from its first parent's tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DropCount {
+    /// Dropped file objects.
+    pub dropped: u64,
+    /// File objects of the parent's tree.
+    pub before: u64,
+}
+
+impl DropCount {
+    /// Manifests and chunks dropped from `before` to `after`. A full delta counts chunks only:
+    /// a barrier or a repair seals manifests again, which renames them without dropping a
+    /// file, while the chunks of a dropped file go in every case.
+    fn of(before: &codec::Reachable, after: &codec::Reachable, full: bool) -> Self {
+        let chunks_after: BTreeSet<&ObjectId> = after.chunks().collect();
+        let mut dropped = before
+            .chunks()
+            .filter(|id| !chunks_after.contains(id))
+            .count() as u64;
+        let mut count_before = before.chunks().count() as u64;
+        if !full {
+            dropped += before.manifests.difference(&after.manifests).count() as u64;
+            count_before += before.manifests.len() as u64;
+        }
+        Self {
+            dropped,
+            before: count_before,
+        }
+    }
+}
+
+/// What [`FolderSync::verify_tree_deltas`] found besides a refusal.
+#[derive(Debug, Clone, Default)]
+struct TreeCheck {
+    /// A tree on the way is beyond the limits of a folder.
+    limit: bool,
+    /// File objects each checked head dropped, for "Undo a device" ([`TimelineRec`]).
+    drops: BTreeMap<CommitId, DropCount>,
+}
+
+/// The reachable objects of `root`, from `cache` or the objects (see [`Readable`]).
+fn readable_set(
+    root: &ObjectId,
+    crypto: &FolderCrypto,
+    cx: &mut Ctx<'_>,
+    cache: &mut BTreeMap<ObjectId, Readable>,
+) -> Result<Readable, SyncError> {
+    if let Some(known) = cache.get(root) {
+        return Ok(known.clone());
+    }
+    let read = match codec::reachable_typed(root, crypto, cx.store, cx.server) {
+        Ok(set) => Readable::Set(set),
+        Err(CodecError::Limit) => Readable::Limit,
+        Err(CodecError::Net(NetError::Server(body))) if body.code == ErrorCode::NotFound => {
+            Readable::Gone
+        }
+        Err(e) => return Err(e.into()),
+    };
+    cache.insert(*root, read.clone());
+    Ok(read)
 }
 
 /// One intermediate tree of a publish that is too large for one commit (open point B): the
