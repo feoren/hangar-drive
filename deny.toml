@@ -1,0 +1,57 @@
+# cargo-deny configuration (schema version 2), checked in CI by the job `licenses` with
+# `cargo deny check licenses sources`. The license policy and every exception are decided in
+# docs/wiki/pages/decisions/0001-foundation.md, section 8.
+#
+# Advisories run through cargo-audit in the job `audit`, so they are not checked here. Bans are
+# not checked: the Tauri graph carries about fifty crates in two or more versions, which would
+# only produce warnings nobody can act on.
+
+[graph]
+# No `targets`: every platform's dependencies are checked, so the Linux and macOS crates count
+# on a Windows machine too.
+all-features = false
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Permissive licenses allowed for every crate (ADR 0001, section 8, "License allowlist").
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+# An allowance or exception that no crate needs any more is an error, so the list stays exactly
+# what the workspace uses.
+unused-allowed-license = "deny"
+unused-license-exception = "deny"
+
+exceptions = [
+    # ADR 0001, section 8, `notify`: CC0 waives all rights.
+    { crate = "notify", allow = ["CC0-1.0"] },
+    # ADR 0001, section 8, `xxhash-rust`: BSL-1.0, permissive like MIT, pulled by notify.
+    { crate = "xxhash-rust", allow = ["BSL-1.0"] },
+    # ADR 0001, section 8, `option-ext`: MPL-2.0 file-level copyleft, used unmodified, pulled
+    # by dirs-sys through dirs.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    # ADR 0001, section 8, `option-ext` (same reasoning): MPL-2.0 HTML crates pulled by Tauri
+    # through dom_query, used unmodified.
+    { crate = "cssparser", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short", allow = ["MPL-2.0"] },
+    { crate = "selectors", allow = ["MPL-2.0"] },
+    # ADR 0001, section 8, `webpki-root-certs`: permissive data license for the Mozilla root
+    # certificates, pulled by rustls-platform-verifier.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+]
+
+# Every crate comes from crates.io; a git dependency or another registry fails the check until it
+# is added here with a reason.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
