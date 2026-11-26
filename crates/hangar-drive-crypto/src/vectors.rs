@@ -419,6 +419,7 @@ fn compute() -> BTreeMap<String, String> {
     let recovery = code.identity().unwrap().public_keys();
     put("recovery.sign_public", hex(recovery.sign.as_bytes()));
     put("recovery.kem_public", hex(recovery.kem.as_bytes()));
+    put("recovery.device_id", code.device_id().unwrap().to_hex());
 
     // Pairing.
     let pairing = PairingSecret::generate(&mut FixedEntropy::counting(0xe0, 16)).unwrap();

@@ -18,6 +18,7 @@
 //! | `GET`, `PUT /api/v1/account/records/{kind}[/{folder}]` | [`RecordPut`] | [`RecordResponse`] |
 //! | `GET /api/v1/account/feed?after=N` | | [`FeedPage`] |
 //! | `GET /api/v1/account/events` (SSE) | | [`SequenceEvent`] per event |
+//! | `PUT /api/v1/pairing/{pairing id}` | | [`PairingReservation`] |
 //! | `POST /api/v1/pairing/{pairing id}` | [`PairingRequest`] | `204` |
 //! | `GET /api/v1/pairing/{pairing id}` | | [`PairingRequest`] |
 //! | `POST /api/v1/folders/{folder}/objects/missing` | [`MissingObjectsRequest`] | [`MissingObjectsResponse`] |
@@ -85,7 +86,8 @@ pub fn record_path(key: &RecordKey) -> String {
     }
 }
 
-/// Path of a pairing slot.
+/// Path of a pairing slot: `PUT` reserves it (the inviting device, with its session), `POST`
+/// fills it once (the new device, without a session), `GET` reads it (the reserving account).
 pub fn pairing_path(pairing: &PairingId) -> String {
     format!("{API_PREFIX}/pairing/{pairing}")
 }
@@ -334,6 +336,9 @@ pub enum ApiCall {
     GetFeed,
     /// `GET /api/v1/account/events`.
     Events,
+    /// `PUT /api/v1/pairing/{pairing id}`: the inviting device reserves the slot before it
+    /// shows the offer; a new device can post only into a reserved, empty slot.
+    ReservePairing,
     /// `GET /api/v1/pairing/{pairing id}` (the inviting device fetches the request).
     GetPairing,
     /// `POST /api/v1/folders/{folder}/objects/missing`.
@@ -539,6 +544,19 @@ pub struct PairingRequest {
     pub name: String,
     /// HMAC-SHA-256 under the pairing MAC key.
     pub tag: Blob,
+}
+
+/// Reserved pairing slots one account may hold at a time.
+pub const MAX_OPEN_PAIRINGS: usize = 4;
+
+/// The reply to `PUT /api/v1/pairing/{pairing id}`: the slot is reserved for the session's
+/// account until it expires with the offer. Reserving it again from the same account is
+/// idempotent; a slot of another account is [`ErrorCode::AlreadyExists`], and more than
+/// [`MAX_OPEN_PAIRINGS`] open slots are [`ErrorCode::RateLimited`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingReservation {
+    /// Seconds until the slot expires.
+    pub expires_in_secs: u32,
 }
 
 impl PairingRequest {
@@ -1158,6 +1176,7 @@ mod tests {
             ApiCall::PutRecord,
             ApiCall::GetFeed,
             ApiCall::Events,
+            ApiCall::ReservePairing,
             ApiCall::GetPairing,
             ApiCall::MissingObjects,
             ApiCall::PutObject,
@@ -1197,6 +1216,19 @@ mod tests {
         let mut device = SessionScope::Device;
         device.record_append();
         assert_eq!(device.check_append(&two), Ok(()));
+    }
+
+    #[test]
+    fn a_pairing_reservation_names_its_lifetime() {
+        let reply = PairingReservation {
+            expires_in_secs: 600,
+        };
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({ "expires_in_secs": 600 })
+        );
+        assert!(SessionScope::Device.allows(ApiCall::ReservePairing));
+        assert_eq!(MAX_OPEN_PAIRINGS, 4);
     }
 
     #[test]

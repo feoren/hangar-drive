@@ -52,7 +52,7 @@
 
 use std::fmt;
 
-use hangar_drive_protocol::ids::{AccountId, DeviceId, Epoch, LogHash, PublicKey};
+use hangar_drive_protocol::ids::{AccountId, DeviceId, Epoch, FolderId, LogHash, PublicKey};
 use hpke::aead::ChaCha20Poly1305;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::X25519HkdfSha256;
@@ -420,6 +420,108 @@ pub struct Removal {
     pub rotation: Rotation,
     /// The verified state after the batch, to apply once the server accepted it.
     pub state: AccountState,
+    /// The proof that lets the removing device verify a folder delta without the removed
+    /// signer rule, to write its barrier commits
+    /// ([`crate::commit::FolderView::verify_delta_before_barrier`]; security review N2).
+    pub permit: BarrierPermit,
+}
+
+/// Proof that a removal and its rotation are in the verified log and that the holder may write
+/// the barrier commits after it (security review N2). Only [`remove_devices`] makes one for the
+/// removing device, valid in every folder, and [`BarrierPermit::takeover`] for a current device
+/// that completes the step of a removing device that went away (N1). A takeover permit is bound
+/// to one folder and can only be made from a [`crate::commit::RemovedSignerRefusal`], the
+/// result of a delta that [`crate::commit::FolderView::check_delta`] refused by the removed
+/// signer rule, so no device verifies a delta without that rule unless it first failed with it
+/// (security review H1). [`crate::commit::FolderView::verify_delta_before_barrier`] refuses a
+/// permit for any other state or folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarrierPermit {
+    account: AccountId,
+    removal_index: u64,
+    holder: DeviceId,
+    folder: Option<FolderId>,
+}
+
+impl BarrierPermit {
+    /// The permit of a current, regular device for the folder of `refusal`, when the removing
+    /// device did not finish its barriers (N1). `None` if the refusal belongs to another account
+    /// or another removal than the last one of `state`, while a rotation is due, or if `device`
+    /// is not a current regular device.
+    pub fn takeover(
+        state: &AccountState,
+        device: &DeviceId,
+        refusal: &crate::commit::RemovedSignerRefusal,
+    ) -> Option<Self> {
+        let removal_index = state.last_removal_index();
+        if removal_index == 0 || state.rotation_due() {
+            return None;
+        }
+        if refusal.account() != state.account() || refusal.removal_index() != removal_index {
+            return None;
+        }
+        if state.current_epoch()?.index < removal_index {
+            return None;
+        }
+        state
+            .device(device)
+            .filter(|d| d.is_current() && !d.recovery)?;
+        Some(Self {
+            account: *state.account(),
+            removal_index,
+            holder: *device,
+            folder: Some(*refusal.folder()),
+        })
+    }
+
+    /// The permit of the device that issued the last removal of the verified log `state`, for
+    /// a removal job it resumes after a crash or a lost answer (N1): the log entry it signed is
+    /// the proof, so no other device can get this permit, which holds in every folder. `None`
+    /// while a rotation is due or if `device` did not issue the last removal or is no longer a
+    /// current regular device.
+    pub fn of_own_removal(state: &AccountState, device: &DeviceId) -> Option<Self> {
+        let removal_index = state.last_removal_index();
+        if removal_index == 0 || state.rotation_due() || state.last_removal_issuer() != Some(device)
+        {
+            return None;
+        }
+        state
+            .device(device)
+            .filter(|d| d.is_current() && !d.recovery)?;
+        Some(Self {
+            account: *state.account(),
+            removal_index,
+            holder: *device,
+            folder: None,
+        })
+    }
+
+    /// Whether this permit covers the last removal of `state` and its holder is still a
+    /// current regular device there.
+    pub fn covers(&self, state: &AccountState) -> bool {
+        self.removal_index > 0
+            && self.account == *state.account()
+            && self.removal_index == state.last_removal_index()
+            && state
+                .device(&self.holder)
+                .is_some_and(|d| d.is_current() && !d.recovery)
+    }
+
+    /// Whether this permit may be used in `folder`: the removing device's permit in every
+    /// folder, a takeover permit only in the folder whose delta was refused.
+    pub fn allows_folder(&self, folder: &FolderId) -> bool {
+        self.folder.is_none_or(|f| f == *folder)
+    }
+
+    /// The log index of the removal.
+    pub fn removal_index(&self) -> u64 {
+        self.removal_index
+    }
+
+    /// Whether this is a takeover permit (bound to one folder).
+    pub fn is_takeover(&self) -> bool {
+        self.folder.is_some()
+    }
 }
 
 /// Builds the append call that removes `targets` and rotates at once, issued by `identity` as
@@ -449,10 +551,17 @@ pub fn remove_devices(
     let rotation = rotate(&after, identity, issuer, issued_at_ms, entropy)?;
     after.apply(&rotation.entry)?;
     entries.push(rotation.entry.clone());
+    let permit = BarrierPermit {
+        account: *after.account(),
+        removal_index: after.last_removal_index(),
+        holder: issuer,
+        folder: None,
+    };
     Ok(Removal {
         entries,
         rotation,
         state: after,
+        permit,
     })
 }
 

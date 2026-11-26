@@ -45,7 +45,19 @@ fuzz_target!(|data: &[u8]| {
                 outcome.heads.last().map(|h| h.id)
             );
         }
-        let _ = view.verify_delta_before_barrier(&fixture.state, generation, &delta);
+        // The fixture's log has no removal, so no delta is refused by the removed signer rule
+        // and no takeover permit exists (security review N2, H1): the check before a barrier is
+        // unreachable here, which is the point.
+        if let Ok(hangar_drive_crypto::commit::DeltaCheck::RemovedSigner(refusal)) =
+            view.check_delta(&fixture.state, generation, &delta)
+        {
+            assert!(hangar_drive_crypto::epoch::BarrierPermit::takeover(
+                &fixture.state,
+                &common::DEVICE,
+                &refusal
+            )
+            .is_none());
+        }
         let _ = view.reanchor_base(&fixture.state, generation, &delta);
     }
 });

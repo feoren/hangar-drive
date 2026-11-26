@@ -195,6 +195,86 @@ pub fn record_header(data: &[u8]) -> Option<RecordHeader> {
     parse(data).ok().map(|p| p.header)
 }
 
+fn record_aad(
+    account: &AccountId,
+    epoch: Epoch,
+    key: &RecordKey,
+    version: u64,
+    sender: &DeviceId,
+    head: &LogHead,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.field(LABEL_RECORD)
+        .field_u8(RECORD_VERSION)
+        .field(account.as_bytes())
+        .field_u32(epoch.0)
+        .field(key.kind.label().as_bytes())
+        .field(&key.id_bytes())
+        .field_u64(version)
+        .field(sender.as_bytes())
+        .field_u64(head.index)
+        .field(head.hash.as_bytes());
+    w.into_bytes()
+}
+
+/// The checks of [`RecordCipher::open`] that need no key, for the server, which cannot open
+/// records: the format, a log head in `state` (hash included), a current regular sender that
+/// was valid at that head, the head not before the epoch's rotation, and the sender's signature
+/// over the record as `key`. Returns the checked header. A record that passes can still fail to
+/// decrypt on a device; the server cannot tell, and need not.
+pub fn verify_record_signature(
+    state: &AccountState,
+    key: &RecordKey,
+    data: &[u8],
+) -> Result<RecordHeader, OpenError> {
+    let parsed = parse(data)?;
+    let header = parsed.header;
+    if header.head.index == 0 || header.head.index > state.len() {
+        return Err(OpenError::AheadOfLog {
+            index: header.head.index,
+        });
+    }
+    if !state.contains(&header.head) {
+        return Err(OpenError::Fork {
+            index: header.head.index,
+        });
+    }
+    if state.device(&header.sender).is_none() {
+        return Err(OpenError::UnknownSender);
+    }
+    let signer = state
+        .signer_at(&header.sender, header.head.index)
+        .filter(|d| d.is_current())
+        .ok_or(OpenError::SenderNotValid)?;
+    let epoch_start =
+        state
+            .epoch(header.epoch)
+            .map(|e| e.index)
+            .ok_or(OpenError::EpochMismatch {
+                expected: state.current_epoch().map_or(0, |e| e.epoch.0),
+                got: header.epoch.0,
+            })?;
+    if header.head.index < epoch_start {
+        return Err(OpenError::HeadBeforeEpoch);
+    }
+    let aad = record_aad(
+        state.account(),
+        header.epoch,
+        key,
+        header.version,
+        &header.sender,
+        &header.head,
+    );
+    if !verify(
+        &signer.keys.sign,
+        &framed(&[LABEL_RECORD_SIG, &aad, parsed.nonce, parsed.ciphertext]),
+        &parsed.signature,
+    ) {
+        return Err(OpenError::Signature);
+    }
+    Ok(header)
+}
+
 /// An opened record. `Debug` does not show the plaintext.
 pub struct OpenedRecord {
     /// Which record.
@@ -259,18 +339,7 @@ impl RecordCipher {
     }
 
     fn aad(&self, key: &RecordKey, version: u64, sender: &DeviceId, head: &LogHead) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.field(LABEL_RECORD)
-            .field_u8(RECORD_VERSION)
-            .field(self.account().as_bytes())
-            .field_u32(self.epoch().0)
-            .field(key.kind.label().as_bytes())
-            .field(&key.id_bytes())
-            .field_u64(version)
-            .field(sender.as_bytes())
-            .field_u64(head.index)
-            .field(head.hash.as_bytes());
-        w.into_bytes()
+        record_aad(self.account(), self.epoch(), key, version, sender, head)
     }
 
     fn cipher(&self) -> Option<XChaCha20Poly1305> {
@@ -553,6 +622,45 @@ pub(crate) mod tests {
         let header = record_header(&data).unwrap();
         assert_eq!(header.version, 1);
         assert_eq!(header.epoch, Epoch(1));
+    }
+
+    #[test]
+    fn the_server_checks_the_signature_without_the_key() {
+        let s = setup();
+        let key = ring_key();
+        let data = sealed(&s, &key, 1, b"ring");
+        let header = verify_record_signature(&s.state, &key, &data).unwrap();
+        assert_eq!((header.sender, header.version), (s.a.id, 1));
+        // Bytes that only look like a record: a valid header and random rest.
+        let mut forged = data.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert_eq!(
+            verify_record_signature(&s.state, &key, &forged).unwrap_err(),
+            OpenError::Signature
+        );
+        let mut garbled = data.clone();
+        garbled[HEADER_LEN + NONCE_LEN] ^= 1;
+        assert_eq!(
+            verify_record_signature(&s.state, &key, &garbled).unwrap_err(),
+            OpenError::Signature
+        );
+        let other = RecordKey::new(RecordKind::Folders, None).unwrap();
+        assert_eq!(
+            verify_record_signature(&s.state, &other, &data).unwrap_err(),
+            OpenError::Signature
+        );
+        // A record that names b as its sender but carries a's signature.
+        let mut renamed = data.clone();
+        renamed[13..29].copy_from_slice(s.b.id.as_bytes());
+        assert_eq!(
+            verify_record_signature(&s.state, &key, &renamed).unwrap_err(),
+            OpenError::Signature
+        );
+        assert_eq!(
+            verify_record_signature(&s.state, &key, &data[..10]).unwrap_err(),
+            OpenError::Malformed
+        );
     }
 
     #[test]

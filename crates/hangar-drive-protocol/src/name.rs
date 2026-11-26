@@ -381,7 +381,14 @@ pub fn is_ignored(name: &str, at_root: bool) -> bool {
     if IGNORED_NAMES.contains(&lower.as_str()) {
         return true;
     }
-    if at_root && lower == RESERVED_ROOT_DIR {
+    // The reserved directory is compared with the case keys of the name policy, not only in
+    // ASCII: a case-insensitive file system may fold a name such as `.hangar-dr\u{131}ve`
+    // (dotless i) onto the real directory, and an entry written there could reach the root
+    // marker, the temporary files or the quarantine.
+    if at_root
+        && (lower == RESERVED_ROOT_DIR
+            || CaseKeys::of(name).collides(&CaseKeys::of(RESERVED_ROOT_DIR)))
+    {
         return true;
     }
     if name == "Icon\r" {
@@ -700,6 +707,20 @@ mod tests {
         }
         assert!(is_ignored(".hangar-drive", true));
         assert!(!is_ignored(".hangar-drive", false));
+        // Case variants beyond ASCII that a case-insensitive file system may fold onto the
+        // reserved directory: the dotless i has the simple uppercase `I`.
+        for name in [
+            ".HANGAR-DRIVE",
+            ".hangar-dr\u{131}ve",
+            ".Hangar-Dr\u{131}ve",
+        ] {
+            assert!(
+                is_ignored(name, true),
+                "{name:?} must be ignored at the root"
+            );
+            assert!(!is_ignored(name, false));
+        }
+        assert!(!is_ignored(".hangar-drives", true));
         for name in [
             "Icon",
             "icon\r",

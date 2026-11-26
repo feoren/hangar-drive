@@ -68,7 +68,10 @@
 //!   the barrier "nothing goes back" refuses it. The device verifies the whole delta up to the
 //!   server's sequence (every page) in one call, so a barrier on a later page counts. The
 //!   removing device itself builds the barrier with [`FolderView::verify_delta_before_barrier`],
-//!   which skips only this rule.
+//!   which skips only this rule, needs the [`crate::epoch::BarrierPermit`] of the removal and
+//!   returns the heads of removed devices it let in, so the app can offer "Undo a device" for
+//!   them (security review N2). Any other device gets a permit only from a
+//!   [`RemovedSignerRefusal`] of [`FolderView::check_delta`], bound to that folder (H1).
 //!
 //! Marks are kept per folder: a device's counter rises across all its commits, but delta pulls of
 //! different folders arrive in any order.
@@ -681,6 +684,72 @@ pub enum ChainError {
     /// A head this device discarded at a re-anchor.
     #[error("the server presents a head this device discarded at a re-anchor")]
     Discarded,
+    /// The barrier permit does not cover the last removal of this device log.
+    #[error("the barrier permit does not cover the last removal of the device log")]
+    Permit,
+}
+
+/// A head of a removed device that [`FolderView::verify_delta_before_barrier`] let in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedHead {
+    /// The commit.
+    pub commit: CommitId,
+    /// The removed device that signed it.
+    pub device: DeviceId,
+    /// Its folder sequence.
+    pub sequence: u64,
+    /// The log index that removed the device.
+    pub removed_at: u64,
+}
+
+/// The delta before a barrier: what [`FolderView::verify_delta`] returns, plus the heads of
+/// removed devices among them (security review N2).
+#[derive(Debug, Clone)]
+pub struct BarrierDelta {
+    /// The accepted delta. Its view is never stored on its own; only the view of the accepted
+    /// barrier ([`FolderView::accept_published`]) is.
+    pub outcome: DeltaOutcome,
+    /// Heads signed by devices the verified log has removed, in order. The barrier that
+    /// follows covers them; the app offers "Undo a device" for them.
+    pub removed_heads: Vec<RemovedHead>,
+}
+
+/// The proof that [`FolderView::check_delta`] refused a delta by the removed signer rule and by
+/// no other rule before it: a head of a device the verified log has removed, without a barrier
+/// commit after it (security review H1). It is the only input from which
+/// [`crate::epoch::BarrierPermit::takeover`] makes a permit, bound to this folder. Only this
+/// module creates one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedSignerRefusal {
+    account: AccountId,
+    folder: FolderId,
+    removal_index: u64,
+}
+
+impl RemovedSignerRefusal {
+    /// The account.
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    /// The folder whose delta was refused.
+    pub fn folder(&self) -> &FolderId {
+        &self.folder
+    }
+
+    /// The last removal of the log the delta was checked against.
+    pub fn removal_index(&self) -> u64 {
+        self.removal_index
+    }
+}
+
+/// The result of [`FolderView::check_delta`].
+#[derive(Debug, Clone)]
+pub enum DeltaCheck {
+    /// The delta passed every rule.
+    Accepted(DeltaOutcome),
+    /// The delta failed the removed signer rule.
+    RemovedSigner(RemovedSignerRefusal),
 }
 
 /// What a device verified of one folder (module docs).
@@ -982,6 +1051,27 @@ impl FolderView {
         self.verify(state, newest_generation, delta, true)
     }
 
+    /// [`FolderView::verify_delta`], with a refusal by the removed signer rule returned as a
+    /// [`RemovedSignerRefusal`] instead of an error. A device that is not the removing one
+    /// calls this first and takes over the barrier only after a real refusal (security review
+    /// H1); every other refusal stays an error.
+    pub fn check_delta(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+        delta: &[DeltaCommit],
+    ) -> Result<DeltaCheck, ChainError> {
+        match self.verify(state, newest_generation, delta, true) {
+            Ok(outcome) => Ok(DeltaCheck::Accepted(outcome)),
+            Err(ChainError::RemovedSigner) => Ok(DeltaCheck::RemovedSigner(RemovedSignerRefusal {
+                account: self.account,
+                folder: self.folder,
+                removal_index: state.last_removal_index(),
+            })),
+            Err(e) => Err(e),
+        }
+    }
+
     /// [`FolderView::verify_delta`] without the removed signer rule, for the removing device
     /// only: right after its removal and rotation were accepted it verifies the folder's delta
     /// with this and writes the barrier commit ([`Commit::barrier`]) on the head it returns.
@@ -993,8 +1083,38 @@ impl FolderView {
         state: &AccountState,
         newest_generation: Generation,
         delta: &[DeltaCommit],
-    ) -> Result<DeltaOutcome, ChainError> {
-        self.verify(state, newest_generation, delta, false)
+        permit: &crate::epoch::BarrierPermit,
+    ) -> Result<BarrierDelta, ChainError> {
+        if !permit.covers(state) || !permit.allows_folder(&self.folder) {
+            return Err(ChainError::Permit);
+        }
+        let outcome = self.verify(state, newest_generation, delta, false)?;
+        let sequences: BTreeMap<CommitId, u64> = delta
+            .iter()
+            .filter(|d| d.role == CommitRole::Head)
+            .filter_map(|d| {
+                SignedCommit::decode(d.commit.as_bytes())
+                    .ok()
+                    .map(|c| (c.id, d.sequence))
+            })
+            .collect();
+        let removed_heads = outcome
+            .heads
+            .iter()
+            .filter_map(|h| {
+                let removed_at = state.device(&h.commit.device)?.removed_at?;
+                Some(RemovedHead {
+                    commit: h.id,
+                    device: h.commit.device,
+                    sequence: sequences.get(&h.id).copied().unwrap_or(0),
+                    removed_at,
+                })
+            })
+            .collect();
+        Ok(BarrierDelta {
+            outcome,
+            removed_heads,
+        })
     }
 
     fn verify(
@@ -2309,6 +2429,102 @@ mod tests {
     }
 
     #[test]
+    fn the_barrier_check_needs_a_permit_of_the_last_removal() {
+        let mut w = world();
+        let (a, b) = (w.a.id, w.b.id);
+        let (view, _) = linear(&mut w);
+        let g2 = Generation(2);
+        // No removal yet: no delta is refused by the removed signer rule, so no takeover permit
+        // can be made.
+        assert!(matches!(
+            view.check_delta(&w.state, g2, &[]),
+            Ok(DeltaCheck::Accepted(_))
+        ));
+        let removal = crate::epoch::remove_devices(
+            &w.state,
+            &w.a.identity,
+            a,
+            0,
+            &[b],
+            &mut crate::entropy::OsEntropy,
+        )
+        .unwrap();
+        // The permit belongs to the state after the removal.
+        assert_eq!(
+            view.verify_delta_before_barrier(&w.state, g2, &[], &removal.permit)
+                .unwrap_err(),
+            ChainError::Permit
+        );
+        w.state = removal.state.clone();
+        assert!(view
+            .verify_delta_before_barrier(&w.state, g2, &[], &removal.permit)
+            .is_ok());
+        // Another current device may take the step over (N1) only with a refusal of this
+        // account's last removal (H1); the removed one may not. The permit holds in the
+        // refused folder only.
+        let refusal = RemovedSignerRefusal {
+            account: ACCOUNT,
+            folder: FOLDER,
+            removal_index: w.state.last_removal_index(),
+        };
+        let takeover = crate::epoch::BarrierPermit::takeover(&w.state, &a, &refusal).unwrap();
+        assert!(takeover.covers(&w.state));
+        assert!(takeover.is_takeover());
+        assert!(takeover.allows_folder(&FOLDER));
+        assert!(!takeover.allows_folder(&FolderId::from_bytes([0x0f; 16])));
+        assert!(!removal.permit.is_takeover());
+        // The removing device can make its own permit again from the log (a resumed job); the
+        // other devices cannot.
+        assert_eq!(
+            crate::epoch::BarrierPermit::of_own_removal(&w.state, &a),
+            Some(removal.permit)
+        );
+        assert!(crate::epoch::BarrierPermit::of_own_removal(&w.state, &b).is_none());
+        assert!(crate::epoch::BarrierPermit::takeover(&w.state, &b, &refusal).is_none());
+        let stale = RemovedSignerRefusal {
+            removal_index: refusal.removal_index - 1,
+            ..refusal.clone()
+        };
+        assert!(crate::epoch::BarrierPermit::takeover(&w.state, &a, &stale).is_none());
+        let other_account = RemovedSignerRefusal {
+            account: AccountId::from_bytes([0x01; 16]),
+            ..refusal.clone()
+        };
+        assert!(crate::epoch::BarrierPermit::takeover(&w.state, &a, &other_account).is_none());
+        let other_view = FolderView::new(ACCOUNT, FolderId::from_bytes([0x0f; 16]));
+        assert_eq!(
+            other_view
+                .verify_delta_before_barrier(&w.state, g2, &[], &takeover)
+                .unwrap_err(),
+            ChainError::Permit
+        );
+        // A later removal makes the older permit useless.
+        let c = dev(3);
+        let add = w
+            .state
+            .next_entry(
+                &w.a.identity,
+                a,
+                0,
+                EntryKind::AddDevice(LogDevice::of(&c.identity, &ACCOUNT, c.id, false)),
+            )
+            .unwrap();
+        w.state.apply(&add).unwrap();
+        let second = crate::epoch::remove_devices(
+            &w.state,
+            &w.a.identity,
+            a,
+            0,
+            &[c.id],
+            &mut crate::entropy::OsEntropy,
+        )
+        .unwrap();
+        w.state = second.state;
+        assert!(!removal.permit.covers(&w.state));
+        assert!(second.permit.covers(&w.state));
+    }
+
+    #[test]
     fn a_removed_signers_head_needs_a_later_barrier() {
         let mut w = world();
         let (a, b) = (w.a.id, w.b.id);
@@ -2334,7 +2550,7 @@ mod tests {
             &mut crate::entropy::OsEntropy,
         )
         .unwrap();
-        w.state = removal.state;
+        w.state = removal.state.clone();
         let removed_at = 4;
         assert_eq!(w.state.device(&b).unwrap().removed_at, Some(removed_at));
 
@@ -2344,6 +2560,19 @@ mod tests {
                 .unwrap_err(),
             ChainError::RemovedSigner
         );
+        // The same refusal as a takeover input, naming the folder and the removal (H1).
+        match view.check_delta(&w.state, g2, &[head(&c4, 4)]).unwrap() {
+            DeltaCheck::RemovedSigner(refusal) => {
+                assert_eq!(refusal.folder(), &FOLDER);
+                assert_eq!(refusal.removal_index(), w.state.last_removal_index());
+                let permit = crate::epoch::BarrierPermit::takeover(&w.state, &a, &refusal).unwrap();
+                let taken = view
+                    .verify_delta_before_barrier(&w.state, g2, &[head(&c4, 4)], &permit)
+                    .unwrap();
+                assert_eq!(taken.removed_heads.len(), 1);
+            }
+            DeltaCheck::Accepted(_) => panic!("a removed signer without a barrier passed"),
+        }
         assert_eq!(
             c4.verify_for_server(&w.state, &FOLDER),
             Err(CommitError::SignerRemoved)
@@ -2381,9 +2610,19 @@ mod tests {
         // The removing device verifies the delta before its barrier and writes the barrier on
         // the head it found: same tree, new log head and generation.
         let before = view
-            .verify_delta_before_barrier(&w.state, g2, &[head(&c4, 4)])
+            .verify_delta_before_barrier(&w.state, g2, &[head(&c4, 4)], &removal.permit)
             .unwrap();
-        assert_eq!(before.heads, vec![c4.clone()]);
+        assert_eq!(before.outcome.heads, vec![c4.clone()]);
+        // The removed device's head the barrier covers is reported (N2).
+        assert_eq!(
+            before.removed_heads,
+            vec![RemovedHead {
+                commit: c4.id,
+                device: b,
+                sequence: 4,
+                removed_at,
+            }]
+        );
         let counter = w.content(a, 0, g2).counter;
         let barrier = Commit::barrier(&c4, 4, g2, a, w.state.head().unwrap(), counter)
             .sign(&w.a.identity)

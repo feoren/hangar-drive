@@ -467,6 +467,7 @@ pub struct AccountState {
     /// A recovery device added its one device while the rotation is due.
     recovery_added_while_due: bool,
     last_removal: u64,
+    last_removal_issuer: Option<DeviceId>,
     used_keys: BTreeSet<[u8; 32]>,
 }
 
@@ -481,6 +482,7 @@ impl AccountState {
             rotation_due: false,
             recovery_added_while_due: false,
             last_removal: 0,
+            last_removal_issuer: None,
             used_keys: BTreeSet::new(),
         }
     }
@@ -579,6 +581,11 @@ impl AccountState {
     /// ([`crate::folder_keys::writable_generation`]).
     pub fn last_removal_index(&self) -> u64 {
         self.last_removal
+    }
+
+    /// The device that issued the newest remove device entry, `None` if the log has none.
+    pub fn last_removal_issuer(&self) -> Option<&DeviceId> {
+        self.last_removal_issuer.as_ref()
     }
 
     /// The log safety number at the head.
@@ -833,7 +840,7 @@ impl AccountState {
                 {
                     return Err(LogError::UnknownDevice);
                 }
-                Ok(Change::Remove(*target))
+                Ok(Change::Remove(*target, entry.issuer))
             }
             EntryKind::Rotate { epoch, commitment } => {
                 if issuer.recovery {
@@ -870,11 +877,12 @@ impl AccountState {
                     );
                 }
             }
-            Change::Remove(target) => {
+            Change::Remove(target, issuer) => {
                 if let Some(record) = self.devices.get_mut(&target) {
                     record.removed_at = Some(index);
                 }
                 self.last_removal = index;
+                self.last_removal_issuer = Some(issuer);
                 self.rotation_due = true;
             }
             Change::Rotate(epoch, commitment) => {
@@ -896,7 +904,7 @@ impl AccountState {
 enum Change {
     /// The devices, and whether a recovery device added them while a rotation is due.
     Add(Vec<LogDevice>, bool),
-    Remove(DeviceId),
+    Remove(DeviceId, DeviceId),
     Rotate(Epoch, EpochCommitment),
 }
 

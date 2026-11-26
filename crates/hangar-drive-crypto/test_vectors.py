@@ -750,6 +750,7 @@ def compute():
     okm = hkdf(RECOVERY_ENTROPY, framed(label("recovery-identity")), 64)
     out["recovery.sign_public"] = ed25519_public(okm[:32]).hex()
     out["recovery.kem_public"] = x25519_public(okm[32:]).hex()
+    out["recovery.device_id"] = hkdf(RECOVERY_ENTROPY, framed(label("recovery-device-id")), 16).hex()
 
     # Pairing: code, routing ID, request tag and offer.
     out["pairing.code"] = crockford_code("pairing-code", PAIRING_SECRET)

@@ -63,6 +63,22 @@ pub fn blob_len(len: usize) -> Option<usize> {
     OBJECT_HEADER_LEN.checked_add(padded)?.checked_add(TAG_LEN)
 }
 
+/// Server side: whether a blob of `len` bytes can be an object of `kind` as far as its length
+/// tells: a padded part that is exactly a Padmé length holding at least the length prefix, and
+/// no more than the largest plaintext of the type pads to. Says nothing about the content, which
+/// the server cannot open.
+pub fn blob_len_fits(kind: ObjectType, len: usize) -> bool {
+    let Some(padded) = len.checked_sub(OBJECT_HEADER_LEN + TAG_LEN) else {
+        return false;
+    };
+    let Ok(padded) = u64::try_from(padded) else {
+        return false;
+    };
+    padded >= 8
+        && padme(padded) == padded
+        && blob_len(kind.max_plaintext_len()).is_some_and(|max| len <= max)
+}
+
 /// Why an object was not sealed or did not open.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ObjectError {
@@ -321,6 +337,37 @@ mod tests {
 
     const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
     const FOLDER: FolderId = FolderId::from_bytes([3; 16]);
+
+    #[test]
+    fn blob_lengths_the_server_accepts() {
+        for len in [0usize, 1, 7, 100, 4096, 65_537] {
+            let blob = blob_len(len).unwrap();
+            assert!(blob_len_fits(ObjectType::DirectoryNode, blob), "{len}");
+            assert!(blob_len_fits(ObjectType::Chunk, blob), "{len}");
+        }
+        let chunk_max = blob_len(CHUNK_SIZE as usize).unwrap();
+        assert!(blob_len_fits(ObjectType::Chunk, chunk_max));
+        // One Padmé step above a full chunk is a longer blob than a chunk may have (a few bytes
+        // more pad to the same length as a full chunk).
+        assert_eq!(blob_len(CHUNK_SIZE as usize + 1), Some(chunk_max));
+        let over = blob_len(CHUNK_SIZE as usize + 128 * 1024).unwrap();
+        assert!(over > chunk_max);
+        assert!(!blob_len_fits(ObjectType::Chunk, over));
+        assert!(blob_len_fits(ObjectType::FileManifest, over));
+        // Not a Padmé length, and too short for the length prefix.
+        assert!(!blob_len_fits(ObjectType::Chunk, chunk_max - 1));
+        assert!(!blob_len_fits(
+            ObjectType::Chunk,
+            OBJECT_HEADER_LEN + TAG_LEN + 7
+        ));
+        assert!(!blob_len_fits(ObjectType::Chunk, 3));
+        let manifest_max = blob_len(ObjectType::FileManifest.max_plaintext_len()).unwrap();
+        assert!(blob_len_fits(ObjectType::FileManifest, manifest_max));
+        assert!(!blob_len_fits(
+            ObjectType::FileManifest,
+            manifest_max + (1 << 20)
+        ));
+    }
 
     fn ring() -> FolderKeyRing {
         let mut ring = FolderKeyRing::new(FOLDER, 1, &mut OsEntropy).unwrap();

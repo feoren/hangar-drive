@@ -23,7 +23,12 @@
 //! ```text
 //! okm = HKDF-SHA256(salt none, ikm = entropy, info = field("hangar-drive/v1/recovery-identity"), 64 bytes)
 //! Ed25519 seed = okm[0..32], X25519 private key = okm[32..64]
+//! device ID = HKDF-SHA256(salt none, ikm = entropy, info = field("hangar-drive/v1/recovery-device-id"), 16 bytes)
 //! ```
+//!
+//! The device ID is derived as well, so the recovery sheet needs only the server, the account
+//! and the code: the recovering installation signs in as exactly the recovery device that the
+//! account's log lists (open point A of the sync engine review).
 //!
 //! The recovery device sits in the device log with `recovery: true` and receives every epoch
 //! wrap. Its only log entry is adding the new installation as a regular device
@@ -37,9 +42,11 @@ use zeroize::Zeroizing;
 use crate::encoding::{constant_time_eq, framed, hkdf, sha256_framed};
 use crate::entropy::{Entropy, EntropyError};
 use crate::identity::{DeviceIdentity, IdentityError};
+use hangar_drive_protocol::ids::DeviceId;
 
 const LABEL_CODE: &[u8] = b"hangar-drive/v1/recovery-code";
 const LABEL_IDENTITY: &[u8] = b"hangar-drive/v1/recovery-identity";
+const LABEL_DEVICE_ID: &[u8] = b"hangar-drive/v1/recovery-device-id";
 const CODE_VERSION: u8 = 1;
 pub(crate) const ENTROPY_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 1 + ENTROPY_LEN + 3;
@@ -185,6 +192,13 @@ impl RecoveryCode {
     /// Reads a typed code.
     pub fn parse(text: &str) -> Result<Self, CodeError> {
         decode_code(text, LABEL_CODE, CODE_VERSION).map(Self)
+    }
+
+    /// The device ID of the offline recovery device this code stands for (module docs).
+    pub fn device_id(&self) -> Result<DeviceId, IdentityError> {
+        let okm =
+            hkdf::<16>(self.0.as_ref(), &framed(&[LABEL_DEVICE_ID])).ok_or(IdentityError::Key)?;
+        Ok(DeviceId::from_bytes(*okm))
     }
 
     /// The offline recovery device this code stands for.
