@@ -1,7 +1,7 @@
 [package]
 name = "hangar-drive-protocol"
 version = "0.1.0"
-description = "Wire types and the protocol version shared by the Hangar Drive app and server (no I/O)"
+description = "Wire types, plaintext formats, name policy and the protocol version shared by the Hangar Drive app and server (no I/O)"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,7 +10,31 @@ publish = false
 [dependencies]
 # Wire types (JSON) of the API. Purpose, license and status: see the workspace manifest.
 serde.workspace = true
+# Error types of the formats and requests. MIT/Apache-2.0, see the workspace manifest.
+thiserror.workspace = true
+# Canonical hex and base64url without padding: decoding refuses padding, upper case hex and
+# non-zero trailing bits, so every ID and key has one spelling. MIT, no dependencies, about
+# 60 KB of source; the same version the sister project's crypto crate uses.
+data-encoding = "2"
+# NFC comparison keys of names (ADR 0001, section 8). (MIT OR Apache-2.0) AND Unicode-3.0: the
+# Unicode data license is permissive and accepted in the ADR. One dependency (tinyvec, Zlib OR
+# Apache-2.0 OR MIT), mostly tables; the same version as the sister project. The standard
+# library has no normalization.
+unicode-normalization = "0.1"
+# Full Unicode case folding (CaseFolding.txt, status C and F) for one of the case collision keys
+# of names (ADR 0001, section 7). MIT OR Apache-2.0, maintained by seanmonstar (tables
+# regenerated in 2026), no dependencies, about 75 KB of tables. Chosen over `caseless` (MIT
+# only, little activity) and over an own table of about 1500 mappings that would have to follow
+# every Unicode release by hand. Only `UniCase::to_folded_case` is used.
+unicase = "2.10"
+# Wipes session and invite tokens on drop. MIT/Apache-2.0, no dependencies; the crypto crate
+# needs it anyway.
+zeroize = "1"
 
 [dev-dependencies]
 # The tests check the exact JSON on the wire. MIT/Apache-2.0, see the workspace manifest.
 serde_json.workspace = true
+# Property tests of the formats (`tests/properties.rs`): decode(encode(x)) == x, and a decoder
+# accepts only what encode produces. MIT OR Apache-2.0, proptest-rs; test only, never part of a
+# build of the app or the server. Default features off: no fork or timeout runner.
+proptest = { version = "1", default-features = false, features = ["std"] }

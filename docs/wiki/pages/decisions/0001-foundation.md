@@ -182,6 +182,11 @@ publishes a merge commit.
     parent. It is signed by the same device, its counter is above the server's mark for that
     device and below the merge commit's counter, and its own parent is an earlier head of the
     same folder, on the first-parent chain of the current head, whose tree is still retained.
+    Its key generation and named log head are at least those of that parent.
+  - **Side mark** (conclusion, external review finding L1): bit 1 of the commit `flags`, inside
+    the signed body, marks a side commit. Every side commit carries it, and nothing else does: a
+    head with the bit is refused, and so is a side commit without it, so the server can present
+    neither as the other.
   - Each commit's height is one more than the highest height of its parents.
   - Along the first-parent chain, nothing goes back: a new head names a key generation and an
     account log head at least those its first parent names (conclusion). Without the log rule, a
@@ -190,6 +195,10 @@ publishes a merge commit.
     removed device holds.
   - As before: signature, signer valid at the named log head, per device counter above the
     server's mark for that device, every object in a reference delta held.
+  - **Signer current now** (conclusion, finding H1): the signer of every commit of the call is a
+    current device of the server's verified log when the call arrives, whatever log head the
+    commit names. A removed device whose key leaked could otherwise sign commits that name a log
+    head from before its removal.
   - The call is atomic: both commits and the new head are written in one transaction, or nothing
     is.
 - **Folder sequence:** every accepted commit call increments the folder's sequence by one; the
@@ -318,8 +327,18 @@ sequence per account (conclusion; the reports name only the per-folder sequence)
     the log reaches it through the log heads that commits name. Without this rule, a server
     holding a removed device's key could have devices keep writing under a generation that key
     opens. Withholding the log as well is a freeze.
+    - **Generation bound to the last removal** (conclusion, finding M1): every generation in a
+      ring carries the log head index at which its device made it, and a device commits only
+      under a newest generation made at or after the log's last remove device entry. A ring
+      re-sealed under the new epoch without a new generation, or with one made before the
+      removal, is refused even though it opens.
   - `folders`: an old version only hides a new folder or shows a retired one, whose commits the
     server refuses. That is a loss of availability, like a freeze.
+  - **Records of removed devices** (conclusion, finding H1): a record opens only if its sender
+    is a current, regular device of the verified log, not only valid at the log head the record
+    names. After every removal and its rotation the removing device therefore re-seals every
+    account record under the new epoch: each `folder-keys` ring with a new generation, the
+    `folders` list and the `device-names` list.
 - **Folder list:** the names of synced folders live in a sealed, signed account record of kind
   `folders`, so the server sees only folder IDs (conclusion; [[threat-model-and-crypto-design]],
   section 6.1, lists records for key rings, device names and settings).
@@ -370,6 +389,18 @@ primitives the sister app already uses:
     frontier of [[threat-model-and-crypto-design]] (section 3.4) is a set of heads; with one head
     on the server it has one element, and the guarantee is unchanged: only devices sign commits,
     and every commit whose first-parent chain reaches the frontier was made after it.
+    - **Removed signers and the barrier commit** (conclusion, finding H1): a new head signed by
+      a device that the verified log has removed since is accepted only if a later head of the
+      same verified delta, signed by a current device, names a log head at or after that
+      removal. After every removal and its rotation the removing device writes such a barrier
+      commit in every folder: a normal commit on the current head with the same tree, naming the
+      new log head and the new generation. A backdated commit of the removed device after the
+      barrier fails "nothing goes back"; one before it that no barrier follows is never taken in.
+      A device verifies the whole delta up to the server's sequence (every page) at once, so a
+      barrier on a later page counts. Only the removing device, in its removal flow, verifies
+      the delta without this rule to build the barrier on the head it finds. Residual risk: a
+      backdated commit that a malicious server shows the removing device in exactly that moment
+      is covered by its barrier.
     - **Verified chain:** besides the frontier, every device keeps per folder the list of every
       head on the first-parent chain it has verified (commit ID, height, folder sequence), a few
       dozen bytes per head (conclusion). The re-anchor below finds its base in it.
@@ -407,7 +438,9 @@ primitives the sister app already uses:
          of both sides is kept, equal items once and differing ones as conflict copies, so a
          re-anchor never deletes an item that its base does not prove deleted. The new commit
          becomes the frontier, with its lower height and folder sequence, and the folder cursor
-         goes to its sequence.
+         goes to its sequence. The heads of the old chain after A are kept as discarded (their
+         commit IDs; conclusion, finding L2): no later delta and no later re-anchor may present
+         one of them as a head again.
       - **Other devices:** a device whose frontier the server's head reaches (it was behind the
         restored state) sees a normal new head. Every other device sees "the server shows an
         older state" as well, because the re-anchored head does not reach its frontier either,
@@ -432,9 +465,10 @@ primitives the sister app already uses:
         no more than the server can already do by deleting data.
       - **Re-anchor mark** (conclusion, part of the external review): the commit body gets a
         `flags` field (u32) directly after the counter, inside the signed body, so the commit ID
-        and the signature cover it. Bit 0 marks the commit of step 4 as a re-anchor. Version 1
-        knows no other bit; server and devices refuse unknown bits, and bit 0 on a first commit,
-        a side commit or a merge commit. Every other commit writes 0.
+        and the signature cover it. Bit 0 marks the commit of step 4 as a re-anchor. Bit 1 is
+        the side mark (section 3). Version 1 knows no other bit; server and devices refuse
+        unknown bits, and bit 0 on a first commit, a side commit or a merge commit. Every other
+        commit writes 0 in bit 0.
         - The timeline shows its marker from this bit ([[ux-concept]], section 9.1). No sync,
           retention, quota or restore rule reads it, so a device that sets it falsely only adds a
           marker line.
@@ -470,10 +504,37 @@ primitives the sister app already uses:
 - **Pairing:** a new device joins through a QR offer that carries a 128 bit secret and the
   account log head as its trust anchor. Without a camera, the person types the full-entropy code
   or compares safety numbers. Short codes are allowed only once there is a PAKE.
+  - **Signed offer** (conclusion, finding M4): the inviting device signs the offer with its
+    Ed25519 key over `field("hangar-drive/v1/pairing-offer") || offer`; the signature follows
+    the offer bytes. The new device checks it against the inviter's key once it has the log, and
+    a device of the account takes server URL and pin from an offer only after this check
+    (section 6, "Pin rotation").
+  - **Added device** (conclusion, finding L6): the append call with the add device entry
+    carries exactly one wrapped key, the current epoch's secret for the new device, and no
+    rotation happens; the server checks that this wrap names the added device. A new device
+    needs no older epoch, because records are sealed under the newest one and folder key rings
+    hold every generation.
 - **Recovery:** a 128 bit recovery code with a printed recovery sheet. There is no password
   recovery.
+  - **Recovery session** (conclusion): a session of a recovery device may only fetch the device
+    log, fetch its own wrapped keys of every epoch, and make exactly one append with one add
+    device entry for a regular device and its wrap. The server refuses every other call. The
+    protocol crate's session scope type carries the rule, so the server applies one list.
+  - **Stuck log** (conclusion, finding M5): while a rotation is due, a recovery device may add
+    exactly one regular device. The rotation stays due, and the new device removes the lost
+    devices and the recovery device and rotates. Without this exception a log whose regular
+    devices were all lost with a rotation due could never move again.
 - **Removing a device:** triggers an immediate epoch rotation and a new folder key generation.
   Re-encrypting old content is an option and off by default.
+  - **Atomic** (conclusion, finding M5): the server admits an append call as one batch of
+    exactly one of two shapes: removals followed by their rotation, with a wrap for every device
+    that stays, or one added device. The state after the batch must have no rotation due, except
+    after the recovery exception above. A removal therefore never reaches the server's log
+    without its rotation.
+  - **Afterwards** (conclusion, finding H1): the removing device adds a generation to every
+    folder key ring, re-seals every account record under the new epoch (section 3, "Record
+    freshness") and writes a barrier commit in every folder ("Removed signers and the barrier
+    commit" above).
 - **Exports:** if there are any, they use the age format with its STREAM payload. Neither age
   nor Cryptomator is the core.
 - **Code:** option B.
@@ -725,6 +786,13 @@ primitives the sister app already uses:
 - **TLS 1.3:** at the server or at a reverse proxy. The client refuses plain HTTP except for
   `localhost`, and self-signed setups use an SPKI pin from the pairing offer. There is no switch
   to accept invalid certificates.
+  - **Server URL check** (conclusion, finding M2): the URL is parsed with the WHATWG URL
+    Standard parser (`url`, the one reqwest uses), so the host checked is the host the client
+    connects to. Allowed are `https`, and `http` only with the host `localhost`, `127.0.0.1` or
+    `::1`; a URL with a user name or password is refused (this closes forms such as
+    `http://localhost:80@evil.example/`), as is any form other than `scheme://host` and any URL
+    with a query or a fragment, since the client joins API paths onto it. Only the parsed URL is
+    passed on, and an offer carries it in the parser's serialization.
 - **Pin rotation** (conclusion; [[threat-model-and-crypto-design]], section 5, covers the pin
   only at pairing):
   - **Mismatch:** a device whose pin does not match the server's key ends the connection during
@@ -735,7 +803,9 @@ primitives the sister app already uses:
     1. A new pairing offer from a device that already trusts the new key. A device that scans or
        pastes an offer of its own account (the same account ID and server ID, and a log head that
        its verified log contains or that it then verifies as an extension) takes only the server
-       URL and the pin from it and does not pair.
+       URL and the pin from it and does not pair, and only if the offer's signature verifies
+       against the inviter's key in its verified log and the inviter is a current, regular device
+       there (section 4, "Signed offer").
     2. A confirmed comparison with the server CLI. The device shows the server key number of the
        key it now sees, the operator runs a server CLI command that prints the number of the
        server's own key, and the person confirms that both rows match. The confirm button is
@@ -762,6 +832,9 @@ primitives the sister app already uses:
   protocol version. Sessions use short-lived bearer tokens that the server stores only as hashes.
 - **Sessions:** a token lives about one hour, is renewed by a new proof and is revoked at once
   when the device log removes the device. Tokens never appear in URLs or logs.
+  - **Scope:** the server sets a session's scope at sign-in from the verified log. A regular
+    device may make every call; a recovery device only the calls of the recovery session
+    (section 4, "Recovery session").
 - **Rate limits:** per IP and per account on the challenge, proof, invite, pairing and upload
   endpoints.
 - **Client IPs:** taken from `X-Forwarded-For` only when the operator has marked the proxy as
@@ -772,9 +845,27 @@ primitives the sister app already uses:
 
 - Names in the protocol are compared in NFC. The exact bytes from disk are kept.
 - Case-only and normalization-only collisions become conflicts. A case-only rename is a rename.
+  - **Case keys** (conclusion, finding M3): two names collide by case when any of three keys of
+    their NFC forms is equal: the full lowercase, full Unicode case folding (which joins `ſ` with
+    `s` and `ς` with `σ`, as APFS does) and the per-character simple uppercase (which joins `ı`
+    with `i`, as the NTFS upcase table does). A false collision only makes a conflict copy, a
+    missed one would put two names on one file, so the keys err towards collisions.
 - Names that are invalid on Windows are marked "cannot sync on this device" and are never renamed
-  silently. This covers reserved names even with an extension, `< > : " / \ | ? *`, control
-  characters and a trailing dot or space.
+  silently. This covers reserved names even with an extension (`CON`, `PRN`, `AUX`, `NUL`,
+  `CONIN$`, `CONOUT$`, and `COM` and `LPT` with a digit 0 to 9 or a superscript ¹ ² ³; conclusion,
+  finding L4), `< > : " / \ | ? *`, control characters, a trailing dot or space, and names of
+  more than 255 UTF-16 code units.
+- **Display names** (conclusion, finding L3): device, folder and pairing names refuse control
+  characters, format characters (General Category Cf, which holds every bidirectional control)
+  and line and paragraph separators, so a name cannot reorder or hide the text of a prompt such
+  as "Add device <name>?". File names keep their bytes; the app shows them isolated.
+  - **Blank and padded names** (conclusion, finding N5): a display name also needs a visible
+    character and must not start or end with white space. A name made only of white space, of
+    the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0 (letters that render blank), or of a
+    mix of both is refused, so a prompt cannot show an empty name or a name padded to look like
+    another one. A padded name is refused rather than trimmed, because the name is signed and
+    sealed as given; callers trim user input before they submit it. Fillers inside a name stay
+    allowed, since Korean text may use them.
 - Long paths: the app manifest declares `longPathAware`, and file system calls use `\\?\`
   paths, because the manifest alone works only when the `LongPathsEnabled` registry value is set.
 - 8.3 short names from watcher events are resolved to long names before matching.
@@ -935,3 +1026,52 @@ and atime. Everything in this subsection is a conclusion of this ADR.
 - [ ] Sync core with simulation tests (including the merge rules, the join of a non-empty local
       folder, long offline periods and the re-anchor),
       then the first end-to-end sync of one folder.
+
+## Amendment 2026-11-26: own crypto crate first
+
+- **Change:** `crates/hangar-drive-crypto` is built now as a standalone crate in this
+  repository. It does not depend on the sister app's team crypto crate, neither as a git
+  dependency pinned to a commit nor otherwise. This replaces, for now, the second point of
+  "Code: option B" in section 4 and the matching point under Consequences ("Until it lands,
+  Drive's builds depend on a pinned commit of that repository").
+- **Why:** the labels of the sister crate are fixed to `hangar-team/v1/` in its code, so Drive
+  cannot reuse its identity, log, epoch, record and recovery code under the `hangar-drive/v1/`
+  labels this ADR requires ("Separate identities", section 4) without first changing that crate.
+  A shared core can only be extracted after a refactoring there, which is agreed with the sister
+  project before it starts. Waiting for it would block the protocol, the server and the sync
+  core; a git dependency on today's crate would give Drive the wrong labels.
+- **What stays the same:** the crate uses exactly the primitives, crates and versions of the
+  sister crate (table in section 4, plus `hkdf`, `sha2`, `hmac`, `getrandom`, `zeroize` and
+  `subtle`), so the review surface does not grow and the lock file holds no second copy of a
+  crypto crate. Every label starts with `hangar-drive/v1/`. Code taken from the sister crate
+  (MIT, same owner) carries a comment naming its origin.
+- **Differences in substance** (conclusions, part of the external review): the account log has
+  one member, no roles and its own entry kinds (create, add device, remove device, rotate
+  epoch); while a rotation is due after a removal, it accepts only further removals and the
+  rotation, and one added regular device from a recovery device. Records carry a version per record instead of a per-device counter; the replay guard
+  refuses older versions and a different record under an accepted version. There is no history
+  link, because folder key rings hold every generation.
+- **Format changes after the security review of the crates** (2026-11-26, findings M1, M4, L1,
+  L6; formats of version 1, nothing was stored before them, so the version bytes stay 1; the
+  fixed vectors in `crates/hangar-drive-crypto/testdata/vectors.json` and `test_vectors.py`
+  hold the new bytes):
+
+  | Format | Change |
+  | --- | --- |
+  | Folder key ring | each entry is `generation (u32) \|\| created at log index (u64) \|\| FK (32)`; the index is at least 1, never decreases along the ring and is never above the log head index of the ring's record |
+  | Pairing offer | the offer bytes are followed by the inviter's Ed25519 signature over `field("hangar-drive/v1/pairing-offer") \|\| offer`; the server URL is stored in the WHATWG serialization (for example `https://drive.example/`) |
+  | Commit `flags` | bit 1 marks a side commit, in the signed body |
+  | Log append call | `device_wrap`: the new device's wrapped key of the current epoch, with an add device entry; never together with rotation `wraps` |
+  | Account record `device-names` | `0x01 \|\| count (u32) \|\| count x ( device id (16) \|\| field(name) )`, sorted by device ID; names follow the pairing name rule |
+
+- **Rule changes from the same review** (conclusions): the log append call is one batch of
+  removals with their rotation, or one added device, and leaves no rotation due (M5), with the
+  one recovery exception of section 4; records and commits of removed devices need a current
+  sender, the re-seal of every record and a barrier commit per folder (H1, sections 3 and 4);
+  the recovery session scope (section 4); the side commit's generation and log head are not
+  below its base's (L1); discarded re-anchor heads (L2).
+- **Later:** the shared core stays the goal of option B. When it exists, Drive moves to it only if
+  its formats produce the same bytes as `hangar-drive-crypto` under Drive's labels, checked
+  against the fixed vectors in `crates/hangar-drive-crypto/testdata/vectors.json`; otherwise
+  Drive keeps its own crate for the differing parts, because stored logs, records and commits
+  must stay readable.

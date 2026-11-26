@@ -11,18 +11,19 @@ Hangar Drive is part of the Hangar family of desktop apps and is open source und
 [MIT License](LICENSE).
 
 > **Status: early development.** This repository holds the project skeleton: the desktop app shell,
-> the shared protocol crate and a server that only answers a health check. There is no sync and no
-> encryption yet. Do not use it for real data.
+> the shared protocol crate, the crypto crate (not yet externally reviewed) and a server that only
+> answers a health check. There is no sync yet. Do not use it for real data.
 
 ## Repository layout
 
-| Path                           | What it is                                                       |
-| ------------------------------ | ---------------------------------------------------------------- |
-| `src/`                         | Frontend: React and TypeScript, rendered by Tauri                |
-| `src-tauri/`                   | Desktop app: Tauri 2 (Rust)                                      |
-| `crates/hangar-drive-protocol` | Wire types and protocol version shared by the app and the server |
-| `server/`                      | Sync server (Rust, axum) and its Dockerfile                      |
-| `docs/wiki/`                   | Design notes and decisions                                       |
+| Path                           | What it is                                                          |
+| ------------------------------ | ------------------------------------------------------------------- |
+| `src/`                         | Frontend: React and TypeScript, rendered by Tauri                   |
+| `src-tauri/`                   | Desktop app: Tauri 2 (Rust)                                         |
+| `crates/hangar-drive-protocol` | Wire types and protocol version shared by the app and the server    |
+| `crates/hangar-drive-crypto`   | End-to-end cryptography: device keys, account log, objects, commits |
+| `server/`                      | Sync server (Rust, axum) and its Dockerfile                         |
+| `docs/wiki/`                   | Design notes and decisions                                          |
 
 All Rust packages form one Cargo workspace at the repository root.
 

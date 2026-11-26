@@ -79,6 +79,25 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked --no-fail-fast
 
+  # The crypto crate's fixed vectors (testdata/vectors.json), recomputed independently with the
+  # Python standard library. One platform is enough: the script only does arithmetic.
+  crypto-vectors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The runner's own Python decides the Unicode version of unicodedata; the name policy's
+      # tables are Unicode 16.0, which Python 3.14 carries.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Recompute the test vectors
+        run: python3 -I crates/hangar-drive-crypto/test_vectors.py
+
   # The server image as users build it: from the repository root with server/Dockerfile. It must
   # start as a container and answer its health endpoint, then stop cleanly on SIGTERM.
   server-image:

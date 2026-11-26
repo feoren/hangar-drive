@@ -2,9 +2,27 @@
 //! the version of that protocol.
 //!
 //! No I/O, no async runtime, no network: the app and the server both depend on this crate and
-//! bring those themselves. For now it only describes the server's health endpoint.
+//! bring those themselves.
+//!
+//! - [`ids`]: account, device, folder and item IDs (16 bytes), object and commit IDs and log
+//!   hashes (32 bytes), keys, signatures and tokens, with one canonical text form each.
+//! - [`object`]: object types, directory entry kinds and flags, chunk size and limits.
+//! - [`name`]: the cross-platform name policy: NFC comparison keys, case and normalization
+//!   collisions, names Windows cannot hold, the built-in ignore list.
+//! - [`format`](mod@format): the plaintext formats of directory nodes and file manifests.
+//! - [`framing`]: the `field(x)` byte framing all formats, hashes and signatures share.
+//! - [`api`]: the wire types of the server API and the closed list of error codes.
+//!
+//! Design: ADR 0001 in `docs/wiki/pages/decisions/0001-foundation.md`.
 
 #![warn(missing_docs)]
+
+pub mod api;
+pub mod format;
+pub mod framing;
+pub mod ids;
+pub mod name;
+pub mod object;
 
 use serde::{Deserialize, Serialize};
 

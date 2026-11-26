@@ -3,7 +3,9 @@
 # server share the protocol crate by path, so a change to it is built and tested against both.
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/hangar-drive-protocol", "server"]
+members = ["src-tauri", "crates/hangar-drive-protocol", "crates/hangar-drive-crypto", "server"]
+# The fuzz targets need nightly and cargo-fuzz; they are a package of their own.
+exclude = ["crates/hangar-drive-crypto/fuzz"]
 
 [workspace.package]
 edition = "2021"
@@ -20,3 +22,14 @@ serde_json = "1"
 # Error types in modules (project rule). MIT/Apache-2.0, dtolnay; already in Tauri's tree.
 thiserror = "2"
 
+# Unoptimized, the curve and hash arithmetic makes the crypto crate's tests slow: the device log
+# tests sign and verify thousands of entries. Optimizing only these dependencies keeps
+# `cargo test` fast without slowing the build of the app's own code.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

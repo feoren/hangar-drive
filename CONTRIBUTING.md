@@ -14,8 +14,8 @@ Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 Hangar Drive is a Tauri 2 app (Rust backend, React and TypeScript frontend, pnpm) with a sync server
 in Rust. It needs Rust, Node.js, pnpm and the
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/); Docker only for the server image.
-All Rust packages (`src-tauri`, `crates/hangar-drive-protocol`, `server`) form one Cargo workspace at
-the repository root.
+All Rust packages (`src-tauri`, `crates/hangar-drive-protocol`, `crates/hangar-drive-crypto`,
+`server`) form one Cargo workspace at the repository root.
 
 ```sh
 pnpm install
@@ -29,10 +29,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 pnpm format:check && pnpm lint && pnpm test && pnpm build
+py -3 crates/hangar-drive-crypto/test_vectors.py
 ```
 
 The Cargo commands run from the repository root and cover every Rust package of the workspace.
 `pnpm build` comes before the first Cargo build, because the app embeds the built frontend.
+The last line recomputes the crypto crate's fixed test vectors (`testdata/vectors.json`) with the
+Python standard library, independently of the Rust code. It needs Python 3.14, whose `unicodedata`
+has the Unicode version of the name policy; on Linux and macOS run it as `python3`.
+After a deliberate format change, regenerate the file with `--write` and review the diff.
 A change to the server should also pass an image build:
 `docker build -f server/Dockerfile -t hangar-drive-server .`
 

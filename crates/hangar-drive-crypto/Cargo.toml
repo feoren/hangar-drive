@@ -1,0 +1,59 @@
+[package]
+name = "hangar-drive-crypto"
+version = "0.1.0"
+description = "End-to-end cryptography of Hangar Drive: device keys, the account device log, epochs, sealed records, encrypted objects and signed commits (no I/O)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Every primitive and crate version below is the one of the sister project's team crypto crate
+# (ADR 0001, section 4), so the review surface stays the same and the lock file has no second
+# copy of a crypto crate.
+[dependencies]
+# IDs, the field framing, object and record kinds and the plaintext formats. This repository,
+# MIT.
+hangar-drive-protocol.workspace = true
+# Error types of the public API (project rule). MIT/Apache-2.0, see the workspace manifest.
+thiserror.workspace = true
+# Wrapping epoch secrets to devices (RFC 9180, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+# ChaCha20Poly1305). MIT/Apache-2.0, pure Rust, RustCrypto and dalek underneath. Default
+# features off: no ML-KEM, no NIST curves, no system RNG that panics on failure (this crate draws
+# randomness itself, fallibly). Alternative hpke-rs is MPL-2.0.
+hpke = { version = "0.15", default-features = false, features = ["alloc", "x25519", "chacha"] }
+# Device signatures (RFC 8032, strict verification): log entries, commits, records, proofs.
+# BSD-3-Clause, dalek-cryptography; already pulled by hpke through curve25519-dalek. `zeroize`
+# wipes signing keys on drop.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
+# XChaCha20-Poly1305 for objects and records (192-bit random nonces). MIT/Apache-2.0, RustCrypto;
+# hpke already depends on the same version. `zeroize` wipes key and state on drop.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+# Key derivation (RFC 5869), keyed object IDs and the pairing MAC (HMAC-SHA-256), hashes
+# (SHA-256). MIT/Apache-2.0, RustCrypto; hkdf already depends on this hmac. The `zeroize`
+# features wipe keyed hash state on drop.
+hkdf = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
+# The operating system's random number generator, with an error instead of a panic.
+# MIT/Apache-2.0, rust-random; already in the tree through the RustCrypto crates.
+getrandom = "0.4"
+# Wipes secrets on drop. MIT/Apache-2.0, no dependencies.
+zeroize = "1"
+# Constant-time comparison of secrets, tags, IDs and commitments. BSD-3-Clause, dalek
+# cryptography, no dependencies; already in the tree through ed25519-dalek and hpke.
+subtle = { version = "2", default-features = false }
+# The server URL of a pairing offer, parsed with the WHATWG URL Standard parser, the same one
+# reqwest uses, so the host checked here is the host the app connects to (ADR 0001, section 6:
+# plain HTTP only to localhost). MIT OR Apache-2.0, servo; already in the app's tree through
+# Tauri and reqwest, the same version. Hand-made prefix checks miss userinfo and other
+# authority forms.
+url = "2.5"
+
+[dev-dependencies]
+# The tests read the fixed vectors in testdata/vectors.json. MIT/Apache-2.0, see the workspace
+# manifest.
+serde_json.workspace = true
+# Property tests of every format (`tests/properties.rs`). MIT OR Apache-2.0, proptest-rs; test
+# only, never part of a build of the app or the server. Default features off: no fork or
+# timeout runner.
+proptest = { version = "1", default-features = false, features = ["std"] }
