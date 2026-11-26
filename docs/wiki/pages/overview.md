@@ -2,7 +2,7 @@
 title: Overview
 type: overview
 tags: []
-sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]"]
+sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]", "[[tauri-nsis-uninstall-code-reading]]"]
 created: 2026-11-25
 updated: 2026-11-26
 ---
@@ -22,6 +22,8 @@ that only the operator sets, and an account quota that counts only live data.
   [[threat-model-and-crypto-design]].
 - Version scheme X.Y.Z-B and how Tauri treats build metadata: [[0002-version-scheme]],
   [[version-number-wikipedia]], [[tauri-version-handling-code-reading]].
+- Windows installer on upgrade and uninstall: the device keys go only with the ticked "delete app
+  data" box, [[tauri-nsis-uninstall-code-reading]] and the amendment in [[0001-foundation]].
 
 ## Open risks
 - The protocol is built by hand and not reviewed externally; the review blocks the first release.
@@ -30,6 +32,9 @@ that only the operator sets, and an account quota that counts only live data.
 - The single head per folder, its merge rules, the kept commit bodies, the change feed and the
   quota rules are conclusions of [[0001-foundation]], not taken from the sources; they need the
   external review.
+- The installer flow (upgrade, downgrade, uninstall with and without the tick) is verified only
+  in a makensis harness, not with a real installer; it is a manual check of the release checklist
+  in [[0002-version-scheme]].
 
 ## Open questions
 > [!question] Unverified

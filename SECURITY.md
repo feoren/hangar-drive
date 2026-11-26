@@ -22,8 +22,11 @@ Everything it keeps belongs to that user: the program files, the index and the s
 `%LOCALAPPDATA%\Hangar Drive`, and the device keys in that user's Windows Credential Manager
 (local, not roaming). Anyone who can run programs or read files as that user can therefore
 also change the installed app or use its keys; protect the user account itself (a password or
-Windows Hello, BitLocker on a laptop). Uninstalling removes the device keys and the index; the
-synced files stay where they are.
+Windows Hello, BitLocker on a laptop). Uninstalling removes the device keys, the index and the
+settings only when you tick "Delete app data and this PC's device keys" on the uninstaller's
+confirmation page. Without the tick they stay, also when an upgrade or downgrade uninstalls the
+old version first, so that the app carries on as the same device. Tick it, or reset the device
+in the app, before you hand the PC or the Windows account to someone else. The synced files stay where they are either way.
 
 ## Scope
 

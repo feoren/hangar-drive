@@ -52,6 +52,10 @@
       "nsis": {
         "installMode": "currentUser",
         "languages": ["German", "English"],
+        "customLanguageFiles": {
+          "German": "windows/German.nsh",
+          "English": "windows/English.nsh"
+        },
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
         "installerHooks": "windows/hooks.nsh"

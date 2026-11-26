@@ -1,9 +1,10 @@
 //! `--uninstall-cleanup` (security review L1): the Windows uninstaller starts the app with this
-//! argument before it removes the files (src-tauri/windows/hooks.nsh, not on an update), and
-//! the app forgets the account on this device: the device identity and every epoch secret leave
-//! the OS keychain, and the index and settings files are removed. The synced files stay where
-//! they are. Nothing else of the app runs: no window, no engine, no single instance check, so a
-//! running instance cannot swallow the argument.
+//! argument before it removes the files (src-tauri/windows/hooks.nsh), but only when the person
+//! ticked the uninstaller's box to delete the app data and this PC's device keys, never on an
+//! update or an upgrade that uninstalls first; then the app forgets the account on this device:
+//! the device identity and every epoch secret leave the OS keychain, and the index and settings
+//! files are removed. The synced files stay where they are. Nothing else of the app runs: no
+//! window, no engine, no single instance check, so a running instance cannot swallow the argument.
 
 use std::path::Path;
 
@@ -140,17 +141,141 @@ mod tests {
         assert!(!lib.contains("any(|a| a == cleanup::ARG)"));
     }
 
+    /// Runs the body of the hook's `NSIS_HOOK_PREUNINSTALL` with the given NSIS variables and
+    /// tells whether it reaches the line that starts the cleanup. It knows only what the hook
+    /// uses: LogicLib's `${If}`, `${AndIf}`, `${OrIf}`, `${Else}` and `${EndIf}` with `$Var = N`
+    /// and `$Var <> N`, integer comparisons where an empty variable counts as 0, as in NSIS.
+    /// Anything else fails, so a changed hook needs a look at this test.
+    fn hook_reaches_the_cleanup(hook: &str, vars: &[(&str, &str)]) -> bool {
+        let body = hook
+            .split("!macro NSIS_HOOK_PREUNINSTALL")
+            .nth(1)
+            .and_then(|rest| rest.split("!macroend").next())
+            .expect("the hook defines NSIS_HOOK_PREUNINSTALL");
+        let eval = |condition: &str| -> bool {
+            let parts: Vec<&str> = condition.split_whitespace().collect();
+            let [var, op, value] = parts[..] else {
+                panic!("unknown condition: {condition}");
+            };
+            let name = var.strip_prefix('$').expect("a variable on the left");
+            let current = vars.iter().find(|(n, _)| *n == name).map_or("", |(_, v)| v);
+            let number = |text: &str| text.parse::<i64>().unwrap_or(0);
+            match op {
+                "=" => number(current) == number(value),
+                "<>" => number(current) != number(value),
+                _ => panic!("unknown operator: {condition}"),
+            }
+        };
+        // One entry per open `${If}`: whether its condition held, and whether `${Else}` came.
+        let mut open: Vec<(bool, bool)> = Vec::new();
+        let mut reached = false;
+        for line in body.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
+            if let Some(condition) = line.strip_prefix("${If} ") {
+                open.push((eval(condition), false));
+            } else if let Some(condition) = line.strip_prefix("${AndIf} ") {
+                let top = open.last_mut().expect("${AndIf} inside ${If}");
+                top.0 = top.0 && eval(condition);
+            } else if let Some(condition) = line.strip_prefix("${OrIf} ") {
+                let top = open.last_mut().expect("${OrIf} inside ${If}");
+                top.0 = top.0 || eval(condition);
+            } else if line == "${Else}" {
+                open.last_mut().expect("${Else} inside ${If}").1 = true;
+            } else if line == "${EndIf}" {
+                open.pop().expect("${EndIf} closes an ${If}");
+            } else if line.starts_with("!insertmacro CheckIfAppIsRunning ") {
+                // Closes a running app first; it decides nothing.
+            } else if line.starts_with("ExecWait ") && line.contains(ARG) {
+                reached |= open.iter().all(|(held, in_else)| held != in_else);
+            } else {
+                panic!("unknown line in the hook: {line}");
+            }
+        }
+        assert!(open.is_empty(), "every ${{If}} is closed");
+        reached
+    }
+
+    // The installer upgrade finding: an interactive upgrade or downgrade runs the old
+    // uninstaller without /UPDATE, so only the person's tick in the confirmation page may start
+    // the cleanup, never an update, and never a silent or passive uninstall, which leaves the
+    // box's state empty.
     #[test]
-    fn the_uninstall_hook_runs_the_cleanup_except_on_updates() {
+    fn the_uninstall_hook_runs_the_cleanup_only_when_the_person_ticked_it() {
         let hook = include_str!("../windows/hooks.nsh");
-        assert!(hook.contains("NSIS_HOOK_PREUNINSTALL"));
-        assert!(hook.contains(ARG));
-        assert!(hook.contains("$UpdateMode <> 1"));
+        for update in ["", "0", "1"] {
+            for ticked in ["", "0", "1"] {
+                let vars = [
+                    ("UpdateMode", update),
+                    ("DeleteAppDataCheckboxState", ticked),
+                ];
+                assert_eq!(
+                    hook_reaches_the_cleanup(hook, &vars),
+                    update != "1" && ticked == "1",
+                    "UpdateMode {update:?}, box {ticked:?}"
+                );
+            }
+        }
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(
             conf["bundle"]["windows"]["nsis"]["installerHooks"],
             "windows/hooks.nsh"
         );
+    }
+
+    // The box that starts the cleanup says that the device keys go, in every installer
+    // language, and the custom language files (which replace the CLI's built-in ones as a
+    // whole) define the same strings.
+    #[test]
+    fn the_delete_box_names_the_device_keys_in_every_installer_language() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let nsis = &conf["bundle"]["windows"]["nsis"];
+        let files = [
+            (
+                "German",
+                include_str!("../windows/German.nsh"),
+                "Geräteschlüssel",
+            ),
+            (
+                "English",
+                include_str!("../windows/English.nsh"),
+                "device keys",
+            ),
+        ];
+        let languages: Vec<&str> = nsis["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.as_str())
+            .collect();
+        assert_eq!(languages, ["German", "English"]);
+        let names = |text: &str| -> Vec<String> {
+            let mut names: Vec<String> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("LangString "))
+                .filter_map(|l| l.split_whitespace().next())
+                .map(str::to_owned)
+                .collect();
+            names.sort();
+            names
+        };
+        let expected = names(files[0].1);
+        assert!(expected.len() >= 28, "the whole built-in set");
+        for (language, text, keys) in files {
+            assert_eq!(
+                nsis["customLanguageFiles"][language],
+                format!("windows/{language}.nsh")
+            );
+            assert_eq!(names(text), expected, "{language}");
+            let label = text
+                .lines()
+                .find(|l| l.starts_with("LangString deleteAppData "))
+                .expect("deleteAppData");
+            assert!(label.contains(keys), "{language}: {label}");
+            assert!(!text.contains("{{"), "{language}: no unfilled placeholder");
+        }
     }
 }

@@ -4,7 +4,7 @@ type: decision
 status: accepted
 superseded_by:
 tags: [release, version, updater, windows]
-sources: ["[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]"]
+sources: ["[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]", "[[tauri-nsis-uninstall-code-reading]]"]
 created: 2026-11-26
 updated: 2026-11-26
 ---
@@ -134,7 +134,36 @@ so SmartScreen and the person can tell them from a copy:
 
 Neither key nor certificate exists yet; both are the owner's step before the first public release.
 
+## Release checklist: manual checks (amendment 2026-11-26)
+
+Checks no automated test can make, done by a person on a Windows test machine (or a throwaway
+Windows user) before every release; tick them in the release card. Never on a machine whose
+Credential Manager or `%LOCALAPPDATA%` holds an account that matters.
+
+**Installer upgrade, downgrade and uninstall** (amendment "Installer upgrade keeps the device keys"
+in [[0001-foundation]], [[tauri-nsis-uninstall-code-reading]]):
+
+1. Install the previous release (for the first check: a build of the current version with a lower
+   patch number), set up or join an account, let a folder sync.
+2. Note the Credential Manager entries of the service `hangar-drive` (`device-identity`, `epoch-N`)
+   and the index and `settings.json` in `%LOCALAPPDATA%\Hangar Drive`.
+3. Run the new installer interactively and keep the default choice "Vor der Installation
+   deinstallieren"; in the old uninstaller leave "App-Daten und Geräteschlüssel dieses PCs löschen"
+   unticked. Expected: the entries and the index are still there, and the app starts as the same
+   device of the account, without a new setup.
+4. The same with a downgrade (an older installer over the new version). Expected as in step 3.
+5. Uninstall from Windows settings without the tick. Expected: program files and shortcuts gone,
+   Credential Manager entries, index and settings kept, synced files untouched.
+6. Reinstall, check that the device is still set up, uninstall again with the tick. Expected: the
+   `hangar-drive` entries are gone from the Credential Manager, index and settings are gone, the
+   folder `%LOCALAPPDATA%\Hangar Drive` is removed once empty, synced files untouched; the device
+   still shows in the account's device list until another device removes it.
+7. Optional: `uninstall.exe /S` (silent) keeps everything, like step 5.
+
+After a Tauri CLI update, also compare `src-tauri/windows/German.nsh` and `English.nsh` with the
+CLI's built-in language files before running these checks.
+
 ## Evidence
-- [[version-number-wikipedia]], [[tauri-version-handling-code-reading]].
+- [[version-number-wikipedia]], [[tauri-version-handling-code-reading]], [[tauri-nsis-uninstall-code-reading]].
 - Code: `src/version.ts`, `src/buildInfo.ts`, `vite.config.ts`, `src/changelog.json`; tests
   `src/versionSync.test.ts`, `src/version.test.ts`, `src-tauri/src/lib.rs`.
