@@ -77,9 +77,9 @@ const de = {
   "setup.connect.scan": "Mit Kamera scannen",
   "setup.connect.checking": "Einladung wird geprüft …",
   "setup.connect.ok": "Verbunden mit {host}",
-  "setup.connect.pinnedTitle": "Server mit eigenem Zertifikat",
+  "setup.connect.pinnedTitle": "Privat eingerichteter Server",
   "setup.connect.pinned":
-    "Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt.",
+    "Dieser Server weist sich nicht über eine öffentliche Stelle aus. {app} vertraut ihm, weil der Link festlegt, woran es ihn erkennt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt.",
   "link.isInvite": "Das ist ein Einladungslink. Damit richtest du ein neues Konto ein.",
   "link.isPair": "Das ist ein Kopplungslink von einem deiner Geräte.",
   "link.isRecover": "Das ist der Link von deinem Wiederherstellungsblatt.",
@@ -196,8 +196,9 @@ const de = {
   "pair.confirm.no": "Nein, abbrechen",
   "pair.request.body":
     "Danach fragt dein System noch einmal nach und zeigt diese Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt.",
-  "pair.mismatch":
-    "Dann füge das Gerät nicht hinzu. Starte auf dem neuen Gerät noch mal von vorn. Passiert das wieder, sprich mit dem Betreiber deines Servers.",
+  "pair.notAdded.title": "„{device}“ wurde nicht hinzugefügt",
+  "pair.notAdded.body":
+    "War das ein Versehen, starte auf dem neuen Gerät noch mal von vorn. Haben die Zahlen nicht gepasst, sag dem Betreiber deines Servers Bescheid.",
   "pair.added": "„{device}“ ist jetzt dabei.",
   "pair.joined": "Gekoppelt. Gleich geht es weiter.",
   "pair.check.title": "Mit diesem Server verbinden?",
@@ -207,7 +208,7 @@ const de = {
   "pair.check.account": "Konto",
   "pair.check.connect": "Verbinden",
   "pair.check.pinned":
-    "Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt.",
+    "Dieser Server weist sich nicht über eine öffentliche Stelle aus. {app} vertraut ihm, weil der Link festlegt, woran es ihn erkennt.",
   "pair.add.target": "Server {host}, Konto {account}",
   "pair.devices.title": "Das sind deine Geräte?",
   "pair.devices.body":
@@ -313,6 +314,7 @@ const de = {
   "folder.deleted.section": "Gelöschte Ordner",
   "folder.deleted.restore": "Zurückholen",
   "folder.deleted.done": "„{folder}“ ist gelöscht.",
+  "folder.deleted.back": "„{folder}“ ist zurück. Mit „Hierher holen“ kommt er auf dieses Gerät.",
   "folder.deleted.daysLeft.one": "noch {days} Tag",
   "folder.deleted.daysLeft.other": "noch {days} Tage",
   "activity.changed": "geändert",
@@ -741,7 +743,7 @@ const de = {
   "error.invite.unreachable":
     "Der Server aus dem Link antwortet nicht. Prüfe deine Internetverbindung oder frag den Betreiber.",
   "error.insecure":
-    "Dieser Server ist nicht verschlüsselt erreichbar. {app} verbindet sich nur über https.",
+    "Dieser Server ist nicht verschlüsselt erreichbar, und {app} verbindet sich nur über https. Bitte den Betreiber deines Servers, https einzurichten.",
   "error.pair.notALink":
     "Das ist kein Kopplungslink. Kopiere ihn auf dem anderen Gerät unter Geräte und dann Gerät hinzufügen.",
   "error.link.damaged": "Der Link ist unvollständig. Kopiere ihn noch einmal ganz.",
@@ -773,17 +775,21 @@ const de = {
   "error.folder.nested":
     "Dieser Ordner liegt in „{folder}“ oder enthält ihn. Wähle einen Ordner daneben.",
   "error.folder.noAccess": "{app} darf in diesen Ordner nicht schreiben. Wähle einen anderen.",
-  "error.rename.invalid": "Auch dieser Name geht unter Windows nicht.",
-  "error.rename.exists": "Eine Datei mit diesem Namen gibt es dort schon.",
+  "error.rename.invalid": "Auch dieser Name geht unter Windows nicht. Probier einen anderen.",
+  "error.rename.exists":
+    "Eine Datei mit diesem Namen gibt es dort schon. Wähl einen anderen Namen.",
   "error.rename.empty": "Gib einen Namen ein.",
   "error.restore.failed":
     "Das Wiederherstellen hat nicht geklappt. Prüfe die Verbindung und versuch es noch mal. Es wurde nichts verändert.",
   "error.locked":
     "{name} ist gerade in einem anderen Programm geöffnet. {app} versucht es gleich wieder.",
+  "error.lockedFile":
+    "Eine Datei ist gerade in einem anderen Programm geöffnet. Schließ sie und versuch es noch mal.",
   "error.busy": "Gerade beschäftigt. Versuch es gleich noch mal.",
-  "error.notReady": "Das kann diese Version von {app} noch nicht.",
+  "error.notReady":
+    "Das kann diese Version von {app} noch nicht. Installiere Updates, sobald sie angeboten werden.",
   "error.unexpected":
-    "Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen. Speichere einen Fehlerbericht unter Einstellungen.",
+    "Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen. Versuch es noch mal. Klappt es wieder nicht, speichere unter Einstellungen einen Fehlerbericht.",
 } as const satisfies Record<string, string>;
 // @i18n-source-end
 
@@ -828,9 +834,9 @@ const en: Dictionary = {
   "setup.connect.scan": "Scan with camera",
   "setup.connect.checking": "Checking the invite …",
   "setup.connect.ok": "Connected to {host}",
-  "setup.connect.pinnedTitle": "A server with its own certificate",
+  "setup.connect.pinnedTitle": "A privately set up server",
   "setup.connect.pinned":
-    "This server has no public certificate. {app} trusts it because the link says so. Only accept the link if it comes straight from the person who runs your server.",
+    "This server does not prove who it is through a public authority. {app} trusts it because the link states how to recognize it. Only accept the link if it comes straight from the person who runs your server.",
   "link.isInvite": "This is an invite link. It sets up a new account.",
   "link.isPair": "This is a pairing link from one of your devices.",
   "link.isRecover": "This is the link from your recovery sheet.",
@@ -942,8 +948,9 @@ const en: Dictionary = {
   "pair.confirm.no": "No, cancel",
   "pair.request.body":
     "Your system then asks once more and shows this row of numbers. Only say yes if the new device shows the same one.",
-  "pair.mismatch":
-    "Then do not add the device. Start over on the new device. If it happens again, talk to the person who runs your server.",
+  "pair.notAdded.title": "“{device}” was not added",
+  "pair.notAdded.body":
+    "If that was a mistake, start over on the new device. If the numbers did not match, tell the person who runs your server.",
   "pair.added": "“{device}” has been added.",
   "pair.joined": "Paired. Just a moment.",
   "pair.check.title": "Connect to this server?",
@@ -953,7 +960,7 @@ const en: Dictionary = {
   "pair.check.account": "Account",
   "pair.check.connect": "Connect",
   "pair.check.pinned":
-    "This server has no public certificate. {app} trusts it because the link says so.",
+    "This server does not prove who it is through a public authority. {app} trusts it because the link states how to recognize it.",
   "pair.add.target": "Server {host}, account {account}",
   "pair.devices.title": "Are these your devices?",
   "pair.devices.body":
@@ -1054,6 +1061,7 @@ const en: Dictionary = {
   "folder.deleted.section": "Deleted folders",
   "folder.deleted.restore": "Bring back",
   "folder.deleted.done": "“{folder}” has been deleted.",
+  "folder.deleted.back": "“{folder}” is back. Choose “Bring here” to put it on this device.",
   "folder.deleted.daysLeft.one": "{days} day left",
   "folder.deleted.daysLeft.other": "{days} days left",
   "activity.changed": "changed",
@@ -1463,7 +1471,8 @@ const en: Dictionary = {
   "error.invite.expired": "This invite has expired. Ask the operator for a new one.",
   "error.invite.unreachable":
     "The server in the link does not answer. Check your internet connection or ask the operator.",
-  "error.insecure": "This server cannot be reached securely. {app} only connects over https.",
+  "error.insecure":
+    "This server cannot be reached securely, and {app} only connects over https. Ask the person who runs your server to set up https.",
   "error.pair.notALink":
     "That is not a pairing link. Copy it on the other device under Devices, then Add device.",
   "error.link.damaged": "The link is incomplete. Copy all of it again.",
@@ -1493,16 +1502,18 @@ const en: Dictionary = {
   "error.folder.nested":
     "This folder is inside “{folder}” or contains it. Choose a folder next to it.",
   "error.folder.noAccess": "{app} is not allowed to write to this folder. Choose another one.",
-  "error.rename.invalid": "This name does not work on Windows either.",
-  "error.rename.exists": "A file with this name already exists there.",
+  "error.rename.invalid": "This name does not work on Windows either. Try another one.",
+  "error.rename.exists": "A file with this name already exists there. Choose another name.",
   "error.rename.empty": "Enter a name.",
   "error.restore.failed":
     "Restoring did not work. Check the connection and try again. Nothing was changed.",
   "error.locked": "{name} is open in another program right now. {app} will try again shortly.",
+  "error.lockedFile": "A file is open in another program right now. Close it and try again.",
   "error.busy": "Busy right now. Try again in a moment.",
-  "error.notReady": "This version of {app} cannot do that yet.",
+  "error.notReady":
+    "This version of {app} cannot do that yet. Install updates when they are offered.",
   "error.unexpected":
-    "Something went wrong. Your files are not affected. Save an error report under Settings.",
+    "Something went wrong. Your files are not affected. Try again. If it keeps happening, save an error report under Settings.",
 };
 
 // @i18n-translations-begin
@@ -1526,9 +1537,9 @@ const el: Dictionary = {
   "setup.connect.scan": "Σάρωση με την κάμερα",
   "setup.connect.checking": "Έλεγχος της πρόσκλησης …",
   "setup.connect.ok": "Συνδέθηκε με {host}",
-  "setup.connect.pinnedTitle": "Διακομιστής με δικό του πιστοποιητικό",
+  "setup.connect.pinnedTitle": "Ιδιωτικά ρυθμισμένος διακομιστής",
   "setup.connect.pinned":
-    "Αυτός ο διακομιστής δεν έχει δημόσιο πιστοποιητικό. Το {app} τον εμπιστεύεται επειδή το ορίζει ο σύνδεσμος. Δέξου τον σύνδεσμο μόνο αν έρχεται απευθείας από τον διαχειριστή του διακομιστή σου.",
+    "Αυτός ο διακομιστής δεν πιστοποιείται από δημόσια αρχή. Το {app} τον εμπιστεύεται επειδή ο σύνδεσμος ορίζει πώς να τον αναγνωρίζει. Δέξου τον σύνδεσμο μόνο αν έρχεται απευθείας από τον διαχειριστή του διακομιστή σου.",
   "link.isInvite": "Αυτός είναι σύνδεσμος πρόσκλησης. Με αυτόν δημιουργείς νέο λογαριασμό.",
   "link.isPair": "Αυτός είναι σύνδεσμος σύζευξης από μία από τις συσκευές σου.",
   "link.isRecover": "Αυτός είναι ο σύνδεσμος από το φύλλο ανάκτησής σου.",
@@ -1641,8 +1652,9 @@ const el: Dictionary = {
   "pair.confirm.no": "Όχι, ακύρωση",
   "pair.request.body":
     "Μετά το σύστημά σου ρωτά άλλη μία φορά και δείχνει αυτή τη σειρά αριθμών. Πες ναι μόνο αν η νέα συσκευή δείχνει την ίδια.",
-  "pair.mismatch":
-    "Τότε μην προσθέσεις τη συσκευή. Ξεκίνα από την αρχή στη νέα συσκευή. Αν συμβεί ξανά, μίλησε με το άτομο που διαχειρίζεται τον διακομιστή σου.",
+  "pair.notAdded.title": "Η συσκευή «{device}» δεν προστέθηκε",
+  "pair.notAdded.body":
+    "Αν ήταν λάθος, ξεκίνα από την αρχή στη νέα συσκευή. Αν οι αριθμοί δεν ταίριαζαν, ενημέρωσε τον διαχειριστή του διακομιστή σου.",
   "pair.added": "Η συσκευή «{device}» προστέθηκε.",
   "pair.joined": "Η σύζευξη έγινε. Μια στιγμή.",
   "pair.check.title": "Σύνδεση με αυτόν τον διακομιστή;",
@@ -1652,7 +1664,7 @@ const el: Dictionary = {
   "pair.check.account": "Λογαριασμός",
   "pair.check.connect": "Σύνδεση",
   "pair.check.pinned":
-    "Αυτός ο διακομιστής δεν έχει δημόσιο πιστοποιητικό. Το {app} τον εμπιστεύεται επειδή το ορίζει ο σύνδεσμος.",
+    "Αυτός ο διακομιστής δεν πιστοποιείται από δημόσια αρχή. Το {app} τον εμπιστεύεται επειδή ο σύνδεσμος ορίζει πώς να τον αναγνωρίζει.",
   "pair.add.target": "Διακομιστής {host}, λογαριασμός {account}",
   "pair.devices.title": "Αυτές είναι οι συσκευές σου;",
   "pair.devices.body":
@@ -1752,6 +1764,8 @@ const el: Dictionary = {
   "folder.deleted.section": "Διαγραμμένοι φάκελοι",
   "folder.deleted.restore": "Επαναφορά",
   "folder.deleted.done": "Ο φάκελος «{folder}» διαγράφηκε.",
+  "folder.deleted.back":
+    "Ο φάκελος «{folder}» επέστρεψε. Πάτησε «Φέρ’ τον εδώ» για να έρθει σε αυτή τη συσκευή.",
   "folder.deleted.daysLeft.one": "Απομένει {days} ημέρα",
   "folder.deleted.daysLeft.other": "Απομένουν {days} ημέρες",
   "activity.changed": "άλλαξε",
@@ -2169,7 +2183,7 @@ const el: Dictionary = {
   "error.invite.unreachable":
     "Ο διακομιστής του συνδέσμου δεν απαντά. Έλεγξε τη σύνδεσή σου στο διαδίκτυο ή ρώτα τον διαχειριστή.",
   "error.insecure":
-    "Δεν είναι δυνατή η ασφαλής σύνδεση με αυτόν τον διακομιστή. Το {app} συνδέεται μόνο μέσω https.",
+    "Δεν είναι δυνατή η ασφαλής σύνδεση με αυτόν τον διακομιστή, και το {app} συνδέεται μόνο μέσω https. Ζήτα από τον διαχειριστή του διακομιστή σου να ρυθμίσει https.",
   "error.pair.notALink":
     "Αυτό δεν είναι σύνδεσμος σύζευξης. Αντίγραψέ τον στην άλλη συσκευή από τις Συσκευές και μετά Προσθήκη συσκευής.",
   "error.link.damaged": "Ο σύνδεσμος είναι ελλιπής. Αντίγραψέ τον ξανά ολόκληρο.",
@@ -2204,17 +2218,20 @@ const el: Dictionary = {
     "Αυτός ο φάκελος βρίσκεται μέσα στο «{folder}» ή το περιέχει. Επίλεξε έναν φάκελο δίπλα του.",
   "error.folder.noAccess":
     "Το {app} δεν έχει δικαίωμα εγγραφής σε αυτόν τον φάκελο. Επίλεξε άλλον.",
-  "error.rename.invalid": "Αυτό το όνομα δεν λειτουργεί ούτε στα Windows.",
-  "error.rename.exists": "Υπάρχει ήδη εκεί ένα αρχείο με αυτό το όνομα.",
+  "error.rename.invalid": "Αυτό το όνομα δεν λειτουργεί ούτε στα Windows. Δοκίμασε άλλο.",
+  "error.rename.exists": "Υπάρχει ήδη εκεί ένα αρχείο με αυτό το όνομα. Διάλεξε άλλο όνομα.",
   "error.rename.empty": "Γράψε ένα όνομα.",
   "error.restore.failed":
     "Η επαναφορά δεν πέτυχε. Έλεγξε τη σύνδεση και δοκίμασε ξανά. Δεν άλλαξε τίποτα.",
   "error.locked":
     "Το {name} είναι ανοιχτό σε άλλο πρόγραμμα αυτή τη στιγμή. Το {app} θα δοκιμάσει ξανά σε λίγο.",
+  "error.lockedFile":
+    "Ένα αρχείο είναι ανοιχτό σε άλλο πρόγραμμα αυτή τη στιγμή. Κλείσ’ το και δοκίμασε ξανά.",
   "error.busy": "Απασχολημένο αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο.",
-  "error.notReady": "Αυτή η έκδοση του {app} δεν μπορεί να το κάνει ακόμα.",
+  "error.notReady":
+    "Αυτή η έκδοση του {app} δεν μπορεί να το κάνει ακόμα. Εγκατάστησε τις ενημερώσεις μόλις προσφερθούν.",
   "error.unexpected":
-    "Κάτι πήγε στραβά. Τα αρχεία σου δεν επηρεάστηκαν. Αποθήκευσε μια αναφορά σφάλματος στις Ρυθμίσεις.",
+    "Κάτι πήγε στραβά. Τα αρχεία σου δεν επηρεάστηκαν. Δοκίμασε ξανά. Αν συμβεί πάλι, αποθήκευσε μια αναφορά σφάλματος στις Ρυθμίσεις.",
 };
 
 const es: Dictionary = {
@@ -2237,9 +2254,9 @@ const es: Dictionary = {
   "setup.connect.scan": "Escanear con la cámara",
   "setup.connect.checking": "Comprobando la invitación …",
   "setup.connect.ok": "Conectado a {host}",
-  "setup.connect.pinnedTitle": "Un servidor con certificado propio",
+  "setup.connect.pinnedTitle": "Un servidor configurado de forma privada",
   "setup.connect.pinned":
-    "Este servidor no tiene un certificado público. {app} confía en él porque así lo indica el enlace. Acepta el enlace solo si te llega directamente del administrador de tu servidor.",
+    "Este servidor no se identifica a través de una entidad pública. {app} confía en él porque el enlace indica cómo reconocerlo. Acepta el enlace solo si te llega directamente del administrador de tu servidor.",
   "link.isInvite": "Esto es un enlace de invitación. Con él creas una cuenta nueva.",
   "link.isPair": "Esto es un enlace de vinculación de uno de tus dispositivos.",
   "link.isRecover": "Este es el enlace de tu hoja de recuperación.",
@@ -2355,8 +2372,9 @@ const es: Dictionary = {
   "pair.confirm.no": "No, cancelar",
   "pair.request.body":
     "Después, tu sistema te lo pregunta otra vez y muestra esta fila de números. Di que sí solo si el nuevo dispositivo muestra la misma.",
-  "pair.mismatch":
-    "Entonces no añadas el dispositivo. Empieza de nuevo en el dispositivo nuevo. Si vuelve a pasar, habla con la persona que gestiona tu servidor.",
+  "pair.notAdded.title": "No se ha añadido «{device}»",
+  "pair.notAdded.body":
+    "Si fue un error, empieza de nuevo en el dispositivo nuevo. Si los números no coincidían, avisa a la persona que gestiona tu servidor.",
   "pair.added": "Se ha añadido «{device}».",
   "pair.joined": "Vinculado. Un momento.",
   "pair.check.title": "¿Conectar con este servidor?",
@@ -2366,7 +2384,7 @@ const es: Dictionary = {
   "pair.check.account": "Cuenta",
   "pair.check.connect": "Conectar",
   "pair.check.pinned":
-    "Este servidor no tiene un certificado público. {app} confía en él porque así lo indica el enlace.",
+    "Este servidor no se identifica a través de una entidad pública. {app} confía en él porque el enlace indica cómo reconocerlo.",
   "pair.add.target": "Servidor {host}, cuenta {account}",
   "pair.devices.title": "¿Son estos tus dispositivos?",
   "pair.devices.body":
@@ -2471,6 +2489,7 @@ const es: Dictionary = {
   "folder.deleted.section": "Carpetas eliminadas",
   "folder.deleted.restore": "Recuperar",
   "folder.deleted.done": "«{folder}» se ha eliminado.",
+  "folder.deleted.back": "«{folder}» ha vuelto. Con «Traer aquí» lo tienes en este dispositivo.",
   "folder.deleted.daysLeft.one": "Queda {days} día",
   "folder.deleted.daysLeft.many": "Quedan {days} de días",
   "folder.deleted.daysLeft.other": "Quedan {days} días",
@@ -2923,7 +2942,7 @@ const es: Dictionary = {
   "error.invite.unreachable":
     "El servidor del enlace no responde. Comprueba tu conexión a internet o pregunta al administrador.",
   "error.insecure":
-    "No se puede acceder a este servidor de forma segura. {app} solo se conecta por https.",
+    "No se puede acceder a este servidor de forma segura y {app} solo se conecta por https. Pide al administrador de tu servidor que configure https.",
   "error.pair.notALink":
     "Eso no es un enlace de vinculación. Cópialo en el otro dispositivo en Dispositivos y luego Añadir dispositivo.",
   "error.link.damaged": "El enlace está incompleto. Vuelve a copiarlo entero.",
@@ -2952,17 +2971,19 @@ const es: Dictionary = {
   "error.folder.nested":
     "Esta carpeta está dentro de «{folder}» o la contiene. Elige una carpeta al lado.",
   "error.folder.noAccess": "{app} no tiene permiso para escribir en esta carpeta. Elige otra.",
-  "error.rename.invalid": "Este nombre tampoco funciona en Windows.",
-  "error.rename.exists": "Ya existe ahí un archivo con este nombre.",
+  "error.rename.invalid": "Este nombre tampoco funciona en Windows. Prueba con otro.",
+  "error.rename.exists": "Ya existe ahí un archivo con este nombre. Elige otro nombre.",
   "error.rename.empty": "Escribe un nombre.",
   "error.restore.failed":
     "No se ha podido restaurar. Comprueba la conexión e inténtalo de nuevo. No se ha cambiado nada.",
   "error.locked":
     "{name} está abierto ahora en otro programa. {app} lo volverá a intentar en breve.",
+  "error.lockedFile": "Hay un archivo abierto en otro programa. Ciérralo y vuelve a intentarlo.",
   "error.busy": "Ocupado ahora mismo. Inténtalo de nuevo en un momento.",
-  "error.notReady": "Esta versión de {app} todavía no puede hacer eso.",
+  "error.notReady":
+    "Esta versión de {app} todavía no puede hacerlo. Instala las actualizaciones cuando se ofrezcan.",
   "error.unexpected":
-    "Algo ha salido mal. Tus archivos no se han visto afectados. Guarda un informe de errores en Ajustes.",
+    "Algo ha salido mal. Tus archivos no se han visto afectados. Vuelve a intentarlo. Si sigue pasando, guarda un informe de errores en Ajustes.",
 };
 
 const fr: Dictionary = {
@@ -2985,9 +3006,9 @@ const fr: Dictionary = {
   "setup.connect.scan": "Scanner avec la caméra",
   "setup.connect.checking": "Vérification de l’invitation …",
   "setup.connect.ok": "Connecté à {host}",
-  "setup.connect.pinnedTitle": "Un serveur avec son propre certificat",
+  "setup.connect.pinnedTitle": "Un serveur configuré en privé",
   "setup.connect.pinned":
-    "Ce serveur n’a pas de certificat public. {app} lui fait confiance parce que le lien l’indique. N’accepte le lien que s’il vient directement de l’administrateur de ton serveur.",
+    "Ce serveur ne s’identifie pas auprès d’une autorité publique. {app} lui fait confiance parce que le lien indique comment le reconnaître. N’accepte le lien que s’il vient directement de l’administrateur de ton serveur.",
   "link.isInvite": "C’est un lien d’invitation. Il sert à créer un nouveau compte.",
   "link.isPair": "C’est un lien d’association d’un de tes appareils.",
   "link.isRecover": "C’est le lien de ta feuille de récupération.",
@@ -3103,8 +3124,9 @@ const fr: Dictionary = {
   "pair.confirm.no": "Non, annuler",
   "pair.request.body":
     "Ton système te le redemande ensuite et affiche cette suite de chiffres. Ne dis oui que si le nouvel appareil affiche la même.",
-  "pair.mismatch":
-    "Alors n’ajoute pas l’appareil. Recommence sur le nouvel appareil. Si cela se reproduit, parles-en à la personne qui gère ton serveur.",
+  "pair.notAdded.title": "« {device} » n’a pas été ajouté",
+  "pair.notAdded.body":
+    "Si c’était une erreur, recommence sur le nouvel appareil. Si les nombres ne correspondaient pas, préviens la personne qui gère ton serveur.",
   "pair.added": "« {device} » a été ajouté.",
   "pair.joined": "Associé. Un instant.",
   "pair.check.title": "Se connecter à ce serveur ?",
@@ -3114,7 +3136,7 @@ const fr: Dictionary = {
   "pair.check.account": "Compte",
   "pair.check.connect": "Se connecter",
   "pair.check.pinned":
-    "Ce serveur n’a pas de certificat public. {app} lui fait confiance parce que le lien l’indique.",
+    "Ce serveur ne s’identifie pas auprès d’une autorité publique. {app} lui fait confiance parce que le lien indique comment le reconnaître.",
   "pair.add.target": "Serveur {host}, compte {account}",
   "pair.devices.title": "Ce sont bien tes appareils ?",
   "pair.devices.body":
@@ -3219,6 +3241,8 @@ const fr: Dictionary = {
   "folder.deleted.section": "Dossiers supprimés",
   "folder.deleted.restore": "Récupérer",
   "folder.deleted.done": "« {folder} » a été supprimé.",
+  "folder.deleted.back":
+    "« {folder} » est de retour. Choisis « Récupérer ici » pour l’avoir sur cet appareil.",
   "folder.deleted.daysLeft.one": "Encore {days} jour",
   "folder.deleted.daysLeft.many": "Encore {days} de jours",
   "folder.deleted.daysLeft.other": "Encore {days} jours",
@@ -3677,7 +3701,7 @@ const fr: Dictionary = {
   "error.invite.unreachable":
     "Le serveur du lien ne répond pas. Vérifie ta connexion internet ou demande à l’administrateur.",
   "error.insecure":
-    "Impossible de joindre ce serveur de façon sécurisée. {app} se connecte uniquement en https.",
+    "Impossible de joindre ce serveur de façon sécurisée, et {app} se connecte uniquement en https. Demande à l’administrateur de ton serveur d’activer https.",
   "error.pair.notALink":
     "Ce n’est pas un lien d’association. Copie-le sur l’autre appareil sous Appareils, puis Ajouter un appareil.",
   "error.link.damaged": "Le lien est incomplet. Copie-le de nouveau en entier.",
@@ -3709,16 +3733,19 @@ const fr: Dictionary = {
   "error.folder.nested":
     "Ce dossier se trouve dans « {folder} » ou le contient. Choisis un dossier à côté.",
   "error.folder.noAccess": "{app} n’a pas le droit d’écrire dans ce dossier. Choisis-en un autre.",
-  "error.rename.invalid": "Ce nom ne fonctionne pas non plus sous Windows.",
-  "error.rename.exists": "Un fichier portant ce nom existe déjà à cet endroit.",
+  "error.rename.invalid": "Ce nom ne fonctionne pas non plus sous Windows. Essaie un autre nom.",
+  "error.rename.exists":
+    "Un fichier portant ce nom existe déjà à cet endroit. Choisis un autre nom.",
   "error.rename.empty": "Saisis un nom.",
   "error.restore.failed":
     "La restauration n’a pas fonctionné. Vérifie la connexion et réessaie. Rien n’a été modifié.",
   "error.locked": "{name} est ouvert dans un autre programme. {app} réessaiera sous peu.",
+  "error.lockedFile": "Un fichier est ouvert dans un autre programme. Ferme-le et réessaie.",
   "error.busy": "Occupé pour le moment. Réessaie dans un instant.",
-  "error.notReady": "Cette version de {app} ne sait pas encore faire cela.",
+  "error.notReady":
+    "Cette version de {app} ne sait pas encore le faire. Installe les mises à jour dès qu’elles sont proposées.",
   "error.unexpected":
-    "Une erreur s’est produite. Tes fichiers ne sont pas concernés. Enregistre un rapport d’erreur sous Paramètres.",
+    "Une erreur s’est produite. Tes fichiers ne sont pas concernés. Réessaie. Si cela se reproduit, enregistre un rapport d’erreur sous Paramètres.",
 };
 
 const it: Dictionary = {
@@ -3741,9 +3768,9 @@ const it: Dictionary = {
   "setup.connect.scan": "Scansiona con la fotocamera",
   "setup.connect.checking": "Controllo l’invito …",
   "setup.connect.ok": "Collegato a {host}",
-  "setup.connect.pinnedTitle": "Un server con un certificato proprio",
+  "setup.connect.pinnedTitle": "Un server configurato privatamente",
   "setup.connect.pinned":
-    "Questo server non ha un certificato pubblico. {app} si fida perché lo indica il link. Accetta il link solo se arriva direttamente dal gestore del tuo server.",
+    "Questo server non si identifica tramite un ente pubblico. {app} si fida perché il link indica come riconoscerlo. Accetta il link solo se arriva direttamente dal gestore del tuo server.",
   "link.isInvite": "Questo è un link di invito. Serve a creare un nuovo account.",
   "link.isPair": "Questo è un link di abbinamento di uno dei tuoi dispositivi.",
   "link.isRecover": "Questo è il link del tuo foglio di recupero.",
@@ -3858,8 +3885,9 @@ const it: Dictionary = {
   "pair.confirm.no": "No, annulla",
   "pair.request.body":
     "Poi il tuo sistema te lo chiede di nuovo e mostra questa serie di numeri. Di’ di sì solo se il nuovo dispositivo mostra la stessa.",
-  "pair.mismatch":
-    "Allora non aggiungere il dispositivo. Ricomincia sul nuovo dispositivo. Se succede di nuovo, parlane con chi gestisce il tuo server.",
+  "pair.notAdded.title": "«{device}» non è stato aggiunto",
+  "pair.notAdded.body":
+    "Se è stato un errore, ricomincia sul nuovo dispositivo. Se i numeri non corrispondevano, avvisa chi gestisce il tuo server.",
   "pair.added": "«{device}» è stato aggiunto.",
   "pair.joined": "Abbinato. Un attimo.",
   "pair.check.title": "Collegarsi a questo server?",
@@ -3869,7 +3897,7 @@ const it: Dictionary = {
   "pair.check.account": "Account",
   "pair.check.connect": "Collega",
   "pair.check.pinned":
-    "Questo server non ha un certificato pubblico. {app} si fida perché lo indica il link.",
+    "Questo server non si identifica tramite un ente pubblico. {app} si fida perché il link indica come riconoscerlo.",
   "pair.add.target": "Server {host}, account {account}",
   "pair.devices.title": "Sono questi i tuoi dispositivi?",
   "pair.devices.body":
@@ -3978,6 +4006,7 @@ const it: Dictionary = {
   "folder.deleted.section": "Cartelle eliminate",
   "folder.deleted.restore": "Recupera",
   "folder.deleted.done": "«{folder}» è stata eliminata.",
+  "folder.deleted.back": "«{folder}» è tornata. Con «Porta qui» arriva su questo dispositivo.",
   "folder.deleted.daysLeft.one": "Ancora {days} giorno",
   "folder.deleted.daysLeft.many": "Ancora {days} di giorni",
   "folder.deleted.daysLeft.other": "Ancora {days} giorni",
@@ -4440,7 +4469,7 @@ const it: Dictionary = {
   "error.invite.unreachable":
     "Il server nel link non risponde. Controlla la connessione a internet o chiedi al gestore.",
   "error.insecure":
-    "Questo server non è raggiungibile in modo sicuro. {app} si collega solo tramite https.",
+    "Questo server non è raggiungibile in modo sicuro e {app} si collega solo tramite https. Chiedi al gestore del tuo server di attivare https.",
   "error.pair.notALink":
     "Questo non è un link di abbinamento. Copialo sull’altro dispositivo in Dispositivi, poi Aggiungi dispositivo.",
   "error.link.damaged": "Il link è incompleto. Copialo di nuovo per intero.",
@@ -4472,16 +4501,18 @@ const it: Dictionary = {
   "error.folder.nested":
     "Questa cartella si trova dentro «{folder}» o la contiene. Scegli una cartella accanto.",
   "error.folder.noAccess": "{app} non può scrivere in questa cartella. Scegline un’altra.",
-  "error.rename.invalid": "Neanche questo nome funziona su Windows.",
-  "error.rename.exists": "Lì esiste già un file con questo nome.",
+  "error.rename.invalid": "Neanche questo nome funziona su Windows. Provane un altro.",
+  "error.rename.exists": "Lì esiste già un file con questo nome. Scegli un altro nome.",
   "error.rename.empty": "Inserisci un nome.",
   "error.restore.failed":
     "Il ripristino non è riuscito. Controlla la connessione e riprova. Non è stato cambiato nulla.",
   "error.locked": "{name} è aperto in un altro programma. {app} riproverà tra poco.",
+  "error.lockedFile": "Un file è aperto in un altro programma. Chiudilo e riprova.",
   "error.busy": "Occupato al momento. Riprova tra un attimo.",
-  "error.notReady": "Questa versione di {app} non sa ancora farlo.",
+  "error.notReady":
+    "Questa versione di {app} non può ancora farlo. Installa gli aggiornamenti quando vengono proposti.",
   "error.unexpected":
-    "Qualcosa è andato storto. I tuoi file non sono coinvolti. Salva un rapporto errori in Impostazioni.",
+    "Qualcosa è andato storto. I tuoi file non sono coinvolti. Riprova. Se succede ancora, salva un rapporto errori in Impostazioni.",
 };
 
 const ja: Dictionary = {
@@ -4504,9 +4535,9 @@ const ja: Dictionary = {
   "setup.connect.scan": "カメラで読み取る",
   "setup.connect.checking": "招待を確認しています…",
   "setup.connect.ok": "{host} に接続しました",
-  "setup.connect.pinnedTitle": "独自の証明書を使うサーバー",
+  "setup.connect.pinnedTitle": "個人で設定されたサーバー",
   "setup.connect.pinned":
-    "このサーバーには公開の証明書がありません。リンクで指定されているため、{app} はこのサーバーを信頼します。サーバーの管理者から直接受け取ったリンクだけを使ってください。",
+    "このサーバーは公的な機関による身元確認を受けていません。リンクに見分け方が指定されているため、{app} はこのサーバーを信頼します。サーバーの管理者から直接受け取ったリンクだけを使ってください。",
   "link.isInvite": "これは招待リンクです。新しいアカウントを作成するためのものです。",
   "link.isPair": "これは別のデバイスからのペアリングリンクです。",
   "link.isRecover": "これは復元シートのリンクです。",
@@ -4615,8 +4646,9 @@ const ja: Dictionary = {
   "pair.confirm.no": "いいえ、キャンセル",
   "pair.request.body":
     "このあとシステムがもう一度確認し、この数字の列を表示します。新しいデバイスに同じ数字が表示されている場合のみ「はい」を選んでください。",
-  "pair.mismatch":
-    "その場合はデバイスを追加しないでください。新しいデバイスで最初からやり直してください。再び起きる場合は、サーバーの管理者に相談してください。",
+  "pair.notAdded.title": "「{device}」は追加されませんでした",
+  "pair.notAdded.body":
+    "誤って操作した場合は、新しいデバイスで最初からやり直してください。数字が一致しなかった場合は、サーバーの管理者に連絡してください。",
   "pair.added": "「{device}」を追加しました。",
   "pair.joined": "ペアリングしました。少しお待ちください。",
   "pair.check.title": "このサーバーに接続しますか？",
@@ -4626,7 +4658,7 @@ const ja: Dictionary = {
   "pair.check.account": "アカウント",
   "pair.check.connect": "接続",
   "pair.check.pinned":
-    "このサーバーには公開の証明書がありません。リンクで指定されているため、{app} はこのサーバーを信頼します。",
+    "このサーバーは公的な機関による身元確認を受けていません。リンクに見分け方が指定されているため、{app} はこのサーバーを信頼します。",
   "pair.add.target": "サーバー {host}、アカウント {account}",
   "pair.devices.title": "これらのデバイスに心当たりはありますか？",
   "pair.devices.body":
@@ -4723,6 +4755,8 @@ const ja: Dictionary = {
   "folder.deleted.section": "削除したフォルダー",
   "folder.deleted.restore": "元に戻す",
   "folder.deleted.done": "「{folder}」を削除しました。",
+  "folder.deleted.back":
+    "「{folder}」が戻りました。「ここに置く」を選ぶと、このデバイスに置かれます。",
   "folder.deleted.daysLeft.other": "残り {days} 日",
   "activity.changed": "変更",
   "activity.added": "新規",
@@ -5097,7 +5131,8 @@ const ja: Dictionary = {
   "error.invite.expired": "この招待は期限切れです。新しい招待を管理者に依頼してください。",
   "error.invite.unreachable":
     "リンクのサーバーが応答しません。インターネット接続を確認するか、管理者に問い合わせてください。",
-  "error.insecure": "このサーバーには安全に接続できません。{app} は https でのみ接続します。",
+  "error.insecure":
+    "このサーバーには安全に接続できません。{app} は https でのみ接続します。サーバーの管理者に https の設定を依頼してください。",
   "error.pair.notALink":
     "ペアリングリンクではありません。ほかのデバイスの「デバイス」から「デバイスを追加」でコピーしてください。",
   "error.link.damaged": "リンクが不完全です。もう一度すべてコピーしてください。",
@@ -5130,16 +5165,19 @@ const ja: Dictionary = {
     "このフォルダーは「{folder}」の中にあるか、それを含んでいます。その隣のフォルダーを選んでください。",
   "error.folder.noAccess":
     "{app} はこのフォルダーに書き込めません。別のフォルダーを選んでください。",
-  "error.rename.invalid": "この名前も Windows では使えません。",
-  "error.rename.exists": "同じ名前のファイルがすでにあります。",
+  "error.rename.invalid": "この名前も Windows では使えません。別の名前をお試しください。",
+  "error.rename.exists": "同じ名前のファイルがすでにあります。別の名前を選んでください。",
   "error.rename.empty": "名前を入力してください。",
   "error.restore.failed":
     "復元できませんでした。接続を確認して、もう一度お試しください。何も変更されていません。",
   "error.locked": "{name} は現在ほかのプログラムで開かれています。{app} はまもなく再試行します。",
+  "error.lockedFile":
+    "ファイルがほかのプログラムで開かれています。閉じてから、もう一度お試しください。",
   "error.busy": "現在処理中です。少し待ってからお試しください。",
-  "error.notReady": "このバージョンの {app} ではまだできません。",
+  "error.notReady":
+    "この {app} のバージョンではまだできません。アップデートが提供されたらインストールしてください。",
   "error.unexpected":
-    "問題が発生しました。ファイルには影響ありません。「設定」でエラーレポートを保存してください。",
+    "問題が発生しました。ファイルには影響ありません。もう一度お試しください。繰り返し起きる場合は、「設定」でエラーレポートを保存してください。",
 };
 
 const pl: Dictionary = {
@@ -5162,9 +5200,9 @@ const pl: Dictionary = {
   "setup.connect.scan": "Zeskanuj aparatem",
   "setup.connect.checking": "Sprawdzam zaproszenie …",
   "setup.connect.ok": "Połączono z {host}",
-  "setup.connect.pinnedTitle": "Serwer z własnym certyfikatem",
+  "setup.connect.pinnedTitle": "Serwer skonfigurowany prywatnie",
   "setup.connect.pinned":
-    "Ten serwer nie ma publicznego certyfikatu. {app} ufa mu, bo tak określa link. Przyjmij link tylko wtedy, gdy pochodzi bezpośrednio od administratora twojego serwera.",
+    "Ten serwer nie potwierdza swojej tożsamości przez publiczną instytucję. {app} ufa mu, bo link określa, jak go rozpoznać. Przyjmij link tylko wtedy, gdy pochodzi bezpośrednio od administratora twojego serwera.",
   "link.isInvite": "To jest link z zaproszeniem. Służy do założenia nowego konta.",
   "link.isPair": "To jest link parowania z jednego z twoich urządzeń.",
   "link.isRecover": "To jest link z twojej karty odzyskiwania.",
@@ -5284,8 +5322,9 @@ const pl: Dictionary = {
   "pair.confirm.no": "Nie, anuluj",
   "pair.request.body":
     "Potem system zapyta jeszcze raz i pokaże ten ciąg liczb. Zgódź się tylko wtedy, gdy nowe urządzenie pokazuje ten sam.",
-  "pair.mismatch":
-    "W takim razie nie dodawaj urządzenia. Zacznij od nowa na nowym urządzeniu. Jeśli to się powtórzy, porozmawiaj z osobą, która prowadzi twój serwer.",
+  "pair.notAdded.title": "Nie dodano „{device}”",
+  "pair.notAdded.body":
+    "Jeśli to była pomyłka, zacznij od nowa na nowym urządzeniu. Jeśli liczby się nie zgadzały, powiadom osobę, która prowadzi twój serwer.",
   "pair.added": "Dodano „{device}”.",
   "pair.joined": "Sparowano. Chwileczkę.",
   "pair.check.title": "Połączyć z tym serwerem?",
@@ -5295,7 +5334,7 @@ const pl: Dictionary = {
   "pair.check.account": "Konto",
   "pair.check.connect": "Połącz",
   "pair.check.pinned":
-    "Ten serwer nie ma publicznego certyfikatu. {app} ufa mu, bo tak określa link.",
+    "Ten serwer nie potwierdza swojej tożsamości przez publiczną instytucję. {app} ufa mu, bo link określa, jak go rozpoznać.",
   "pair.add.target": "Serwer {host}, konto {account}",
   "pair.devices.title": "Czy to twoje urządzenia?",
   "pair.devices.body":
@@ -5409,6 +5448,8 @@ const pl: Dictionary = {
   "folder.deleted.section": "Usunięte foldery",
   "folder.deleted.restore": "Przywróć",
   "folder.deleted.done": "Usunięto „{folder}”.",
+  "folder.deleted.back":
+    "Folder „{folder}” wrócił. Wybierz „Pobierz tutaj”, aby mieć go na tym urządzeniu.",
   "folder.deleted.daysLeft.one": "Został {days} dzień",
   "folder.deleted.daysLeft.few": "Zostały {days} dni",
   "folder.deleted.daysLeft.many": "Zostało {days} dni",
@@ -5909,7 +5950,7 @@ const pl: Dictionary = {
   "error.invite.unreachable":
     "Serwer z linku nie odpowiada. Sprawdź połączenie z internetem albo zapytaj administratora.",
   "error.insecure":
-    "Z tym serwerem nie da się połączyć bezpiecznie. {app} łączy się tylko przez https.",
+    "Z tym serwerem nie da się połączyć bezpiecznie, a {app} łączy się tylko przez https. Poproś administratora twojego serwera o włączenie https.",
   "error.pair.notALink":
     "To nie jest link parowania. Skopiuj go na drugim urządzeniu w sekcji Urządzenia, a potem Dodaj urządzenie.",
   "error.link.damaged": "Link jest niepełny. Skopiuj go jeszcze raz w całości.",
@@ -5938,17 +5979,19 @@ const pl: Dictionary = {
   "error.folder.nested":
     "Ten folder znajduje się w „{folder}” albo go zawiera. Wybierz folder obok.",
   "error.folder.noAccess": "{app} nie ma uprawnień do zapisu w tym folderze. Wybierz inny.",
-  "error.rename.invalid": "Ta nazwa również nie zadziała w Windows.",
-  "error.rename.exists": "Plik o tej nazwie już tam istnieje.",
+  "error.rename.invalid": "Ta nazwa również nie zadziała w Windows. Spróbuj innej.",
+  "error.rename.exists": "Plik o tej nazwie już tam istnieje. Wybierz inną nazwę.",
   "error.rename.empty": "Wpisz nazwę.",
   "error.restore.failed":
     "Przywracanie się nie udało. Sprawdź połączenie i spróbuj ponownie. Nic nie zostało zmienione.",
   "error.locked":
     "Plik {name} jest teraz otwarty w innym programie. {app} za chwilę spróbuje ponownie.",
+  "error.lockedFile": "Plik jest teraz otwarty w innym programie. Zamknij go i spróbuj ponownie.",
   "error.busy": "Trwa inna operacja. Spróbuj za chwilę.",
-  "error.notReady": "Ta wersja {app} jeszcze tego nie potrafi.",
+  "error.notReady":
+    "Ta wersja {app} jeszcze tego nie potrafi. Instaluj aktualizacje, gdy tylko się pojawią.",
   "error.unexpected":
-    "Coś poszło nie tak. Twoje pliki nie są zagrożone. Zapisz raport o błędzie w Ustawieniach.",
+    "Coś poszło nie tak. Twoje pliki nie są zagrożone. Spróbuj ponownie. Jeśli to się powtarza, zapisz raport o błędzie w Ustawieniach.",
 };
 
 const pt: Dictionary = {
@@ -5971,9 +6014,9 @@ const pt: Dictionary = {
   "setup.connect.scan": "Escanear com a câmera",
   "setup.connect.checking": "Verificando o convite …",
   "setup.connect.ok": "Conectado a {host}",
-  "setup.connect.pinnedTitle": "Um servidor com certificado próprio",
+  "setup.connect.pinnedTitle": "Um servidor configurado de forma privada",
   "setup.connect.pinned":
-    "Este servidor não tem um certificado público. O {app} confia nele porque o link determina isso. Só aceite o link se ele vier diretamente do administrador do seu servidor.",
+    "Este servidor não se identifica por meio de uma autoridade pública. O {app} confia nele porque o link diz como reconhecê-lo. Só aceite o link se ele vier diretamente do administrador do seu servidor.",
   "link.isInvite": "Este é um link de convite. Com ele você cria uma conta nova.",
   "link.isPair": "Este é um link de pareamento de um dos seus dispositivos.",
   "link.isRecover": "Este é o link da sua folha de recuperação.",
@@ -6091,8 +6134,9 @@ const pt: Dictionary = {
   "pair.confirm.no": "Não, cancelar",
   "pair.request.body":
     "Depois, seu sistema pergunta mais uma vez e mostra esta sequência de números. Só diga sim se o novo dispositivo mostrar a mesma.",
-  "pair.mismatch":
-    "Então não adicione o dispositivo. Comece de novo no novo dispositivo. Se acontecer outra vez, fale com quem cuida do seu servidor.",
+  "pair.notAdded.title": "“{device}” não foi adicionado",
+  "pair.notAdded.body":
+    "Se foi um engano, comece de novo no novo dispositivo. Se os números não batiam, avise quem cuida do seu servidor.",
   "pair.added": "“{device}” foi adicionado.",
   "pair.joined": "Pareado. Só um momento.",
   "pair.check.title": "Conectar a este servidor?",
@@ -6102,7 +6146,7 @@ const pt: Dictionary = {
   "pair.check.account": "Conta",
   "pair.check.connect": "Conectar",
   "pair.check.pinned":
-    "Este servidor não tem um certificado público. O {app} confia nele porque o link determina isso.",
+    "Este servidor não se identifica por meio de uma autoridade pública. O {app} confia nele porque o link diz como reconhecê-lo.",
   "pair.add.target": "Servidor {host}, conta {account}",
   "pair.devices.title": "Estes são os seus dispositivos?",
   "pair.devices.body":
@@ -6210,6 +6254,8 @@ const pt: Dictionary = {
   "folder.deleted.section": "Pastas excluídas",
   "folder.deleted.restore": "Trazer de volta",
   "folder.deleted.done": "“{folder}” foi excluída.",
+  "folder.deleted.back":
+    "“{folder}” voltou. Escolha “Trazer para cá” para tê-la neste dispositivo.",
   "folder.deleted.daysLeft.one": "Falta {days} dia",
   "folder.deleted.daysLeft.many": "Faltam {days} de dias",
   "folder.deleted.daysLeft.other": "Faltam {days} dias",
@@ -6671,7 +6717,7 @@ const pt: Dictionary = {
   "error.invite.unreachable":
     "O servidor do link não responde. Confira sua conexão com a internet ou pergunte ao administrador.",
   "error.insecure":
-    "Não é possível acessar este servidor com segurança. O {app} só se conecta por https.",
+    "Não é possível acessar este servidor com segurança, e o {app} só se conecta por https. Peça ao administrador do seu servidor para ativar o https.",
   "error.pair.notALink":
     "Isso não é um link de pareamento. Copie-o no outro dispositivo em Dispositivos, depois Adicionar dispositivo.",
   "error.link.damaged": "O link está incompleto. Copie-o de novo por inteiro.",
@@ -6701,17 +6747,19 @@ const pt: Dictionary = {
   "error.folder.nested":
     "Esta pasta está dentro de “{folder}” ou contém essa pasta. Escolha uma pasta ao lado.",
   "error.folder.noAccess": "O {app} não tem permissão para gravar nesta pasta. Escolha outra.",
-  "error.rename.invalid": "Este nome também não funciona no Windows.",
-  "error.rename.exists": "Já existe um arquivo com este nome aí.",
+  "error.rename.invalid": "Este nome também não funciona no Windows. Tente outro.",
+  "error.rename.exists": "Já existe um arquivo com este nome aí. Escolha outro nome.",
   "error.rename.empty": "Digite um nome.",
   "error.restore.failed":
     "Não foi possível restaurar. Confira a conexão e tente de novo. Nada foi alterado.",
   "error.locked":
     "{name} está aberto em outro programa agora. O {app} vai tentar de novo daqui a pouco.",
+  "error.lockedFile": "Um arquivo está aberto em outro programa. Feche-o e tente de novo.",
   "error.busy": "Ocupado agora. Tente de novo em um instante.",
-  "error.notReady": "Esta versão do {app} ainda não faz isso.",
+  "error.notReady":
+    "Esta versão do {app} ainda não consegue fazer isso. Instale as atualizações quando forem oferecidas.",
   "error.unexpected":
-    "Algo deu errado. Seus arquivos não foram afetados. Salve um relatório de erro em Configurações.",
+    "Algo deu errado. Seus arquivos não foram afetados. Tente de novo. Se continuar acontecendo, salve um relatório de erro em Configurações.",
 };
 
 const ru: Dictionary = {
@@ -6735,9 +6783,9 @@ const ru: Dictionary = {
   "setup.connect.scan": "Сканировать камерой",
   "setup.connect.checking": "Проверяю приглашение …",
   "setup.connect.ok": "Подключено к {host}",
-  "setup.connect.pinnedTitle": "Сервер с собственным сертификатом",
+  "setup.connect.pinnedTitle": "Частный сервер",
   "setup.connect.pinned":
-    "У этого сервера нет публичного сертификата. {app} доверяет ему, потому что так указано в ссылке. Принимай ссылку, только если она пришла напрямую от администратора твоего сервера.",
+    "Этот сервер не подтверждает свою подлинность через публичную организацию. {app} доверяет ему, потому что в ссылке указано, как его узнать. Принимай ссылку, только если она пришла напрямую от администратора твоего сервера.",
   "link.isInvite": "Это ссылка-приглашение. С ней создаётся новая учётная запись.",
   "link.isPair": "Это ссылка для привязки с одного из твоих устройств.",
   "link.isRecover": "Это ссылка с твоего листа восстановления.",
@@ -6857,8 +6905,9 @@ const ru: Dictionary = {
   "pair.confirm.no": "Нет, отменить",
   "pair.request.body":
     "Затем система спросит ещё раз и покажет этот ряд чисел. Соглашайся, только если новое устройство показывает тот же ряд.",
-  "pair.mismatch":
-    "Тогда не добавляй устройство. Начни заново на новом устройстве. Если это повторится, поговори с человеком, который обслуживает твой сервер.",
+  "pair.notAdded.title": "Устройство «{device}» не добавлено",
+  "pair.notAdded.body":
+    "Если это была ошибка, начни заново на новом устройстве. Если числа не совпали, сообщи человеку, который обслуживает твой сервер.",
   "pair.added": "Устройство «{device}» добавлено.",
   "pair.joined": "Привязано. Минутку.",
   "pair.check.title": "Подключиться к этому серверу?",
@@ -6868,7 +6917,7 @@ const ru: Dictionary = {
   "pair.check.account": "Учётная запись",
   "pair.check.connect": "Подключить",
   "pair.check.pinned":
-    "У этого сервера нет публичного сертификата. {app} доверяет ему, потому что так указано в ссылке.",
+    "Этот сервер не подтверждает свою подлинность через публичную организацию. {app} доверяет ему, потому что в ссылке указано, как его узнать.",
   "pair.add.target": "Сервер {host}, учётная запись {account}",
   "pair.devices.title": "Это твои устройства?",
   "pair.devices.body":
@@ -6981,6 +7030,8 @@ const ru: Dictionary = {
   "folder.deleted.section": "Удалённые папки",
   "folder.deleted.restore": "Вернуть",
   "folder.deleted.done": "Папка «{folder}» удалена.",
+  "folder.deleted.back":
+    "Папка «{folder}» вернулась. Нажми «Добавить сюда», чтобы она появилась на этом устройстве.",
   "folder.deleted.daysLeft.one": "Остался {days} день",
   "folder.deleted.daysLeft.few": "Осталось {days} дня",
   "folder.deleted.daysLeft.many": "Осталось {days} дней",
@@ -7478,7 +7529,7 @@ const ru: Dictionary = {
   "error.invite.unreachable":
     "Сервер из ссылки не отвечает. Проверь подключение к интернету или спроси администратора.",
   "error.insecure":
-    "К этому серверу нельзя подключиться безопасно. {app} подключается только по https.",
+    "К этому серверу нельзя подключиться безопасно, а {app} подключается только по https. Попроси администратора твоего сервера включить https.",
   "error.pair.notALink":
     "Это не ссылка для привязки. Скопируй её на другом устройстве в разделе Устройства, затем Добавить устройство.",
   "error.link.damaged": "Ссылка неполная. Скопируй её ещё раз целиком.",
@@ -7508,16 +7559,18 @@ const ru: Dictionary = {
   "error.folder.nested":
     "Эта папка находится внутри «{folder}» или содержит её. Выбери папку рядом.",
   "error.folder.noAccess": "{app} не может записывать в эту папку. Выбери другую.",
-  "error.rename.invalid": "Такое название в Windows тоже не подходит.",
-  "error.rename.exists": "Там уже есть файл с таким названием.",
+  "error.rename.invalid": "Такое название в Windows тоже не подходит. Попробуй другое.",
+  "error.rename.exists": "Там уже есть файл с таким названием. Выбери другое название.",
   "error.rename.empty": "Введи название.",
   "error.restore.failed":
     "Восстановить не получилось. Проверь подключение и попробуй снова. Ничего не изменено.",
   "error.locked": "Файл {name} сейчас открыт в другой программе. {app} скоро попробует снова.",
+  "error.lockedFile": "Файл сейчас открыт в другой программе. Закрой его и попробуй снова.",
   "error.busy": "Сейчас занято. Попробуй чуть позже.",
-  "error.notReady": "Эта версия {app} пока так не умеет.",
+  "error.notReady":
+    "Эта версия {app} пока так не умеет. Устанавливай обновления, когда они появятся.",
   "error.unexpected":
-    "Что-то пошло не так. С твоими файлами всё в порядке. Сохрани отчёт об ошибке в Настройках.",
+    "Что-то пошло не так. С твоими файлами всё в порядке. Попробуй ещё раз. Если не получится, сохрани отчёт об ошибке в Настройках.",
 };
 
 const tr: Dictionary = {
@@ -7540,9 +7593,9 @@ const tr: Dictionary = {
   "setup.connect.scan": "Kamerayla tara",
   "setup.connect.checking": "Davet kontrol ediliyor …",
   "setup.connect.ok": "Bağlandı: {host}",
-  "setup.connect.pinnedTitle": "Kendi sertifikası olan bir sunucu",
+  "setup.connect.pinnedTitle": "Özel olarak kurulmuş bir sunucu",
   "setup.connect.pinned":
-    "Bu sunucunun herkese açık bir sertifikası yok. {app} ona bağlantı öyle belirttiği için güveniyor. Bağlantıyı yalnızca doğrudan sunucunun yöneticisinden geldiyse kabul et.",
+    "Bu sunucu kimliğini herkese açık bir kurum üzerinden kanıtlamıyor. {app} ona, bağlantı onu nasıl tanıyacağını belirttiği için güveniyor. Bağlantıyı yalnızca doğrudan sunucunun yöneticisinden geldiyse kabul et.",
   "link.isInvite": "Bu bir davet bağlantısı. Onunla yeni bir hesap kurarsın.",
   "link.isPair": "Bu, cihazlarından birinden gelen bir eşleştirme bağlantısı.",
   "link.isRecover": "Bu, kurtarma kâğıdındaki bağlantı.",
@@ -7653,8 +7706,9 @@ const tr: Dictionary = {
   "pair.confirm.no": "Hayır, iptal et",
   "pair.request.body":
     "Ardından sistemin bir kez daha sorar ve bu sayı dizisini gösterir. Yalnızca yeni cihaz aynısını gösteriyorsa evet de.",
-  "pair.mismatch":
-    "O zaman cihazı ekleme. Yeni cihazda baştan başla. Yine olursa sunucunu yöneten kişiyle konuş.",
+  "pair.notAdded.title": "“{device}” eklenmedi",
+  "pair.notAdded.body":
+    "Bu bir hataysa yeni cihazda baştan başla. Sayılar eşleşmediyse sunucunu yöneten kişiye haber ver.",
   "pair.added": "“{device}” eklendi.",
   "pair.joined": "Eşleştirildi. Bir saniye.",
   "pair.check.title": "Bu sunucuya bağlanılsın mı?",
@@ -7664,7 +7718,7 @@ const tr: Dictionary = {
   "pair.check.account": "Hesap",
   "pair.check.connect": "Bağlan",
   "pair.check.pinned":
-    "Bu sunucunun herkese açık bir sertifikası yok. {app} ona bağlantı öyle belirttiği için güveniyor.",
+    "Bu sunucu kimliğini herkese açık bir kurum üzerinden kanıtlamıyor. {app} ona, bağlantı onu nasıl tanıyacağını belirttiği için güveniyor.",
   "pair.add.target": "Sunucu {host}, hesap {account}",
   "pair.devices.title": "Bunlar senin cihazların mı?",
   "pair.devices.body":
@@ -7766,6 +7820,7 @@ const tr: Dictionary = {
   "folder.deleted.section": "Silinen klasörler",
   "folder.deleted.restore": "Geri getir",
   "folder.deleted.done": "“{folder}” silindi.",
+  "folder.deleted.back": "“{folder}” geri geldi. Bu cihaza almak için “Buraya getir”i seç.",
   "folder.deleted.daysLeft.one": "{days} gün kaldı",
   "folder.deleted.daysLeft.other": "{days} gün kaldı",
   "activity.changed": "değişti",
@@ -8176,7 +8231,7 @@ const tr: Dictionary = {
   "error.invite.unreachable":
     "Bağlantıdaki sunucu yanıt vermiyor. İnternet bağlantını kontrol et veya yöneticiye sor.",
   "error.insecure":
-    "Bu sunucuya güvenli şekilde ulaşılamıyor. {app} yalnızca https üzerinden bağlanır.",
+    "Bu sunucuya güvenli şekilde ulaşılamıyor ve {app} yalnızca https üzerinden bağlanır. Sunucunu yöneten kişiden https’i etkinleştirmesini iste.",
   "error.pair.notALink":
     "Bu bir eşleştirme bağlantısı değil. Onu diğer cihazda Cihazlar, sonra Cihaz ekle altında kopyala.",
   "error.link.damaged": "Bağlantı eksik. Onu bir kez daha tamamen kopyala.",
@@ -8205,16 +8260,18 @@ const tr: Dictionary = {
   "error.folder.system": "Bu klasör sisteme ait. Kendine ait bir klasör seç.",
   "error.folder.nested": "Bu klasör “{folder}” içinde ya da onu içeriyor. Yanında bir klasör seç.",
   "error.folder.noAccess": "{app} bu klasöre yazamıyor. Başka bir klasör seç.",
-  "error.rename.invalid": "Bu ad Windows’ta da çalışmaz.",
-  "error.rename.exists": "Orada bu adda bir dosya zaten var.",
+  "error.rename.invalid": "Bu ad Windows’ta da çalışmaz. Başka bir ad dene.",
+  "error.rename.exists": "Orada bu adda bir dosya zaten var. Başka bir ad seç.",
   "error.rename.empty": "Bir ad gir.",
   "error.restore.failed":
     "Geri yükleme çalışmadı. Bağlantıyı kontrol et ve tekrar dene. Hiçbir şey değiştirilmedi.",
   "error.locked": "{name} şu an başka bir programda açık. {app} birazdan tekrar deneyecek.",
+  "error.lockedFile": "Bir dosya şu an başka bir programda açık. Dosyayı kapatıp tekrar dene.",
   "error.busy": "Şu an meşgul. Biraz sonra tekrar dene.",
-  "error.notReady": "{app} uygulamasının bu sürümü bunu henüz yapamıyor.",
+  "error.notReady":
+    "{app} uygulamasının bu sürümü bunu henüz yapamıyor. Güncellemeler sunulduğunda yükle.",
   "error.unexpected":
-    "Bir şeyler ters gitti. Dosyaların etkilenmedi. Ayarlar altında bir hata raporu kaydet.",
+    "Bir şeyler ters gitti. Dosyaların etkilenmedi. Tekrar dene. Yine olursa Ayarlar altında bir hata raporu kaydet.",
 };
 
 const zh: Dictionary = {
@@ -8236,9 +8293,9 @@ const zh: Dictionary = {
   "setup.connect.scan": "用相机扫描",
   "setup.connect.checking": "正在检查邀请…",
   "setup.connect.ok": "已连接到 {host}",
-  "setup.connect.pinnedTitle": "使用自有证书的服务器",
+  "setup.connect.pinnedTitle": "私人配置的服务器",
   "setup.connect.pinned":
-    "此服务器没有公开证书。{app} 信任它，是因为链接中这样指定。只有当链接直接来自服务器管理员时才接受它。",
+    "此服务器未经公共机构验证身份。{app} 信任它，是因为链接指明了如何识别它。只有当链接直接来自服务器管理员时才接受它。",
   "link.isInvite": "这是邀请链接，用于创建新账户。",
   "link.isPair": "这是来自其他设备的配对链接。",
   "link.isRecover": "这是恢复单上的链接。",
@@ -8340,8 +8397,8 @@ const zh: Dictionary = {
   "pair.confirm.no": "否，取消",
   "pair.request.body":
     "接下来系统会再询问一次，并显示这串数字。只有新设备显示的数字相同时，才选择“是”。",
-  "pair.mismatch":
-    "那就不要添加这台设备。请在新设备上重新开始。如果再次出现这种情况，请联系服务器管理员。",
+  "pair.notAdded.title": "未添加“{device}”",
+  "pair.notAdded.body": "如果是误操作，请在新设备上重新开始。如果数字不一致，请告知服务器管理员。",
   "pair.added": "已添加“{device}”。",
   "pair.joined": "已配对，请稍候。",
   "pair.check.title": "连接到此服务器吗？",
@@ -8349,7 +8406,7 @@ const zh: Dictionary = {
   "pair.check.server": "服务器",
   "pair.check.account": "账户",
   "pair.check.connect": "连接",
-  "pair.check.pinned": "此服务器没有公开证书。{app} 信任它，是因为链接中这样指定。",
+  "pair.check.pinned": "此服务器未经公共机构验证身份。{app} 信任它，是因为链接指明了如何识别它。",
   "pair.add.target": "服务器 {host}，账户 {account}",
   "pair.devices.title": "认识这些设备吗？",
   "pair.devices.body":
@@ -8440,6 +8497,7 @@ const zh: Dictionary = {
   "folder.deleted.section": "已删除的文件夹",
   "folder.deleted.restore": "找回",
   "folder.deleted.done": "已删除“{folder}”。",
+  "folder.deleted.back": "“{folder}”已恢复。选择“放到这里”即可放到这台设备上。",
   "folder.deleted.daysLeft.other": "还剩 {days} 天",
   "activity.changed": "已更改",
   "activity.added": "新增",
@@ -8772,7 +8830,8 @@ const zh: Dictionary = {
   "error.invite.used": "此邀请已被使用。请向管理员索取新的邀请。",
   "error.invite.expired": "此邀请已过期。请向管理员索取新的邀请。",
   "error.invite.unreachable": "链接中的服务器没有响应。请检查网络连接，或询问管理员。",
-  "error.insecure": "无法安全地连接此服务器。{app} 只通过 https 连接。",
+  "error.insecure":
+    "无法安全地连接此服务器，而 {app} 只通过 https 连接。请让服务器管理员启用 https。",
   "error.pair.notALink": "这不是配对链接。请在其他设备上的“设备”，“添加设备”中复制。",
   "error.link.damaged": "链接不完整。请重新完整复制。",
   "error.recover.notALink": "这不是恢复单上的链接。恢复单上的链接以 hangar-drive://recover# 开头。",
@@ -8795,14 +8854,16 @@ const zh: Dictionary = {
   "error.folder.system": "此文件夹属于系统。请选择自己的文件夹。",
   "error.folder.nested": "此文件夹位于“{folder}”中或包含它。请选择旁边的文件夹。",
   "error.folder.noAccess": "{app} 无权写入此文件夹。请选择其他文件夹。",
-  "error.rename.invalid": "这个名称在 Windows 上也不可用。",
-  "error.rename.exists": "那里已有同名文件。",
+  "error.rename.invalid": "这个名称在 Windows 上也不可用。请换一个。",
+  "error.rename.exists": "那里已有同名文件。请换一个名称。",
   "error.rename.empty": "请输入名称。",
   "error.restore.failed": "恢复失败。请检查连接后重试。没有做任何更改。",
   "error.locked": "{name} 目前在另一个程序中打开。{app} 稍后会重试。",
+  "error.lockedFile": "有文件正在另一个程序中打开。请关闭它后重试。",
   "error.busy": "当前正忙，请稍后再试。",
-  "error.notReady": "此版本的 {app} 还不支持此功能。",
-  "error.unexpected": "出了点问题。文件不受影响。请在“设置”中保存错误报告。",
+  "error.notReady": "此版本的 {app} 暂时无法执行此操作。有更新时请安装。",
+  "error.unexpected":
+    "出了点问题。文件不受影响。请重试。如果问题仍然出现，请在“设置”中保存错误报告。",
 };
 // @i18n-translations-end
 

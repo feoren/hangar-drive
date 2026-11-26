@@ -274,7 +274,22 @@ function DeviceRow({
           returnFocus={main}
         />
       </div>
-      {stale && <p className="row-note">{t("devices.stale")}</p>}
+      {stale && (
+        <p className="row-note with-action">
+          <span>{t("devices.stale")}</span>
+          {/* The next step right where the note suggests it; the shell asks natively first. */}
+          <button
+            type="button"
+            className="button secondary small"
+            aria-label={`${t("devices.remove")}: ${device.name}`}
+            onClick={() => {
+              onOpen({ kind: "remove", device });
+            }}
+          >
+            {t("devices.remove")}
+          </button>
+        </p>
+      )}
     </div>
   );
 }

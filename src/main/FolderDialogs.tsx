@@ -3,10 +3,11 @@
 // dialog of its own: the shell asks natively (security review L2, H1), see FolderList and
 // `bring` below.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import type { Folder, FolderId, FolderPlace } from "../backend/types";
-import { useT } from "../i18n";
+import { formatSize } from "../format";
+import { useLanguage, useT } from "../i18n";
 import { useBackend, useSnapshot } from "../ui/backendContext";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Dialog } from "../ui/Dialog";
@@ -113,14 +114,25 @@ export function NotSyncedDialog({
   );
 }
 
-/** "Add folder" (UX 6.3): folders of the other devices first, then any folder here. */
+/**
+ * "Add folder" (UX 6.3): folders of the other devices first, then any folder here. With nothing
+ * to offer from the other devices, the picker opens at once; the dialog only appears to explain a
+ * refused folder or a failure.
+ */
 export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
   const t = useT();
+  const language = useLanguage();
   const backend = useBackend();
   const snapshot = useSnapshot();
   const titleId = useId();
   const action = useAction();
   const [message, setMessage] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  // Decided once when the dialog opens, so a folder that appears meanwhile does not change it.
+  const [direct] = useState(
+    () => snapshot.remoteFolders.length === 0 && snapshot.deletedFolders.length === 0,
+  );
+  const started = useRef(false);
 
   /**
    * The backend proposes the place (and its token) right when the person asks, so a folder that
@@ -158,11 +170,15 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
     });
   };
 
-  const chooseOther = () => {
+  /** `quiet`: opened straight from the window, so a cancelled picker closes everything again. */
+  const chooseOther = (quiet = false) => {
     setMessage(null);
     void action.run(async () => {
       const result = await backend.pickFolder({ kind: "new" });
-      if (result.kind === "cancelled") return;
+      if (result.kind === "cancelled") {
+        if (quiet) onClose();
+        return;
+      }
       if (result.kind === "refused") {
         setMessage(folderRefusalText(result.reason, result.folder, t));
         return;
@@ -171,6 +187,37 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
       onClose();
     });
   };
+
+  /**
+   * Brings a deleted folder back and, when the account proposes a place for it, straight onto
+   * this device: whoever brings a folder back wants it here. Without a proposal it waits in the
+   * list of the other devices' folders, and the line says so.
+   */
+  const bringBack = (folderId: FolderId, name: string) => {
+    setMessage(null);
+    setInfo(null);
+    void action.run(async () => {
+      await backend.restoreDeletedFolder(folderId);
+      const proposals = await backend.listAccountFolders();
+      const found = proposals.folders.find((folder) => folder.id === folderId);
+      if (found) {
+        await join(folderId, found.proposedToken);
+        return;
+      }
+      setInfo(t("folder.deleted.back", { folder: name }));
+    });
+  };
+
+  useEffect(() => {
+    if (!direct || started.current) return;
+    started.current = true;
+    chooseOther(true);
+    // Runs once, for the picker that replaces an empty dialog.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The picker is the dialog while it is open; the window stays as it is behind it.
+  if (direct && message === null && action.error === null) return null;
 
   const remote = snapshot.remoteFolders;
   const deleted = snapshot.deletedFolders;
@@ -186,7 +233,10 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
             {remote.map((folder) => (
               <li key={folder.id} className="plain-item with-action">
                 <FolderIcon />
-                <span className="plain-name">{folder.name}</span>
+                <span className="plain-name">
+                  {folder.name}
+                  <span className="plain-sub"> {formatSize(language, folder.size)}</span>
+                </span>
                 <button
                   type="button"
                   className="button secondary small"
@@ -221,7 +271,7 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
                   className="button secondary small"
                   disabled={action.pending}
                   onClick={() => {
-                    void action.run(() => backend.restoreDeletedFolder(folder.id));
+                    bringBack(folder.id, folder.name);
                   }}
                 >
                   {t("folder.deleted.restore")}
@@ -237,12 +287,15 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
           className="button secondary with-icon"
           data-autofocus={remote.length === 0 ? true : undefined}
           disabled={action.pending}
-          onClick={chooseOther}
+          onClick={() => {
+            chooseOther();
+          }}
         >
           <PlusIcon size={18} />
           {remote.length + deleted.length > 0 ? t("main.addFolder.new") : t("main.addFolder")}
         </button>
       </div>
+      {info && <Feedback>{info}</Feedback>}
       {message && <Feedback tone="error">{message}</Feedback>}
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
       <div className="dialog-actions">

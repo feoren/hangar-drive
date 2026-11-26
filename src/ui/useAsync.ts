@@ -12,8 +12,9 @@ export function errorKey(error: unknown): MessageKey {
     case "notImplemented":
       return "error.notReady";
     case "busy":
-    case "locked":
       return "error.busy";
+    case "locked":
+      return "error.lockedFile";
     default:
       return "error.unexpected";
   }

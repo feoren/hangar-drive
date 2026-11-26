@@ -850,6 +850,14 @@ code.command {
   color: var(--muted);
 }
 
+.row-note.with-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px var(--space-1);
+  margin-right: 36px;
+}
+
 .row .feedback {
   margin: 0 0 6px 54px;
 }
@@ -1011,6 +1019,7 @@ code.command {
   z-index: 300;
   min-width: 220px;
   max-width: min(320px, calc(100vw - 16px));
+  overflow-y: auto;
   padding: 4px;
   background: var(--panel-raised);
   border: var(--hairline) solid var(--border);
@@ -2237,6 +2246,31 @@ code.command {
 
   .welcome-doors {
     margin-top: var(--space-3);
+  }
+
+  /* The step's buttons stay in reach at the smallest window, the content scrolls behind them. */
+  .setup .step-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    margin-top: 0;
+    padding: 10px 0 var(--space-2);
+    background: var(--bg);
+  }
+
+  .setup-page {
+    padding-top: var(--space-2);
+    padding-bottom: 0;
+  }
+
+  .setup .step-form {
+    gap: 10px;
+  }
+
+  .setup .code-groups {
+    margin: var(--space-1) 0;
+    padding: 10px 20px;
+    row-gap: 4px;
   }
 
   .status {

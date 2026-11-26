@@ -298,6 +298,21 @@ function CleanupStep({
   const [devices] = useLoad(() => backend.recoveryDevices(), [backend]);
   const [kept, setKept] = useState<ReadonlySet<DeviceId>>(new Set());
   const action = useAction();
+  const finish = (remove: readonly DeviceId[]) => {
+    void action.run(async () => {
+      // Removing devices asks natively with their names (follow-up check N-2); after a "no"
+      // there the step stays as it is.
+      const code = await backend.finishRecoveryCleanup(remove);
+      if (code !== null) onNext(code);
+    });
+  };
+  // No old device left in the account: nothing to decide, the step passes by itself.
+  const nothingToRemove = devices.status === "ready" && devices.data.length === 0;
+  useEffect(() => {
+    if (nothingToRemove) finish([]);
+    // Runs once, when the empty list arrives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nothingToRemove]);
 
   return (
     <div className="step-form">
@@ -305,8 +320,8 @@ function CleanupStep({
       <h1 id={titleId} className="step-title" tabIndex={-1}>
         {t("recover.cleanup.title")}
       </h1>
-      <p className="step-body">{t("recover.cleanup.body")}</p>
-      {devices.status === "loading" && <Loading />}
+      {!nothingToRemove && <p className="step-body">{t("recover.cleanup.body")}</p>}
+      {(devices.status === "loading" || (nothingToRemove && action.error === null)) && <Loading />}
       {devices.status === "failed" && (
         <Feedback tone="error">{errorText(devices.error, t)}</Feedback>
       )}
@@ -351,15 +366,9 @@ function CleanupStep({
           aria-disabled={devices.status !== "ready" || action.pending}
           onClick={() => {
             if (devices.status !== "ready") return;
-            const remove = devices.data
-              .filter((device) => !kept.has(device.id))
-              .map((device) => device.id);
-            void action.run(async () => {
-              // Removing devices asks natively with their names (follow-up check N-2); after a
-              // "no" there the step stays as it is.
-              const code = await backend.finishRecoveryCleanup(remove);
-              if (code !== null) onNext(code);
-            });
+            finish(
+              devices.data.filter((device) => !kept.has(device.id)).map((device) => device.id),
+            );
           }}
         >
           {t("setup.next")}

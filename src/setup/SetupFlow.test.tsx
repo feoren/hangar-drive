@@ -87,14 +87,14 @@ describe("new account", () => {
     const match = /Tippe die (\d)\. Gruppe/.exec(text());
     const index = Number(match?.[1]);
     expect(index).toBeGreaterThan(1);
+    // A whole group is checked as soon as it is typed; the button stays for a shorter input.
     await type(field(`Gruppe ${String(index)}`), "zzzz");
-    await click("Bestätigen");
     expect(text()).toContain("Das passt nicht.");
+    expect(heading()).toBe("Kurz prüfen");
     await click("Code noch mal ansehen");
     expect(heading()).toBe("Dein Wiederherstellungscode");
     await click("Ich habe ihn gesichert");
     await type(field(`Gruppe ${String(index)}`), ` ${(groups[index - 1] ?? "").toLowerCase()} `);
-    await click("Bestätigen");
 
     expect(heading()).toBe("Wo sollen deine Dateien liegen?");
     expect(text()).toContain("C:\\Users\\Alex\\Hangar Drive");
@@ -111,7 +111,7 @@ describe("new account", () => {
     ["https://drive.example.org/join#used", "Diese Einladung wurde schon benutzt."],
     ["https://drive.example.org/join#expired", "Diese Einladung ist abgelaufen."],
     ["https://drive.example.org/join#offline", "Der Server aus dem Link antwortet nicht."],
-    ["http://drive.example.org/join#x", "Dieser Server ist nicht verschlüsselt erreichbar."],
+    ["http://drive.example.org/join#x", "Bitte den Betreiber deines Servers, https einzurichten."],
   ])("explains a bad invite %s while typing", async (link, message) => {
     await renderApp("setup");
     await click("Mit Einladungslink starten");
@@ -159,7 +159,6 @@ describe("folder step", () => {
     await click("Ich habe ihn gesichert");
     const index = Number(/Tippe die (\d)\./.exec(text())?.[1]);
     await type(field(`Gruppe ${String(index)}`), groups[index - 1] ?? "");
-    await click("Bestätigen");
     return harness;
   }
 
@@ -232,7 +231,7 @@ describe("additional device", () => {
     mock.controls.clipboard = MOCK_INPUTS.pairPinned;
     await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
     await click("Einfügen");
-    expect(text()).toContain("Dieser Server hat kein öffentliches Zertifikat.");
+    expect(text()).toContain("Dieser Server weist sich nicht über eine öffentliche Stelle aus.");
     expect(document.querySelector(".notice")?.getAttribute("role")).toBe("note");
   });
 
@@ -417,7 +416,7 @@ describe("invite with a pin (N3)", () => {
     await click("Mit Einladungslink starten");
     await click("Einfügen");
     await wait(400);
-    expect(text()).toContain("Server mit eigenem Zertifikat");
+    expect(text()).toContain("Privat eingerichteter Server");
     expect(text()).toContain("Nimm den Link nur an, wenn er direkt vom Betreiber");
     expect(button("Weiter").getAttribute("aria-disabled")).toBe("false");
   });
@@ -507,7 +506,6 @@ describe("recovery with the sheet", () => {
     await click("Ich habe ihn gesichert");
     const index = Number(/Tippe die (\d)\./.exec(text())?.[1]);
     await type(field(`Gruppe ${String(index)}`), groups[index - 1] ?? "");
-    await click("Bestätigen");
     expect(heading()).toBe("Welche Ordner sollen auf dieses Gerät?");
   });
 
@@ -531,7 +529,7 @@ describe("recovery with the sheet", () => {
   it.each([
     ["drive.example.org", "Das ist nicht der Link von deinem Blatt."],
     ["hangar-drive://recover#damaged", "Der Link ist unvollständig."],
-    ["hangar-drive://recover#insecure", "Dieser Server ist nicht verschlüsselt erreichbar."],
+    ["hangar-drive://recover#insecure", "Dieser Server ist nicht verschlüsselt erreichbar"],
   ])("explains a sheet link it cannot read: %s", async (link, message) => {
     await enterSheet(link);
     expect(text()).toContain(message);

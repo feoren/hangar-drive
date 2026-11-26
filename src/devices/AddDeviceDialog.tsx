@@ -33,7 +33,8 @@ export function AddDeviceDialog({
   const [copied, setCopied] = useState(false);
   const [showCode, setShowCode] = useState(false);
   const [request, setRequest] = useState<PairRequest | null>(null);
-  const [declined, setDeclined] = useState(false);
+  /** The name of the device that was not added, for the closing line. */
+  const [declined, setDeclined] = useState<string | null>(null);
 
   useEffect(() => {
     let current = true;
@@ -84,12 +85,12 @@ export function AddDeviceDialog({
         onClose();
       } else {
         setRequest(null);
-        setDeclined(true);
+        setDeclined(request.deviceName);
       }
     });
   };
 
-  const stage = declined ? "declined" : request ? "request" : "offer";
+  const stage = declined !== null ? "declined" : request ? "request" : "offer";
   return (
     <Dialog
       labelledBy={titleId}
@@ -102,7 +103,9 @@ export function AddDeviceDialog({
         else onClose();
       }}
     >
-      {stage === "declined" && <DeclinedView titleId={titleId} onClose={onClose} />}
+      {stage === "declined" && (
+        <DeclinedView titleId={titleId} device={declined ?? ""} onClose={onClose} />
+      )}
       {stage === "request" && request && (
         <RequestView
           titleId={titleId}
@@ -144,20 +147,23 @@ export function AddDeviceDialog({
   );
 }
 
+/** The end after "Decline" here or "No" in the native question: what happened, what now. */
 function DeclinedView({
   titleId,
+  device,
   onClose,
 }: {
   readonly titleId: string;
+  readonly device: string;
   readonly onClose: () => void;
 }) {
   const t = useT();
   return (
     <>
       <h2 id={titleId} className="dialog-title">
-        {t("pair.add.title")}
+        {t("pair.notAdded.title", { device })}
       </h2>
-      <p className="dialog-body">{t("pair.mismatch")}</p>
+      <p className="dialog-body">{t("pair.notAdded.body")}</p>
       <div className="dialog-actions">
         <button type="button" className="button primary" data-autofocus onClick={onClose}>
           {t("common.close")}

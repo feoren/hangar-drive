@@ -14,6 +14,9 @@ import { CodeGroups, Feedback } from "../ui/parts";
 import { errorText, useAction } from "../ui/useAsync";
 import { recoverySheetDocument } from "./recoverySheet";
 
+/** Characters in one group of the recovery code. */
+const GROUP_LENGTH = 4;
+
 interface Props {
   readonly code: RecoveryCode;
   /** The title element id, so the surrounding dialog or page can point at it. */
@@ -56,19 +59,23 @@ export function RecoveryCodeStep({
   const inputId = useId();
   const messageId = useId();
 
+  const confirm = (value: string) => {
+    if (value.trim() === "") return;
+    void action.run(async () => {
+      const check = await backend.confirmRecoveryGroup(normalizeCode(value));
+      // "declined": the person kept the old code in the native question; nothing to say.
+      if (check === "confirmed") onConfirmed();
+      else if (check === "wrong") setWrong(true);
+    });
+  };
+
   if (phase === "check") {
     return (
       <form
         className="step-form"
         onSubmit={(event) => {
           event.preventDefault();
-          if (typed.trim() === "") return;
-          void action.run(async () => {
-            const check = await backend.confirmRecoveryGroup(normalizeCode(typed));
-            // "declined": the person kept the old code in the native question; nothing to say.
-            if (check === "confirmed") onConfirmed();
-            else if (check === "wrong") setWrong(true);
-          });
+          confirm(typed);
         }}
       >
         {step}
@@ -93,8 +100,11 @@ export function RecoveryCodeStep({
             aria-invalid={wrong ? true : undefined}
             aria-describedby={messageId}
             onChange={(event) => {
-              setTyped(event.target.value);
+              const value = event.target.value;
+              setTyped(value);
               setWrong(false);
+              // A whole group is checked at once, so the person does not need the button.
+              if (normalizeCode(value).length === GROUP_LENGTH) confirm(value);
             }}
           />
           <div id={messageId} className="field-message" aria-live="polite">
@@ -157,17 +167,7 @@ export function RecoveryCodeStep({
       {intro && <p className="step-body">{intro}</p>}
       <p className="step-body">{t("recovery.body")}</p>
       <CodeGroups groups={code.groups} label={t("recovery.codeLabel")} />
-      <details className="disclosure">
-        <summary>{t("sheet.more")}</summary>
-        <dl className="facts">
-          <dt>{t("pair.check.server")}</dt>
-          <dd>{code.sheet.serverUrl}</dd>
-          <dt>{t("sheet.accountId")}</dt>
-          <dd>{groupHex(code.sheet.accountId)}</dd>
-          <dt>{t("sheet.link")}</dt>
-          <dd>{code.sheet.link}</dd>
-        </dl>
-      </details>
+      {/* Keeping the code comes right after it; what else the sheet says waits below. */}
       <div className="keep-actions">
         <button
           type="button"
@@ -220,6 +220,17 @@ export function RecoveryCodeStep({
       )}
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
       <p className="step-note">{t("recovery.keepSafe")}</p>
+      <details className="disclosure">
+        <summary>{t("sheet.more")}</summary>
+        <dl className="facts">
+          <dt>{t("pair.check.server")}</dt>
+          <dd>{code.sheet.serverUrl}</dd>
+          <dt>{t("sheet.accountId")}</dt>
+          <dd>{groupHex(code.sheet.accountId)}</dd>
+          <dt>{t("sheet.link")}</dt>
+          <dd>{code.sheet.link}</dd>
+        </dl>
+      </details>
       <div className="step-actions">
         {secondary ?? <span />}
         <button

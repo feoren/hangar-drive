@@ -2,7 +2,7 @@
 // additional device, or the recovery sheet when no device is left. A link from the OS or a link of
 // another kind pasted into a field opens the door it belongs to, with the link filled in.
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import type { IncomingLink } from "../App";
 import type { LinkKind } from "../backend/types";
@@ -10,6 +10,7 @@ import { cleanLink, linkKind } from "../domain/links";
 
 import { useT } from "../i18n";
 import { useBackend } from "../ui/backendContext";
+import { noOverlay, useFocusKeeper } from "../ui/focusKeeper";
 import { Feedback } from "../ui/parts";
 import { StatusMark } from "../ui/StatusMark";
 import { errorText, useAction } from "../ui/useAsync";
@@ -33,6 +34,16 @@ export function SetupFlow({
   readonly onFinished: () => void;
 }) {
   const backend = useBackend();
+  const page = useRef<HTMLDivElement>(null);
+  // A new step takes the focus: its marked control, else its title, so a keyboard or screen
+  // reader user starts where the step starts instead of at the top of the page (UX 12).
+  useFocusKeeper(page, {
+    near: false,
+    inFront: noOverlay,
+    fallback: (root) =>
+      root.querySelector<HTMLElement>("[data-autofocus]") ??
+      root.querySelector<HTMLElement>("h1[tabindex]"),
+  });
   const [door, setDoor] = useState<Door>("welcome");
   // The link a door starts with, and a counter so a new link opens the door afresh.
   const [start, setStart] = useState<{ link: string; round: number }>({ link: "", round: 0 });
@@ -52,7 +63,7 @@ export function SetupFlow({
   };
 
   return (
-    <div className="setup">
+    <div ref={page} className="setup">
       <main className="setup-page" key={`${door}-${String(start.round)}`}>
         {door === "welcome" && <Welcome onChoose={setDoor} />}
         {door === "new" && (

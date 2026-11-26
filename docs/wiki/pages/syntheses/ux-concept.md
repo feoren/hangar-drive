@@ -1394,8 +1394,8 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `setup.connect.scan` | Mit Kamera scannen | Scan with camera |
 | `setup.connect.checking` | Einladung wird geprüft … | Checking the invite … |
 | `setup.connect.ok` | Verbunden mit {host} | Connected to {host} |
-| `setup.connect.pinnedTitle` | Server mit eigenem Zertifikat | A server with its own certificate |
-| `setup.connect.pinned` | Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt. | This server has no public certificate. {app} trusts it because the link says so. Only accept the link if it comes straight from the person who runs your server. |
+| `setup.connect.pinnedTitle` | Privat eingerichteter Server | A privately set up server |
+| `setup.connect.pinned` | Dieser Server weist sich nicht über eine öffentliche Stelle aus. {app} vertraut ihm, weil der Link festlegt, woran es ihn erkennt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt. | This server does not prove who it is through a public authority. {app} trusts it because the link states how to recognize it. Only accept the link if it comes straight from the person who runs your server. |
 | `link.isInvite` | Das ist ein Einladungslink. Damit richtest du ein neues Konto ein. | This is an invite link. It sets up a new account. |
 | `link.isPair` | Das ist ein Kopplungslink von einem deiner Geräte. | This is a pairing link from one of your devices. |
 | `link.isRecover` | Das ist der Link von deinem Wiederherstellungsblatt. | This is the link from your recovery sheet. |
@@ -1497,7 +1497,8 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `pair.confirm.no` | Nein, abbrechen | No, cancel |
 | `pair.request.body` | Danach fragt dein System noch einmal nach und zeigt diese Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt. | Your system then asks once more and shows this row of numbers. Only say yes if the new device shows the same one. |
 | `pair.request.lookAlike` | Es gibt schon ein Gerät, das so heißt: „{device}“. Prüfe die Zahlen besonders genau. | There is already a device with this name: “{device}”. Check the numbers especially carefully. |
-| `pair.mismatch` | Dann füge das Gerät nicht hinzu. Starte auf dem neuen Gerät noch mal von vorn. Passiert das wieder, sprich mit dem Betreiber deines Servers. | Then do not add the device. Start over on the new device. If it happens again, talk to the person who runs your server. |
+| `pair.notAdded.title` | „{device}“ wurde nicht hinzugefügt | “{device}” was not added |
+| `pair.notAdded.body` | War das ein Versehen, starte auf dem neuen Gerät noch mal von vorn. Haben die Zahlen nicht gepasst, sag dem Betreiber deines Servers Bescheid. | If that was a mistake, start over on the new device. If the numbers did not match, tell the person who runs your server. |
 | `pair.added` | „{device}“ ist jetzt dabei. | “{device}” has been added. |
 | `pair.joined` | Gekoppelt. Gleich geht es weiter. | Paired. Just a moment. |
 | `pair.check.title` | Mit diesem Server verbinden? | Connect to this server? |
@@ -1505,7 +1506,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `pair.check.server` | Server | Server |
 | `pair.check.account` | Konto | Account |
 | `pair.check.connect` | Verbinden | Connect |
-| `pair.check.pinned` | Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. | This server has no public certificate. {app} trusts it because the link says so. |
+| `pair.check.pinned` | Dieser Server weist sich nicht über eine öffentliche Stelle aus. {app} vertraut ihm, weil der Link festlegt, woran es ihn erkennt. | This server does not prove who it is through a public authority. {app} trusts it because the link states how to recognize it. |
 | `pair.add.target` | Server {host}, Konto {account} | Server {host}, account {account} |
 | `pair.devices.title` | Das sind deine Geräte? | Are these your devices? |
 | `pair.devices.body` | Dieses Gerät ist jetzt mit dem Konto verbunden. Kennst du die Geräte nicht, brich ab: Dann wird es wieder getrennt, bevor Dateien übertragen werden. | This device is now connected to the account. If you do not know these devices, cancel: it is then disconnected before any files move. |
@@ -1609,6 +1610,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `folder.deleted.section` | Gelöschte Ordner | Deleted folders |
 | `folder.deleted.restore` | Zurückholen | Bring back |
 | `folder.deleted.done` | „{folder}“ ist gelöscht. | “{folder}” has been deleted. |
+| `folder.deleted.back` | „{folder}“ ist zurück. Mit „Hierher holen“ kommt er auf dieses Gerät. | “{folder}” is back. Choose “Bring here” to put it on this device. |
 | `activity.changed` | geändert | changed |
 | `activity.added` | neu | new |
 | `activity.deleted` | gelöscht | deleted |
@@ -1965,7 +1967,7 @@ Each says what happened and what to do; the technical cause goes into the error 
 | `error.invite.used` | Diese Einladung wurde schon benutzt. Bitte den Betreiber um eine neue. | This invite has already been used. Ask the operator for a new one. |
 | `error.invite.expired` | Diese Einladung ist abgelaufen. Bitte den Betreiber um eine neue. | This invite has expired. Ask the operator for a new one. |
 | `error.invite.unreachable` | Der Server aus dem Link antwortet nicht. Prüfe deine Internetverbindung oder frag den Betreiber. | The server in the link does not answer. Check your internet connection or ask the operator. |
-| `error.insecure` | Dieser Server ist nicht verschlüsselt erreichbar. {app} verbindet sich nur über https. | This server cannot be reached securely. {app} only connects over https. |
+| `error.insecure` | Dieser Server ist nicht verschlüsselt erreichbar, und {app} verbindet sich nur über https. Bitte den Betreiber deines Servers, https einzurichten. | This server cannot be reached securely, and {app} only connects over https. Ask the person who runs your server to set up https. |
 | `error.pair.notALink` | Das ist kein Kopplungslink. Kopiere ihn auf dem anderen Gerät unter Geräte und dann Gerät hinzufügen. | That is not a pairing link. Copy it on the other device under Devices, then Add device. |
 | `error.link.damaged` | Der Link ist unvollständig. Kopiere ihn noch einmal ganz. | The link is incomplete. Copy all of it again. |
 | `error.recover.notALink` | Das ist nicht der Link von deinem Blatt. Er beginnt mit hangar-drive://recover#. | That is not the link from your sheet. It starts with hangar-drive://recover#. |
@@ -1985,15 +1987,16 @@ Each says what happened and what to do; the technical cause goes into the error 
 | `error.folder.system` | Dieser Ordner gehört zum System. Wähle einen eigenen Ordner. | This folder belongs to the system. Choose a folder of your own. |
 | `error.folder.nested` | Dieser Ordner liegt in „{folder}“ oder enthält ihn. Wähle einen Ordner daneben. | This folder is inside “{folder}” or contains it. Choose a folder next to it. |
 | `error.folder.noAccess` | {app} darf in diesen Ordner nicht schreiben. Wähle einen anderen. | {app} is not allowed to write to this folder. Choose another one. |
-| `error.rename.invalid` | Auch dieser Name geht unter Windows nicht. | This name does not work on Windows either. |
-| `error.rename.exists` | Eine Datei mit diesem Namen gibt es dort schon. | A file with this name already exists there. |
+| `error.rename.invalid` | Auch dieser Name geht unter Windows nicht. Probier einen anderen. | This name does not work on Windows either. Try another one. |
+| `error.rename.exists` | Eine Datei mit diesem Namen gibt es dort schon. Wähl einen anderen Namen. | A file with this name already exists there. Choose another name. |
 | `error.restore.failed` | Das Wiederherstellen hat nicht geklappt. Prüfe die Verbindung und versuch es noch mal. Es wurde nichts verändert. | Restoring did not work. Check the connection and try again. Nothing was changed. |
 | `error.locked` | {name} ist gerade in einem anderen Programm geöffnet. {app} versucht es gleich wieder. | {name} is open in another program right now. {app} will try again shortly. |
+| `error.lockedFile` | Eine Datei ist gerade in einem anderen Programm geöffnet. Schließ sie und versuch es noch mal. | A file is open in another program right now. Close it and try again. |
 | `error.busy` | Gerade beschäftigt. Versuch es gleich noch mal. | Busy right now. Try again in a moment. |
-| `error.unexpected` | Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen. Speichere einen Fehlerbericht unter Einstellungen. | Something went wrong. Your files are not affected. Save an error report under Settings. |
+| `error.unexpected` | Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen. Versuch es noch mal. Klappt es wieder nicht, speichere unter Einstellungen einen Fehlerbericht. | Something went wrong. Your files are not affected. Try again. If it keeps happening, save an error report under Settings. |
 | `error.server.unreachable` | Der Server antwortet nicht. Prüfe deine Internetverbindung oder frag den Betreiber. | The server does not answer. Check your internet connection or ask the operator. |
 | `error.rename.empty` | Gib einen Namen ein. | Enter a name. |
-| `error.notReady` | Das kann diese Version von {app} noch nicht. | This version of {app} cannot do that yet. |
+| `error.notReady` | Das kann diese Version von {app} noch nicht. Installiere Updates, sobald sie angeboten werden. | This version of {app} cannot do that yet. Install updates when they are offered. |
 
 ## 14. Open questions
 
@@ -2192,3 +2195,129 @@ overall security review").
   device log the server sent is forgotten at once and shows the "removed" banner with the name
   of the removing device; the banner "Dein Server meldet ..." with "Bestätigen" remains only for
   a report without such a removal. It cannot be hidden.
+
+## Usability pass (2026-11-26)
+
+The owner's requirement for this pass: every main flow works without prior knowledge in a few
+clear steps. Each flow below was played through on the mock (`pnpm dev`, `?scenario=…`) at
+640 × 420 and 1280 × 800, light and dark, in German and English, with samples in Russian and
+Japanese, and with the keyboard alone. "Steps" counts the screens or dialogs a person passes;
+"controls" counts what the person operates on the way (a native question of the shell counts as
+one; the window asks nothing before it). Section 13 lists the changed texts.
+
+These rules hold for every flow from now on. [Design]
+
+- **The focus never falls back to the page.** A focus keeper (`src/ui/focusKeeper.ts`) watches
+  the setup page and every dialog. When the focused element is removed (a restored file, a
+  resolved conflict, a removed device, a replaced setup step), the focus goes to the element now
+  at the same place in a dialog (the next row), and to the step's marked control or else its
+  title on the setup page. A button disabled while its action runs gets the focus back once it is
+  enabled again. Only the view in front acts, never one behind a dialog.
+- **The step's buttons stay in reach.** At window heights up to 520 px the action row of a setup
+  step sticks to the bottom and the content scrolls behind it; the recovery code step is laid out
+  so that code, keep buttons and action row fit into 640 × 420 without scrolling.
+- **Menus stay inside the window.** A row menu that would leave the window is moved fully into it
+  and scrolls when the window is lower than the menu (at 640 × 420 "Auf allen Geräten löschen" was
+  cut off).
+- **Every error says what to do now.** Every code the bridge can return (`BackendErrorCode` in
+  `src/backend/errors.ts` and the result unions of `src/backend/types.ts`) has a sentence with a
+  next step. New: `error.lockedFile` for `locked` (it said "busy" before); `error.unexpected` and
+  `error.notReady` gained their next step, and so did `error.insecure`, `error.rename.invalid`
+  and `error.rename.exists`.
+- **No technical words for a pinned server.** "Zertifikat" is gone from the interface: the notice
+  says the server does not prove who it is through a public authority and that the link states
+  how to recognize it.
+
+### 1. Accept an invite (new account)
+
+| | Before | After |
+| --- | --- | --- |
+| Steps | 6 (welcome, connect, code, check, folder, all set) | 6 |
+| Controls | 9 (start, paste, next, keep the code, "saved", type, confirm, done, open folder) | 8 (the typed group is checked as soon as it is whole) |
+| Focus after a step | on the page; Tab started at the top | on the step's title, or on its marked control ("Fertig", the group field) |
+| 640 × 420 | "Ich habe ihn gesichert" below the fold | code, keep buttons and action row visible together |
+
+Changes: the group check runs as soon as four characters are typed ("Bestätigen" stays for
+Enter); "Was noch auf dem Blatt steht" moved below the keep buttons, so keeping the code comes
+right after it; the pinned-server notice without "Zertifikat".
+
+### 2. Choose and add a folder
+
+| | Before | After |
+| --- | --- | --- |
+| Nothing on the other devices | 2 (a dialog with one button, then the picker) | 1 (the picker opens at once) |
+| A folder of the other devices | 2 (dialog, "Hierher holen") | 2, with the size of each folder |
+| Bring back a deleted folder | 3 ("Zurückholen", then "Hierher holen"; no feedback, focus lost) | 1 ("Zurückholen" brings it onto this device) |
+
+Changes: with no folder of the other devices and none deleted, "Ordner hinzufügen" opens the
+picker straight away; the dialog only appears to explain a refused folder or a failure.
+"Zurückholen" restores the folder and joins it at the proposed place; without a proposal it waits
+in the list and `folder.deleted.back` says how to bring it here. The size next to each folder
+helps to decide whether it fits.
+
+### 3. Pair a second device
+
+| | Before | After |
+| --- | --- | --- |
+| New device: steps | 5 (link and name, server question, waiting, "your devices?", folders) | 5 |
+| New device: controls | 5 (paste, pair, connect, yes, done) | 5 |
+| Existing device: steps | 4 (devices, offer, request, native question) | 4 |
+| After "Ablehnen" or a native "No" | "Dann füge das Gerät nicht hinzu." under the offer's title | "„MacBook“ wurde nicht hinzugefügt" and what to do now |
+
+The server question and the device check stay (N2), and so does the native question (L2).
+Changes: the closing view names the device and says what to do after a mistake or numbers that
+did not match; on the new device the focus moves to each new stage.
+
+### 4. Resolve a conflict
+
+| | Before | After |
+| --- | --- | --- |
+| Steps | 2 (banner "Ansehen", dialog) | 2 |
+| Controls per file | 1 ("Beide behalten", focused) | 1 |
+| Focus after a file is done | on the page | on the next file |
+
+### 5. Restore
+
+| | Before | After |
+| --- | --- | --- |
+| One file | 3 (row menu, "Frühere Versionen", "Wiederherstellen"); focus lost while it ran | 3; the focus stays on the button |
+| Whole folder | 4 (row menu, versions, reset, native question) | 4 |
+| Trash, one file | 3 (row menu, "Papierkorb", "Wiederherstellen"); focus lost after | 3; the focus moves to the next file |
+| "Undo a device" | 4 (banner, versions, scroll to the reset, native question) | 3 (banner, the reset is primary and focused, native question) |
+
+### 6. Remove a device
+
+| | Before | After |
+| --- | --- | --- |
+| A device not seen for long | 4 (devices, row menu, "Entfernen", native question) | 3 ("Entfernen" right at the hint) |
+| Any other device | 4 | 4 |
+| Focus after removing | on the page | inside the dialog, on the next control |
+
+### 7. Recovery with the sheet
+
+| | Before | After |
+| --- | --- | --- |
+| Steps | 5 (sheet, old devices, code, check, folders) | 5, or 4 when no old device is left |
+| Controls | 8 (paste, type the code, next, next, keep, "saved", type, done) | 7 (the group is checked when it is typed), 6 without old devices |
+
+Changes: "Alte Geräte entfernen" passes by itself when the account has no other device; the new
+code is checked as soon as the group is typed.
+
+### Checked in the shell and the engine
+
+- **`finish_recovery_cleanup` with nothing to remove.** The window calls
+  `finishRecoveryCleanup([])` on its own when `recoveryDevices` is empty. The shell asks natively
+  only when the list names at least one offered device (`cleanup_after_recovery`,
+  `src-tauri/src/commands.rs:1085`); with an empty list it asks nothing and the engine removes
+  only the recovery devices, so the used code stops working, exactly as when every old device is
+  kept. The mock behaves the same.
+- **`restore_deleted_folder` and the folder list.** The engine puts the folder back into the
+  account's folder list within the call, and `remoteFolders` (and with it `listAccountFolders`)
+  is derived from that list (`crates/hangar-drive-sync/src/engine.rs:1119`), so the restored
+  folder is proposed right away; the mock adds it to `remoteFolders` too. `folder.deleted.back`
+  is only the fallback when no place can be proposed.
+
+### Open requests to shell and engine
+
+- **`locked` without a name.** `BackendError("locked")` names no file, so the window can only say
+  "Eine Datei". The file's name (as `error.locked` has it) would let the person find it.

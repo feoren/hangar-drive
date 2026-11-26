@@ -119,7 +119,6 @@ describe("devices (UX 10)", () => {
     await click("Ich habe ihn gesichert");
     const index = Number(/Tippe die (\d)\./.exec(text())?.[1]);
     await type(field(`Gruppe ${String(index)}`), groups[index - 1] ?? "");
-    await click("Bestätigen");
     expect(text()).toContain("Neuer Code gilt. Der alte funktioniert nicht mehr.");
   });
 });
@@ -170,7 +169,9 @@ describe("adding a device (UX 5)", () => {
     expect(maybeButton("Ja, gleiche Zahlen, hinzufügen")).toBeUndefined();
     await click("Ablehnen");
     expect(mock.calls).toContain("answerPairRequest:decline");
-    expect(text()).toContain("Dann füge das Gerät nicht hinzu.");
+    expect(dialogTitle()).toBe("„MacBook“ wurde nicht hinzugefügt");
+    expect(text()).toContain("War das ein Versehen, starte auf dem neuen Gerät noch mal von vorn.");
+    expect(document.activeElement?.textContent).toBe("Schließen");
   });
 
   it("does not add the device when the native question is answered with no", async () => {
@@ -181,7 +182,7 @@ describe("adding a device (UX 5)", () => {
     await click(button(/^Hinzufügen …$/));
     expect(mock.calls).toContain("answerPairRequest:accept");
     expect(text()).not.toContain("ist jetzt dabei");
-    expect(text()).toContain("Dann füge das Gerät nicht hinzu.");
+    expect(dialogTitle()).toBe("„MacBook“ wurde nicht hinzugefügt");
     expect((await mock.listDevices()).devices.map((device) => device.name)).not.toContain(
       "MacBook",
     );

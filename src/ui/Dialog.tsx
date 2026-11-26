@@ -1,25 +1,14 @@
 // Modal dialog in the shape of the sister app: focus moves in on open (to the element marked
 // `data-autofocus`, else the first control), Tab stays inside, Escape closes without deciding,
-// and focus returns to the element that opened it (UX 12).
+// focus returns to the element that opened it, and a focus whose element goes away stays inside
+// (focusKeeper, UX 12).
 
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
-const FOCUSABLE = [
-  "button:not(:disabled)",
-  "input:not(:disabled)",
-  "select:not(:disabled)",
-  "textarea:not(:disabled)",
-  "[href]",
-  '[tabindex]:not([tabindex="-1"])',
-].join(", ");
+import { focusables, topOverlay, useFocusKeeper } from "./focusKeeper";
 
-export function focusables(root: HTMLElement): HTMLElement[] {
-  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-    (element) =>
-      element.tabIndex >= 0 && !element.closest("[hidden]") && !element.closest("[inert]"),
-  );
-}
+export { focusables };
 
 interface Props {
   readonly labelledBy: string;
@@ -57,6 +46,12 @@ export function Dialog({
 }: Props) {
   const panel = useRef<HTMLDivElement>(null);
   const shownKey = useRef(focusKey);
+  // A row that leaves (a restored file, a resolved conflict) hands the focus to the next one.
+  useFocusKeeper(panel, {
+    near: true,
+    inFront: topOverlay,
+    fallback: (root) => root.querySelector<HTMLElement>("[data-autofocus]") ?? root,
+  });
 
   useLayoutEffect(() => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;

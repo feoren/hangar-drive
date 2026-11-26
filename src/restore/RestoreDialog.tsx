@@ -219,6 +219,7 @@ function VersionsTab({
             folderId={folderId}
             folderName={folderName}
             entry={selected}
+            beforeDevice={marker?.entryId === selected.id}
             onHistory={(filePath) => {
               setPath(filePath);
               setChosen(null);
@@ -444,11 +445,14 @@ function VersionTreeView({
   folderId,
   folderName,
   entry,
+  beforeDevice,
   onHistory,
 }: {
   readonly folderId: FolderId;
   readonly folderName: string;
   readonly entry: TimelineEntry;
+  /** The state before a device's changes: resetting the folder is what the person came for. */
+  readonly beforeDevice: boolean;
   readonly onHistory: (path: string) => void;
 }) {
   const t = useT();
@@ -463,6 +467,15 @@ function VersionTreeView({
   const reset = useOutcome();
   const when = whenText(language, t, entry.at, now);
   const checkId = useId();
+  const resetButton = useRef<HTMLButtonElement>(null);
+  const treeReady = tree.status === "ready";
+  // "Undo a device" (UX 8.9) leads here: the reset gets the focus once the state is shown, so
+  // Enter leads on to the native question that names what changes.
+  useEffect(() => {
+    if (!beforeDevice || !treeReady) return;
+    resetButton.current?.scrollIntoView({ block: "nearest" });
+    resetButton.current?.focus();
+  }, [beforeDevice, treeReady]);
 
   return (
     <div className="tree-view">
@@ -492,8 +505,9 @@ function VersionTreeView({
           />
           <div className="tree-actions">
             <button
+              ref={resetButton}
               type="button"
-              className="button secondary"
+              className={beforeDevice ? "button primary" : "button secondary"}
               disabled={reset.action.pending}
               onClick={() => {
                 reset.clear();

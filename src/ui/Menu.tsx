@@ -48,6 +48,21 @@ export function RowMenu({ items, label, open, onOpenChange, returnFocus }: Props
     setPosition(next);
   }, [open, items.length]);
 
+  // The estimate above can miss (long labels, larger text); the measured menu is moved fully into
+  // the window, and scrolls when the window is lower than the menu (UX 12: nothing cut off).
+  useLayoutEffect(() => {
+    const element = menu.current;
+    if (!open || !position || !element) return;
+    const margin = 8;
+    const room = window.innerHeight - 2 * margin;
+    element.style.maxHeight = `${String(room)}px`;
+    const rect = element.getBoundingClientRect();
+    if (rect.top >= margin && rect.bottom <= window.innerHeight - margin) return;
+    const top = Math.max(margin, Math.min(rect.top, window.innerHeight - margin - rect.height));
+    element.classList.remove("menu-up");
+    element.style.top = `${String(top)}px`;
+  }, [open, position]);
+
   useLayoutEffect(() => {
     if (open && position) menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
   }, [open, position]);
