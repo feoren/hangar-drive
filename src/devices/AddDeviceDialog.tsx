@@ -1,11 +1,13 @@
 // Adding a device, seen from this device (UX 5): a code to scan or a link to copy, valid until a
-// fixed time. When the new device answers, one question: add it or not. On the typed path the
-// comparison of the numbers is part of the question; on the link path it can be opened.
+// fixed time. When the new device answers, the window shows who wants to join, with "Decline"
+// and "Add ...". The question itself, with the numbers to compare, is the native one the shell
+// asks after "Add ..." (security review L2); the window does not ask it a second time.
 // One dialog throughout, so focus moves to the new question instead of jumping out and back.
 
 import { useEffect, useId, useState } from "react";
 
 import type { PairingOffer, PairRequest } from "../backend/types";
+import { groupHex } from "../domain/links";
 import { formatTime } from "../format";
 import { useLanguage, useT } from "../i18n";
 import { useBackendEvent } from "../ui/appContext";
@@ -76,8 +78,8 @@ export function AddDeviceDialog({
   const answer = (accept: boolean) => {
     if (!request) return;
     void action.run(async () => {
-      await backend.answerPairRequest(request.offerId, accept);
-      if (accept) {
+      const answer = await backend.answerPairRequest(request.offerId, accept);
+      if (answer === "added") {
         onAdded(request.deviceName);
         onClose();
       } else {
@@ -185,15 +187,12 @@ function RequestView({
       <h2 id={titleId} className="dialog-title">
         {t("pair.confirm.title", { device: request.deviceName })}
       </h2>
+      <p className="dialog-body">{t("pair.request.body")}</p>
       {typed ? (
-        <>
-          <p className="dialog-body">{t("pair.confirm.body")}</p>
-          <NumberRows rows={request.safety} label={t("safety.label")} />
-        </>
+        <NumberRows rows={request.safety} label={t("safety.label")} />
       ) : (
         <details className="disclosure">
           <summary>{t("pair.numbers.compare")}</summary>
-          <p className="dialog-body">{t("pair.confirm.body")}</p>
           <NumberRows rows={request.safety} label={t("safety.label")} />
         </details>
       )}
@@ -208,7 +207,7 @@ function RequestView({
             onAnswer(false);
           }}
         >
-          {typed ? t("pair.confirm.no") : t("pair.confirm.decline")}
+          {t("pair.confirm.decline")}
         </button>
         <ArmedButton
           armKey={request.offerId + request.safety.groups.join("")}
@@ -216,7 +215,7 @@ function RequestView({
             onAnswer(true);
           }}
         >
-          {typed ? t("pair.confirm.yes") : t("pair.confirm.add")}
+          {t("pair.confirm.add")}
         </ArmedButton>
       </div>
     </>
@@ -276,7 +275,7 @@ function OfferView({
         </div>
       ) : (
         <div className="offer">
-          <QrCode matrix={offer.qr} label={t("pair.add.qrLabel")} />
+          <QrCode svg={offer.qrSvg} label={t("pair.add.qrLabel")} />
           <div className="offer-side">
             <button
               type="button"
@@ -292,6 +291,9 @@ function OfferView({
             {copied && <Feedback>{t("pair.add.copied")}</Feedback>}
             <p className="muted">
               {t("pair.add.validUntil", { time: formatTime(language, offer.expiresAt) })}
+            </p>
+            <p className="muted">
+              {t("pair.add.target", { host: offer.host, account: groupHex(offer.account) })}
             </p>
             {showCode ? (
               <div className="typed-code">

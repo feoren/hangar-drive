@@ -18,20 +18,28 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use hangar_drive_crypto::devicelog::LogDevice;
-use hangar_drive_crypto::identity::{folder_safety_number, safety_number, DeviceIdentity};
-use hangar_drive_crypto::pairing::{OfferContent, PairingOffer, PairingSecret};
+use hangar_drive_crypto::folder_keys::{FolderEntry, FolderList};
+use hangar_drive_crypto::identity::{
+    folder_safety_number, safety_number, server_key_number, DeviceIdentity,
+};
+use hangar_drive_crypto::pairing::{
+    OfferContent, PairingError, PairingOffer, PairingSecret, ServerAddress,
+};
 use hangar_drive_crypto::recovery::RecoveryCode;
 use hangar_drive_crypto::Entropy;
 use hangar_drive_protocol::api::{ErrorCode, Notice};
-use hangar_drive_protocol::ids::{AccountId, DeviceId, FolderId, InviteToken, ItemId, ServerId};
+use hangar_drive_protocol::ids::{
+    base64url, AccountId, CommitId, DeviceId, FolderId, InviteToken, ItemId, LogHash, LogHead,
+    ServerId,
+};
 use hangar_drive_protocol::name::{check_display_name, windows_problem, WindowsNameProblem};
 use serde::{Deserialize, Serialize};
 
-use crate::account::Account;
+use crate::account::{Account, Genesis};
 use crate::api::*;
 use crate::chunker::DynEntropy;
 use crate::error::SyncError;
-use crate::folder::{Ctx, FolderSettings, FolderState, FolderSync, StopReason};
+use crate::folder::{Ctx, FolderSettings, FolderState, FolderSync, StopReason, UndoState};
 use crate::http::{HttpServer, ServerConfig, SessionIdentity};
 use crate::names::LabelWords;
 use crate::ports::{Clock, FileSystem, FsError, Keychain, NetError, ServerApi, Store};
@@ -47,6 +55,18 @@ const SILENT_AFTER_MS: i64 = 2 * 60 * 1000;
 /// The feed is polled at least this often while the event stream is down.
 pub const POLL_INTERVAL_MS: i64 = 60 * 1000;
 const MAX_ACTIVITY: usize = 50;
+/// Undo tokens kept: the window offers "Undo" only right after an action.
+const MAX_UNDO: usize = 20;
+/// How often a restore that waits for the upload budget is tried again (UX 9.1: it runs by
+/// itself once the budget allows, at the latest within a day).
+pub const RESTORE_RETRY_MS: i64 = 15 * 60 * 1000;
+/// The retention window a deleted folder can be brought back in, while the server does not
+/// say it (ADR 0001, section 5: 30 days by default).
+const RETENTION_DAYS: i64 = 30;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// The server CLI command that prints the server key number (`server/src/main.rs`), shown in
+/// the comparison dialog (UX 8.3).
+pub const SERVER_NUMBER_COMMAND: &str = "hangar-drive-server server-key-number";
 
 /// Builds the sync root (and its watcher) for a local path.
 pub type FsFactory =
@@ -69,9 +89,11 @@ pub fn real_fs_factory() -> FsFactory {
 /// Checks a folder as a sync root next to the existing roots and returns its canonical form.
 pub type RootCheck = Box<dyn Fn(&Path, &[PathBuf]) -> Result<PathBuf, crate::roots::RootError>>;
 
-/// The real root check: [`crate::roots::check_root`] (security review M4).
+/// The real root check: [`crate::roots::check_planned_root`], which is
+/// [`crate::roots::check_root`] (security review M4) for an existing folder and checks a folder
+/// that does not exist yet before the app creates it (security review L4).
 pub fn real_root_check() -> RootCheck {
-    Box::new(crate::roots::check_root)
+    Box::new(crate::roots::check_planned_root)
 }
 
 /// The real server: [`HttpServer`].
@@ -83,8 +105,8 @@ pub fn real_server_factory() -> ServerFactory {
 
 /// A prover that signs session challenges with `identity`.
 pub fn prover(identity: DeviceIdentity) -> crate::http::Prover {
-    Box::new(move |server, account, device, challenge| {
-        identity.prove_session(server, account, device, challenge)
+    Box::new(move |server, url, account, device, challenge| {
+        identity.prove_session(server, url, account, device, challenge)
     })
 }
 
@@ -125,6 +147,54 @@ struct Persisted {
     paused_until: Option<Option<i64>>,
     ignored_names: BTreeSet<String>,
     dismissed: BTreeSet<String>,
+    /// This device was removed from its account, by the device named here (empty when the name
+    /// is not known); its secrets and its account are forgotten (security review L1). Cleared
+    /// once the device belongs to an account again.
+    removed_by: Option<String>,
+    /// Restores that wait for the upload budget (UX 9.1), tried again by the loop.
+    #[serde(default)]
+    restore_jobs: Vec<RestoreJob>,
+    /// The account's folders as this device last saw them, to notice one that left the list.
+    #[serde(default)]
+    known_folders: Vec<(FolderId, String)>,
+    /// Folders deleted everywhere with the time this device noticed it, while they can still be
+    /// brought back (UX 6, "Gelöschte Ordner").
+    #[serde(default)]
+    deleted_folders: Vec<(FolderId, String, i64)>,
+}
+
+/// A restore that waits for the upload budget. It is computed again when it runs, on the then
+/// current state, so whatever changed meanwhile stays as a version too (UX 9.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RestoreJob {
+    id: String,
+    folder: FolderId,
+    kind: RestoreKind,
+    next_try_ms: i64,
+}
+
+/// What a restore brings back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum RestoreKind {
+    /// One file or directory of a timeline entry (`restoreFile`).
+    File { entry: CommitId, path: Vec<String> },
+    /// The whole folder at a timeline entry (`resetFolder`).
+    Folder { entry: CommitId },
+    /// Items of the trash, each with the entry that still had it (`restoreTrash`).
+    Trash { items: Vec<(CommitId, ItemId)> },
+}
+
+/// What a restore did: the files, the name a file came back under when its own was taken, and
+/// what it changed, for its undo token.
+type Restored = (u64, Option<String>, Option<UndoState>);
+
+/// The files another device deleted in one round, for "Wiederherstellen" in the activity list
+/// (UX 8.1): the head before the round still holds them.
+#[derive(Debug, Clone)]
+struct RemoteDelete {
+    folder: FolderId,
+    commit: CommitId,
+    items: Vec<ItemId>,
 }
 
 struct LocalFolder {
@@ -133,17 +203,36 @@ struct LocalFolder {
     watcher: Option<Box<dyn ChangeSource>>,
     path: String,
     last_full_scan: i64,
+    /// Rounds in a row that failed with an error other than "offline", and the last one: the
+    /// window shows it once it persists ([`FAILED_ROUNDS_SHOWN`]), instead of the folder
+    /// silently staying at "uploading" (finding E2E-2).
+    failed_rounds: u32,
+    last_error: Option<crate::error::ErrorKind>,
 }
+
+/// Failed rounds in a row after which a folder's error is shown: a single failure (a head that
+/// moved between pull and commit, say) heals in the next round and is not worth a banner.
+const FAILED_ROUNDS_SHOWN: u32 = 3;
 
 struct PendingAccount {
     url: String,
     invite: InviteToken,
     pin: Option<[u8; 32]>,
     server: ServerId,
-    account: AccountId,
+    /// Entry 1, made before the code is shown so the sheet names its hash (N1).
+    genesis: Genesis,
     name: String,
     code: RecoveryCode,
     check_group: u32,
+}
+
+/// A new recovery code shown to the person, waiting for the typed group (ux-concept 10.3).
+struct Renewal {
+    code: RecoveryCode,
+    check_group: u32,
+    /// Already in the log (after a recovery); otherwise the group check adds it and removes the
+    /// old recovery device, so closing the dialog midway leaves the old code valid.
+    added: bool,
 }
 
 /// A recovered installation between `recover_account` and `finish_recovery_cleanup`.
@@ -184,14 +273,21 @@ pub struct EngineCore {
     last_sync: Option<i64>,
     last_file: Option<LastFile>,
     pin_mismatch: bool,
-    removed: bool,
     pending: Option<PendingAccount>,
     recovering: Option<Recovering>,
+    renewal: Option<Renewal>,
     offers: BTreeMap<String, OpenOffer>,
     joining: Option<Joining>,
     events: Vec<BackendEvent>,
     last_snapshot: Option<Snapshot>,
     counter: u64,
+    /// Undo tokens of the last actions, oldest first (`undo`).
+    undo: VecDeque<(String, FolderId, UndoState)>,
+    /// The "deleted on another device" entries of the activity list, by entry ID.
+    remote_deletes: BTreeMap<String, RemoteDelete>,
+    /// The pin of the key whose server number was shown last (`getServerNumber`), the only one
+    /// `confirmServerNumber` takes.
+    server_candidate: Option<[u8; 32]>,
 }
 
 fn hex_id<T: std::fmt::Display>(id: &T) -> String {
@@ -208,24 +304,53 @@ fn name_error(name: &str) -> Option<NameError> {
     }
 }
 
-/// The sheet view of a recovery code's account.
+/// The sheet view of a recovery code's account: its server, its genesis anchor and the pin this
+/// device trusts (N1).
 fn sheet_view(
     url: &str,
     server: ServerId,
     account: AccountId,
+    genesis: LogHash,
+    pin: Option<[u8; 32]>,
 ) -> Result<RecoverySheetView, SyncError> {
     let sheet = crate::links::RecoverySheet {
         server_url: hangar_drive_crypto::pairing::parse_server_url(url)
             .map_err(|_| SyncError::Invalid("server url"))?,
         server,
         account,
+        genesis,
+        pin,
     };
     Ok(RecoverySheetView {
         server_url: sheet.server_url.to_string(),
         server_id: server.to_hex(),
         account_id: account.to_hex(),
+        genesis_anchor: genesis.to_hex(),
+        pin: pin.map(|p| hangar_drive_protocol::ids::base64url(&p)),
         link: crate::links::recovery_link(&sheet),
     })
+}
+
+/// The check group of a new code: one-based, never 1 (people copy the first group from memory).
+fn pick_check_group(entropy: &mut dyn Entropy) -> Result<u32, SyncError> {
+    let mut pick = [0u8; 1];
+    entropy.fill(&mut pick)?;
+    Ok(2 + u32::from(pick[0]) % 7)
+}
+
+/// Whether the typed group is the code's check group (case and surrounding space forgiven; the
+/// window maps Crockford's look-alike letters before it sends).
+fn group_matches(code: &RecoveryCode, check_group: u32, typed: &str) -> bool {
+    let groups = group(&code.reveal(), 4);
+    let index = usize::try_from(check_group.saturating_sub(1)).unwrap_or(0);
+    let expected = groups.get(index).cloned().unwrap_or_default();
+    !expected.is_empty() && typed.trim().to_ascii_uppercase() == expected
+}
+
+/// Whether a host label is punycode, which can hide a look-alike name (N3).
+fn has_punycode(host: &str) -> bool {
+    host.split(['.', ':'])
+        .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"))
 }
 
 fn random_id<const N: usize>(entropy: &mut dyn Entropy) -> Result<[u8; N], SyncError> {
@@ -270,14 +395,17 @@ impl EngineCore {
             last_sync: None,
             last_file: None,
             pin_mismatch: false,
-            removed: false,
             pending: None,
             recovering: None,
+            renewal: None,
             offers: BTreeMap::new(),
             joining: None,
             events: Vec::new(),
             last_snapshot: None,
             counter: 0,
+            undo: VecDeque::new(),
+            remote_deletes: BTreeMap::new(),
+            server_candidate: None,
         };
         core.connect()?;
         for (id, path) in core.persisted.folders.clone() {
@@ -306,6 +434,9 @@ impl EngineCore {
     }
 
     fn save(&mut self) -> Result<(), SyncError> {
+        if self.account.is_some() {
+            self.persisted.removed_by = None;
+        }
         let bytes =
             serde_json::to_vec(&self.persisted).map_err(|e| SyncError::Corrupt(e.to_string()))?;
         self.ports.store.put_account_value(ENGINE_KEY, &bytes)?;
@@ -337,6 +468,8 @@ impl EngineCore {
                 watcher,
                 path: path.to_owned(),
                 last_full_scan: 0,
+                failed_rounds: 0,
+                last_error: None,
             },
         );
         Ok(())
@@ -367,8 +500,15 @@ impl EngineCore {
 
     /// One pass of the control loop (module docs). Returns the events for the window.
     pub fn tick(&mut self) -> Vec<BackendEvent> {
-        if let Err(e) = self.tick_inner() {
-            self.note_net(&e);
+        match self.tick_inner() {
+            Ok(()) => {}
+            // The server answered this device's own proof with "removed" (finding E2E-3): it
+            // can no longer read the log that says so, so it forgets the account now, as when
+            // the log shows the removal. The name of the removing device is not known here.
+            Err(e) if e.is_device_removed() && self.account.is_some() => {
+                let _ = self.forget_device(Some(String::new()));
+            }
+            Err(e) => self.note_net(&e),
         }
         self.poll_joining();
         let snapshot = self.snapshot();
@@ -394,8 +534,16 @@ impl EngineCore {
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Ok(());
         };
-        if self.removed {
-            return Ok(());
+        // A new account whose first epoch or device names did not make it yet (finding E2E-1):
+        // carried on here, also after a restart, before anything else uses the account.
+        if account.setup_pending() {
+            account.finish_setup(
+                server.as_mut(),
+                &mut *self.ports.keychain,
+                &mut *self.ports.store,
+                &mut *self.ports.entropy,
+                u64::try_from(now).unwrap_or(0),
+            )?;
         }
         let refresh = account.refresh(
             server.as_mut(),
@@ -407,8 +555,12 @@ impl EngineCore {
         self.connection = Connection::Online;
         self.pin_mismatch = false;
         if refresh.removed {
-            self.removed = true;
-            return Ok(());
+            let by = account
+                .state()
+                .last_removal_issuer()
+                .and_then(|issuer| account.device_display_name(issuer))
+                .unwrap_or_default();
+            return self.forget_device(Some(by));
         }
         for notice in &refresh.notices {
             match notice {
@@ -428,6 +580,7 @@ impl EngineCore {
         for id in offers {
             self.poll_offer(&id);
         }
+        self.note_folder_list();
         if self.paused() {
             return Ok(());
         }
@@ -451,7 +604,7 @@ impl EngineCore {
                 settings: &self.folder_settings,
             };
             if let Err(e) = complete_pending(&mut jx, &mut list) {
-                if e.is_offline() {
+                if e.is_offline() || e.is_device_removed() {
                     return Err(e);
                 }
             }
@@ -478,6 +631,8 @@ impl EngineCore {
                 folder.sync.request_full_scan();
                 folder.last_full_scan = now;
             }
+            // The head before the round still holds what another device deletes in it.
+            let head_before = folder.sync.view().frontier().map(|e| e.commit);
             let mut cx = Ctx {
                 account,
                 server: server.as_mut(),
@@ -489,11 +644,18 @@ impl EngineCore {
                 settings: &self.folder_settings,
             };
             let report = match folder.sync.round(&mut cx) {
-                Ok(r) => r,
-                Err(e) if e.is_offline() => return Err(e),
+                Ok(r) => {
+                    folder.failed_rounds = 0;
+                    folder.last_error = None;
+                    r
+                }
+                Err(e) if e.is_offline() || e.is_device_removed() => return Err(e),
                 Err(e) => {
+                    // Not swallowed (finding E2E-2): the folder tries again from a full scan,
+                    // and an error that persists is shown ([`Self::snapshot`]).
                     folder.sync.request_full_scan();
-                    let _ = e;
+                    folder.failed_rounds = folder.failed_rounds.saturating_add(1);
+                    folder.last_error = Some(e.code());
                     all_in_sync = false;
                     continue;
                 }
@@ -521,7 +683,56 @@ impl EngineCore {
                     heads,
                 });
             }
+            // Deletes another device made are one entry with "Wiederherstellen" (UX 8.1); those
+            // of this device's own restores stay single entries.
+            let deleter = folder
+                .sync
+                .meta()
+                .timeline
+                .iter()
+                .rev()
+                .find(|t| !t.side)
+                .map(|t| t.device)
+                .filter(|d| self.account.as_ref().is_some_and(|a| a.device() != d));
+            let remote_deleted: Vec<&crate::folder::ItemChange> = match (deleter, head_before) {
+                (Some(_), Some(_)) => report
+                    .changes
+                    .iter()
+                    .filter(|c| c.incoming && c.action == crate::folder::ChangeAction::Deleted)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if let (Some(device), Some(commit), false) =
+                (deleter, head_before, remote_deleted.is_empty())
+            {
+                self.counter += 1;
+                let entry = format!("a-{}", self.counter);
+                let count = remote_deleted.iter().filter(|c| !c.dir).count() as u64;
+                self.remote_deletes.insert(
+                    entry.clone(),
+                    RemoteDelete {
+                        folder: id,
+                        commit,
+                        items: remote_deleted.iter().map(|c| c.item).collect(),
+                    },
+                );
+                self.activity.push_front(ActivityEntry::RemoteDeleted {
+                    id: entry,
+                    folder_id: folder_id.clone(),
+                    folder_name: name.clone(),
+                    count,
+                    device: self
+                        .account
+                        .as_ref()
+                        .and_then(|a| a.device_display_name(&device))
+                        .unwrap_or_default(),
+                    at: now,
+                });
+            }
             for change in &report.changes {
+                if remote_deleted.iter().any(|c| c.item == change.item) {
+                    continue;
+                }
                 let file_name = change.path.rsplit('/').next().unwrap_or("").to_owned();
                 self.last_file = Some(LastFile {
                     name: file_name.clone(),
@@ -565,11 +776,59 @@ impl EngineCore {
                 });
             }
             self.activity.truncate(MAX_ACTIVITY);
+            let shown: BTreeSet<&str> = self.activity.iter().map(activity_id).collect();
+            self.remote_deletes
+                .retain(|id, _| shown.contains(id.as_str()));
         }
         if all_in_sync {
             self.last_sync = Some(now);
         }
+        self.run_restore_jobs();
         Ok(())
+    }
+
+    /// Notices folders that left the account's folder list (deleted everywhere, here or on
+    /// another device) and keeps them under "Gelöschte Ordner" while they can be brought back;
+    /// a folder stopped as retired here syncs again once it is back in the list.
+    fn note_folder_list(&mut self) {
+        let Some(account) = self.account.as_ref().filter(|a| a.has_folder_list()) else {
+            return;
+        };
+        let listed: Vec<(FolderId, String)> = account
+            .folders()
+            .into_iter()
+            .map(|f| (f.folder, f.name))
+            .collect();
+        let now = self.now();
+        let before = (
+            self.persisted.known_folders.clone(),
+            self.persisted.deleted_folders.clone(),
+        );
+        for (id, name) in &self.persisted.known_folders {
+            let gone = !listed.iter().any(|(f, _)| f == id);
+            if gone && !self.persisted.deleted_folders.iter().any(|(f, ..)| f == id) {
+                self.persisted
+                    .deleted_folders
+                    .push((*id, name.clone(), now));
+            }
+        }
+        self.persisted.deleted_folders.retain(|(id, _, at)| {
+            !listed.iter().any(|(f, _)| f == id) && now - at < RETENTION_DAYS * DAY_MS
+        });
+        self.persisted.known_folders = listed.clone();
+        if before
+            != (
+                self.persisted.known_folders.clone(),
+                self.persisted.deleted_folders.clone(),
+            )
+        {
+            let _ = self.save();
+        }
+        for (id, folder) in self.folders.iter_mut() {
+            if listed.iter().any(|(f, _)| f == id) {
+                let _ = folder.sync.clear_retired(&mut *self.ports.store);
+            }
+        }
     }
 
     // -- Snapshot ---------------------------------------------------------------------------
@@ -611,6 +870,27 @@ impl EngineCore {
             files(local, synced),
             files(remote, synced).saturating_sub(skip),
         )
+    }
+
+    /// The banner of a folder whose rounds keep failing: the full quota, the server's full disk
+    /// and a server that needs a newer app have their own (one per account); anything else is
+    /// "the server refused", per folder.
+    fn folder_error_warning(folder: &FolderId, kind: crate::error::ErrorKind) -> Warning {
+        use crate::error::ErrorKind;
+        match kind {
+            ErrorKind::QuotaFull => Warning::QuotaFull {
+                id: "quotaFull".into(),
+            },
+            ErrorKind::ServerDisk => Warning::ServerDisk {
+                id: "serverDisk".into(),
+            },
+            ErrorKind::UpdateRequired => Warning::UpdateRequired {
+                id: "updateRequired".into(),
+            },
+            _ => Warning::Refused {
+                id: format!("refused-{folder}"),
+            },
+        }
     }
 
     /// Everything the window shows.
@@ -665,6 +945,15 @@ impl EngineCore {
                 }
                 _ => {}
             }
+            if let (true, Some(kind)) = (f.failed_rounds >= FAILED_ROUNDS_SHOWN, f.last_error) {
+                let warning = Self::folder_error_warning(id, kind);
+                if !warnings
+                    .iter()
+                    .any(|w| warning_id(w) == warning_id(&warning))
+                {
+                    warnings.push(warning);
+                }
+            }
             if !meta.held.is_empty() {
                 let sample = meta
                     .held
@@ -696,10 +985,10 @@ impl EngineCore {
                 }),
             });
         }
-        if self.removed {
+        if let (Some(by), None) = (&self.persisted.removed_by, &self.account) {
             warnings.push(Warning::Removed {
                 id: "removed".into(),
-                by: String::new(),
+                by: by.clone(),
             });
         }
         if conflicts > 0 {
@@ -762,7 +1051,19 @@ impl EngineCore {
                 has_other_devices: a.state().current_devices().filter(|d| !d.recovery).count() > 1,
             }),
             remote_folders,
-            deleted_folders: Vec::new(),
+            deleted_folders: self
+                .persisted
+                .deleted_folders
+                .iter()
+                .filter_map(|(id, name, at)| {
+                    let left = RETENTION_DAYS - (self.now() - at).max(0) / DAY_MS;
+                    (left > 0).then(|| DeletedFolder {
+                        id: hex_id(id),
+                        name: name.clone(),
+                        days_left: u32::try_from(left).unwrap_or(0),
+                    })
+                })
+                .collect(),
             env: Environment {
                 camera: self.settings.camera,
             },
@@ -771,11 +1072,16 @@ impl EngineCore {
 
     // -- Setup ------------------------------------------------------------------------------
 
-    /// Checks an invite link (`checkInvite`).
-    pub fn check_invite(&mut self, link: &str) -> ApiResult<String, InviteError> {
+    /// Checks an invite link (`checkInvite`): the host in its ASCII form and whether the link
+    /// pins a key, so the window can warn before anything is sent (N3).
+    pub fn check_invite(&mut self, link: &str) -> ApiResult<InviteCheck, InviteError> {
         match crate::links::parse_invite(link) {
             Ok(invite) => match url_host(invite.server_url.as_str()) {
-                Some(host) => ApiResult::Ok(host),
+                Some(host) => ApiResult::Ok(InviteCheck {
+                    punycode: has_punycode(&host),
+                    pinned: invite.pin.is_some(),
+                    host,
+                }),
                 None => ApiResult::Err(InviteError::NotALink),
             },
             Err(crate::links::LinkError::Insecure) => ApiResult::Err(InviteError::Insecure),
@@ -788,18 +1094,24 @@ impl EngineCore {
         &mut self,
         link: &str,
         device_name: &str,
-    ) -> Result<ApiResult<RecoveryCodeView, InviteError>, SyncError> {
+    ) -> Result<ApiResult<RecoveryCodeView, BeginError>, SyncError> {
+        if self.account.is_some() {
+            return Err(SyncError::Invalid(
+                "this device already belongs to an account",
+            ));
+        }
         if let Some(e) = name_error(device_name) {
             return Ok(ApiResult::Err(match e {
-                NameError::Blank | NameError::EdgeWhitespace => InviteError::NotALink,
+                NameError::Blank => BeginError::Blank,
+                NameError::EdgeWhitespace => BeginError::EdgeWhitespace,
             }));
         }
         let invite = match crate::links::parse_invite(link) {
             Ok(invite) => invite,
             Err(crate::links::LinkError::Insecure) => {
-                return Ok(ApiResult::Err(InviteError::Insecure))
+                return Ok(ApiResult::Err(BeginError::Insecure))
             }
-            Err(_) => return Ok(ApiResult::Err(InviteError::NotALink)),
+            Err(_) => return Ok(ApiResult::Err(BeginError::NotALink)),
         };
         let url = invite.server_url.to_string();
         let account = AccountId::from_bytes(random_id(&mut *self.ports.entropy)?);
@@ -810,33 +1122,49 @@ impl EngineCore {
         let mut server = match (self.ports.server)(&config, None) {
             Ok(s) => s,
             Err(NetError::Tls(_)) | Err(NetError::PinMismatch) => {
-                return Ok(ApiResult::Err(InviteError::Insecure))
+                return Ok(ApiResult::Err(BeginError::Insecure))
             }
-            Err(_) => return Ok(ApiResult::Err(InviteError::Unreachable)),
+            Err(_) => return Ok(ApiResult::Err(BeginError::Unreachable)),
         };
         let probe = DeviceId::from_bytes(random_id(&mut *self.ports.entropy)?);
         let server_id = match server.challenge(&account, &probe) {
             Ok(c) => c.server,
             Err(NetError::Tls(_)) | Err(NetError::PinMismatch) => {
-                return Ok(ApiResult::Err(InviteError::Insecure))
+                return Ok(ApiResult::Err(BeginError::Insecure))
             }
-            Err(_) => return Ok(ApiResult::Err(InviteError::Unreachable)),
+            Err(_) => return Ok(ApiResult::Err(BeginError::Unreachable)),
         };
         if invite.server.is_some_and(|s| s != server_id) {
-            return Ok(ApiResult::Err(InviteError::Insecure));
+            return Ok(ApiResult::Err(BeginError::Insecure));
         }
         let code = RecoveryCode::generate(&mut DynEntropy(&mut *self.ports.entropy))?;
-        let mut pick = [0u8; 1];
-        self.ports.entropy.fill(&mut pick)?;
-        let check_group = 2 + u32::from(pick[0]) % 7;
+        let check_group = pick_check_group(&mut *self.ports.entropy)?;
         let groups = group(&code.reveal(), 4);
-        let sheet = sheet_view(&url, server_id, account)?;
+        // Entry 1 is made now, so the sheet can name its hash (N1); the recovery device it
+        // lists is derived from the code alone. Nothing reaches the server before the group
+        // check (ux-concept 4.2.1).
+        let device = DeviceId::from_bytes(random_id(&mut *self.ports.entropy)?);
+        let recovery_identity = code
+            .identity()
+            .map_err(|_| SyncError::Invalid("recovery identity"))?;
+        let recovery_id = code
+            .device_id()
+            .map_err(|_| SyncError::Invalid("recovery identity"))?;
+        let now = u64::try_from(self.now()).unwrap_or(0);
+        let genesis = Genesis::new(
+            &mut *self.ports.entropy,
+            now,
+            account,
+            device,
+            Some((&recovery_identity, recovery_id)),
+        )?;
+        let sheet = sheet_view(&url, server_id, account, genesis.hash()?, invite.pin)?;
         self.pending = Some(PendingAccount {
             url,
             invite: invite.token,
             pin: invite.pin,
             server: server_id,
-            account,
+            genesis,
             name: device_name.to_owned(),
             code,
             check_group,
@@ -848,16 +1176,24 @@ impl EngineCore {
         }))
     }
 
-    /// Checks the typed group of the recovery code and creates the account
-    /// (`confirmRecoveryGroup`).
+    /// Checks the typed group of the recovery code (`confirmRecoveryGroup`): creates the account
+    /// of a new setup, or, for a renewed code, makes the new code the account's only one.
+    ///
+    /// A new account is made in two steps (finding E2E-1): the invite is redeemed without a
+    /// session, then this device signs in with its new identity for the first epoch and the
+    /// device names. Should the second step fail, the account is stored already and the setup
+    /// is carried on by calling this again or by the next tick, also after a restart; a failure
+    /// before the server took the invite keeps the code, so the same group can be confirmed
+    /// again.
     pub fn confirm_recovery_group(&mut self, typed: &str) -> Result<bool, SyncError> {
+        if self.pending.is_none() && self.account.as_ref().is_some_and(Account::setup_pending) {
+            self.finish_account_setup()?;
+            return Ok(true);
+        }
         let Some(pending) = &self.pending else {
-            return Ok(false);
+            return self.confirm_renewal(typed);
         };
-        let groups = group(&pending.code.reveal(), 4);
-        let index = usize::try_from(pending.check_group.saturating_sub(1)).unwrap_or(0);
-        let expected = groups.get(index).cloned().unwrap_or_default();
-        if typed.trim().to_ascii_uppercase() != expected {
+        if !group_matches(&pending.code, pending.check_group, typed) {
             return Ok(false);
         }
         let Some(pending) = self.pending.take() else {
@@ -865,32 +1201,31 @@ impl EngineCore {
         };
         let mut config = ServerConfig::new(&pending.url, pending.pin)?;
         config.server = Some(pending.server);
-        let mut server = (self.ports.server)(&config, None)?;
-        let account_id = pending.account;
-        let device = DeviceId::from_bytes(random_id(&mut *self.ports.entropy)?);
-        // The recovery device is derived from the code alone, so the sheet needs no device ID.
-        let recovery_identity = pending
-            .code
-            .identity()
-            .map_err(|_| SyncError::Invalid("recovery identity"))?;
-        let recovery_id = pending
-            .code
-            .device_id()
-            .map_err(|_| SyncError::Invalid("recovery identity"))?;
-        let now = u64::try_from(self.now()).unwrap_or(0);
-        let account = Account::create(
-            server.as_mut(),
-            &mut *self.ports.keychain,
-            &mut *self.ports.store,
-            &mut *self.ports.entropy,
-            now,
-            pending.invite,
-            account_id,
-            device,
-            &pending.name,
-            Some((&recovery_identity, recovery_id)),
-        )?;
+        let created = (self.ports.server)(&config, None)
+            .map_err(SyncError::from)
+            .and_then(|mut server| {
+                Account::create_from(
+                    server.as_mut(),
+                    &mut *self.ports.keychain,
+                    &mut *self.ports.store,
+                    pending.invite.clone(),
+                    &pending.genesis,
+                    &pending.name,
+                )
+            });
+        let account = match created {
+            Ok(account) => account,
+            Err(e) => {
+                // Nothing is stored; the server repeats a creation that went through as the same
+                // success, so a confirmation after a lost answer carries on.
+                self.pending = Some(pending);
+                return Err(e);
+            }
+        };
         if account.server_id() != Some(pending.server) {
+            // Another server than the one the code was made for: nothing of it may stay.
+            drop(account);
+            let _ = crate::account::forget(&mut *self.ports.store, &mut *self.ports.keychain);
             return Err(SyncError::Net(NetError::Protocol(
                 "the server ID changed".into(),
             )));
@@ -900,7 +1235,114 @@ impl EngineCore {
         self.persisted.pin = pending.pin;
         self.save()?;
         self.connect()?;
+        self.finish_account_setup()?;
         Ok(true)
+    }
+
+    /// The second step of a new account ([`Account::finish_setup`]) with this device's session.
+    fn finish_account_setup(&mut self) -> Result<(), SyncError> {
+        let now = u64::try_from(self.now()).unwrap_or(0);
+        let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
+            return Err(SyncError::NotSetUp("no account"));
+        };
+        account.finish_setup(
+            server.as_mut(),
+            &mut *self.ports.keychain,
+            &mut *self.ports.store,
+            &mut *self.ports.entropy,
+            now,
+        )
+    }
+
+    /// The group check of a renewed code (ux-concept 10.3).
+    fn confirm_renewal(&mut self, typed: &str) -> Result<bool, SyncError> {
+        let Some(renewal) = &self.renewal else {
+            return Ok(false);
+        };
+        if !group_matches(&renewal.code, renewal.check_group, typed) {
+            return Ok(false);
+        }
+        let Some(renewal) = self.renewal.take() else {
+            return Ok(false);
+        };
+        if renewal.added {
+            return Ok(true);
+        }
+        let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
+            return Err(SyncError::NotSetUp("no account"));
+        };
+        let recovery_identity = renewal
+            .code
+            .identity()
+            .map_err(|_| SyncError::Invalid("recovery identity"))?;
+        let recovery_id = renewal
+            .code
+            .device_id()
+            .map_err(|_| SyncError::Invalid("recovery identity"))?;
+        let old: Vec<DeviceId> = account
+            .state()
+            .current_devices()
+            .filter(|d| d.recovery && d.id != recovery_id)
+            .map(|d| d.id)
+            .collect();
+        let now = u64::try_from(self.ports.clock.now_ms()).unwrap_or(0);
+        // The new code first: should the removal fail after this, both codes work, never none.
+        account.add_recovery_device(
+            server.as_mut(),
+            &mut *self.ports.store,
+            LogDevice::of(&recovery_identity, account.id(), recovery_id, true),
+            now,
+            &mut *self.ports.entropy,
+        )?;
+        if !old.is_empty() {
+            self.remove_with_barriers(&old)?;
+        }
+        Ok(true)
+    }
+
+    /// A new recovery code for this account (`renewRecoveryCode`, ux-concept 10.3). Nothing
+    /// changes until the person types the check group back ([`Self::confirm_recovery_group`]);
+    /// the old code stays valid until then.
+    pub fn renew_recovery_code(&mut self) -> Result<RecoveryCodeView, SyncError> {
+        if self.pending.is_some() || self.recovering.is_some() {
+            return Err(SyncError::Invalid("the setup is not finished"));
+        }
+        let url = self
+            .persisted
+            .server_url
+            .clone()
+            .ok_or(SyncError::NotSetUp("no server"))?;
+        let account = self
+            .account
+            .as_ref()
+            .ok_or(SyncError::NotSetUp("no account"))?;
+        let sheet = self.own_sheet(account, &url)?;
+        let code = RecoveryCode::generate(&mut DynEntropy(&mut *self.ports.entropy))?;
+        let check_group = pick_check_group(&mut *self.ports.entropy)?;
+        let groups = group(&code.reveal(), 4);
+        self.renewal = Some(Renewal {
+            code,
+            check_group,
+            added: false,
+        });
+        Ok(RecoveryCodeView {
+            groups,
+            check_group,
+            sheet,
+        })
+    }
+
+    /// The sheet of this device's account: its server, genesis anchor and the pin it trusts.
+    fn own_sheet(&self, account: &Account, url: &str) -> Result<RecoverySheetView, SyncError> {
+        let server_id = account
+            .server_id()
+            .ok_or(SyncError::NotSetUp("the server ID is not known yet"))?;
+        let genesis = account
+            .state()
+            .hash_at(1)
+            .copied()
+            .ok_or(SyncError::NotSetUp("the account log is empty"))?;
+        sheet_view(url, server_id, *account.id(), genesis, self.persisted.pin)
     }
 
     /// Account recovery with the recovery sheet (`recoverAccount`, open point A): `sheet` is
@@ -919,8 +1361,12 @@ impl EngineCore {
                 "this device already belongs to an account",
             ));
         }
-        if name_error(device_name).is_some() {
-            return Err(SyncError::Invalid("device name"));
+        match name_error(device_name) {
+            Some(NameError::Blank) => return Ok(ApiResult::Err(RecoverError::Blank)),
+            Some(NameError::EdgeWhitespace) => {
+                return Ok(ApiResult::Err(RecoverError::EdgeWhitespace))
+            }
+            None => {}
         }
         let sheet = match crate::links::parse_recovery_link(sheet) {
             Ok(s) => s,
@@ -943,7 +1389,7 @@ impl EngineCore {
             .device_id()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
         let url = sheet.server_url.to_string();
-        let mut config = ServerConfig::new(&url, None)?;
+        let mut config = ServerConfig::new(&url, sheet.pin)?;
         config.server = Some(sheet.server);
         let net = |e: &NetError| match e {
             NetError::Tls(_) | NetError::PinMismatch => RecoverError::Insecure,
@@ -968,6 +1414,7 @@ impl EngineCore {
         let anchor = match crate::recovery::add_device_with_code(
             recovery_server.as_mut(),
             sheet.account,
+            &sheet.genesis,
             &code,
             entry,
             now,
@@ -1003,14 +1450,32 @@ impl EngineCore {
             sheet.account,
             device,
             device_name,
-            Some(anchor),
+            // The new device's own view of the log must start with the sheet's entry 1 too, and
+            // contain the head its add device entry made (N1, N6).
+            &[
+                LogHead {
+                    index: 1,
+                    hash: sheet.genesis,
+                },
+                anchor,
+            ],
         )?;
         account.set_server_id(sheet.server);
         account.save(&mut *self.ports.store)?;
+        // Its own name in the sealed device names, as a paired device's (finding E2E-4), so
+        // this device and the account's others show it. Should this fail (offline, or a
+        // rotation still due), `finish_recovery_cleanup` writes it after its re-seal.
+        let _ = account.set_device_name(
+            server.as_mut(),
+            &mut *self.ports.store,
+            &device,
+            device_name,
+            &mut *self.ports.entropy,
+        );
         self.account = Some(account);
         self.server = Some(server);
         self.persisted.server_url = Some(url.clone());
-        self.persisted.pin = None;
+        self.persisted.pin = sheet.pin;
         self.recovering = Some(Recovering { url });
         self.save()?;
         Ok(ApiResult::Ok(()))
@@ -1063,6 +1528,17 @@ impl EngineCore {
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Err(SyncError::NotSetUp("no account"));
         };
+        // This device's name, if `recover_account` could not write it (finding E2E-4).
+        if account.device_display_name(&me).is_none() {
+            let name = account.device_name().to_owned();
+            account.set_device_name(
+                server.as_mut(),
+                &mut *self.ports.store,
+                &me,
+                &name,
+                &mut *self.ports.entropy,
+            )?;
+        }
         let recovery_identity = code
             .identity()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
@@ -1077,16 +1553,23 @@ impl EngineCore {
             now,
             &mut *self.ports.entropy,
         )?;
-        let server_id = account
-            .server_id()
-            .ok_or(SyncError::NotSetUp("the server ID is not known yet"))?;
-        let sheet = sheet_view(&url, server_id, *account.id())?;
-        let mut pick = [0u8; 1];
-        self.ports.entropy.fill(&mut pick)?;
+        let account = self
+            .account
+            .as_ref()
+            .ok_or(SyncError::NotSetUp("no account"))?;
+        let sheet = self.own_sheet(account, &url)?;
+        let check_group = pick_check_group(&mut *self.ports.entropy)?;
         self.recovering = None;
+        let groups = group(&code.reveal(), 4);
+        // The code is in the log already; the group check only confirms it was written down.
+        self.renewal = Some(Renewal {
+            code,
+            check_group,
+            added: true,
+        });
         Ok(RecoveryCodeView {
-            groups: group(&code.reveal(), 4),
-            check_group: 2 + u32::from(pick[0]) % 7,
+            groups,
+            check_group,
             sheet,
         })
     }
@@ -1157,6 +1640,7 @@ impl EngineCore {
             link: crate::links::pairing_link(&bytes),
             code,
             host: url_host(url).unwrap_or_default(),
+            account: account.id().to_hex(),
             qr: None,
             expires_at,
         })
@@ -1186,14 +1670,18 @@ impl EngineCore {
         let Ok(Some(request)) = server.get_pairing(&pairing_id) else {
             return;
         };
-        let Ok(keys) = offer.secret.verify_request(account.id(), &request) else {
+        let Ok(verified) = offer.secret.verify_request(account.id(), &request) else {
             return;
         };
-        let safety = NumberRows::of(&safety_number(account.id(), &request.device, &keys));
+        let safety = NumberRows::of(&safety_number(
+            account.id(),
+            &request.device,
+            &verified.keys,
+        ));
         self.events.push(BackendEvent::PairRequest {
             request: PairRequestView {
                 offer_id: id.to_owned(),
-                device_name: request.name.clone(),
+                device_name: verified.name,
                 path: PairPath::Link,
                 safety,
             },
@@ -1201,7 +1689,29 @@ impl EngineCore {
         offer.request = Some(request);
     }
 
-    /// The person's answer to a new device (`answerPairRequest`).
+    /// The new device that answered an open offer, with its safety number, as the window was
+    /// told it; `None` while nobody answered or for an unknown offer. The shell names both in
+    /// its own confirmation before it accepts (security review L2).
+    pub fn pair_request(&self, offer_id: &str) -> Option<PairRequestView> {
+        let account = self.account.as_ref()?;
+        let offer = self.offers.get(offer_id)?;
+        let request = offer.request.as_ref()?;
+        let verified = offer.secret.verify_request(account.id(), request).ok()?;
+        Some(PairRequestView {
+            offer_id: offer_id.to_owned(),
+            device_name: verified.name,
+            path: PairPath::Link,
+            safety: NumberRows::of(&safety_number(
+                account.id(),
+                &request.device,
+                &verified.keys,
+            )),
+        })
+    }
+
+    /// The person's answer to a new device (`answerPairRequest`). Accepted or declined, the
+    /// slot is closed on the server afterwards, so the request does not wait there until it
+    /// expires (finding E2E-6); a slot that could not be closed goes when it expires.
     pub fn answer_pair_request(&mut self, offer_id: &str, accept: bool) -> Result<(), SyncError> {
         let Some(offer) = self.offers.remove(offer_id) else {
             return Ok(());
@@ -1209,31 +1719,85 @@ impl EngineCore {
         let Some(request) = offer.request else {
             return Ok(());
         };
-        if !accept {
-            return Ok(());
-        }
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Err(SyncError::NotSetUp("no account"));
         };
-        let keys = offer
-            .secret
-            .verify_request(account.id(), &request)
-            .map_err(|_| SyncError::Invalid("pairing request"))?;
-        let device = LogDevice {
-            id: request.device,
-            keys,
-            recovery: false,
-            proof: request.proof,
+        let added = if accept {
+            match offer.secret.verify_request(account.id(), &request) {
+                Ok(verified) => {
+                    let device = LogDevice {
+                        id: request.device,
+                        keys: verified.keys,
+                        recovery: false,
+                        proof: request.proof,
+                    };
+                    let now = u64::try_from(self.ports.clock.now_ms()).unwrap_or(0);
+                    account.add_device(
+                        server.as_mut(),
+                        &mut *self.ports.store,
+                        device,
+                        &verified.name,
+                        now,
+                        &mut *self.ports.entropy,
+                    )
+                }
+                Err(_) => Err(SyncError::Invalid("pairing request")),
+            }
+        } else {
+            Ok(())
         };
-        let now = u64::try_from(self.ports.clock.now_ms()).unwrap_or(0);
-        account.add_device(
-            server.as_mut(),
-            &mut *self.ports.store,
-            device,
-            &request.name,
-            now,
-            &mut *self.ports.entropy,
-        )
+        if let Ok(pairing_id) = offer.secret.pairing_id() {
+            let _ = server.close_pairing(&pairing_id);
+        }
+        added
+    }
+
+    /// What a link names, read offline before anything is sent (`inspectLink`, N2): an
+    /// invite, a pairing offer or a recovery sheet, with its host and account. The window shows
+    /// them and connects only after the person confirmed. Nothing is checked against a server
+    /// and nothing is kept; an expired offer is reported by `startPairing`.
+    pub fn inspect_link(&self, link: &str) -> ApiResult<InspectedLink, LinkProblem> {
+        use crate::links::LinkError;
+        let problem = |e: LinkError| match e {
+            LinkError::NotALink => LinkProblem::NotALink,
+            LinkError::Malformed => LinkProblem::Damaged,
+            LinkError::Insecure => LinkProblem::Insecure,
+        };
+        let host_of = |url: &str| url_host(url).ok_or(LinkProblem::Damaged);
+        let inspected = match crate::links::parse_invite(link) {
+            Ok(invite) => host_of(invite.server_url.as_str()).map(|host| InspectedLink::Invite {
+                host,
+                pinned: invite.pin.is_some(),
+            }),
+            Err(LinkError::NotALink) => match crate::links::parse_pairing_link(link) {
+                Ok(bytes) => match PairingOffer::decode(&bytes) {
+                    Ok(offer) => {
+                        host_of(offer.content.server_url.as_str()).map(|host| InspectedLink::Pair {
+                            host,
+                            account: offer.content.account.to_hex(),
+                            pinned: offer.content.spki_pin.is_some(),
+                        })
+                    }
+                    Err(_) => Err(LinkProblem::Damaged),
+                },
+                Err(LinkError::NotALink) => match crate::links::parse_recovery_link(link) {
+                    Ok(sheet) => {
+                        host_of(sheet.server_url.as_str()).map(|host| InspectedLink::Recover {
+                            host,
+                            account: sheet.account.to_hex(),
+                            pinned: sheet.pin.is_some(),
+                        })
+                    }
+                    Err(e) => Err(problem(e)),
+                },
+                Err(e) => Err(problem(e)),
+            },
+            Err(e) => Err(problem(e)),
+        };
+        match inspected {
+            Ok(link) => ApiResult::Ok(link),
+            Err(e) => ApiResult::Err(e),
+        }
     }
 
     /// Starts pairing on a new device with the link of an offer (`startPairing`).
@@ -1263,7 +1827,13 @@ impl EngineCore {
         let request = offer
             .content
             .secret
-            .request(&identity, &account, device, device_name)
+            .request(
+                &identity,
+                &account,
+                device,
+                device_name,
+                &mut DynEntropy(&mut *self.ports.entropy),
+            )
             .map_err(|_| SyncError::Invalid("pairing request"))?;
         let mut config =
             ServerConfig::new(offer.content.server_url.as_str(), offer.content.spki_pin)?;
@@ -1306,6 +1876,66 @@ impl EngineCore {
         Ok(ApiResult::Ok(safety))
     }
 
+    /// Forgets the account on this device (security review L1): the device identity and every
+    /// epoch secret leave the keychain, the stored account and the folders' sync state leave the
+    /// index, and the engine is back at the setup. The files in the folders stay where they are.
+    /// `removed_by` keeps the "this device was removed" warning until the device is set up
+    /// again. Every step is tried; the first failure is returned.
+    fn forget_device(&mut self, removed_by: Option<String>) -> Result<(), SyncError> {
+        let mut first =
+            crate::account::forget(&mut *self.ports.store, &mut *self.ports.keychain).err();
+        for (id, _) in &self.persisted.folders {
+            if let Err(e) = self.ports.store.delete_folder(id) {
+                first.get_or_insert(e.into());
+            }
+        }
+        self.account = None;
+        self.server = None;
+        self.folders.clear();
+        self.activity.clear();
+        self.notices.clear();
+        self.pin_mismatch = false;
+        self.pending = None;
+        self.recovering = None;
+        self.renewal = None;
+        self.offers.clear();
+        self.joining = None;
+        self.last_sync = None;
+        self.last_file = None;
+        self.undo.clear();
+        self.remote_deletes.clear();
+        self.server_candidate = None;
+        self.persisted = Persisted {
+            removed_by,
+            ..Persisted::default()
+        };
+        if let Err(e) = self.save() {
+            first.get_or_insert(e);
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Resets this device (`resetDevice`): the account is forgotten as when the device is
+    /// removed ([`Self::forget_device`]), without the warning. For "pair again" after a removal
+    /// and for starting over.
+    pub fn reset_device(&mut self) -> Result<(), SyncError> {
+        self.forget_device(None)
+    }
+
+    /// Disconnects this device from its account (`disconnectThisDevice`): after "these are not
+    /// my devices" right after joining (N2), and from the device list. A device never removes
+    /// itself from the account log (ADR 0001, section 4), and the server has no call that ends a
+    /// session, so the device forgets the account here at once, as a reset does: its identity
+    /// and every epoch secret leave the keychain, the account and the folders' sync state leave
+    /// the index, and the session token, which lives only in memory, goes with the server
+    /// connection and runs out on the server within the hour. The device stays in the
+    /// account's log until a device of that account removes it; without its keys it can
+    /// neither sign in nor open anything (ADR 0001, section 4, "Disconnecting this device").
+    /// Files in the folders stay where they are.
+    pub fn disconnect_this_device(&mut self) -> Result<(), SyncError> {
+        self.forget_device(None)
+    }
+
     /// Stops a pairing of this new device (`cancelPairing`).
     pub fn cancel_pairing(&mut self) {
         self.joining = None;
@@ -1340,7 +1970,7 @@ impl EngineCore {
             joining.account,
             joining.device,
             &joining.name,
-            Some(joining.offer.content.head),
+            &[joining.offer.content.head],
         );
         let Ok(mut account) = joined else {
             // Not added yet (or the server is down): try again at the next tick.
@@ -1354,6 +1984,10 @@ impl EngineCore {
         )
         .is_err()
         {
+            // The join stored the other account and its secrets; none of it may stay (security
+            // review L1).
+            drop(account);
+            let _ = crate::account::forget(&mut *self.ports.store, &mut *self.ports.keychain);
             self.joining = None;
             self.events.push(BackendEvent::PairResult {
                 result: PairResult::Failed {
@@ -1372,8 +2006,13 @@ impl EngineCore {
         self.account = Some(account);
         self.server = Some(joining.server);
         let _ = self.save();
+        // The account's devices, for the person to confirm these are their own (N2).
+        let devices = self
+            .list_devices()
+            .map(|list| list.devices)
+            .unwrap_or_default();
         self.events.push(BackendEvent::PairResult {
-            result: PairResult::Joined,
+            result: PairResult::Joined { devices },
         });
     }
 
@@ -1441,7 +2080,79 @@ impl EngineCore {
             &mut *self.ports.entropy,
         )?;
         server.retire(&id)?;
+        let name = self.folders.get(&id).map(|f| f.sync.meta().name.clone());
+        if let Some(name) = name.or_else(|| {
+            self.persisted
+                .known_folders
+                .iter()
+                .find(|(f, _)| *f == id)
+                .map(|(_, n)| n.clone())
+        }) {
+            if !self
+                .persisted
+                .deleted_folders
+                .iter()
+                .any(|(f, ..)| *f == id)
+            {
+                let now = self.now();
+                self.persisted.deleted_folders.push((id, name, now));
+            }
+        }
+        self.persisted.known_folders.retain(|(f, _)| *f != id);
         self.stop_folder(folder)
+    }
+
+    /// Brings a folder deleted everywhere back within the retention window
+    /// (`restoreDeletedFolder`, ADR 0001, section 3, "Folder list"): the server's retire call is
+    /// undone, then the folder list names it again. It shows under "Ordner hinzufügen" on every
+    /// device; a device that still syncs it carries on. Both steps may be repeated: a folder that
+    /// is no longer retired is fine.
+    pub fn restore_deleted_folder(&mut self, folder: &str) -> Result<(), SyncError> {
+        let id = parse_folder(folder)?;
+        let name = self
+            .persisted
+            .deleted_folders
+            .iter()
+            .find(|(f, ..)| *f == id)
+            .map(|(_, name, _)| name.clone())
+            .ok_or(SyncError::Invalid("unknown deleted folder"))?;
+        let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
+            return Err(SyncError::NotSetUp("no account"));
+        };
+        match server.bring_back(&id) {
+            Ok(()) => {}
+            // The server answers so for a folder that is not retired (any more).
+            Err(e) if e.code() == Some(ErrorCode::BadRequest) => {}
+            Err(e) if e.code() == Some(ErrorCode::NotFound) => {
+                // The window passed meanwhile; the folder cannot come back.
+                self.persisted.deleted_folders.retain(|(f, ..)| *f != id);
+                self.save()?;
+                return Err(e.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+        account.refresh(
+            server.as_mut(),
+            &mut *self.ports.keychain,
+            &mut *self.ports.store,
+        )?;
+        let mut list = account.folders();
+        if !list.iter().any(|f| f.folder == id) {
+            list.push(FolderEntry {
+                folder: id,
+                name: name.clone(),
+            });
+            account.put_folder_list(
+                server.as_mut(),
+                FolderList::new(list)?,
+                &mut *self.ports.entropy,
+            )?;
+        }
+        self.persisted.deleted_folders.retain(|(f, ..)| *f != id);
+        if !self.persisted.known_folders.iter().any(|(f, _)| *f == id) {
+            self.persisted.known_folders.push((id, name));
+        }
+        self.save()
     }
 
     /// Pauses all syncing (`pause`); `until` for "tomorrow" comes from the app (local midnight).
@@ -1539,6 +2250,41 @@ impl EngineCore {
         Ok(true)
     }
 
+    /// "Download again" for a missing folder (`redownloadFolder`, UX 8.2): the folder's old
+    /// place, which the app created again, is filled from the server's tree. Nothing is deleted
+    /// anywhere; files that are at the place already are joined as at a first sync (ADR 0001,
+    /// section 3). Only for a folder that stopped because its place went missing.
+    pub fn redownload_folder(&mut self, folder: &str) -> Result<(), SyncError> {
+        let id = parse_folder(folder)?;
+        let f = self
+            .folders
+            .get(&id)
+            .ok_or(SyncError::Invalid("unknown folder"))?;
+        if f.sync.state() != FolderState::Stopped(StopReason::MarkerMissing) {
+            return Err(SyncError::Invalid("the folder is not missing"));
+        }
+        let path = f.path.clone();
+        self.check_root(&path, Some(id))?;
+        let (fs, watcher) = (self.ports.fs)(Path::new(&path))?;
+        let f = self
+            .folders
+            .get_mut(&id)
+            .ok_or(SyncError::Invalid("unknown folder"))?;
+        f.fs = fs;
+        f.watcher = watcher;
+        f.last_full_scan = 0;
+        f.failed_rounds = 0;
+        f.last_error = None;
+        f.sync.forget_disk(&mut *self.ports.store)?;
+        f.sync.write_marker(&*f.fs)
+    }
+
+    /// The path of a synced folder, for the app to create its place again
+    /// (`redownloadFolder`).
+    pub fn folder_path(&self, folder: &str) -> Result<String, SyncError> {
+        Ok(self.folder(folder)?.path.clone())
+    }
+
     /// Checks `path` as a sync root against every other folder's root (security review M4);
     /// `except` is the folder that moves there.
     fn check_root(&self, path: &str, except: Option<FolderId>) -> Result<PathBuf, SyncError> {
@@ -1550,6 +2296,52 @@ impl EngineCore {
             .map(|(_, p)| PathBuf::from(p))
             .collect();
         Ok((self.ports.roots)(Path::new(path), &existing)?)
+    }
+
+    /// Whether `path` may become a sync root (`pickFolder`), with `except` the folder that would
+    /// move there; `None` when it may. The window shows the reason before anything is created.
+    pub fn check_folder(&self, path: &str, except: Option<&str>) -> Option<FolderRefusalView> {
+        use crate::roots::RootError;
+        let except = except.and_then(|f| FolderId::from_hex(f).ok());
+        let error = match self.check_root(path, except) {
+            Ok(_) => return None,
+            Err(SyncError::Root(e)) => e,
+            Err(_) => {
+                return Some(FolderRefusalView {
+                    reason: FolderRefusal::NoAccess,
+                    folder: None,
+                })
+            }
+        };
+        let reason = match error {
+            RootError::Unresolved(_) => FolderRefusal::NoAccess,
+            RootError::Overlaps => FolderRefusal::Nested,
+            RootError::DriveRoot => FolderRefusal::Root,
+            RootError::HoldsIndex | RootError::System | RootError::OtherCloud(_) => {
+                FolderRefusal::System
+            }
+        };
+        let folder = if reason == FolderRefusal::Nested {
+            self.overlapping_folder(path, except)
+        } else {
+            None
+        };
+        Some(FolderRefusalView { reason, folder })
+    }
+
+    /// The name of the synced folder `path` lies in or around.
+    fn overlapping_folder(&self, path: &str, except: Option<FolderId>) -> Option<String> {
+        let canonical = |p: &str| {
+            std::fs::canonicalize(p)
+                .map(|c| crate::roots::key(&c))
+                .unwrap_or_else(|_| crate::roots::key(Path::new(p)))
+        };
+        let wanted = canonical(path);
+        self.folders
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .find(|(_, f)| crate::roots::overlap(&wanted, &canonical(&f.path)))
+            .map(|(_, f)| f.sync.meta().name.clone())
     }
 
     fn folder(&self, folder: &str) -> Result<&LocalFolder, SyncError> {
@@ -1616,6 +2408,128 @@ impl EngineCore {
             settings: &self.folder_settings,
         };
         f.sync.reanchor(&mut cx)
+    }
+
+    /// The server key number of the key the server presents instead of the pinned one
+    /// (`getServerNumber`, ADR 0001, section 6, "Pin rotation"), with the server CLI command
+    /// that prints the number of the server's own key. The key comes from the aborted handshake
+    /// and is trusted only once the person confirmed that both numbers match
+    /// ([`Self::confirm_server_number`]).
+    pub fn server_number(&mut self) -> Result<ServerNumberView, SyncError> {
+        let server = self
+            .account
+            .as_ref()
+            .and_then(Account::server_id)
+            .ok_or(SyncError::NotSetUp("no account"))?;
+        let mut seen = self.server.as_ref().and_then(|s| s.seen_pin());
+        if seen.is_none() {
+            // One more attempt shows the server's key again.
+            if let Err(e) = self.tick_inner() {
+                self.note_net(&e);
+            }
+            seen = self.server.as_ref().and_then(|s| s.seen_pin());
+        }
+        let pin = seen.ok_or(SyncError::Invalid("the server presents no other key"))?;
+        self.server_candidate = Some(pin);
+        Ok(ServerNumberView {
+            number: NumberRows::of(&server_key_number(&server, &pin)),
+            command: SERVER_NUMBER_COMMAND.to_owned(),
+        })
+    }
+
+    /// The person confirmed that the server number matches the server CLI's
+    /// (`confirmServerNumber`): the key whose number was shown becomes the pin, and the device
+    /// connects with it. Never any other key.
+    pub fn confirm_server_number(&mut self) -> Result<(), SyncError> {
+        let pin = self
+            .server_candidate
+            .take()
+            .ok_or(SyncError::Invalid("no server number was shown"))?;
+        self.persisted.pin = Some(pin);
+        self.save()?;
+        self.connect()?;
+        self.pin_mismatch = false;
+        Ok(())
+    }
+
+    /// The new server identity from a pairing offer of a device that still connects
+    /// (`fixServerWithOffer`, ADR 0001, section 6, "Pin rotation"): only the server URL and the
+    /// pin are taken, and only from an offer of this account and server whose signature verifies
+    /// against a current, regular device of the verified log. This device does not pair again.
+    pub fn fix_server_with_offer(
+        &mut self,
+        link: &str,
+    ) -> Result<ApiResult<(), FixServerError>, SyncError> {
+        let Some(offer) = crate::links::parse_pairing_link(link)
+            .ok()
+            .and_then(|bytes| PairingOffer::decode(&bytes).ok())
+        else {
+            return Ok(ApiResult::Err(FixServerError::NotALink));
+        };
+        if offer
+            .check_fresh(u64::try_from(self.now()).unwrap_or(0))
+            .is_err()
+        {
+            return Ok(ApiResult::Err(FixServerError::Expired));
+        }
+        let account = self
+            .account
+            .as_ref()
+            .ok_or(SyncError::NotSetUp("no account"))?;
+        let server = account
+            .server_id()
+            .ok_or(SyncError::NotSetUp("the server ID is not known yet"))?;
+        let address = match offer.server_address(account.state(), &server) {
+            Ok(address) => address,
+            Err(PairingError::AheadOfLog { .. }) => {
+                match self.address_after_log_check(&offer, &server)? {
+                    Some(address) => address,
+                    None => return Ok(ApiResult::Err(FixServerError::OtherAccount)),
+                }
+            }
+            Err(_) => return Ok(ApiResult::Err(FixServerError::OtherAccount)),
+        };
+        self.persisted.server_url = Some(address.url.to_string());
+        self.persisted.pin = address.spki_pin;
+        self.save()?;
+        self.connect()?;
+        self.pin_mismatch = false;
+        self.server_candidate = None;
+        Ok(ApiResult::Ok(()))
+    }
+
+    /// An offer whose log head is newer than this device's verified log: the log is fetched
+    /// through the offered address and verified from this device's anchor, then the offer is
+    /// checked again (ADR 0001, section 6). On any failure the old address stays.
+    fn address_after_log_check(
+        &mut self,
+        offer: &PairingOffer,
+        server: &ServerId,
+    ) -> Result<Option<ServerAddress>, SyncError> {
+        let previous = (self.persisted.server_url.clone(), self.persisted.pin);
+        self.persisted.server_url = Some(offer.content.server_url.to_string());
+        self.persisted.pin = offer.content.spki_pin;
+        let checked = self.connect().and_then(|()| {
+            let (Some(account), Some(connection)) = (self.account.as_mut(), self.server.as_mut())
+            else {
+                return Err(SyncError::NotSetUp("no account"));
+            };
+            account.refresh(
+                connection.as_mut(),
+                &mut *self.ports.keychain,
+                &mut *self.ports.store,
+            )?;
+            Ok(offer.server_address(account.state(), server).ok())
+        });
+        if !matches!(checked, Ok(Some(_))) {
+            (self.persisted.server_url, self.persisted.pin) = previous;
+            self.connect()?;
+        }
+        match checked {
+            Ok(address) => Ok(address),
+            Err(e) if e.is_offline() => Err(e),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Hides a warning on this device only (`dismissSuspect`; ADR 0001, section 5: no shared
@@ -1720,7 +2634,7 @@ impl EngineCore {
 
     /// "Keep this" (`keepConflictVersion`): the original's file takes the chosen content and
     /// the copies are deleted; the other contents stay restorable through the history. Returns
-    /// an undo token (the current head, for a restore).
+    /// an undo token ([`Self::undo`]), empty when the server holds nothing of the group yet.
     pub fn keep_conflict_version(
         &mut self,
         group_id: &str,
@@ -1733,12 +2647,15 @@ impl EngineCore {
             .get_mut(&fid)
             .ok_or(SyncError::Invalid("unknown folder"))?;
         let tree = f.sync.local().clone();
-        let token = f
-            .sync
-            .view()
-            .frontier()
-            .map(|e| e.commit.to_hex())
-            .unwrap_or_default();
+        // The group as the server holds it now, for the undo: the original and every copy.
+        let before = UndoState::of(
+            f.sync.remote(),
+            std::iter::once(original).chain(
+                tree.iter()
+                    .filter(|(_, n)| n.conflict_of == Some(original))
+                    .map(|(id, _)| *id),
+            ),
+        );
         let orig_path = tree.path(&original).ok_or(SyncError::Invalid("original"))?;
         if chosen != original {
             let chosen_path = tree.path(&chosen).ok_or(SyncError::Invalid("version"))?;
@@ -1787,7 +2704,7 @@ impl EngineCore {
             }
         }
         f.sync.request_full_scan();
-        Ok(token)
+        Ok(self.remember_undo(fid, Some(before)).unwrap_or_default())
     }
 
     /// Items this device cannot hold (`listNameIssues`).
@@ -2016,41 +2933,210 @@ impl EngineCore {
         })
     }
 
-    /// Restores one file or directory of a timeline entry (`restoreFile`).
+    /// Restores one file or directory of a timeline entry (`restoreFile`). The answer carries
+    /// an undo token; a restore the upload budget holds back waits as a job.
     pub fn restore_file(
         &mut self,
         folder: &str,
         entry: &str,
         path: &str,
     ) -> Result<RestoreOutcome, SyncError> {
-        let commit = hangar_drive_protocol::ids::CommitId::from_hex(entry)
-            .map_err(|_| SyncError::Invalid("entry"))?;
-        let names: Vec<String> = path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let result = self.with_ctx(folder, |sync, cx| {
-            let old = sync.tree_at(cx, &commit)?;
-            let item = old.lookup(&names).ok_or(SyncError::Invalid("path"))?;
-            let original = old.get(&item).map(|n| n.name.clone()).unwrap_or_default();
-            let name = sync.restore_item(cx, &commit, &item)?;
-            Ok((name, original))
-        });
-        Ok(restore_outcome(result.map(|(name, original)| {
-            (1, (name != original).then_some(name))
-        })))
+        let id = parse_folder(folder)?;
+        let kind = RestoreKind::File {
+            entry: CommitId::from_hex(entry).map_err(|_| SyncError::Invalid("entry"))?,
+            path: path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        };
+        let result = self.run_restore(id, &kind);
+        Ok(self.restore_answer(id, kind, result))
     }
 
-    /// Restores the whole folder to a timeline entry (`resetFolder`).
+    /// Restores the whole folder to a timeline entry (`resetFolder`), with an undo token; a
+    /// waiting reset is computed again when it runs.
     pub fn reset_folder(&mut self, folder: &str, entry: &str) -> Result<RestoreOutcome, SyncError> {
-        let commit = hangar_drive_protocol::ids::CommitId::from_hex(entry)
-            .map_err(|_| SyncError::Invalid("entry"))?;
-        let result = self.with_ctx(folder, |sync, cx| {
-            sync.restore_folder(cx, &commit)?;
-            Ok(sync.remote().count_files() as u64)
+        let id = parse_folder(folder)?;
+        let kind = RestoreKind::Folder {
+            entry: CommitId::from_hex(entry).map_err(|_| SyncError::Invalid("entry"))?,
+        };
+        let result = self.run_restore(id, &kind);
+        Ok(self.restore_answer(id, kind, result))
+    }
+
+    /// Runs a restore on the current state.
+    fn run_restore(&mut self, folder: FolderId, kind: &RestoreKind) -> Result<Restored, SyncError> {
+        let hex = hex_id(&folder);
+        match kind {
+            RestoreKind::File { entry, path } => self.with_ctx(&hex, |sync, cx| {
+                let old = sync.tree_at(cx, entry)?;
+                let item = old.lookup(path).ok_or(SyncError::Invalid("path"))?;
+                let original = old.get(&item).map(|n| n.name.clone()).unwrap_or_default();
+                let name = sync.restore_item(cx, entry, &item)?;
+                let renamed = (name != original).then_some(name);
+                Ok((1, renamed, sync.take_last_action()))
+            }),
+            RestoreKind::Folder { entry } => self.with_ctx(&hex, |sync, cx| {
+                sync.restore_folder(cx, entry)?;
+                let files = sync.remote().count_files() as u64;
+                Ok((files, None, sync.take_last_action()))
+            }),
+            RestoreKind::Trash { items } => self.with_ctx(&hex, |sync, cx| {
+                let mut by_entry: BTreeMap<CommitId, Vec<ItemId>> = BTreeMap::new();
+                for (entry, item) in items {
+                    by_entry.entry(*entry).or_default().push(*item);
+                }
+                let mut count = 0;
+                let mut undo: Option<UndoState> = None;
+                for (entry, ids) in &by_entry {
+                    count += sync.restore_items(cx, entry, ids)?;
+                    if let Some(change) = sync.take_last_action() {
+                        match &mut undo {
+                            Some(all) => all.merge(change),
+                            None => undo = Some(change),
+                        }
+                    }
+                }
+                Ok((count, None, undo))
+            }),
+        }
+    }
+
+    /// The window's answer to a restore: done with its undo token, a job for a restore the
+    /// upload budget holds back, or why nothing changed.
+    fn restore_answer(
+        &mut self,
+        folder: FolderId,
+        kind: RestoreKind,
+        result: Result<Restored, SyncError>,
+    ) -> RestoreOutcome {
+        match result {
+            Ok((count, renamed_to, change)) => RestoreOutcome::Done {
+                count,
+                renamed_to,
+                undo_token: self.remember_undo(folder, change),
+            },
+            Err(e) => match restore_refusal(e) {
+                RestoreOutcome::WaitBudget { .. } => match self.add_restore_job(folder, kind) {
+                    Ok(job_id) => RestoreOutcome::WaitBudget { job_id },
+                    Err(_) => RestoreOutcome::Failed,
+                },
+                other => other,
+            },
+        }
+    }
+
+    fn add_restore_job(
+        &mut self,
+        folder: FolderId,
+        kind: RestoreKind,
+    ) -> Result<String, SyncError> {
+        let id = base64url(&random_id::<12>(&mut *self.ports.entropy)?);
+        let next_try_ms = self.now() + RESTORE_RETRY_MS;
+        self.persisted.restore_jobs.push(RestoreJob {
+            id: id.clone(),
+            folder,
+            kind,
+            next_try_ms,
         });
-        Ok(restore_outcome(result.map(|n| (n, None))))
+        self.save()?;
+        Ok(id)
+    }
+
+    /// Stops a restore that waits for the upload budget (`cancelRestore`); a job that ran or
+    /// was stopped already is no error.
+    pub fn cancel_restore(&mut self, job_id: &str) -> Result<(), SyncError> {
+        let before = self.persisted.restore_jobs.len();
+        self.persisted.restore_jobs.retain(|j| j.id != job_id);
+        if self.persisted.restore_jobs.len() != before {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Tries the waiting restores that are due again. One the budget still holds back, or that
+    /// cannot reach the server, waits on; one that ran or can no longer run (expired, no room,
+    /// the folder is gone) leaves the list.
+    fn run_restore_jobs(&mut self) {
+        let now = self.now();
+        let due: Vec<RestoreJob> = self
+            .persisted
+            .restore_jobs
+            .iter()
+            .filter(|j| j.next_try_ms <= now)
+            .cloned()
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for job in due {
+            let wait = match self.run_restore(job.folder, &job.kind) {
+                Ok(_) => false,
+                Err(e) if e.is_offline() => true,
+                Err(e) => matches!(restore_refusal(e), RestoreOutcome::WaitBudget { .. }),
+            };
+            if wait {
+                if let Some(j) = self
+                    .persisted
+                    .restore_jobs
+                    .iter_mut()
+                    .find(|j| j.id == job.id)
+                {
+                    j.next_try_ms = now + RESTORE_RETRY_MS;
+                }
+            } else {
+                self.persisted.restore_jobs.retain(|j| j.id != job.id);
+            }
+        }
+        let _ = self.save();
+    }
+
+    /// Keeps what an action changed under a new undo token; `None` when it changed nothing or
+    /// no token could be drawn (the window then offers no undo).
+    fn remember_undo(&mut self, folder: FolderId, change: Option<UndoState>) -> Option<String> {
+        let change = change.filter(|c| !c.is_empty())?;
+        let token = base64url(&random_id::<16>(&mut *self.ports.entropy).ok()?);
+        self.undo.push_back((token.clone(), folder, change));
+        while self.undo.len() > MAX_UNDO {
+            self.undo.pop_front();
+        }
+        Some(token)
+    }
+
+    /// Undoes a restore, a folder reset or a "keep this" (`undo`, UX 7 and 9): a new commit puts
+    /// the items the action touched back in their state before it, so the history keeps both
+    /// and changes of other devices since stay. A token is used once.
+    pub fn undo(&mut self, token: &str) -> Result<(), SyncError> {
+        let index = self
+            .undo
+            .iter()
+            .position(|(t, _, _)| t == token)
+            .ok_or(SyncError::Invalid("unknown undo token"))?;
+        let (_, folder, change) = self
+            .undo
+            .get(index)
+            .cloned()
+            .ok_or(SyncError::Invalid("unknown undo token"))?;
+        self.with_ctx(&hex_id(&folder), |sync, cx| sync.revert(cx, &change))?;
+        self.undo.remove(index);
+        Ok(())
+    }
+
+    /// Brings back the files another device deleted, from an activity entry
+    /// (`restoreRemoteDeleted`, UX 8.1): one commit with every file that is still gone, at its
+    /// old place; a file that is back already stays as it is. Returns the files that came back.
+    pub fn restore_remote_deleted(&mut self, activity_id: &str) -> Result<u64, SyncError> {
+        let delete = self
+            .remote_deletes
+            .get(activity_id)
+            .cloned()
+            .ok_or(SyncError::Invalid("unknown activity entry"))?;
+        self.with_ctx(&hex_id(&delete.folder), |sync, cx| {
+            let back = sync.restore_items(cx, &delete.commit, &delete.items)?;
+            sync.take_last_action();
+            Ok(back)
+        })
     }
 
     /// "Undo a device" (`findBeforeDevice`, ADR 0001, section 5): the last head before the first
@@ -2135,30 +3221,27 @@ impl EngineCore {
         })
     }
 
-    /// Restores trash items (`restoreTrash`).
+    /// Restores trash items (`restoreTrash`): one commit per timeline entry they come from,
+    /// with one undo token for all of them.
     pub fn restore_trash(
         &mut self,
         folder: &str,
         items: &[String],
     ) -> Result<RestoreOutcome, SyncError> {
-        let mut count = 0u64;
+        let id = parse_folder(folder)?;
+        let mut picked = Vec::with_capacity(items.len());
         for item in items {
-            let (commit, id) = item
+            let (commit, item) = item
                 .split_once(':')
                 .ok_or(SyncError::Invalid("trash item"))?;
-            let commit = hangar_drive_protocol::ids::CommitId::from_hex(commit)
-                .map_err(|_| SyncError::Invalid("trash item"))?;
-            let id = ItemId::from_hex(id).map_err(|_| SyncError::Invalid("trash item"))?;
-            match self.with_ctx(folder, |sync, cx| sync.restore_item(cx, &commit, &id)) {
-                Ok(_) => count += 1,
-                Err(e) => return Ok(restore_outcome(Err(e))),
-            }
+            picked.push((
+                CommitId::from_hex(commit).map_err(|_| SyncError::Invalid("trash item"))?,
+                ItemId::from_hex(item).map_err(|_| SyncError::Invalid("trash item"))?,
+            ));
         }
-        Ok(RestoreOutcome::Done {
-            count,
-            renamed_to: None,
-            undo_token: None,
-        })
+        let kind = RestoreKind::Trash { items: picked };
+        let result = self.run_restore(id, &kind);
+        Ok(self.restore_answer(id, kind, result))
     }
 
     // -- Devices ----------------------------------------------------------------------------
@@ -2304,9 +3387,9 @@ impl EngineCore {
 
     /// The person takes in the heads of a removed device that stopped a folder
     /// (`acceptRemovedHeads`, security review H1): the barrier after them is written, the folder
-    /// syncs again, and the window offers "Undo a device" for them (`findBeforeDevice`).
-    /// Returns how many heads the barrier covers.
-    pub fn accept_removed_heads(&mut self, folder: &str) -> Result<usize, SyncError> {
+    /// syncs again, and the window offers "Undo a device" for them: the answer names the
+    /// timeline entry right before the first of them.
+    pub fn accept_removed_heads(&mut self, folder: &str) -> Result<AcceptedHeads, SyncError> {
         let id = parse_folder(folder)?;
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Err(SyncError::NotSetUp("no account"));
@@ -2324,8 +3407,20 @@ impl EngineCore {
             entropy: &mut *self.ports.entropy,
             settings: &self.folder_settings,
         };
+        let first = lf.sync.removed_heads().iter().map(|h| h.sequence).min();
         let outcome = accept_removed_heads(&mut jx, &mut lf.sync, &*lf.fs)?;
-        Ok(outcome.removed_heads.len())
+        let before_entry_id = first.and_then(|first| {
+            lf.sync
+                .meta()
+                .timeline
+                .iter()
+                .rfind(|t| !t.side && t.sequence < first)
+                .map(|t| t.commit.to_hex())
+        });
+        Ok(AcceptedHeads {
+            count: outcome.removed_heads.len() as u64,
+            before_entry_id,
+        })
     }
 
     fn device_name_of(&self, device: &DeviceId) -> String {
@@ -2378,14 +3473,10 @@ fn diff_counts(before: &Tree, now: &Tree) -> (u64, u64, u64) {
     (changed, added, deleted)
 }
 
-fn restore_outcome(result: Result<(u64, Option<String>), SyncError>) -> RestoreOutcome {
-    match result {
-        Ok((count, renamed_to)) => RestoreOutcome::Done {
-            count,
-            renamed_to,
-            undo_token: None,
-        },
-        Err(SyncError::Net(e)) => match e.code() {
+/// Why a restore changed nothing, as the window says it; `WaitBudget` names no job yet.
+fn restore_refusal(error: SyncError) -> RestoreOutcome {
+    match error {
+        SyncError::Net(e) => match e.code() {
             Some(ErrorCode::BudgetExceeded) => RestoreOutcome::WaitBudget {
                 job_id: String::new(),
             },
@@ -2393,7 +3484,16 @@ fn restore_outcome(result: Result<(u64, Option<String>), SyncError>) -> RestoreO
             Some(ErrorCode::MissingObjects) | Some(ErrorCode::NotFound) => RestoreOutcome::Expired,
             _ => RestoreOutcome::Failed,
         },
-        Err(_) => RestoreOutcome::Failed,
+        _ => RestoreOutcome::Failed,
+    }
+}
+
+fn activity_id(entry: &ActivityEntry) -> &str {
+    match entry {
+        ActivityEntry::File { id, .. }
+        | ActivityEntry::Group { id, .. }
+        | ActivityEntry::RemoteDeleted { id, .. }
+        | ActivityEntry::CameBack { id, .. } => id,
     }
 }
 

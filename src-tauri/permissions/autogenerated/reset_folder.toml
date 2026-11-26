@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reset-folder"
+description = "Enables the reset_folder command without any pre-configured scope."
+commands.allow = ["reset_folder"]
+
+[[permission]]
+identifier = "deny-reset-folder"
+description = "Denies the reset_folder command without any pre-configured scope."
+commands.deny = ["reset_folder"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-older-state"
+description = "Enables the check_older_state command without any pre-configured scope."
+commands.allow = ["check_older_state"]
+
+[[permission]]
+identifier = "deny-check-older-state"
+description = "Denies the check_older_state command without any pre-configured scope."
+commands.deny = ["check_older_state"]

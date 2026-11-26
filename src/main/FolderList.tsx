@@ -27,7 +27,11 @@ export function folderStatusText(folder: Folder, t: Translate): string {
     case "stopped":
       return t("folder.status.stopped", {
         reason: t(
-          status.reason === "missing" ? "folder.reason.missing" : "folder.reason.olderState",
+          status.reason === "missing"
+            ? "folder.reason.missing"
+            : status.reason === "olderState"
+              ? "folder.reason.olderState"
+              : "folder.reason.removedHeads",
         ),
       });
   }
@@ -48,9 +52,12 @@ function statusTone(folder: Folder): string {
 export function FolderList({
   folders,
   open,
+  onDeleted,
 }: {
   readonly folders: readonly Folder[];
   readonly open: Open;
+  /** A folder was deleted everywhere (the person said yes in the native question). */
+  readonly onDeleted: (name: string) => void;
 }) {
   const t = useT();
   const roving = useRoving(folders.length + 1);
@@ -61,6 +68,7 @@ export function FolderList({
           key={folder.id}
           folder={folder}
           open={open}
+          onDeleted={onDeleted}
           tabIndex={roving.tabIndex(index)}
           onFocus={() => {
             roving.onItemFocus(index);
@@ -93,11 +101,13 @@ export function FolderList({
 function FolderRow({
   folder,
   open,
+  onDeleted,
   tabIndex,
   onFocus,
 }: {
   readonly folder: Folder;
   readonly open: Open;
+  readonly onDeleted: (name: string) => void;
   readonly tabIndex: 0 | -1;
   readonly onFocus: () => void;
 }) {
@@ -157,8 +167,13 @@ function FolderRow({
       label: t("folder.menu.delete"),
       danger: true,
       separated: true,
+      // No question of the window's own: the shell asks natively and names the folder (security
+      // review L2), so a second question here would only make the person answer twice.
       onSelect: () => {
-        open({ kind: "deleteFolder", folder });
+        void action.run(async () => {
+          const outcome = await backend.deleteFolderEverywhere(folder.id);
+          if (outcome === "deleted") onDeleted(folder.name);
+        });
       },
     },
   ];

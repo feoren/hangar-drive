@@ -9,6 +9,12 @@
 //! anyone could create slots under invented IDs until the server's slot limit refused every
 //! real pairing. Now each account holds at most [`MAX_OPEN_PAIRINGS`] open slots, and only the
 //! reserving account can read its slot.
+//!
+//! Lifetime (finding E2E-6): the request carries the new device's name sealed under a key only
+//! the holders of the pairing secret derive, and the inviting device closes the slot with
+//! `DELETE` once the person answered, so the request leaves the server at once; a slot nobody
+//! closes is deleted when it expires, by the next reservation and by the periodic housekeeping
+//! of the collection job (`retention::housekeeping`).
 
 use hangar_drive_crypto::pairing::OFFER_LIFETIME_MS;
 use hangar_drive_protocol::api::{
@@ -94,6 +100,20 @@ pub async fn post(app: &App, id: PairingId, request: PairingRequest) -> ApiResul
         None => ErrorCode::NotFound,
     }
     .into())
+}
+
+/// `DELETE /pairing/{id}` (the inviting device, once the person accepted or declined): deletes
+/// the slot and the request in it. Only a slot of the session's account; closing a slot that is
+/// gone already is no error, so a retry after a lost answer succeeds.
+pub async fn close(app: &App, session: &Session, id: PairingId) -> ApiResult<()> {
+    let mut tx = begin_write(&app.db).await?;
+    sqlx::query("DELETE FROM pairing WHERE id = ? AND account_pk = ?")
+        .bind(id.as_bytes().as_slice())
+        .bind(session.account_pk)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// `GET /pairing/{id}` (the inviting device, only of its own account).

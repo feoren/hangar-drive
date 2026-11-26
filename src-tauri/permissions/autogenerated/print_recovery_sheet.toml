@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-print-recovery-sheet"
+description = "Enables the print_recovery_sheet command without any pre-configured scope."
+commands.allow = ["print_recovery_sheet"]
+
+[[permission]]
+identifier = "deny-print-recovery-sheet"
+description = "Denies the print_recovery_sheet command without any pre-configured scope."
+commands.deny = ["print_recovery_sheet"]

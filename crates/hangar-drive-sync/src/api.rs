@@ -55,6 +55,29 @@ impl NumberRows {
     }
 }
 
+/// The server key number of the key the server presents now (`getServerNumber`, ADR 0001,
+/// section 6, "Pin rotation"), and the server CLI command that prints the server's own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerNumberView {
+    /// The number to compare.
+    pub number: NumberRows,
+    /// The command the operator runs on the server.
+    pub command: String,
+}
+
+/// Why an offer could not bring the server's new identity (`fixServerWithOffer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FixServerError {
+    /// Not a pairing link.
+    NotALink,
+    /// The offer is of another account or server, or no trusted device of this account signed
+    /// it.
+    OtherAccount,
+    /// The offer's time is over.
+    Expired,
+}
+
 /// A QR code as a square of modules, row by row, "1" dark and "0" light.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QrMatrix {
@@ -521,7 +544,8 @@ pub struct RecoveryCodeView {
 }
 
 /// The public part of the recovery sheet: printed in the clear, and as the link
-/// `hangar-drive://recover#...`, which never carries the code (open point A).
+/// `hangar-drive://recover#...`, which never carries the code (open point A). The link is
+/// what a recovery reads: it also carries the genesis anchor and the optional pin (N1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoverySheetView {
@@ -531,6 +555,10 @@ pub struct RecoverySheetView {
     pub server_id: String,
     /// The account ID.
     pub account_id: String,
+    /// The hash of the account's first log entry, in hex (the genesis anchor).
+    pub genesis_anchor: String,
+    /// The SPKI pin of a self-signed server in base64url (as in an invite link), if any.
+    pub pin: Option<String>,
     /// The recovery link.
     pub link: String,
 }
@@ -551,6 +579,10 @@ pub enum RecoverError {
     Unreachable,
     /// Not secure.
     Insecure,
+    /// The new device's name is blank.
+    Blank,
+    /// The new device's name has white space at an edge.
+    EdgeWhitespace,
 }
 
 /// One version of a conflict group.
@@ -834,6 +866,8 @@ pub struct PairingOfferView {
     pub code: Vec<String>,
     /// The server's host.
     pub host: String,
+    /// The account ID in hex, so the new device's question can be compared (N2).
+    pub account: String,
     /// The QR code of the link, drawn by the app shell (`None` here).
     pub qr: Option<QrMatrix>,
     /// When it expires.
@@ -887,11 +921,15 @@ pub enum PairError {
 }
 
 /// The outcome of pairing on the new device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PairResult {
-    /// Joined.
-    Joined,
+    /// Joined: the devices of the account the new device joined, for the person to confirm
+    /// that these are their own (N2).
+    Joined {
+        /// The account's devices, this one included.
+        devices: Vec<Device>,
+    },
     /// Failed.
     Failed {
         /// Why.
@@ -947,6 +985,123 @@ pub struct RemovedHeadView {
     pub device_name: String,
     /// The folder sequence.
     pub sequence: u64,
+}
+
+/// A checked invite link (`checkInvite`, N3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteCheck {
+    /// The server's host (and port) as the client connects to it: internationalized names in
+    /// their ASCII (punycode) form, so a look-alike name shows as `xn--`.
+    pub host: String,
+    /// The link carries an SPKI pin (a self-signed server): the window can say that this link
+    /// trusts that one key and no certificate authority.
+    pub pinned: bool,
+    /// A label of the host is punycode (`xn--`), which can hide a look-alike name.
+    pub punycode: bool,
+}
+
+/// What a link names, read offline before anything is sent (`inspectLink`, N2): the window
+/// shows host and account and asks before it connects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum InspectedLink {
+    /// An operator's invite.
+    Invite {
+        /// The server's host, as in [`InviteCheck::host`].
+        host: String,
+        /// The link carries an SPKI pin.
+        pinned: bool,
+    },
+    /// A pairing offer of another device.
+    Pair {
+        /// The server's host.
+        host: String,
+        /// The account ID in hex.
+        account: String,
+        /// The offer carries an SPKI pin.
+        pinned: bool,
+    },
+    /// A recovery sheet.
+    Recover {
+        /// The server's host.
+        host: String,
+        /// The account ID in hex.
+        account: String,
+        /// The sheet carries an SPKI pin.
+        pinned: bool,
+    },
+}
+
+/// Why `inspectLink` read nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkProblem {
+    /// Not a link of the app.
+    NotALink,
+    /// A link of the app, but a part of it does not decode.
+    Damaged,
+    /// The server address is not allowed.
+    Insecure,
+}
+
+/// What taking in a removed device's heads did (`acceptRemovedHeads`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedHeads {
+    /// The heads the barrier covers.
+    pub count: u64,
+    /// The timeline entry right before the first of them, for "Undo a device"; `None` when
+    /// the folder has no earlier version.
+    pub before_entry_id: Option<String>,
+}
+
+/// Why a new account could not be started (`beginAccount`): an invite or a device name error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BeginError {
+    /// Not an invite link.
+    NotALink,
+    /// The invite was used.
+    Used,
+    /// The invite expired.
+    Expired,
+    /// The server cannot be reached.
+    Unreachable,
+    /// Not secure.
+    Insecure,
+    /// The device name is blank.
+    Blank,
+    /// The device name has white space at an edge.
+    EdgeWhitespace,
+}
+
+/// Why a folder cannot be synced (the window's `FolderRefusal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FolderRefusal {
+    /// A network drive.
+    Network,
+    /// A whole drive.
+    Root,
+    /// A system folder, the home folder, application data, the app's own data or another
+    /// sync client's folder.
+    System,
+    /// Inside or around a synced folder.
+    Nested,
+    /// The folder cannot be read or resolved.
+    NoAccess,
+    /// The folder's marker names another folder (`findMissingFolder`).
+    WrongFolder,
+}
+
+/// A refused folder and, for [`FolderRefusal::Nested`], the synced folder it collides with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FolderRefusalView {
+    /// Why.
+    pub reason: FolderRefusal,
+    /// The colliding synced folder's name.
+    pub folder: Option<String>,
 }
 
 /// Why an invite link was refused.

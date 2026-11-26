@@ -16,6 +16,7 @@ export type ShownWarningKind = ShownWarning["kind"];
 const PRIORITY: readonly ShownWarningKind[] = [
   "suspect",
   "massDelete",
+  "removedHeads",
   "removed",
   "refused",
   "updateRequired",

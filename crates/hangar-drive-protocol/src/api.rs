@@ -21,12 +21,14 @@
 //! | `PUT /api/v1/pairing/{pairing id}` | | [`PairingReservation`] |
 //! | `POST /api/v1/pairing/{pairing id}` | [`PairingRequest`] | `204` |
 //! | `GET /api/v1/pairing/{pairing id}` | | [`PairingRequest`] |
+//! | `DELETE /api/v1/pairing/{pairing id}` | | `204` |
 //! | `POST /api/v1/folders/{folder}/objects/missing` | [`MissingObjectsRequest`] | [`MissingObjectsResponse`] |
 //! | `PUT /api/v1/folders/{folder}/objects/{id}` | object bytes | [`UploadResponse`] |
 //! | `GET /api/v1/folders/{folder}/objects/{id}` | | object bytes |
 //! | `POST /api/v1/folders/{folder}/commit` | [`CommitRequest`] | [`CommitResponse`] |
 //! | `GET /api/v1/folders/{folder}/commits?after=N` | | [`DeltaPage`] |
 //! | `POST /api/v1/folders/{folder}/retire` | | `204` |
+//! | `DELETE /api/v1/folders/{folder}/retire` (brings a retired folder back) | | `204` |
 //!
 //! Every error reply is an [`ErrorBody`] with the HTTP status of [`ErrorCode::http_status`].
 //! Tokens travel only in the `Authorization: Bearer` header, never in a path or query.
@@ -56,7 +58,6 @@ use crate::ids::{
     AccountId, Blob, Challenge, CommitId, DeviceId, Epoch, FolderId, InviteToken, LogHead,
     ObjectId, PairingId, PublicKey, ServerId, SessionToken, Signature,
 };
-use crate::name::check_display_name;
 
 /// Prefix of every path of this protocol version.
 pub const API_PREFIX: &str = "/api/v1";
@@ -219,6 +220,10 @@ pub struct ProofRequest {
     pub device: DeviceId,
     /// The challenge it answers.
     pub challenge: Challenge,
+    /// The base URL the device connects to (`hangar_drive_crypto::session::base_url`), part of
+    /// the signed statement. A server with a public URL refuses every other one, so a host that
+    /// relays a sign-in under the real server ID cannot hand on the session.
+    pub server_url: String,
     /// Ed25519 signature with the device's key from the account log.
     pub signature: Signature,
 }
@@ -341,6 +346,9 @@ pub enum ApiCall {
     ReservePairing,
     /// `GET /api/v1/pairing/{pairing id}` (the inviting device fetches the request).
     GetPairing,
+    /// `DELETE /api/v1/pairing/{pairing id}`: the inviting device closes its slot once the
+    /// person answered the request, so the request does not wait on the server until it expires.
+    ClosePairing,
     /// `POST /api/v1/folders/{folder}/objects/missing`.
     MissingObjects,
     /// `PUT /api/v1/folders/{folder}/objects/{id}`.
@@ -351,7 +359,8 @@ pub enum ApiCall {
     Commit,
     /// `GET /api/v1/folders/{folder}/commits`.
     GetCommits,
-    /// `POST /api/v1/folders/{folder}/retire`.
+    /// `POST /api/v1/folders/{folder}/retire`, and `DELETE` on the same path, which brings a
+    /// retired folder back: one folder lifecycle call.
     Retire,
 }
 
@@ -528,7 +537,9 @@ pub struct RecordResponse {
 // ------------------------------------------------------------------------------------------
 
 /// A new device's request to join, routed by the pairing ID. `tag` is the HMAC under the
-/// pairing secret, which the server never learns.
+/// pairing secret, which the server never learns, and the device name travels sealed under a
+/// key derived from the same secret (`hangar_drive_crypto::pairing`), so the server never sees
+/// it either: device names are sealed records everywhere else (ADR 0001, section 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairingRequest {
@@ -540,11 +551,15 @@ pub struct PairingRequest {
     pub kem: PublicKey,
     /// Its proof of possession.
     pub proof: Signature,
-    /// Its name, shown in `Add device <name>?`.
-    pub name: String,
+    /// Its name, shown in `Add device <name>?`, sealed: a 24-byte nonce, then the
+    /// XChaCha20-Poly1305 ciphertext of the UTF-8 name with its 16-byte tag.
+    pub sealed_name: Blob,
     /// HMAC-SHA-256 under the pairing MAC key.
     pub tag: Blob,
 }
+
+/// Bytes a sealed device name adds to the name: the nonce and the AEAD tag.
+pub const SEALED_NAME_OVERHEAD: usize = 24 + 16;
 
 /// Reserved pairing slots one account may hold at a time.
 pub const MAX_OPEN_PAIRINGS: usize = 4;
@@ -560,9 +575,12 @@ pub struct PairingReservation {
 }
 
 impl PairingRequest {
-    /// The name ([`crate::name::check_display_name`]) and the tag size.
+    /// The sizes of the sealed name (one to [`MAX_DEVICE_NAME_LEN`] bytes of name) and of the
+    /// tag. The name itself is checked by the inviting device once it opened it
+    /// ([`crate::name::check_display_name`]); the server cannot read it.
     pub fn validate(&self) -> Result<(), RequestError> {
-        if check_display_name(&self.name, MAX_DEVICE_NAME_LEN).is_err() || self.tag.0.len() != 32 {
+        let names = SEALED_NAME_OVERHEAD + 1..=SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN;
+        if !names.contains(&self.sealed_name.0.len()) || self.tag.0.len() != 32 {
             return Err(RequestError::Invalid);
         }
         Ok(())
@@ -857,6 +875,11 @@ pub enum ErrorCode {
     ChallengeInvalid,
     /// The session proof does not verify.
     ProofInvalid,
+    /// The session proof verifies with the key the account log last listed for this device,
+    /// but the log removed the device. Only the device itself (or a holder of its key) can
+    /// produce such a proof, so nobody else learns from this code whether a device was removed;
+    /// the device then forgets the account (ADR 0001, section 6, "Sessions").
+    DeviceRemoved,
     /// The account, device or folder ID is already taken.
     AlreadyExists,
     /// A log entry the device log verifier refused.
@@ -901,7 +924,7 @@ impl ErrorCode {
             | ErrorCode::CommitRefused
             | ErrorCode::MissingObjects => 400,
             ErrorCode::Unauthorized | ErrorCode::ChallengeInvalid | ErrorCode::ProofInvalid => 401,
-            ErrorCode::Forbidden | ErrorCode::InviteInvalid => 403,
+            ErrorCode::Forbidden | ErrorCode::InviteInvalid | ErrorCode::DeviceRemoved => 403,
             ErrorCode::NotFound => 404,
             ErrorCode::AlreadyExists
             | ErrorCode::RecordVersion
@@ -1178,6 +1201,7 @@ mod tests {
             ApiCall::Events,
             ApiCall::ReservePairing,
             ApiCall::GetPairing,
+            ApiCall::ClosePairing,
             ApiCall::MissingObjects,
             ApiCall::PutObject,
             ApiCall::GetObject,
@@ -1238,22 +1262,26 @@ mod tests {
             sign: PublicKey::from_bytes([2; 32]),
             kem: PublicKey::from_bytes([3; 32]),
             proof: Signature::from_bytes([4; 64]),
-            name: "Laptop".into(),
+            sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
             tag: Blob(vec![5; 32]),
         };
         assert_eq!(request.validate(), Ok(()));
-        let mut bad = request.clone();
-        bad.name = String::new();
-        assert_eq!(bad.validate(), Err(RequestError::Invalid));
-        let mut bad = request.clone();
-        bad.name = "a\nb".into();
-        assert_eq!(bad.validate(), Err(RequestError::Invalid));
-        let mut bad = request.clone();
-        bad.name = "Lap\u{202e}pot".into();
-        assert_eq!(bad.validate(), Err(RequestError::Invalid));
-        let mut bad = request.clone();
-        bad.name = "a".repeat(MAX_DEVICE_NAME_LEN + 1);
-        assert_eq!(bad.validate(), Err(RequestError::Invalid));
+        let mut longest = request.clone();
+        longest.sealed_name = Blob(vec![6; SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN]);
+        assert_eq!(longest.validate(), Ok(()));
+        // An empty name, or one longer than any name, does not fit.
+        for len in [
+            0,
+            SEALED_NAME_OVERHEAD,
+            SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN + 1,
+        ] {
+            let mut bad = request.clone();
+            bad.sealed_name = Blob(vec![6; len]);
+            assert_eq!(bad.validate(), Err(RequestError::Invalid), "{len}");
+        }
+        // Nothing called a name reaches the server in the clear.
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("sealed_name").is_some() && json.get("name").is_none());
         let mut bad = request;
         bad.tag = Blob(vec![5; 31]);
         assert_eq!(bad.validate(), Err(RequestError::Invalid));

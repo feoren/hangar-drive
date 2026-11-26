@@ -127,7 +127,9 @@ describe("server identity (UX 8.3)", () => {
     const { mock } = await renderApp("serverIdentityAlone");
     await click("Mit dem Betreiber vergleichen");
     expect(dialogTitle()).toBe("Servernummer vergleichen");
-    expect(dialog()?.querySelector("code")?.textContent).toBe("hangar-drive-server key-number");
+    expect(dialog()?.querySelector("code")?.textContent).toBe(
+      "hangar-drive-server server-key-number",
+    );
     expect(all(".number-group")).toHaveLength(6);
     const yes = button("Ja, gleiche Zahlen, verbinden");
     expect(yes.getAttribute("aria-disabled")).toBe("true");
@@ -138,6 +140,17 @@ describe("server identity (UX 8.3)", () => {
     await click(yes);
     expect(mock.calls).toContain("confirmServerNumber");
     expect(text()).toContain("Verbunden. Alles läuft wieder.");
+  });
+
+  it("trusts nothing when the native question is answered with no", async () => {
+    const { mock } = await renderApp("serverIdentityAlone");
+    mock.controls.nativeConfirm = "no";
+    await click("Mit dem Betreiber vergleichen");
+    await wait(ARM_DELAY_MS + 50);
+    await click("Ja, gleiche Zahlen, verbinden");
+    expect(mock.calls).toContain("confirmServerNumber");
+    expect(text()).toContain("Dann verbinde nicht.");
+    expect(text()).not.toContain("Verbunden. Alles läuft wieder.");
   });
 
   it("says what to do when the numbers differ", async () => {

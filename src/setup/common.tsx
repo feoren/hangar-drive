@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react";
 
-import type { AccountFolder, FolderChoice, NameError } from "../backend/types";
+import type { AccountFolder, FolderChoice, FolderPlace, NameError } from "../backend/types";
 import { formatSize } from "../format";
 import { nameProblem } from "../domain/names";
 import { useLanguage, useT, type Translate } from "../i18n";
@@ -75,8 +75,13 @@ export function DeviceNameField({
 
 interface Choice {
   readonly folder: AccountFolder;
-  readonly path: string;
+  /** The proposed place, or the one the person picked instead. */
+  readonly place: FolderPlace;
   readonly checked: boolean;
+}
+
+function proposed(folder: AccountFolder): FolderPlace {
+  return { path: folder.proposedPath, name: folder.name, token: folder.proposedToken };
 }
 
 /**
@@ -107,7 +112,7 @@ export function FolderChoiceStep({
   const list =
     choices ??
     (loaded.status === "ready"
-      ? loaded.data.folders.map((folder) => ({ folder, path: folder.proposedPath, checked: true }))
+      ? loaded.data.folders.map((folder) => ({ folder, place: proposed(folder), checked: true }))
       : null);
 
   const update = (id: string, change: Partial<Choice>) => {
@@ -123,12 +128,12 @@ export function FolderChoiceStep({
       while (rest.length > 0) {
         const next = rest[0];
         if (!next) break;
-        const count = await backend.countLocalFiles(next.path);
+        const count = await backend.countLocalFiles(next.place.token);
         if (count > 0) {
           setAsking({ queue: rest, done: accepted });
           return;
         }
-        accepted.push({ folderId: next.folder.id, path: next.path });
+        accepted.push({ folderId: next.folder.id, token: next.place.token });
         rest.shift();
       }
       setAsking(null);
@@ -165,7 +170,7 @@ export function FolderChoiceStep({
               <FolderIcon />
               <span className="choice-text">
                 <span className="row-name">{choice.folder.name}</span>
-                <PathText path={choice.path} className="row-sub" />
+                <PathText path={choice.place.path} className="row-sub" />
               </span>
               <span className="choice-size">{formatSize(language, choice.folder.size)}</span>
             </label>
@@ -181,7 +186,7 @@ export function FolderChoiceStep({
                     kind: "account",
                     folderId: choice.folder.id,
                   });
-                  if (result.kind === "picked") update(choice.folder.id, { path: result.path });
+                  if (result.kind === "picked") update(choice.folder.id, { place: result });
                   if (result.kind === "refused")
                     setMessage(folderRefusalText(result.reason, result.folder, t));
                 });
@@ -218,10 +223,10 @@ export function FolderChoiceStep({
         <MergeDialog
           folderId={current.folder.id}
           folderName={current.folder.name}
-          path={current.path}
-          onMerge={(path) => {
-            update(current.folder.id, { path });
-            const accepted = [...asking.done, { folderId: current.folder.id, path }];
+          place={current.place}
+          onMerge={(place) => {
+            update(current.folder.id, { place });
+            const accepted = [...asking.done, { folderId: current.folder.id, token: place.token }];
             setAsking(null);
             proceed(asking.queue.slice(1), accepted);
             return Promise.resolve();

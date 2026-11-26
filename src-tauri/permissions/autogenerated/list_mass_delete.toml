@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-mass-delete"
+description = "Enables the list_mass_delete command without any pre-configured scope."
+commands.allow = ["list_mass_delete"]
+
+[[permission]]
+identifier = "deny-list-mass-delete"
+description = "Denies the list_mass_delete command without any pre-configured scope."
+commands.deny = ["list_mass_delete"]

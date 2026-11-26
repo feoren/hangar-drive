@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-mass-delete"
+description = "Enables the resolve_mass_delete command without any pre-configured scope."
+commands.allow = ["resolve_mass_delete"]
+
+[[permission]]
+identifier = "deny-resolve-mass-delete"
+description = "Denies the resolve_mass_delete command without any pre-configured scope."
+commands.deny = ["resolve_mass_delete"]

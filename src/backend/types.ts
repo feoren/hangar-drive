@@ -7,8 +7,13 @@
 // - Times are milliseconds since the epoch (UTC), sizes are bytes.
 // - Expected outcomes that the person has to see (a used invite, a typo in a code, a restore that
 //   waits) are part of the return type. Only unexpected failures reject, with a BackendError.
-// - Nothing here carries keys, tokens or secrets except the recovery code and the pairing link,
-//   which the person has to see to write down or pass on.
+// - Nothing here carries keys or secrets except the recovery code and the pairing link, which the
+//   person has to see to write down or pass on.
+// - The window never sends a path of its own choosing (security review L2). A place on disk is
+//   one the backend proposed or the person picked in a native dialog, and the backend names it
+//   with an opaque `token`; later commands take the token, the path is only shown.
+// - Hosts are always the ASCII form the client connects to: an internationalized name arrives in
+//   punycode (`xn--...`), so letters that look alike cannot hide another server (N2).
 
 import type { Language } from "../i18n";
 import type { TrayModel } from "../tray/trayModel";
@@ -63,7 +68,13 @@ export type FolderStatus =
   | { readonly kind: "uploading"; readonly count: number }
   | { readonly kind: "downloading"; readonly count: number }
   | { readonly kind: "paused" }
-  | { readonly kind: "stopped"; readonly reason: "missing" | "olderState" };
+  | { readonly kind: "stopped"; readonly reason: StopReason };
+
+/**
+ * Why a folder stopped: its folder is missing, the server shows an older state (UX 8.6), or
+ * changes of a removed device wait for the person's decision (UX 8.9, security review H1).
+ */
+export type StopReason = "missing" | "olderState" | "removedHeads";
 
 export interface Folder {
   readonly id: FolderId;
@@ -148,6 +159,25 @@ export type Warning =
       readonly folderId: FolderId;
       readonly folderName: string;
     }
+  /**
+   * Changes of a device that was removed from the account arrived without the removal's
+   * confirmation. The folder stays stopped until the person takes them in
+   * (`acceptRemovedHeads`) and then usually undoes them (UX 8.9).
+   */
+  | {
+      readonly kind: "removedHeads";
+      readonly id: string;
+      readonly folderId: FolderId;
+      readonly folderName: string;
+      /** The removed devices' names as far as this device still knows them; "" when unknown. */
+      readonly devices: readonly string[];
+      /** How many saved states (commits) of them wait; for the error report, never shown. */
+      readonly count: number;
+    }
+  /**
+   * This device was removed from the account. `by` names the device that removed it, "" when
+   * that is unknown (the server only answered `deviceRemoved` at sign-in).
+   */
   | { readonly kind: "removed"; readonly id: string; readonly by: string }
   | { readonly kind: "updateRequired"; readonly id: string }
   | { readonly kind: "refused"; readonly id: string }
@@ -224,6 +254,37 @@ export interface Snapshot {
 
 export type InviteError = "notALink" | "used" | "expired" | "unreachable" | "insecure";
 
+/** What `checkInvite` learnt from a valid invite. */
+export interface InviteCheck {
+  /** The server's host, ASCII (punycode for an internationalized name). */
+  readonly host: string;
+  /**
+   * The link carries a pin: the server has no certificate from a public authority, and this
+   * device will trust the key the link names (N3). The window warns calmly before going on.
+   */
+  readonly pinned: boolean;
+}
+
+/** The kinds of link the app reads (UX 4.2 to 4.4); `domain/links.ts` tells them apart. */
+export type LinkKind = "invite" | "pair" | "recover";
+
+/** Why a link could not be read offline: not a link of the app, damaged, or not encrypted. */
+export type LinkError = "notALink" | "damaged" | "insecure";
+
+/**
+ * What a link says before anything is sent (`inspectLink`): read offline, nothing leaves the
+ * device. The window shows host and account and asks before it connects (N2).
+ */
+export type InspectedLink =
+  | { readonly kind: "invite"; readonly host: string; readonly pinned: boolean }
+  | {
+      readonly kind: "pair" | "recover";
+      readonly host: string;
+      /** The account ID in lowercase hex (32 characters), as the recovery sheet prints it. */
+      readonly account: string;
+      readonly pinned: boolean;
+    };
+
 /**
  * Why a device name was refused (rule N5): empty or only filler characters after trimming, or
  * whitespace at the edges. The window trims before sending; the backend checks again.
@@ -235,18 +296,63 @@ export interface RecoveryCode {
   readonly groups: readonly string[];
   /** One-based group the person types back; never 1. */
   readonly checkGroup: number;
+  /** What the recovery sheet prints next to the code (version 2 of the sheet). */
+  readonly sheet: RecoverySheet;
+}
+
+/**
+ * The public part of the recovery sheet, printed in the clear and carried by its link. None of it
+ * is secret; the code is never part of it.
+ */
+export interface RecoverySheet {
+  /** The server address as the client connects to it (`https://drive.example.org/`). */
+  readonly serverUrl: string;
+  /** The server ID, lowercase hex. */
+  readonly serverId: string;
+  /** The account ID, lowercase hex. */
+  readonly accountId: string;
+  /** The genesis anchor: the hash of the account log's first entry, lowercase hex. */
+  readonly genesisAnchor: string;
+  /** The server's pin for a server without a public certificate, null otherwise. */
+  readonly pin: string | null;
+  /** `hangar-drive://recover#...`, which the person pastes or scans during a recovery. */
+  readonly link: string;
+}
+
+/**
+ * The recovery sheet as the person reads it, in the window's language: the window writes the
+ * words, the backend lays them out for printing (with a QR code of `qrLink`) or writes them as
+ * a text file. The code is one of the fields; nothing else secret is in it.
+ */
+export interface RecoverySheetDocument {
+  /** BCP 47 tag of the texts, for the printed page. */
+  readonly language: string;
+  readonly title: string;
+  /** Label and value, in print order: code, server, IDs, anchor, pin, link, date, device. */
+  readonly fields: readonly { readonly label: string; readonly value: string }[];
+  /** The plain sentences under the fields (UX 4.2 step 2). */
+  readonly notes: readonly string[];
+  /** The sheet's link, for the QR code; never the code. */
+  readonly qrLink: string;
+  /** The proposed file name for "Save as file", without a folder. */
+  readonly fileName: string;
 }
 
 export type SaveResult =
   | { readonly kind: "saved"; readonly path: string }
   | { readonly kind: "cancelled" }
   /** The chosen place lies in a synced folder (recovery file only). */
-  | { readonly kind: "inSyncFolder" };
+  | { readonly kind: "inSyncFolder" }
+  /**
+   * The chosen place lies in another sync client's or a cloud folder (OneDrive, Dropbox, Google
+   * Drive, iCloud Drive; security review M2); recovery file only.
+   */
+  | { readonly kind: "inCloudFolder" };
 
 export type FolderRefusal = "network" | "root" | "system" | "nested" | "noAccess" | "wrongFolder";
 
 export type PickResult =
-  | { readonly kind: "picked"; readonly path: string; readonly name: string }
+  | ({ readonly kind: "picked" } & FolderPlace)
   | { readonly kind: "cancelled" }
   | {
       readonly kind: "refused";
@@ -262,9 +368,15 @@ export type PickPurpose =
   /** The new place of a missing folder; the marker must match. */
   | { readonly kind: "find"; readonly folderId: FolderId };
 
+/**
+ * A place on disk the backend handed out. `token` names it in `countLocalFiles`, `finishSetup`,
+ * `addFolder`, `addAccountFolder` and `joinFolders`; `path` and `name` are only shown. The token
+ * from `findMissingFolder` is empty: the folder has moved already, there is nothing to name.
+ */
 export interface FolderPlace {
   readonly path: string;
   readonly name: string;
+  readonly token: string;
 }
 
 export type PairError =
@@ -290,12 +402,15 @@ export interface AccountFolder {
   readonly id: FolderId;
   readonly name: string;
   readonly size: Bytes;
+  /** Where the folder would go, for display; `proposedToken` names that place. */
   readonly proposedPath: string;
+  readonly proposedToken: string;
 }
 
+/** An account folder and the token of its place (`proposedToken` or a picked place). */
 export interface FolderChoice {
   readonly folderId: FolderId;
-  readonly path: string;
+  readonly token: string;
 }
 
 export type RecoverError = "typo" | "unknown" | "used" | "otherApp" | "unreachable" | "insecure";
@@ -430,7 +545,15 @@ export interface PairingOffer {
   /** The code to type, 26 characters, already grouped for reading. */
   readonly code: readonly string[];
   readonly host: string;
+  /** The account ID in lowercase hex, so the new device's question can be compared (N2). */
+  readonly account: string;
   readonly qr: QrMatrix;
+  /**
+   * The same code as a complete SVG document (black on white, with its quiet zone). The window
+   * shows it only as an image (`<img>` with a `data:` URL), never as markup, so nothing the
+   * backend sends becomes part of the page.
+   */
+  readonly qrSvg: string;
   readonly expiresAt: Millis;
 }
 
@@ -439,6 +562,28 @@ export interface PairRequest {
   readonly deviceName: string;
   readonly path: "link" | "typed";
   readonly safety: NumberRows;
+}
+
+/** One saved state of a removed device that stopped a folder (`removedHeads` event). */
+export interface RemovedHead {
+  /** The commit; its timeline entry ID once taken in. */
+  readonly commit: string;
+  readonly deviceId: DeviceId;
+  /** "" when this device no longer knows the name. */
+  readonly deviceName: string;
+  /** The folder sequence. */
+  readonly sequence: number;
+}
+
+/** What `acceptRemovedHeads` did. */
+export interface AcceptedHeads {
+  /** Saved states the barrier now covers. */
+  readonly count: number;
+  /**
+   * The timeline entry right before the first of them, for "Undo a device" (UX 9.4); null when
+   * the folder has no earlier version.
+   */
+  readonly beforeEntryId: string | null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -452,7 +597,27 @@ export interface Settings {
 export interface About {
   readonly version: string;
   readonly build: number | null;
+  /**
+   * Whether in-app updates are set up (an updater key and endpoint in this build). While false,
+   * the window hides "Update now"; `installUpdate` would reject with "updatesOff".
+   */
+  readonly updates: boolean;
 }
+
+/** What `installUpdate` did. */
+export type UpdateOutcome =
+  | { readonly kind: "upToDate" }
+  /** The signed update is installed; on Windows the installer ends the app. */
+  | { readonly kind: "installed"; readonly version: string };
+
+/**
+ * The answer of the native confirmation behind `deleteFolderEverywhere`, an accepted
+ * `answerPairRequest` and `confirmServerNumber` (security review L2). "No" there is not an
+ * error: the folder stays, the device is declined, or the server key is not trusted.
+ */
+export type DeleteOutcome = "deleted" | "kept";
+export type PairAnswer = "added" | "declined";
+export type ServerConfirm = "confirmed" | "declined";
 
 export type PauseDuration = "hour" | "tomorrow" | "manual";
 
@@ -474,7 +639,21 @@ export type BackendEvent =
   /** A notification was clicked: show the window with this banner. */
   | { readonly type: "focusWarning"; readonly warningId: string }
   /** An item of the native tray menu was chosen; the id comes from `TrayMenuItem.id`. */
-  | { readonly type: "trayAction"; readonly actionId: string };
+  | { readonly type: "trayAction"; readonly actionId: string }
+  /**
+   * Changes of a removed device stopped a folder (UX 8.9). The matching `removedHeads` warning
+   * comes with the snapshot; this event asks the window to put the question in front.
+   */
+  | {
+      readonly type: "removedHeads";
+      readonly folderId: FolderId;
+      readonly heads: readonly RemovedHead[];
+    }
+  /**
+   * The OS handed the app a `hangar-drive://` link (join, pair, recover), at start or while it
+   * runs. The text is passed on as it came; the window never acts on it without the person.
+   */
+  | { readonly type: "openLink"; readonly link: string };
 
 export type Unsubscribe = () => void;
 
@@ -488,19 +667,26 @@ export interface Backend {
   getSnapshot(): Promise<Snapshot>;
   subscribe(listener: (event: BackendEvent) => void): Unsubscribe;
 
-  /** Reads text from the clipboard, only when the person clicked "Paste" (UX 4.2 step 1). */
+  /**
+   * Reads text from the clipboard, only when the person clicked "Paste" (UX 4.2 step 1). Only a
+   * link or code of the app comes back; anything else, like an empty clipboard, is "".
+   */
   readClipboardText(): Promise<string>;
 
   // Setup, new account (UX 4.2)
-  checkInvite(link: string): Promise<Result<{ readonly host: string }, InviteError>>;
+  checkInvite(link: string): Promise<Result<InviteCheck, InviteError>>;
+  /** Reads a link offline, without contacting anyone, so the window can ask first (N2). */
+  inspectLink(link: string): Promise<Result<InspectedLink, LinkError>>;
   defaultDeviceName(): Promise<string>;
   /** Checks the invite again and creates the device identity locally; redeems nothing yet. */
   beginAccount(
     link: string,
     deviceName: string,
   ): Promise<Result<RecoveryCode, InviteError | NameError>>;
-  printRecoverySheet(): Promise<void>;
-  saveRecoveryFile(): Promise<SaveResult>;
+  /** Prints the sheet of the current code as the window worded it. */
+  printRecoverySheet(document: RecoverySheetDocument): Promise<void>;
+  /** Writes the same sheet as a text file; refuses a place inside a synced folder. */
+  saveRecoveryFile(document: RecoverySheetDocument): Promise<SaveResult>;
   /** Copies the code; the backend clears the clipboard after one minute. */
   copyRecoveryCode(): Promise<void>;
   /**
@@ -510,24 +696,46 @@ export interface Backend {
   confirmRecoveryGroup(group: string): Promise<boolean>;
   defaultFolderPlace(): Promise<FolderPlace>;
   pickFolder(purpose: PickPurpose): Promise<PickResult>;
-  /** Number of local files at a place, ignoring the built-in ignore list (6.5). */
-  countLocalFiles(path: string): Promise<number>;
-  finishSetup(path: string): Promise<void>;
+  /** Number of local files at a place (its token), ignoring the built-in ignore list (6.5). */
+  countLocalFiles(token: string): Promise<number>;
+  finishSetup(token: string): Promise<void>;
 
   // Setup, additional device (4.3) and recovery (4.4)
   scanWithCamera(): Promise<string | null>;
-  startPairing(input: PairInput): Promise<Result<PairWaiting, PairError>>;
+  /**
+   * Answers an offer of another device. `deviceName` is the name of this new device (trimmed),
+   * which the other device shows in its question; refused by rule N5 like every device name.
+   */
+  startPairing(
+    input: PairInput,
+    deviceName: string,
+  ): Promise<Result<PairWaiting, PairError | NameError>>;
   cancelPairing(): Promise<void>;
   listAccountFolders(): Promise<{
     readonly folders: readonly AccountFolder[];
     readonly free: Bytes;
   }>;
   joinFolders(choices: readonly FolderChoice[]): Promise<void>;
-  recoverAccount(server: string, code: string): Promise<Result<null, RecoverError>>;
+  /**
+   * Recovery with the sheet (UX 4.4): `sheet` is the sheet's link `hangar-drive://recover#...`
+   * (pasted or scanned, white space removed), `code` the typed code (normalized), `deviceName`
+   * the name of this new device (trimmed).
+   */
+  recoverAccount(
+    sheet: string,
+    code: string,
+    deviceName: string,
+  ): Promise<Result<null, RecoverError | NameError>>;
+  /** No longer called by the window (the name goes with `recoverAccount`); kept for the shell. */
   setDeviceName(name: string): Promise<Result<null, NameError>>;
   recoveryDevices(): Promise<readonly Device[]>;
   /** Removes the chosen old devices and the used recovery device, returns the new code. */
   finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode>;
+  /**
+   * Forgets the account on this device: secrets, stored account and the folders' sync state; the
+   * files stay. The next snapshot says `setup: "needed"`, so the window shows the welcome again.
+   */
+  resetDevice(): Promise<void>;
 
   // Everyday (6)
   openFolder(folderId: FolderId | null, path?: string): Promise<void>;
@@ -538,10 +746,11 @@ export interface Backend {
   retryConnection(): Promise<void>;
   pauseFolder(folderId: FolderId): Promise<void>;
   resumeFolder(folderId: FolderId): Promise<void>;
-  addFolder(path: string): Promise<void>;
-  addAccountFolder(folderId: FolderId, path: string): Promise<void>;
+  addFolder(token: string): Promise<void>;
+  addAccountFolder(folderId: FolderId, token: string): Promise<void>;
   stopFolder(folderId: FolderId): Promise<void>;
-  deleteFolderEverywhere(folderId: FolderId): Promise<void>;
+  /** Asks once more in a native dialog that names the folder; "no" there keeps it. */
+  deleteFolderEverywhere(folderId: FolderId): Promise<DeleteOutcome>;
   restoreDeletedFolder(folderId: FolderId): Promise<void>;
   listNotSynced(folderId: FolderId): Promise<readonly NotSyncedEntry[]>;
   /** Checks with the server first; "offline" without a connection (8.6). */
@@ -558,13 +767,20 @@ export interface Backend {
   findMissingFolder(folderId: FolderId): Promise<PickResult>;
   redownloadFolder(folderId: FolderId): Promise<void>;
   getServerNumber(): Promise<{ readonly number: NumberRows; readonly command: string }>;
-  confirmServerNumber(): Promise<void>;
+  /** Asks once more in a native dialog with the server number; "no" there trusts nothing. */
+  confirmServerNumber(): Promise<ServerConfirm>;
   fixServerWithOffer(link: string): Promise<Result<null, "notALink" | "otherAccount" | "expired">>;
   checkOlderState(folderId: FolderId): Promise<"stillOlder" | "resolved">;
   reanchor(folderId: FolderId, compared: boolean): Promise<void>;
   dismissSuspect(warningId: string): Promise<void>;
+  /**
+   * Takes in the changes of a removed device that stopped a folder (UX 8.9): the barrier after
+   * them is written and the folder syncs again. The window then offers to undo them.
+   */
+  acceptRemovedHeads(folderId: FolderId): Promise<AcceptedHeads>;
   openStorageSettings(): Promise<void>;
-  installUpdate(): Promise<void>;
+  /** Rejects with "updatesOff" while this build has no updater key (see `About.updates`). */
+  installUpdate(): Promise<UpdateOutcome>;
   copyErrorReport(): Promise<void>;
   previewErrorReport(): Promise<string>;
   saveErrorReport(): Promise<SaveResult>;
@@ -603,7 +819,11 @@ export interface Backend {
   disconnectThisDevice(): Promise<void>;
   createPairingOffer(): Promise<PairingOffer>;
   copyPairingLink(offerId: string): Promise<void>;
-  answerPairRequest(offerId: string, accept: boolean): Promise<void>;
+  /**
+   * Accepting asks once more in a native dialog with the device's name and safety number; "no"
+   * there declines the request.
+   */
+  answerPairRequest(offerId: string, accept: boolean): Promise<PairAnswer>;
   /** Starts a new recovery code; the old one stays valid until the group check succeeds. */
   renewRecoveryCode(): Promise<RecoveryCode>;
 

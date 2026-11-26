@@ -583,6 +583,13 @@ impl Store for SqliteStore {
             .map_err(db)?;
         Ok(())
     }
+
+    fn delete_account_value(&mut self, key: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM account WHERE key = ?1", params![key])
+            .map_err(db)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

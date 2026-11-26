@@ -30,7 +30,7 @@ use hangar_drive_protocol::api::{
     WrappedKeyEntry,
 };
 use hangar_drive_protocol::ids::{
-    AccountId, Blob, DeviceId, Epoch, FolderId, Generation, InviteToken, LogHead, ServerId,
+    AccountId, Blob, DeviceId, Epoch, FolderId, Generation, InviteToken, LogHash, LogHead, ServerId,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -45,6 +45,49 @@ const STORE_KEY: &str = "account";
 
 fn epoch_key_name(epoch: Epoch) -> String {
     format!("epoch-{}", epoch.0)
+}
+
+/// Epoch secrets past the newest one the stored log names that [`forget`] deletes as well: a
+/// refresh stores a new epoch's secret before it saves the log that names it, so a crash in
+/// between leaves a secret the stored log does not know of.
+const FORGET_MARGIN: u32 = 8;
+
+/// Deletes this device's secrets from the keychain (security review L1): the device identity
+/// and the epoch secrets 1 to `newest`. Every key is tried, so one failure does not keep the
+/// others; the first failure is returned.
+pub fn forget_secrets(keychain: &mut dyn Keychain, newest: u32) -> Result<(), SyncError> {
+    let mut first = keychain.delete(KEY_IDENTITY).err();
+    for epoch in 1..=newest {
+        if let Err(e) = keychain.delete(&epoch_key_name(Epoch(epoch))) {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), |e| Err(e.into()))
+}
+
+/// The newest epoch the stored account's log names; 0 without a stored account or with one
+/// that does not read.
+fn stored_newest_epoch(store: &dyn Store) -> u32 {
+    let Ok(Some(bytes)) = store.account_value(STORE_KEY) else {
+        return 0;
+    };
+    let Ok(p) = serde_json::from_slice::<Persisted>(&bytes) else {
+        return 0;
+    };
+    AccountState::from_entries(p.account, p.log.iter().map(|b| b.0.as_slice()))
+        .ok()
+        .and_then(|state| state.current_epoch().map(|e| e.epoch.0))
+        .unwrap_or(0)
+}
+
+/// Forgets the account on this device (security review L1: the device was removed, the person
+/// resets it, or the app is uninstalled): every secret of the keychain, then the stored account.
+/// The local files and the folders' sync state are the caller's.
+pub fn forget(store: &mut dyn Store, keychain: &mut dyn Keychain) -> Result<(), SyncError> {
+    let newest = stored_newest_epoch(store).saturating_add(FORGET_MARGIN);
+    let secrets = forget_secrets(keychain, newest);
+    store.delete_account_value(STORE_KEY)?;
+    secrets
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +108,10 @@ struct Persisted {
     feed_cursor: u64,
     records: Vec<StoredRecord>,
     guard: Vec<(RecordKey, u64, [u8; 32])>,
+    /// The account exists on the server, but its first epoch or its device names may not yet
+    /// ([`Account::finish_setup`]).
+    #[serde(default)]
+    setup_pending: bool,
 }
 
 /// What a refresh found besides the account state itself.
@@ -80,6 +127,73 @@ pub struct Refresh {
     pub folders_changed: bool,
     /// This device was removed from the account.
     pub removed: bool,
+}
+
+/// Entry 1 of a new account, made and verified before the invite is redeemed: the recovery
+/// sheet names its hash as the genesis anchor (N1), so it must exist before the code is shown.
+/// Nothing of it is on the server until [`Account::create_from`].
+pub struct Genesis {
+    identity: DeviceIdentity,
+    account: AccountId,
+    device: DeviceId,
+    entry: Vec<u8>,
+    state: AccountState,
+}
+
+impl std::fmt::Debug for Genesis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Genesis")
+            .field("account", &self.account)
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Genesis {
+    /// A new device identity and the create entry listing it (and the recovery device, if
+    /// given), applied to a fresh log.
+    pub fn new(
+        entropy: &mut dyn Entropy,
+        now_ms: u64,
+        account: AccountId,
+        device: DeviceId,
+        recovery: Option<(&DeviceIdentity, DeviceId)>,
+    ) -> Result<Self, SyncError> {
+        let identity = DeviceIdentity::generate(&mut DynEntropy(entropy))
+            .map_err(|_| SyncError::Entropy(hangar_drive_crypto::EntropyError))?;
+        let mut devices = vec![LogDevice::of(&identity, &account, device, false)];
+        if let Some((recovery_identity, recovery_id)) = recovery {
+            devices.push(LogDevice::of(
+                recovery_identity,
+                &account,
+                recovery_id,
+                true,
+            ));
+        }
+        let mut state = AccountState::new(account);
+        let entry = state.next_entry(&identity, device, now_ms, EntryKind::Create { devices })?;
+        state.apply(&entry)?;
+        Ok(Self {
+            identity,
+            account,
+            device,
+            entry,
+            state,
+        })
+    }
+
+    /// The account.
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    /// The hash of entry 1, the recovery sheet's genesis anchor.
+    pub fn hash(&self) -> Result<LogHash, SyncError> {
+        self.state
+            .hash_at(1)
+            .copied()
+            .ok_or(SyncError::Invalid("the genesis entry"))
+    }
 }
 
 /// The verified account (module docs).
@@ -99,6 +213,7 @@ pub struct Account {
     guard: RecordGuard,
     counter: CommitCounter,
     feed_cursor: u64,
+    setup_pending: bool,
 }
 
 impl std::fmt::Debug for Account {
@@ -117,6 +232,9 @@ impl Account {
 
     /// Creates a new account on the server: entry 1 lists this device (and the recovery device
     /// derived from the recovery code, if given), then the first epoch, then the device names.
+    /// `server` is used without a session for the creation and must sign in as this device
+    /// for the rest (a client of one session identity cannot; the engine uses
+    /// [`Account::create_from`] and [`Account::finish_setup`] with two clients).
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         server: &mut dyn ServerApi,
@@ -130,34 +248,43 @@ impl Account {
         device_name: &str,
         recovery: Option<(&DeviceIdentity, DeviceId)>,
     ) -> Result<Self, SyncError> {
-        let identity = DeviceIdentity::generate(&mut DynEntropy(entropy))
-            .map_err(|_| SyncError::Entropy(hangar_drive_crypto::EntropyError))?;
-        let mut devices = vec![LogDevice::of(&identity, &account, device, false)];
-        if let Some((recovery_identity, recovery_id)) = recovery {
-            devices.push(LogDevice::of(
-                recovery_identity,
-                &account,
-                recovery_id,
-                true,
-            ));
-        }
-        let mut state = AccountState::new(account);
-        let genesis = state.next_entry(&identity, device, now_ms, EntryKind::Create { devices })?;
+        let genesis = Genesis::new(entropy, now_ms, account, device, recovery)?;
+        let mut me = Self::create_from(server, keychain, store, invite, &genesis, device_name)?;
+        me.finish_setup(server, keychain, store, entropy, now_ms)?;
+        Ok(me)
+    }
+
+    /// The first step of [`Account::create`] with entry 1 made beforehand ([`Genesis::new`]),
+    /// so the recovery sheet shown before the invite is redeemed can name the hash of that
+    /// entry (N1). Redeems the invite with entry 1 through `server`, which needs no session,
+    /// and stores the device identity and the account at once, marked as not set up yet: the
+    /// rest ([`Account::finish_setup`]) needs a session of this device, and a failure after the
+    /// invite was used must leave an account this device can carry on with, not a half one it
+    /// forgot (finding E2E-1). Nothing is stored when the server refuses.
+    pub fn create_from(
+        server: &mut dyn ServerApi,
+        keychain: &mut dyn Keychain,
+        store: &mut dyn Store,
+        invite: InviteToken,
+        genesis: &Genesis,
+        device_name: &str,
+    ) -> Result<Self, SyncError> {
         let created = server.create_account(&CreateAccountRequest {
             invite,
-            account,
-            genesis: Blob(genesis.clone()),
+            account: genesis.account,
+            genesis: Blob(genesis.entry.clone()),
         })?;
-        state.apply(&genesis)?;
+        let identity = DeviceIdentity::import(&genesis.identity.export())
+            .map_err(|_| SyncError::Corrupt("device identity".into()))?;
         keychain.store(KEY_IDENTITY, &identity.export())?;
-        let mut me = Self {
-            account,
-            device,
+        let me = Self {
+            account: genesis.account,
+            device: genesis.device,
             device_name: device_name.to_owned(),
             server: Some(created.server),
             identity,
-            state,
-            log: vec![genesis],
+            state: genesis.state.clone(),
+            log: vec![genesis.entry.clone()],
             secrets: BTreeMap::new(),
             rings: BTreeMap::new(),
             folders: None,
@@ -166,15 +293,49 @@ impl Account {
             guard: RecordGuard::new(),
             counter: CommitCounter::resume(0),
             feed_cursor: 0,
+            setup_pending: true,
         };
-        me.rotate(server, keychain, &[], now_ms, entropy)?;
-        let names = DeviceNameList::new(vec![DeviceName {
-            device,
-            name: device_name.to_owned(),
-        }])?;
-        me.put_device_names(server, &names, entropy)?;
         me.save(store)?;
         Ok(me)
+    }
+
+    /// Whether the account exists on the server but [`Account::finish_setup`] has not
+    /// completed yet.
+    pub fn setup_pending(&self) -> bool {
+        self.setup_pending
+    }
+
+    /// The second step of a new account, through `server` signed in as this device: the first
+    /// epoch and the device names. It reads first what an earlier attempt got through (the log
+    /// and the device names record), so it can be repeated after any failure, also after a
+    /// restart of the app. Does nothing once the setup is complete.
+    pub fn finish_setup(
+        &mut self,
+        server: &mut dyn ServerApi,
+        keychain: &mut dyn Keychain,
+        store: &mut dyn Store,
+        entropy: &mut dyn Entropy,
+        now_ms: u64,
+    ) -> Result<(), SyncError> {
+        if !self.setup_pending {
+            return Ok(());
+        }
+        self.refresh(server, keychain, store)?;
+        if self.state.current_epoch().is_none() {
+            self.rotate(server, keychain, &[], now_ms, entropy)?;
+        }
+        if self.device_names.is_none() {
+            self.fetch_record(server, keychain, &device_names_key())?;
+        }
+        if self.device_names.is_none() {
+            let names = DeviceNameList::new(vec![DeviceName {
+                device: self.device,
+                name: self.device_name.clone(),
+            }])?;
+            self.put_device_names(server, &names, entropy)?;
+        }
+        self.setup_pending = false;
+        self.save(store)
     }
 
     /// A device that was just added to the log by another device (pairing, recovery): reads the
@@ -188,7 +349,7 @@ impl Account {
         account: AccountId,
         device: DeviceId,
         device_name: &str,
-        anchor: Option<LogHead>,
+        anchors: &[LogHead],
     ) -> Result<Self, SyncError> {
         keychain.store(KEY_IDENTITY, &identity.export())?;
         let mut me = Self {
@@ -207,21 +368,46 @@ impl Account {
             guard: RecordGuard::new(),
             counter: CommitCounter::resume(0),
             feed_cursor: 0,
+            setup_pending: false,
         };
-        me.sync_log(server)?;
-        if let Some(anchor) = anchor {
-            me.state.check_anchor(&anchor)?;
+        match me.finish_join(server, keychain, store, anchors) {
+            Ok(()) => Ok(me),
+            Err(error) => {
+                // An aborted join leaves no secret behind (security review L1): the identity
+                // stored above and every epoch secret the refresh fetched.
+                let newest = me
+                    .state
+                    .current_epoch()
+                    .map_or(0, |e| e.epoch.0)
+                    .max(me.secrets.keys().copied().max().unwrap_or(0));
+                let _ = forget_secrets(keychain, newest.saturating_add(FORGET_MARGIN));
+                let _ = store.delete_account_value(STORE_KEY);
+                Err(error)
+            }
         }
-        if !me
+    }
+
+    fn finish_join(
+        &mut self,
+        server: &mut dyn ServerApi,
+        keychain: &mut dyn Keychain,
+        store: &mut dyn Store,
+        anchors: &[LogHead],
+    ) -> Result<(), SyncError> {
+        self.sync_log(server)?;
+        for anchor in anchors {
+            self.state.check_anchor(anchor)?;
+        }
+        let device = self.device;
+        if !self
             .state
             .device(&device)
             .is_some_and(|d| d.is_current() && !d.recovery)
         {
             return Err(SyncError::NotSetUp("this device is not in the account log"));
         }
-        me.refresh(server, keychain, store)?;
-        me.save(store)?;
-        Ok(me)
+        self.refresh(server, keychain, store)?;
+        self.save(store)
     }
 
     /// The stored account, with its secrets from the keychain; `None` if none is set up.
@@ -265,6 +451,7 @@ impl Account {
             guard: RecordGuard::resume(p.guard.into_iter().map(|(k, v, d)| (k, (v, d))).collect()),
             counter: CommitCounter::resume(p.counter),
             feed_cursor: p.feed_cursor,
+            setup_pending: p.setup_pending,
         };
         for record in p.records {
             // Records were verified when they were accepted; a record that no longer opens (its
@@ -299,6 +486,7 @@ impl Account {
                 .iter()
                 .map(|(k, (v, d))| (*k, *v, *d))
                 .collect(),
+            setup_pending: self.setup_pending,
         };
         let bytes = serde_json::to_vec(&p).map_err(|e| SyncError::Corrupt(e.to_string()))?;
         store.put_account_value(STORE_KEY, &bytes)?;
@@ -355,6 +543,12 @@ impl Account {
             .as_ref()
             .map(|(list, _)| list.folders().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Whether this device holds the account's folder list record yet; until then
+    /// [`Self::folders`] is empty without meaning that the account has no folders.
+    pub fn has_folder_list(&self) -> bool {
+        self.folders.is_some()
     }
 
     /// A device's name from the sealed list.
@@ -445,6 +639,13 @@ impl Account {
         let mut changed = false;
         loop {
             let page = server.log(self.state.len())?;
+            // No log is longer than this; a server that claims more is refused before its
+            // entries are read (N4, as in `recovery::fetch_log`).
+            if page.length > hangar_drive_crypto::devicelog::MAX_LOG_ENTRIES {
+                return Err(SyncError::Net(crate::ports::NetError::Protocol(
+                    "the log is longer than any log can be".into(),
+                )));
+            }
             if page.length < self.state.len() {
                 // The server's log is behind ours: an older state of the account (re-anchor,
                 // step 2, republishes it; ADR 0001, section 4).
@@ -986,9 +1187,15 @@ impl Account {
         let removal = self.state.last_removal_index();
         removal > 0
             && !self.state.rotation_due()
-            && self
+            && (self
                 .rings
                 .values()
                 .any(|r| r.ring.newest_created_at() < removal)
+                // An account without folders has no ring, yet its device names (and folder
+                // list) were sealed before the removal and must move to the new epoch too:
+                // otherwise a device added later finds a record under an epoch it never got.
+                || self.records.values().any(|(_, data)| {
+                    record_header(data).is_some_and(|h| h.head.index < removal)
+                }))
     }
 }

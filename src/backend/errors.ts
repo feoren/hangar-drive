@@ -10,6 +10,11 @@ export type BackendErrorCode =
   | "locked"
   /** The backend answered with data the window could not read. */
   | "badResponse"
+  /**
+   * This build has no updater key yet, so it cannot update itself. Not shown as an error: the
+   * window hides "Update now" instead.
+   */
+  | "updatesOff"
   | "unexpected";
 
 export class BackendError extends Error {

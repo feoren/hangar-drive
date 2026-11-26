@@ -131,32 +131,101 @@ async fn raw_plain(addr: std::net::SocketAddr) -> String {
 }
 
 fn cli(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_hangar-drive-server"))
+    cli_with(dir, args, None)
+}
+
+fn cli_with(
+    dir: &std::path::Path,
+    args: &[&str],
+    public_url: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hangar-drive-server"));
+    command
         .args(args)
         .env("HANGAR_DRIVE_DATA_DIR", dir)
         .env_remove("HANGAR_DRIVE_TLS_CERT")
         .env_remove("HANGAR_DRIVE_TLS_KEY")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap()
+        .env_remove("HANGAR_DRIVE_PUBLIC_URL")
+        .stdin(std::process::Stdio::null());
+    if let Some(url) = public_url {
+        command.env("HANGAR_DRIVE_PUBLIC_URL", url);
+    }
+    command.output().unwrap()
+}
+
+/// Token, server ID and pin of an invite link `<base>join#<token>.<server>[.<pin>]`.
+fn invite_parts(link: &str, base: &str) -> Vec<String> {
+    let fragment = link
+        .strip_prefix(&format!("{base}join#"))
+        .unwrap_or_else(|| panic!("{link}"));
+    fragment.split('.').map(str::to_owned).collect()
 }
 
 #[test]
 fn the_admin_cli_creates_invites_prints_key_numbers_and_refuses_unconfirmed_purges() {
     let dir = data_dir("cli");
-    let out = cli(&dir, &["invite", "--days", "3"]);
+    // Without the public address the server does not start and no invite is made at all.
+    let refused = cli(&dir, &["serve"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("HANGAR_DRIVE_PUBLIC_URL=https://"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refused = cli(&dir, &["invite"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("HANGAR_DRIVE_PUBLIC_URL"));
+    let base = "https://drive.example.org/";
+    let out = cli_with(
+        &dir,
+        &["invite", "--days", "3"],
+        Some("https://DRIVE.example.org"),
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let token = String::from_utf8(out.stdout).unwrap();
+    let link = String::from_utf8(out.stdout).unwrap();
+    let parts = invite_parts(link.trim(), base);
+    assert_eq!(parts.len(), 2, "no pin without --pin: {link}");
     assert!(
-        hangar_drive_protocol::ids::InviteToken::from_base64url(token.trim()).is_ok(),
-        "{token}"
+        hangar_drive_protocol::ids::InviteToken::from_base64url(&parts[0]).is_ok(),
+        "{link}"
     );
+    assert!(hangar_drive_protocol::ids::ServerId::from_hex(&parts[1]).is_ok());
     assert!(String::from_utf8_lossy(&out.stderr).contains("valid for 3 days"));
-    assert!(!cli(&dir, &["invite", "--days", "0"]).status.success());
+    assert!(!cli_with(&dir, &["invite", "--days", "0"], Some(base))
+        .status
+        .success());
+    assert!(
+        !cli_with(&dir, &["invite"], Some("http://drive.example.org/"))
+            .status
+            .success()
+    );
+    let cert = testdata("cert.pem");
+    let pinned = cli_with(
+        &dir,
+        &["invite", "--pin", "--cert", cert.to_str().unwrap()],
+        Some("https://example.org/drive"),
+    );
+    assert!(
+        pinned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+    let link = String::from_utf8(pinned.stdout).unwrap();
+    let parts = invite_parts(link.trim(), "https://example.org/drive/");
+    let pin = hangar_drive_server::tls::spki_pin_of_file(&cert).unwrap();
+    assert_eq!(parts.len(), 3, "{link}");
+    assert_eq!(parts[2], hangar_drive_protocol::ids::base64url(&pin));
+    assert!(!cli_with(
+        &dir,
+        &["invite", "--cert", cert.to_str().unwrap()],
+        Some(base)
+    )
+    .status
+    .success());
 
     let spki = std::fs::read_to_string(testdata("spki-sha256.txt")).unwrap();
     let by_hash = cli(&dir, &["server-key-number", "--spki", spki.trim()]);
@@ -189,7 +258,7 @@ fn the_admin_cli_creates_invites_prints_key_numbers_and_refuses_unconfirmed_purg
     assert!(status.status.success());
     let text = String::from_utf8(status.stdout).unwrap();
     assert!(
-        text.contains("open invites: 1") && text.contains("accounts: 0"),
+        text.contains("open invites: 2") && text.contains("accounts: 0"),
         "{text}"
     );
 

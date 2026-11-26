@@ -717,7 +717,11 @@ function BeforeDevice({
       }}
     >
       <p className="muted">{t("restore.beforeDevice.advice")}</p>
-      <div className="field-grid">
+      {devices.status === "loading" && <Loading />}
+      {devices.status === "failed" && (
+        <Feedback tone="error">{errorText(devices.error, t)}</Feedback>
+      )}
+      <div className="field-grid" hidden={devices.status !== "ready"}>
         <label htmlFor={deviceField} className="field-label">
           {t("restore.beforeDevice.device")}
         </label>
@@ -752,9 +756,11 @@ function BeforeDevice({
         <button
           type="submit"
           className="button secondary small"
-          disabled={action.pending || list.length === 0}
+          disabled={list.length === 0}
+          aria-disabled={action.pending || undefined}
+          aria-busy={action.pending || undefined}
         >
-          {t("restore.beforeDevice.find")}
+          {action.pending ? t("restore.beforeDevice.finding") : t("restore.beforeDevice.find")}
         </button>
       </div>
       {message && <Feedback tone="info">{message}</Feedback>}

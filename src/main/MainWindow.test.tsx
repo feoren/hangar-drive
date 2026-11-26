@@ -226,6 +226,38 @@ describe("banners", () => {
     const update = await renderApp("updateRequired");
     await click("Jetzt aktualisieren");
     expect(update.mock.calls).toContain("installUpdate");
+    expect(banner()?.textContent).toContain("Version 0.2.0 ist installiert.");
+    update.mock.controls.update = "upToDate";
+    await click("Jetzt aktualisieren");
+    expect(banner()?.textContent).toContain("Es gibt noch keine neuere Version.");
+  });
+
+  it("hides the update button while this build cannot update itself", async () => {
+    const { mock } = await renderApp("updateOff");
+    expect(mock.calls).toContain("getAbout");
+    expect(maybeButton("Jetzt aktualisieren")).toBeUndefined();
+    expect(banner()?.textContent).toContain(
+      "Installiere die neue Version, dann geht es von selbst weiter.",
+    );
+  });
+
+  it("hides the update button when the shell says updates are off, without an error", async () => {
+    const { mock } = await renderApp("updateRequired");
+    mock.controls.update = "off";
+    await click("Jetzt aktualisieren");
+    expect(mock.calls).toContain("installUpdate");
+    expect(maybeButton("Jetzt aktualisieren")).toBeUndefined();
+    expect(document.querySelector(".feedback-error")).toBeNull();
+    expect(banner()?.textContent).toContain("Installiere die neue Version");
+  });
+
+  it("names no device when the server only said this device was removed", async () => {
+    await renderApp("removedUnknown");
+    expect(banner()?.textContent).toContain(
+      "Dieses Gerät wurde aus deinem Konto entfernt. Deine Dateien bleiben hier",
+    );
+    expect(banner()?.textContent).not.toContain("„“");
+    expect(button("Wieder koppeln")).toBeTruthy();
   });
 
   it("explains 'that was not me' after a removal", async () => {
@@ -299,15 +331,28 @@ describe("folders", () => {
     expect(maybeButton("Fotos, D:\\Fotos")).toBeUndefined();
   });
 
-  it("deletes a folder everywhere with the retention window named", async () => {
+  // The shell asks natively (security review L2); the window does not ask a second time.
+  it("deletes a folder everywhere after the native question, with the retention window named", async () => {
     const { mock } = await renderApp();
     await click("Aktionen für „Fotos“");
     await click("Auf allen Geräten löschen");
-    expect(dialog()?.textContent).toContain(
-      "30 Tage lang kannst du ihn unter Ordner hinzufügen zurückholen.",
-    );
-    await click("Überall löschen");
+    expect(dialog()).toBeNull();
     expect(mock.calls).toContain("deleteFolderEverywhere");
+    expect(maybeButton("Fotos, D:\\Fotos")).toBeUndefined();
+    expect(text()).toContain(
+      "„Fotos“ ist gelöscht. Der Ordner verschwindet von allen deinen Geräten. 30 Tage lang kannst du ihn unter Ordner hinzufügen zurückholen.",
+    );
+  });
+
+  it("keeps the folder quietly when the native question is answered with no", async () => {
+    const { mock } = await renderApp();
+    mock.controls.nativeConfirm = "no";
+    await click("Aktionen für „Fotos“");
+    await click("Auf allen Geräten löschen");
+    expect(mock.calls).toContain("deleteFolderEverywhere");
+    expect(button("Fotos, D:\\Fotos")).toBeTruthy();
+    expect(text()).not.toContain("ist gelöscht");
+    expect(document.querySelector(".feedback-error")).toBeNull();
   });
 
   it("shows the folder number, or why it cannot", async () => {

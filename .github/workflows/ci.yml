@@ -115,7 +115,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name drive -p 127.0.0.1:8080:8080 --read-only --cap-drop ALL \
-            hangar-drive-server:ci
+            -e HANGAR_DRIVE_PUBLIC_URL=http://localhost:8080/ hangar-drive-server:ci
           for _ in $(seq 1 30); do
             if body=$(curl -fsS http://127.0.0.1:8080/api/v1/health); then
               break
@@ -170,9 +170,9 @@ jobs:
       - name: npm dependencies
         run: pnpm audit --prod
 
-  # The license policy of ADR 0001 section 8 (deny.toml) and the allowed crate sources. cargo-deny
-  # is installed at a fixed version from its own lock file, like cargo-audit; advisories stay with
-  # the job `audit`.
+  # The license policy of ADR 0001 section 8 (deny.toml), the allowed crate sources and the RustSec
+  # advisories with the reasoned exceptions of deny.toml (security review I2). cargo-deny is
+  # installed at a fixed version from its own lock file, like cargo-audit.
   licenses:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -191,3 +191,8 @@ jobs:
       # Reads Cargo.lock and the crates' manifests for every target platform; nothing is built.
       - name: Licenses and sources
         run: cargo deny --locked check licenses sources
+
+      # Fetches the advisory database; fails on vulnerabilities, unmaintained and unsound crates
+      # that deny.toml does not list with a reason.
+      - name: Advisories
+        run: cargo deny --locked check advisories

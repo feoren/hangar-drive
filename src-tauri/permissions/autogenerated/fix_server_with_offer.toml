@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fix-server-with-offer"
+description = "Enables the fix_server_with_offer command without any pre-configured scope."
+commands.allow = ["fix_server_with_offer"]
+
+[[permission]]
+identifier = "deny-fix-server-with-offer"
+description = "Denies the fix_server_with_offer command without any pre-configured scope."
+commands.deny = ["fix_server_with_offer"]

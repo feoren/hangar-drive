@@ -143,6 +143,12 @@ impl SyncError {
     pub fn is_offline(&self) -> bool {
         matches!(self, SyncError::Net(e) if e.is_transient())
     }
+
+    /// Whether the server said that this device was removed from its account: its own proof,
+    /// made with its key, was answered with `DeviceRemoved` (never a mere `ProofInvalid`).
+    pub fn is_device_removed(&self) -> bool {
+        matches!(self, SyncError::Net(e) if e.code() == Some(ErrorCode::DeviceRemoved))
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +171,10 @@ mod tests {
             ErrorKind::OlderState
         );
         assert!(SyncError::Net(NetError::Unreachable).is_offline());
+        let removed = SyncError::Net(NetError::Server(ErrorBody::new(ErrorCode::DeviceRemoved)));
+        assert!(removed.is_device_removed() && !removed.is_offline());
+        for other in [ErrorCode::ProofInvalid, ErrorCode::Unauthorized] {
+            assert!(!SyncError::Net(NetError::Server(ErrorBody::new(other))).is_device_removed());
+        }
     }
 }

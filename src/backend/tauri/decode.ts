@@ -47,6 +47,11 @@ export function nullable<T>(inner: Decoder<T>): Decoder<T | null> {
   return (value, path) => (value === null || value === undefined ? null : inner(value, path));
 }
 
+/** A field an older shell may leave out: absent (or null) reads as `fallback`. */
+export function orDefault<T>(inner: Decoder<T>, fallback: T): Decoder<T> {
+  return (value, path) => (value === null || value === undefined ? fallback : inner(value, path));
+}
+
 export function array<T>(inner: Decoder<T>): Decoder<T[]> {
   return (value, path) => {
     if (!Array.isArray(value)) throw new DecodeError(path, "array");

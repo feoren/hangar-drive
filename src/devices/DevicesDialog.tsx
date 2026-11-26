@@ -122,6 +122,11 @@ export function DevicesDialog({ onClose }: { readonly onClose: () => void }) {
       {sub?.kind === "disconnect" && <DisconnectDialog lastOne={sub.lastOne} onClose={closeSub} />}
       {sub?.kind === "renew" && (
         <RenewDialog
+          deviceName={
+            list.status === "ready"
+              ? list.data.devices.find((device) => device.isThis)?.name
+              : undefined
+          }
           onDone={() => {
             setFeedback(t("devices.recovery.renewed"));
           }}
@@ -407,9 +412,11 @@ function DisconnectDialog({
 }
 
 function RenewDialog({
+  deviceName,
   onDone,
   onClose,
 }: {
+  readonly deviceName: string | undefined;
   readonly onDone: () => void;
   readonly onClose: () => void;
 }) {
@@ -426,6 +433,7 @@ function RenewDialog({
           code={code.data}
           titleId={titleId}
           intro={t("devices.recovery.renewBody")}
+          deviceName={deviceName}
           secondary={
             <button type="button" className="button secondary" onClick={onClose}>
               {t("common.cancel")}

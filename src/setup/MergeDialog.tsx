@@ -4,7 +4,7 @@
 
 import { useId, useState } from "react";
 
-import type { FolderId } from "../backend/types";
+import type { FolderId, FolderPlace } from "../backend/types";
 import { useT } from "../i18n";
 import { folderRefusalText } from "../main/BannerArea";
 import { useBackend } from "../ui/backendContext";
@@ -16,20 +16,27 @@ import { errorText, useAction, useLoad } from "../ui/useAsync";
 interface Props {
   readonly folderId: FolderId;
   readonly folderName: string;
-  readonly path: string;
-  readonly onMerge: (path: string) => Promise<void>;
+  /** The place the backend proposed or the person picked; its token goes back on "Merge". */
+  readonly place: FolderPlace;
+  readonly onMerge: (place: FolderPlace) => Promise<void>;
   readonly onClose: () => void;
 }
 
-export function MergeDialog({ folderId, folderName, path: initialPath, onMerge, onClose }: Props) {
+export function MergeDialog({
+  folderId,
+  folderName,
+  place: initialPlace,
+  onMerge,
+  onClose,
+}: Props) {
   const t = useT();
   const backend = useBackend();
   const titleId = useId();
   const bodyId = useId();
-  const [path, setPath] = useState(initialPath);
+  const [place, setPlace] = useState(initialPlace);
   const [message, setMessage] = useState<string | null>(null);
   const action = useAction();
-  const [count] = useLoad(() => backend.countLocalFiles(path), [backend, path]);
+  const [count] = useLoad(() => backend.countLocalFiles(place.token), [backend, place.token]);
 
   const known = count.status === "ready" ? count.data : null;
   return (
@@ -41,7 +48,7 @@ export function MergeDialog({ folderId, folderName, path: initialPath, onMerge, 
         {known !== null && <p>{t("merge.body", { count: known, folder: folderName })}</p>}
         <p className="place">
           <FolderIcon />
-          <PathText path={path} />
+          <PathText path={place.path} />
         </p>
       </div>
       {count.status === "failed" && <Feedback tone="error">{errorText(count.error, t)}</Feedback>}
@@ -56,7 +63,7 @@ export function MergeDialog({ folderId, folderName, path: initialPath, onMerge, 
             setMessage(null);
             void action.run(async () => {
               const result = await backend.pickFolder({ kind: "account", folderId });
-              if (result.kind === "picked") setPath(result.path);
+              if (result.kind === "picked") setPlace(result);
               if (result.kind === "refused") {
                 setMessage(folderRefusalText(result.reason, result.folder, t));
               }
@@ -72,7 +79,7 @@ export function MergeDialog({ folderId, folderName, path: initialPath, onMerge, 
           aria-disabled={known === null || action.pending}
           onClick={() => {
             if (known === null) return;
-            void action.run(() => onMerge(path));
+            void action.run(() => onMerge(place));
           }}
         >
           {t("merge.confirm")}

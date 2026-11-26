@@ -60,12 +60,52 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
     );
     let invite = server.invite().await;
     let reused = InviteToken::from_bytes(*invite.expose());
+    let repeated = InviteToken::from_bytes(*invite.expose());
+    let first = request(invite, id);
+    let genesis = first.genesis.clone();
+    assert_eq!(client.post(ACCOUNTS_PATH, &first).await.status, 201);
+    // Finding E2E-1: the same request again (its answer was lost) succeeds again, so the
+    // device can carry on; the same invite with another entry 1 for the account does not.
+    let reply = client
+        .post(
+            ACCOUNTS_PATH,
+            &CreateAccountRequest {
+                invite: InviteToken::from_bytes(*repeated.expose()),
+                account: id,
+                genesis: genesis.clone(),
+            },
+        )
+        .await;
+    assert_eq!(reply.status, 201, "a repeat of the same creation");
     assert_eq!(
-        client
-            .post(ACCOUNTS_PATH, &request(invite, id))
-            .await
-            .status,
-        201
+        reply.json::<CreateAccountResponse>().server,
+        server.app.server_id
+    );
+    let third = Device::new();
+    let another = hangar_drive_crypto::devicelog::AccountState::new(id)
+        .next_entry(
+            &third.identity,
+            third.id,
+            START_MS,
+            hangar_drive_crypto::devicelog::EntryKind::Create {
+                devices: vec![third.log_device(&id)],
+            },
+        )
+        .unwrap();
+    let reply = client
+        .post(
+            ACCOUNTS_PATH,
+            &CreateAccountRequest {
+                invite: repeated,
+                account: id,
+                genesis: Blob(another),
+            },
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (403, ErrorCode::InviteInvalid),
+        "not the same creation"
     );
     let reply = client
         .post(
@@ -137,10 +177,13 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
         .post(CHALLENGE_PATH, &challenge(device.id))
         .await
         .json();
-    let wrong =
-        Device::new()
-            .identity
-            .prove_session(&c.server, &account.id, &device.id, &c.challenge);
+    let wrong = Device::new().identity.prove_session(
+        &c.server,
+        TEST_URL,
+        &account.id,
+        &device.id,
+        &c.challenge,
+    );
     let reply = client
         .post(
             PROOF_PATH,
@@ -148,6 +191,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 account: account.id,
                 device: device.id,
                 challenge: c.challenge,
+                server_url: TEST_URL.into(),
                 signature: wrong,
             },
         )
@@ -155,13 +199,15 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
     assert_eq!((reply.status, reply.code()), (401, ErrorCode::ProofInvalid));
     // Only a proof that verifies uses the challenge up (finding M1): the wrong signature did
     // not, the right one does, and the same proof again is a replay.
-    let right = device
-        .identity
-        .prove_session(&c.server, &account.id, &device.id, &c.challenge);
+    let right =
+        device
+            .identity
+            .prove_session(&c.server, TEST_URL, &account.id, &device.id, &c.challenge);
     let proof = ProofRequest {
         account: account.id,
         device: device.id,
         challenge: c.challenge,
+        server_url: TEST_URL.into(),
         signature: right,
     };
     assert_eq!(client.post(PROOF_PATH, &proof).await.status, 200);
@@ -173,10 +219,13 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
     );
     // The challenge is bound to the device it was made for.
     let other_device = Device::new();
-    let signature =
-        other_device
-            .identity
-            .prove_session(&c.server, &account.id, &other_device.id, &c.challenge);
+    let signature = other_device.identity.prove_session(
+        &c.server,
+        TEST_URL,
+        &account.id,
+        &other_device.id,
+        &c.challenge,
+    );
     let reply = client
         .post(
             PROOF_PATH,
@@ -184,6 +233,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 account: account.id,
                 device: other_device.id,
                 challenge: c.challenge,
+                server_url: TEST_URL.into(),
                 signature,
             },
         )
@@ -191,9 +241,10 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
     assert_eq!(reply.code(), ErrorCode::ChallengeInvalid);
     // 32 bytes the server never made.
     let forged = Challenge::from_bytes(random());
-    let signature = device
-        .identity
-        .prove_session(&c.server, &account.id, &device.id, &forged);
+    let signature =
+        device
+            .identity
+            .prove_session(&c.server, TEST_URL, &account.id, &device.id, &forged);
     let reply = client
         .post(
             PROOF_PATH,
@@ -201,6 +252,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 account: account.id,
                 device: device.id,
                 challenge: forged,
+                server_url: TEST_URL.into(),
                 signature,
             },
         )
@@ -211,9 +263,10 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
         .await
         .json();
     server.clock.advance_ms(61_000);
-    let signature = device
-        .identity
-        .prove_session(&c.server, &account.id, &device.id, &c.challenge);
+    let signature =
+        device
+            .identity
+            .prove_session(&c.server, TEST_URL, &account.id, &device.id, &c.challenge);
     let reply = client
         .post(
             PROOF_PATH,
@@ -221,6 +274,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 account: account.id,
                 device: device.id,
                 challenge: c.challenge,
+                server_url: TEST_URL.into(),
                 signature,
             },
         )
@@ -485,9 +539,9 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         )
         .await
         .json();
-    let signature = b
-        .identity
-        .prove_session(&ch.server, &account.id, &b.id, &ch.challenge);
+    let signature =
+        b.identity
+            .prove_session(&ch.server, TEST_URL, &account.id, &b.id, &ch.challenge);
     let reply = c
         .post(
             PROOF_PATH,
@@ -495,11 +549,60 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
                 account: account.id,
                 device: b.id,
                 challenge: ch.challenge,
+                server_url: TEST_URL.into(),
                 signature,
             },
         )
         .await;
-    assert_eq!(reply.code(), ErrorCode::ProofInvalid);
+    // Finding E2E-3: the removed device's own proof learns that it was removed (so it forgets
+    // the account), once per challenge; nobody without its key learns it.
+    assert_eq!(
+        (reply.status, reply.code()),
+        (403, ErrorCode::DeviceRemoved)
+    );
+    let replay = c
+        .post(
+            PROOF_PATH,
+            &ProofRequest {
+                account: account.id,
+                device: b.id,
+                challenge: ch.challenge,
+                server_url: TEST_URL.into(),
+                signature,
+            },
+        )
+        .await;
+    assert_eq!(replay.code(), ErrorCode::ChallengeInvalid, "used up");
+    let ch: ChallengeResponse = c
+        .post(
+            CHALLENGE_PATH,
+            &ChallengeRequest {
+                account: account.id,
+                device: b.id,
+            },
+        )
+        .await
+        .json();
+    let forged = a
+        .identity
+        .prove_session(&ch.server, TEST_URL, &account.id, &b.id, &ch.challenge);
+    let reply = c
+        .post(
+            PROOF_PATH,
+            &ProofRequest {
+                account: account.id,
+                device: b.id,
+                challenge: ch.challenge,
+                server_url: TEST_URL.into(),
+                signature: forged,
+            },
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (401, ErrorCode::ProofInvalid),
+        "another key never learns of the removal"
+    );
     // Not even another device can publish the removed device's commit (signer removed, and not
     // its own commit).
     let reply = ca
@@ -634,7 +737,7 @@ async fn pairing_slots_are_reserved_by_the_inviter_and_written_once() {
         sign: new.identity.public_keys().sign,
         kem: new.identity.public_keys().kem,
         proof: Signature::from_bytes([4; 64]),
-        name: "Laptop".into(),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
         tag: Blob(vec![5; 32]),
     };
     let anonymous = Client::new(server.addr);
@@ -691,7 +794,7 @@ async fn pairing_slots_are_reserved_by_the_inviter_and_written_once() {
         "nobody replaces a waiting request"
     );
     let mut bad = request.clone();
-    bad.name = "Lap\u{202e}top".into();
+    bad.sealed_name = Blob(vec![6; SEALED_NAME_OVERHEAD]);
     let reply = anonymous
         .post(&pairing_path(&PairingId::from_bytes(random())), &bad)
         .await;
@@ -739,6 +842,81 @@ async fn pairing_slots_are_reserved_by_the_inviter_and_written_once() {
         200,
         "expired slots free their places"
     );
+    server.stop().await.unwrap();
+}
+
+/// Finding E2E-6: the inviting device closes its slot once the person answered, so the request
+/// leaves the server at once; a slot nobody closes goes with the periodic housekeeping.
+#[tokio::test]
+async fn a_pairing_slot_is_closed_by_its_account_and_expired_slots_are_swept() {
+    let mut server = TestServer::start("pairing-close").await;
+    let a = Device::new();
+    let account = Account::create(&server, &a, &[]).await;
+    let ca = account.sign_in(&server, &a).await;
+    let other = Device::new();
+    let other_account = Account::create(&server, &other, &[]).await;
+    let co = other_account.sign_in(&server, &other).await;
+    let new = Device::new();
+    let request = PairingRequest {
+        device: new.id,
+        sign: new.identity.public_keys().sign,
+        kem: new.identity.public_keys().kem,
+        proof: Signature::from_bytes([4; 64]),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
+        tag: Blob(vec![5; 32]),
+    };
+    let anonymous = Client::new(server.addr);
+    let slots = |server: &TestServer| {
+        let db = server.app.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pairing")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        }
+    };
+    let id = PairingId::from_bytes(random());
+    assert_eq!(ca.send("PUT", &pairing_path(&id), &()).await.status, 200);
+    assert_eq!(
+        anonymous.post(&pairing_path(&id), &request).await.status,
+        204
+    );
+    // Only the reserving account closes it; nobody without a session, no other account.
+    assert_eq!(
+        anonymous.delete(&pairing_path(&id)).await.code(),
+        ErrorCode::Unauthorized
+    );
+    assert_eq!(co.delete(&pairing_path(&id)).await.status, 204);
+    let got: PairingRequest = ca.get(&pairing_path(&id)).await.json();
+    assert_eq!(got, request, "another account's close changes nothing");
+    assert_eq!(ca.delete(&pairing_path(&id)).await.status, 204);
+    assert_eq!(slots(&server).await, 0, "the request left the server");
+    assert_eq!(ca.get(&pairing_path(&id)).await.code(), ErrorCode::NotFound);
+    assert_eq!(
+        anonymous.post(&pairing_path(&id), &request).await.code(),
+        ErrorCode::NotFound,
+        "a closed slot takes no second request"
+    );
+    assert_eq!(
+        ca.delete(&pairing_path(&id)).await.status,
+        204,
+        "closing again is no error (a retry after a lost answer)"
+    );
+    // A slot nobody closes: deleted by the housekeeping once it expired, not before.
+    let forgotten = PairingId::from_bytes(random());
+    assert_eq!(
+        ca.send("PUT", &pairing_path(&forgotten), &()).await.status,
+        200
+    );
+    hangar_drive_server::service::retention::housekeeping(&server.app)
+        .await
+        .unwrap();
+    assert_eq!(slots(&server).await, 1, "still open");
+    server.clock.advance_ms(11 * 60_000);
+    hangar_drive_server::service::retention::housekeeping(&server.app)
+        .await
+        .unwrap();
+    assert_eq!(slots(&server).await, 0, "expired and swept");
     server.stop().await.unwrap();
 }
 
@@ -855,15 +1033,26 @@ async fn objects_and_folders_of_another_account_are_out_of_reach() {
         200
     );
 
-    // Y names X's folder ID: it is a different folder for Y.
+    // Y names X's folder ID: it is a different folder for Y, one Y holds nothing of, with the
+    // empty chain every unknown folder has (finding E2E-2), not X's commits.
     assert_eq!(
         cy.get(&object_path(&fx.id, &secret.id)).await.code(),
         ErrorCode::NotFound
     );
+    let page: DeltaPage = cy.get(&commits_path(&fx.id)).await.json();
     assert_eq!(
-        cy.get(&commits_path(&fx.id)).await.code(),
-        ErrorCode::NotFound
+        page,
+        DeltaPage {
+            commits: Vec::new(),
+            sequence: 0,
+            more: false,
+        }
     );
+    let unknown: DeltaPage = cy
+        .get(&commits_path(&FolderId::from_bytes(random())))
+        .await
+        .json();
+    assert_eq!(unknown, page, "the same answer as for any folder");
     let missing: MissingObjectsResponse = cy
         .post(
             &missing_objects_path(&fx.id),
@@ -1157,9 +1346,10 @@ async fn retired_folders_refuse_writes_and_come_back_within_the_window() {
     );
     let outcome = server.gc().await;
     assert_eq!(outcome.deleted_folders, 1);
-    assert_eq!(
-        ca.get(&commits_path(&folder.id)).await.code(),
-        ErrorCode::NotFound
+    let page: DeltaPage = ca.get(&commits_path(&folder.id)).await.json();
+    assert!(
+        page.commits.is_empty() && page.sequence == 0,
+        "gone for good: {page:?}"
     );
     server.stop().await.unwrap();
 }
@@ -1254,18 +1444,20 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         account: account.id,
         device: a.id,
         challenge: c.challenge,
+        server_url: TEST_URL.into(),
         signature,
     };
-    let wrong = Device::new()
-        .identity
-        .prove_session(&c.server, &account.id, &a.id, &c.challenge);
+    let wrong =
+        Device::new()
+            .identity
+            .prove_session(&c.server, TEST_URL, &account.id, &a.id, &c.challenge);
     assert_eq!(
         client.post(PROOF_PATH, &proof(wrong)).await.code(),
         ErrorCode::ProofInvalid
     );
     let right = a
         .identity
-        .prove_session(&c.server, &account.id, &a.id, &c.challenge);
+        .prove_session(&c.server, TEST_URL, &account.id, &a.id, &c.challenge);
     assert_eq!(
         client.post(PROOF_PATH, &proof(right)).await.code(),
         ErrorCode::RateLimited
@@ -1284,10 +1476,13 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
             )
             .await
             .json();
-        let signature =
-            stranger
-                .identity
-                .prove_session(&c.server, &account.id, &stranger.id, &c.challenge);
+        let signature = stranger.identity.prove_session(
+            &c.server,
+            TEST_URL,
+            &account.id,
+            &stranger.id,
+            &c.challenge,
+        );
         let reply = client
             .post(
                 PROOF_PATH,
@@ -1295,6 +1490,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
                     account: account.id,
                     device: stranger.id,
                     challenge: c.challenge,
+                    server_url: TEST_URL.into(),
                     signature,
                 },
             )
@@ -1309,7 +1505,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
     server.clock.advance_ms(600_000);
     let right = a
         .identity
-        .prove_session(&c.server, &account.id, &a.id, &c.challenge);
+        .prove_session(&c.server, TEST_URL, &account.id, &a.id, &c.challenge);
     assert_eq!(
         client.post(PROOF_PATH, &proof(right)).await.code(),
         ErrorCode::ChallengeInvalid,
@@ -1321,7 +1517,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         sign: a.identity.public_keys().sign,
         kem: a.identity.public_keys().kem,
         proof: Signature::from_bytes([4; 64]),
-        name: "Phone".into(),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 5]),
         tag: Blob(vec![5; 32]),
     };
     let (first, second) = (
@@ -1426,5 +1622,71 @@ async fn forwarded_addresses_count_only_from_trusted_proxies() {
         spoof.post(CHALLENGE_PATH, &challenge(3)).await.code(),
         ErrorCode::RateLimited
     );
+    server.stop().await.unwrap();
+}
+
+// Sign-in relay (security review, open point "session binding"): a recovery sheet or link with
+// this server's real ID and a foreign URL makes the device sign its proof for the foreign host.
+// That host can hand the proof on to the real server, but a server that knows its public URL
+// refuses a proof for any other address; its own address still signs in.
+#[tokio::test]
+async fn a_proof_for_another_address_is_refused_by_a_server_with_a_public_url() {
+    let mut server = TestServer::start("flows-relay").await;
+    let a = Device::new();
+    let account = Account::create(&server, &a, &[]).await;
+    let client = Client::new(server.addr);
+    let challenge = ChallengeRequest {
+        account: account.id,
+        device: a.id,
+    };
+    for relay in ["https://drive.example.evil/", "https://evil.example/"] {
+        let c: ChallengeResponse = client.post(CHALLENGE_PATH, &challenge).await.json();
+        let signature =
+            a.identity
+                .prove_session(&c.server, relay, &account.id, &a.id, &c.challenge);
+        let reply = client
+            .post(
+                PROOF_PATH,
+                &ProofRequest {
+                    account: account.id,
+                    device: a.id,
+                    challenge: c.challenge,
+                    server_url: relay.into(),
+                    signature,
+                },
+            )
+            .await;
+        assert_eq!(
+            (reply.status, reply.code()),
+            (401, ErrorCode::ProofInvalid),
+            "{relay}"
+        );
+        // The failure counts like any failed proof (finding M1); the next window is clean.
+        server.clock.advance_ms(61_000);
+    }
+    // The relay also cannot claim the real address over a proof made for its own.
+    let c: ChallengeResponse = client.post(CHALLENGE_PATH, &challenge).await.json();
+    let signature = a.identity.prove_session(
+        &c.server,
+        "https://evil.example/",
+        &account.id,
+        &a.id,
+        &c.challenge,
+    );
+    let reply = client
+        .post(
+            PROOF_PATH,
+            &ProofRequest {
+                account: account.id,
+                device: a.id,
+                challenge: c.challenge,
+                server_url: TEST_URL.into(),
+                signature,
+            },
+        )
+        .await;
+    assert_eq!(reply.code(), ErrorCode::ProofInvalid);
+    server.clock.advance_ms(61_000);
+    account.sign_in(&server, &a).await;
     server.stop().await.unwrap();
 }

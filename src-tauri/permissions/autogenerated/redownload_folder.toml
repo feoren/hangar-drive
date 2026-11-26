@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-redownload-folder"
+description = "Enables the redownload_folder command without any pre-configured scope."
+commands.allow = ["redownload_folder"]
+
+[[permission]]
+identifier = "deny-redownload-folder"
+description = "Denies the redownload_folder command without any pre-configured scope."
+commands.deny = ["redownload_folder"]

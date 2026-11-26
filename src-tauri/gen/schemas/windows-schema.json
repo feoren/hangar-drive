@@ -177,6 +177,1206 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the accept_removed_heads command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-accept-removed-heads",
+          "markdownDescription": "Enables the accept_removed_heads command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_account_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-account-folder",
+          "markdownDescription": "Enables the add_account_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-folder",
+          "markdownDescription": "Enables the add_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the answer_pair_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-answer-pair-request",
+          "markdownDescription": "Enables the answer_pair_request command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the begin_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-begin-account",
+          "markdownDescription": "Enables the begin_account command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-pairing",
+          "markdownDescription": "Enables the cancel_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_restore command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-restore",
+          "markdownDescription": "Enables the cancel_restore command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_invite command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-invite",
+          "markdownDescription": "Enables the check_invite command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_older_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-older-state",
+          "markdownDescription": "Enables the check_older_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-pairing",
+          "markdownDescription": "Enables the check_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_recovery_group command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-recovery-group",
+          "markdownDescription": "Enables the confirm_recovery_group command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_server_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-server-number",
+          "markdownDescription": "Enables the confirm_server_number command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the copy_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-copy-error-report",
+          "markdownDescription": "Enables the copy_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the copy_pairing_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-copy-pairing-link",
+          "markdownDescription": "Enables the copy_pairing_link command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the copy_recovery_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-copy-recovery-code",
+          "markdownDescription": "Enables the copy_recovery_code command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the count_local_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-count-local-files",
+          "markdownDescription": "Enables the count_local_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_pairing_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-create-pairing-offer",
+          "markdownDescription": "Enables the create_pairing_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the default_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-default-device-name",
+          "markdownDescription": "Enables the default_device_name command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the default_folder_place command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-default-folder-place",
+          "markdownDescription": "Enables the default_folder_place command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_folder_everywhere command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-folder-everywhere",
+          "markdownDescription": "Enables the delete_folder_everywhere command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the disconnect_this_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-disconnect-this-device",
+          "markdownDescription": "Enables the disconnect_this_device command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dismiss_suspect command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dismiss-suspect",
+          "markdownDescription": "Enables the dismiss_suspect command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the find_before_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-find-before-device",
+          "markdownDescription": "Enables the find_before_device command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the find_missing_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-find-missing-folder",
+          "markdownDescription": "Enables the find_missing_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the finish_recovery_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-finish-recovery-cleanup",
+          "markdownDescription": "Enables the finish_recovery_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the finish_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-finish-setup",
+          "markdownDescription": "Enables the finish_setup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the fix_server_with_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-fix-server-with-offer",
+          "markdownDescription": "Enables the fix_server_with_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_about command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-about",
+          "markdownDescription": "Enables the get_about command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_folder_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-folder-number",
+          "markdownDescription": "Enables the get_folder_number command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_safety_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-safety-number",
+          "markdownDescription": "Enables the get_safety_number command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_server_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-server-number",
+          "markdownDescription": "Enables the get_server_number command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-settings",
+          "markdownDescription": "Enables the get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-snapshot",
+          "markdownDescription": "Enables the get_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_timeline command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-timeline",
+          "markdownDescription": "Enables the get_timeline command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_trash command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-trash",
+          "markdownDescription": "Enables the get_trash command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_tree_at command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-tree-at",
+          "markdownDescription": "Enables the get_tree_at command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ignore_name_issue command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ignore-name-issue",
+          "markdownDescription": "Enables the ignore_name_issue command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the inspect_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-inspect-link",
+          "markdownDescription": "Enables the inspect_link command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-update",
+          "markdownDescription": "Enables the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the join_folders command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-join-folders",
+          "markdownDescription": "Enables the join_folders command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the keep_both_conflict command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-keep-both-conflict",
+          "markdownDescription": "Enables the keep_both_conflict command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the keep_conflict_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-keep-conflict-version",
+          "markdownDescription": "Enables the keep_conflict_version command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_account_folders command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-account-folders",
+          "markdownDescription": "Enables the list_account_folders command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_conflicts command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-conflicts",
+          "markdownDescription": "Enables the list_conflicts command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-devices",
+          "markdownDescription": "Enables the list_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_mass_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-mass-delete",
+          "markdownDescription": "Enables the list_mass_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_name_issues command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-name-issues",
+          "markdownDescription": "Enables the list_name_issues command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_not_synced command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-not-synced",
+          "markdownDescription": "Enables the list_not_synced command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_conflict command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-conflict",
+          "markdownDescription": "Enables the open_conflict command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-folder",
+          "markdownDescription": "Enables the open_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_storage_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-storage-settings",
+          "markdownDescription": "Enables the open_storage_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pause",
+          "markdownDescription": "Enables the pause command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pause_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pause-folder",
+          "markdownDescription": "Enables the pause_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pick_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pick-folder",
+          "markdownDescription": "Enables the pick_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the preview_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-preview-error-report",
+          "markdownDescription": "Enables the preview_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the print_recovery_sheet command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-print-recovery-sheet",
+          "markdownDescription": "Enables the print_recovery_sheet command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-quit",
+          "markdownDescription": "Enables the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the read_clipboard_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-read-clipboard-text",
+          "markdownDescription": "Enables the read_clipboard_text command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reanchor command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reanchor",
+          "markdownDescription": "Enables the reanchor command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the recover_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-recover-account",
+          "markdownDescription": "Enables the recover_account command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the recovery_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-recovery-devices",
+          "markdownDescription": "Enables the recovery_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the redownload_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-redownload-folder",
+          "markdownDescription": "Enables the redownload_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-device",
+          "markdownDescription": "Enables the remove_device command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rename_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rename-device",
+          "markdownDescription": "Enables the rename_device command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rename_name_issue command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rename-name-issue",
+          "markdownDescription": "Enables the rename_name_issue command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the renew_recovery_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-renew-recovery-code",
+          "markdownDescription": "Enables the renew_recovery_code command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reset_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-device",
+          "markdownDescription": "Enables the reset_device command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reset_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-folder",
+          "markdownDescription": "Enables the reset_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resolve_mass_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resolve-mass-delete",
+          "markdownDescription": "Enables the resolve_mass_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_deleted_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-deleted-folder",
+          "markdownDescription": "Enables the restore_deleted_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-file",
+          "markdownDescription": "Enables the restore_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_remote_deleted command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-remote-deleted",
+          "markdownDescription": "Enables the restore_remote_deleted command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the restore_trash command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restore-trash",
+          "markdownDescription": "Enables the restore_trash command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resume",
+          "markdownDescription": "Enables the resume command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resume_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resume-folder",
+          "markdownDescription": "Enables the resume_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the retry_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-retry-connection",
+          "markdownDescription": "Enables the retry_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-error-report",
+          "markdownDescription": "Enables the save_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_recovery_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-recovery-file",
+          "markdownDescription": "Enables the save_recovery_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the scan_with_camera command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-scan-with-camera",
+          "markdownDescription": "Enables the scan_with_camera command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_autostart command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-autostart",
+          "markdownDescription": "Enables the set_autostart command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-device-name",
+          "markdownDescription": "Enables the set_device_name command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_language command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-language",
+          "markdownDescription": "Enables the set_language command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the show_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-show-window",
+          "markdownDescription": "Enables the show_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-pairing",
+          "markdownDescription": "Enables the start_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-folder",
+          "markdownDescription": "Enables the stop_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sync_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-now",
+          "markdownDescription": "Enables the sync_now command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the take_deep_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-take-deep-link",
+          "markdownDescription": "Enables the take_deep_link command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the undo command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-undo",
+          "markdownDescription": "Enables the undo command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_tray command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-tray",
+          "markdownDescription": "Enables the update_tray command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the accept_removed_heads command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-accept-removed-heads",
+          "markdownDescription": "Denies the accept_removed_heads command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_account_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-account-folder",
+          "markdownDescription": "Denies the add_account_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-folder",
+          "markdownDescription": "Denies the add_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the answer_pair_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-answer-pair-request",
+          "markdownDescription": "Denies the answer_pair_request command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the begin_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-begin-account",
+          "markdownDescription": "Denies the begin_account command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-pairing",
+          "markdownDescription": "Denies the cancel_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_restore command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-restore",
+          "markdownDescription": "Denies the cancel_restore command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_invite command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-invite",
+          "markdownDescription": "Denies the check_invite command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_older_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-older-state",
+          "markdownDescription": "Denies the check_older_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-pairing",
+          "markdownDescription": "Denies the check_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_recovery_group command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-recovery-group",
+          "markdownDescription": "Denies the confirm_recovery_group command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_server_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-server-number",
+          "markdownDescription": "Denies the confirm_server_number command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the copy_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-copy-error-report",
+          "markdownDescription": "Denies the copy_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the copy_pairing_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-copy-pairing-link",
+          "markdownDescription": "Denies the copy_pairing_link command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the copy_recovery_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-copy-recovery-code",
+          "markdownDescription": "Denies the copy_recovery_code command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the count_local_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-count-local-files",
+          "markdownDescription": "Denies the count_local_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_pairing_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-create-pairing-offer",
+          "markdownDescription": "Denies the create_pairing_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the default_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-default-device-name",
+          "markdownDescription": "Denies the default_device_name command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the default_folder_place command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-default-folder-place",
+          "markdownDescription": "Denies the default_folder_place command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_folder_everywhere command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-folder-everywhere",
+          "markdownDescription": "Denies the delete_folder_everywhere command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the disconnect_this_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-disconnect-this-device",
+          "markdownDescription": "Denies the disconnect_this_device command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dismiss_suspect command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dismiss-suspect",
+          "markdownDescription": "Denies the dismiss_suspect command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the find_before_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-find-before-device",
+          "markdownDescription": "Denies the find_before_device command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the find_missing_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-find-missing-folder",
+          "markdownDescription": "Denies the find_missing_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the finish_recovery_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-finish-recovery-cleanup",
+          "markdownDescription": "Denies the finish_recovery_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the finish_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-finish-setup",
+          "markdownDescription": "Denies the finish_setup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the fix_server_with_offer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-fix-server-with-offer",
+          "markdownDescription": "Denies the fix_server_with_offer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_about command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-about",
+          "markdownDescription": "Denies the get_about command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_folder_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-folder-number",
+          "markdownDescription": "Denies the get_folder_number command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_safety_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-safety-number",
+          "markdownDescription": "Denies the get_safety_number command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_server_number command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-server-number",
+          "markdownDescription": "Denies the get_server_number command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-settings",
+          "markdownDescription": "Denies the get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-snapshot",
+          "markdownDescription": "Denies the get_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_timeline command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-timeline",
+          "markdownDescription": "Denies the get_timeline command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_trash command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-trash",
+          "markdownDescription": "Denies the get_trash command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_tree_at command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-tree-at",
+          "markdownDescription": "Denies the get_tree_at command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ignore_name_issue command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ignore-name-issue",
+          "markdownDescription": "Denies the ignore_name_issue command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the inspect_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-inspect-link",
+          "markdownDescription": "Denies the inspect_link command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-update",
+          "markdownDescription": "Denies the install_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the join_folders command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-join-folders",
+          "markdownDescription": "Denies the join_folders command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the keep_both_conflict command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-keep-both-conflict",
+          "markdownDescription": "Denies the keep_both_conflict command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the keep_conflict_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-keep-conflict-version",
+          "markdownDescription": "Denies the keep_conflict_version command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_account_folders command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-account-folders",
+          "markdownDescription": "Denies the list_account_folders command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_conflicts command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-conflicts",
+          "markdownDescription": "Denies the list_conflicts command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-devices",
+          "markdownDescription": "Denies the list_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_mass_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-mass-delete",
+          "markdownDescription": "Denies the list_mass_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_name_issues command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-name-issues",
+          "markdownDescription": "Denies the list_name_issues command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_not_synced command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-not-synced",
+          "markdownDescription": "Denies the list_not_synced command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_conflict command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-conflict",
+          "markdownDescription": "Denies the open_conflict command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-folder",
+          "markdownDescription": "Denies the open_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_storage_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-storage-settings",
+          "markdownDescription": "Denies the open_storage_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pause",
+          "markdownDescription": "Denies the pause command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pause_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pause-folder",
+          "markdownDescription": "Denies the pause_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pick_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pick-folder",
+          "markdownDescription": "Denies the pick_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the preview_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-preview-error-report",
+          "markdownDescription": "Denies the preview_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the print_recovery_sheet command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-print-recovery-sheet",
+          "markdownDescription": "Denies the print_recovery_sheet command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-quit",
+          "markdownDescription": "Denies the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the read_clipboard_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-read-clipboard-text",
+          "markdownDescription": "Denies the read_clipboard_text command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reanchor command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reanchor",
+          "markdownDescription": "Denies the reanchor command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the recover_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-recover-account",
+          "markdownDescription": "Denies the recover_account command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the recovery_devices command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-recovery-devices",
+          "markdownDescription": "Denies the recovery_devices command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the redownload_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-redownload-folder",
+          "markdownDescription": "Denies the redownload_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-device",
+          "markdownDescription": "Denies the remove_device command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rename_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rename-device",
+          "markdownDescription": "Denies the rename_device command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rename_name_issue command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rename-name-issue",
+          "markdownDescription": "Denies the rename_name_issue command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the renew_recovery_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-renew-recovery-code",
+          "markdownDescription": "Denies the renew_recovery_code command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reset_device command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-device",
+          "markdownDescription": "Denies the reset_device command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reset_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-folder",
+          "markdownDescription": "Denies the reset_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resolve_mass_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resolve-mass-delete",
+          "markdownDescription": "Denies the resolve_mass_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_deleted_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-deleted-folder",
+          "markdownDescription": "Denies the restore_deleted_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-file",
+          "markdownDescription": "Denies the restore_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_remote_deleted command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-remote-deleted",
+          "markdownDescription": "Denies the restore_remote_deleted command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restore_trash command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restore-trash",
+          "markdownDescription": "Denies the restore_trash command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resume",
+          "markdownDescription": "Denies the resume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resume_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resume-folder",
+          "markdownDescription": "Denies the resume_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the retry_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-retry-connection",
+          "markdownDescription": "Denies the retry_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_error_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-error-report",
+          "markdownDescription": "Denies the save_error_report command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_recovery_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-recovery-file",
+          "markdownDescription": "Denies the save_recovery_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the scan_with_camera command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-scan-with-camera",
+          "markdownDescription": "Denies the scan_with_camera command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_autostart command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-autostart",
+          "markdownDescription": "Denies the set_autostart command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_device_name command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-device-name",
+          "markdownDescription": "Denies the set_device_name command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_language command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-language",
+          "markdownDescription": "Denies the set_language command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the show_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-show-window",
+          "markdownDescription": "Denies the show_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_pairing command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-pairing",
+          "markdownDescription": "Denies the start_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_folder command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-folder",
+          "markdownDescription": "Denies the stop_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-now",
+          "markdownDescription": "Denies the sync_now command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the take_deep_link command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-take-deep-link",
+          "markdownDescription": "Denies the take_deep_link command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the undo command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-undo",
+          "markdownDescription": "Denies the undo command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_tray command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-tray",
+          "markdownDescription": "Denies the update_tray command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures if your\napplication can enable or disable auto\nstarting the application on boot.\n\n#### Granted Permissions\n\nIt allows all to check, enable and\ndisable the automatic start on boot.\n\n\n#### This default permission set includes:\n\n- `allow-enable`\n- `allow-disable`\n- `allow-is-enabled`",
+          "type": "string",
+          "const": "autostart:default",
+          "markdownDescription": "This permission set configures if your\napplication can enable or disable auto\nstarting the application on boot.\n\n#### Granted Permissions\n\nIt allows all to check, enable and\ndisable the automatic start on boot.\n\n\n#### This default permission set includes:\n\n- `allow-enable`\n- `allow-disable`\n- `allow-is-enabled`"
+        },
+        {
+          "description": "Enables the disable command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:allow-disable",
+          "markdownDescription": "Enables the disable command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:allow-enable",
+          "markdownDescription": "Enables the enable command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the is_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:allow-is-enabled",
+          "markdownDescription": "Enables the is_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the disable command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:deny-disable",
+          "markdownDescription": "Denies the disable command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:deny-enable",
+          "markdownDescription": "Denies the enable command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "autostart:deny-is-enabled",
+          "markdownDescription": "Denies the is_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "No features are enabled by default, as we believe\nthe clipboard can be inherently dangerous and it is \napplication specific if read and/or write access is needed.\n\nClipboard interaction needs to be explicitly enabled.\n",
+          "type": "string",
+          "const": "clipboard-manager:default",
+          "markdownDescription": "No features are enabled by default, as we believe\nthe clipboard can be inherently dangerous and it is \napplication specific if read and/or write access is needed.\n\nClipboard interaction needs to be explicitly enabled.\n"
+        },
+        {
+          "description": "Enables the clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-clear",
+          "markdownDescription": "Enables the clear command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the read_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-read-image",
+          "markdownDescription": "Enables the read_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the read_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-read-text",
+          "markdownDescription": "Enables the read_text command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the write_html command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-write-html",
+          "markdownDescription": "Enables the write_html command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the write_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-write-image",
+          "markdownDescription": "Enables the write_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the write_secret command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-write-secret",
+          "markdownDescription": "Enables the write_secret command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the write_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:allow-write-text",
+          "markdownDescription": "Enables the write_text command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-clear",
+          "markdownDescription": "Denies the clear command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the read_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-read-image",
+          "markdownDescription": "Denies the read_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the read_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-read-text",
+          "markdownDescription": "Denies the read_text command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the write_html command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-write-html",
+          "markdownDescription": "Denies the write_html command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the write_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-write-image",
+          "markdownDescription": "Denies the write_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the write_secret command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-write-secret",
+          "markdownDescription": "Denies the write_secret command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the write_text command without any pre-configured scope.",
+          "type": "string",
+          "const": "clipboard-manager:deny-write-text",
+          "markdownDescription": "Denies the write_text command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",
@@ -2215,6 +3415,390 @@
           "type": "string",
           "const": "core:window:deny-unminimize",
           "markdownDescription": "Denies the unminimize command without any pre-configured scope."
+        },
+        {
+          "description": "Allows reading the opened deep link via the get_current command\n#### This default permission set includes:\n\n- `allow-get-current`",
+          "type": "string",
+          "const": "deep-link:default",
+          "markdownDescription": "Allows reading the opened deep link via the get_current command\n#### This default permission set includes:\n\n- `allow-get-current`"
+        },
+        {
+          "description": "Enables the get_current command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:allow-get-current",
+          "markdownDescription": "Enables the get_current command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the is_registered command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:allow-is-registered",
+          "markdownDescription": "Enables the is_registered command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the register command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:allow-register",
+          "markdownDescription": "Enables the register command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the unregister command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:allow-unregister",
+          "markdownDescription": "Enables the unregister command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_current command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:deny-get-current",
+          "markdownDescription": "Denies the get_current command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_registered command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:deny-is-registered",
+          "markdownDescription": "Denies the is_registered command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:deny-register",
+          "markdownDescription": "Denies the register command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the unregister command without any pre-configured scope.",
+          "type": "string",
+          "const": "deep-link:deny-unregister",
+          "markdownDescription": "Denies the unregister command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`",
+          "type": "string",
+          "const": "dialog:default",
+          "markdownDescription": "This permission set configures the types of dialogs\navailable from the dialog plugin.\n\n#### Granted Permissions\n\nAll dialog types are enabled.\n\n\n\n#### This default permission set includes:\n\n- `allow-message`\n- `allow-save`\n- `allow-open`"
+        },
+        {
+          "description": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-ask",
+          "markdownDescription": "Enables the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:allow-confirm",
+          "markdownDescription": "Enables the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `allow-message` and will be removed in v3)"
+        },
+        {
+          "description": "Enables the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-message",
+          "markdownDescription": "Enables the message command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-open",
+          "markdownDescription": "Enables the open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:allow-save",
+          "markdownDescription": "Enables the save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-ask",
+          "markdownDescription": "Denies the ask command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)",
+          "type": "string",
+          "const": "dialog:deny-confirm",
+          "markdownDescription": "Denies the confirm command without any pre-configured scope. (**DEPRECATED**: This is now an alias to `deny-message` and will be removed in v3)"
+        },
+        {
+          "description": "Denies the message command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-message",
+          "markdownDescription": "Denies the message command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-open",
+          "markdownDescription": "Denies the open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save command without any pre-configured scope.",
+          "type": "string",
+          "const": "dialog:deny-save",
+          "markdownDescription": "Denies the save command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures which\nnotification features are by default exposed.\n\n#### Granted Permissions\n\nIt allows all notification related features.\n\n\n#### This default permission set includes:\n\n- `allow-is-permission-granted`\n- `allow-request-permission`\n- `allow-notify`\n- `allow-register-action-types`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-cancel`\n- `allow-get-pending`\n- `allow-remove-active`\n- `allow-get-active`\n- `allow-check-permissions`\n- `allow-show`\n- `allow-batch`\n- `allow-list-channels`\n- `allow-delete-channel`\n- `allow-create-channel`\n- `allow-permission-state`",
+          "type": "string",
+          "const": "notification:default",
+          "markdownDescription": "This permission set configures which\nnotification features are by default exposed.\n\n#### Granted Permissions\n\nIt allows all notification related features.\n\n\n#### This default permission set includes:\n\n- `allow-is-permission-granted`\n- `allow-request-permission`\n- `allow-notify`\n- `allow-register-action-types`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-cancel`\n- `allow-get-pending`\n- `allow-remove-active`\n- `allow-get-active`\n- `allow-check-permissions`\n- `allow-show`\n- `allow-batch`\n- `allow-list-channels`\n- `allow-delete-channel`\n- `allow-create-channel`\n- `allow-permission-state`"
+        },
+        {
+          "description": "Enables the batch command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-batch",
+          "markdownDescription": "Enables the batch command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-cancel",
+          "markdownDescription": "Enables the cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-check-permissions",
+          "markdownDescription": "Enables the check_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_channel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-create-channel",
+          "markdownDescription": "Enables the create_channel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_channel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-delete-channel",
+          "markdownDescription": "Enables the delete_channel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-get-active",
+          "markdownDescription": "Enables the get_active command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-get-pending",
+          "markdownDescription": "Enables the get_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the is_permission_granted command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-is-permission-granted",
+          "markdownDescription": "Enables the is_permission_granted command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_channels command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-list-channels",
+          "markdownDescription": "Enables the list_channels command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the notify command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-notify",
+          "markdownDescription": "Enables the notify command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the permission_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-permission-state",
+          "markdownDescription": "Enables the permission_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the register_action_types command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-register-action-types",
+          "markdownDescription": "Enables the register_action_types command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-register-listener",
+          "markdownDescription": "Enables the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-remove-active",
+          "markdownDescription": "Enables the remove_active command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-remove-listener",
+          "markdownDescription": "Enables the remove_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-request-permission",
+          "markdownDescription": "Enables the request_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the show command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:allow-show",
+          "markdownDescription": "Enables the show command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the batch command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-batch",
+          "markdownDescription": "Denies the batch command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-cancel",
+          "markdownDescription": "Denies the cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-check-permissions",
+          "markdownDescription": "Denies the check_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_channel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-create-channel",
+          "markdownDescription": "Denies the create_channel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_channel command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-delete-channel",
+          "markdownDescription": "Denies the delete_channel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-get-active",
+          "markdownDescription": "Denies the get_active command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_pending command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-get-pending",
+          "markdownDescription": "Denies the get_pending command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_permission_granted command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-is-permission-granted",
+          "markdownDescription": "Denies the is_permission_granted command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_channels command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-list-channels",
+          "markdownDescription": "Denies the list_channels command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the notify command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-notify",
+          "markdownDescription": "Denies the notify command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the permission_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-permission-state",
+          "markdownDescription": "Denies the permission_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_action_types command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-register-action-types",
+          "markdownDescription": "Denies the register_action_types command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-register-listener",
+          "markdownDescription": "Denies the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_active command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-remove-active",
+          "markdownDescription": "Denies the remove_active command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-remove-listener",
+          "markdownDescription": "Denies the remove_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-request-permission",
+          "markdownDescription": "Denies the request_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the show command without any pre-configured scope.",
+          "type": "string",
+          "const": "notification:deny-show",
+          "markdownDescription": "Denies the show command without any pre-configured scope."
+        },
+        {
+          "description": "This permission set configures which kind of\nupdater functions are exposed to the frontend.\n\n#### Granted Permissions\n\nThe full workflow from checking for updates to installing them\nis enabled.\n\n\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`",
+          "type": "string",
+          "const": "updater:default",
+          "markdownDescription": "This permission set configures which kind of\nupdater functions are exposed to the frontend.\n\n#### Granted Permissions\n\nThe full workflow from checking for updates to installing them\nis enabled.\n\n\n#### This default permission set includes:\n\n- `allow-check`\n- `allow-download`\n- `allow-install`\n- `allow-download-and-install`"
+        },
+        {
+          "description": "Enables the check command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:allow-check",
+          "markdownDescription": "Enables the check command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:allow-download",
+          "markdownDescription": "Enables the download command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_and_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:allow-download-and-install",
+          "markdownDescription": "Enables the download_and_install command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:allow-install",
+          "markdownDescription": "Enables the install command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:deny-check",
+          "markdownDescription": "Denies the check command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:deny-download",
+          "markdownDescription": "Denies the download command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_and_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:deny-download-and-install",
+          "markdownDescription": "Denies the download_and_install command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install command without any pre-configured scope.",
+          "type": "string",
+          "const": "updater:deny-install",
+          "markdownDescription": "Denies the install command without any pre-configured scope."
         }
       ]
     },

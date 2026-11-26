@@ -12,7 +12,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{on, MethodFilter, MethodRouter};
+use axum::routing::{get, on, MethodFilter, MethodRouter};
 use axum::Router;
 use hangar_drive_protocol::api::ErrorCode;
 
@@ -40,6 +40,7 @@ fn method_router(handler: Handler, filter: MethodFilter) -> MethodRouter<AppStat
         Handler::ReservePairing => on(filter, h::reserve_pairing),
         Handler::PostPairing => on(filter, h::post_pairing),
         Handler::GetPairing => on(filter, h::get_pairing),
+        Handler::ClosePairing => on(filter, h::close_pairing),
         Handler::Missing => on(filter, h::missing),
         Handler::PutObject => on(filter, h::put_object),
         Handler::GetObject => on(filter, h::get_object),
@@ -83,6 +84,20 @@ pub fn router(app: AppState) -> Router {
     }
     router
         .route_layer(middleware::from_fn_with_state(app.clone(), authorize))
+        // The static invite page sits outside the access table: no session, no body, and the
+        // same bytes for everyone (the invite stays in the fragment, which no request carries).
+        .route(
+            "/join",
+            get(|| static_reply("text/html; charset=utf-8", crate::links::JOIN_HTML)),
+        )
+        .route(
+            "/join.js",
+            get(|| static_reply("text/javascript; charset=utf-8", crate::links::JOIN_JS)),
+        )
+        .route(
+            "/join.css",
+            get(|| static_reply("text/css; charset=utf-8", crate::links::JOIN_CSS)),
+        )
         .fallback(|| async { ApiError::new(ErrorCode::NotFound) })
         .layer(middleware::from_fn(guard))
         .with_state(app)
@@ -165,6 +180,18 @@ async fn authorize_inner(
     }
 }
 
+/// One file of the `/join` page with its own CSP, which [`set_headers`] keeps.
+async fn static_reply(content_type: &'static str, body: &'static str) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert("content-type", HeaderValue::from_static(content_type));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(crate::links::JOIN_CSP),
+    );
+    response
+}
+
 /// Security headers on every reply and one log line per request.
 async fn guard(request: Request, next: Next) -> Response {
     let method = request.method().clone();
@@ -196,11 +223,15 @@ fn set_headers(headers: &mut HeaderMap) {
     set(headers, "x-frame-options", "DENY");
     set(headers, "referrer-policy", "no-referrer");
     set(headers, "cross-origin-resource-policy", "same-origin");
-    set(
-        headers,
-        "content-security-policy",
-        "default-src 'none'; frame-ancestors 'none'",
-    );
+    // The API answers JSON and needs no policy beyond "nothing"; only the `/join` page sets
+    // its own, stricter-than-default one before this runs.
+    if !headers.contains_key("content-security-policy") {
+        set(
+            headers,
+            "content-security-policy",
+            "default-src 'none'; frame-ancestors 'none'",
+        );
+    }
     if !headers.contains_key("cache-control") {
         set(headers, "cache-control", "no-store");
     }

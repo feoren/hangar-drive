@@ -1,10 +1,11 @@
 # cargo-deny configuration (schema version 2), checked in CI by the job `licenses` with
-# `cargo deny check licenses sources`. The license policy and every exception are decided in
-# docs/wiki/pages/decisions/0001-foundation.md, section 8.
+# `cargo deny --locked check licenses sources advisories`. The license policy and every exception
+# are decided in docs/wiki/pages/decisions/0001-foundation.md, section 8.
 #
-# Advisories run through cargo-audit in the job `audit`, so they are not checked here. Bans are
-# not checked: the Tauri graph carries about fifty crates in two or more versions, which would
-# only produce warnings nobody can act on.
+# Advisories are checked here and by cargo-audit in the job `audit`, against the same RustSec
+# database; the few advisories both tools only warn about are listed under [advisories] with
+# their reason. Bans are not checked: the Tauri graph carries about fifty crates in two or more
+# versions, which would only produce warnings nobody can act on.
 
 [graph]
 # No `targets`: every platform's dependencies are checked, so the Linux and macOS crates count
@@ -29,23 +30,38 @@ allow = [
 unused-allowed-license = "deny"
 unused-license-exception = "deny"
 
+# Every exception names the exact locked version (security review I2): a new version of such a
+# crate fails the check until its license was looked at again and the version updated here.
 exceptions = [
     # ADR 0001, section 8, `notify`: CC0 waives all rights.
-    { crate = "notify", allow = ["CC0-1.0"] },
+    { crate = "notify@9.0.0", allow = ["CC0-1.0"] },
     # ADR 0001, section 8, `xxhash-rust`: BSL-1.0, permissive like MIT, pulled by notify.
-    { crate = "xxhash-rust", allow = ["BSL-1.0"] },
+    { crate = "xxhash-rust@0.8.21", allow = ["BSL-1.0"] },
     # ADR 0001, section 8, `option-ext`: MPL-2.0 file-level copyleft, used unmodified, pulled
     # by dirs-sys through dirs.
-    { crate = "option-ext", allow = ["MPL-2.0"] },
+    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
     # ADR 0001, section 8, `option-ext` (same reasoning): MPL-2.0 HTML crates pulled by Tauri
     # through dom_query, used unmodified.
-    { crate = "cssparser", allow = ["MPL-2.0"] },
-    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
-    { crate = "dtoa-short", allow = ["MPL-2.0"] },
-    { crate = "selectors", allow = ["MPL-2.0"] },
+    { crate = "cssparser@0.37.0", allow = ["MPL-2.0"] },
+    { crate = "cssparser@0.38.0", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros@0.7.1", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short@0.3.5", allow = ["MPL-2.0"] },
+    { crate = "selectors@0.38.0", allow = ["MPL-2.0"] },
+    { crate = "selectors@0.41.0", allow = ["MPL-2.0"] },
     # ADR 0001, section 8, `webpki-root-certs`: permissive data license for the Mozilla root
     # certificates, pulled by rustls-platform-verifier.
-    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-root-certs@1.0.12", allow = ["CDLA-Permissive-2.0"] },
+    # ADR 0001, section 8, app shell: BSL-1.0 like `xxhash-rust`, the Windows clipboard of
+    # arboard, pulled by tauri-plugin-clipboard-manager (the sister app ships the same).
+    { crate = "clipboard-win@5.4.3", allow = ["BSL-1.0"] },
+    { crate = "error-code@3.4.0", allow = ["BSL-1.0"] },
+    # ADR 0001, section 8, app shell: CC0-1.0 like `notify`, pulled by tauri-plugin-deep-link
+    # through rust-ini, ordered-multimap, dlv-list and const-random (a compile-time constant).
+    { crate = "tiny-keccak@2.0.2", allow = ["CC0-1.0"] },
+    # ADR 0001, section 8, app shell: BSD-2-Clause, permissive like BSD-3-Clause without the
+    # endorsement clause; pulled by resvg through tiny-skia-path, at build time only (the tray
+    # icons are rasterized by build.rs), so no byte of it is in the shipped app.
+    { crate = "arrayref@0.3.9", allow = ["BSD-2-Clause"] },
 ]
 
 # Every crate comes from crates.io; a git dependency or another registry fails the check until it
@@ -55,3 +71,32 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+# Known advisories (RustSec). Vulnerabilities, unmaintained and unsound crates fail the check,
+# except the ones listed here, which cargo-audit reports as warnings as well. Each is reviewed
+# with the owner's ADR 0001, section 8, and leaves this list when its dependent updates.
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # The D-Bus crates of zbus 5 were merged into zbus 6 and are no longer released on their
+    # own; no safe upgrade exists until keyring's Secret Service store, the notification and the
+    # single instance plugins move to zbus 6. Linux only, no known vulnerability; the sister
+    # app ships the same.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6, pulled by zbus 5 of keyring and the Tauri plugins on Linux, no vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6, pulled by zbus 5 of keyring and the Tauri plugins on Linux, no vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6, pulled by zbus 5 of keyring and the Tauri plugins on Linux, no vulnerability" },
+    # GTK 3 bindings of Tauri's Linux stack (tao, wry, muda, tray-icon through gtk 0.18): a
+    # build-time proc macro. Only a Tauri release on GTK 4 bindings removes it.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time macro of glib-macros in Tauri's GTK 3 Linux stack" },
+    # cargo-audit also warns about two advisories cargo-deny does not match against the locked
+    # graph, so they are not listed here: RUSTSEC-2024-0429 (glib 0.18 `VariantStrIter` unsound,
+    # the same GTK 3 stack, a function this app never calls) and RUSTSEC-2026-0543 (chrono
+    # unmaintained, in Cargo.lock only as an optional dependency of serde_with that no build of
+    # this workspace enables; `cargo tree -i chrono --target all` prints nothing).
+]
+
+# Bans are not checked (see the top of this file); duplicate versions are Tauri's.
+[bans]
+multiple-versions = "allow"

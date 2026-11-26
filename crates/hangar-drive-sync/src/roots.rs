@@ -337,6 +337,54 @@ pub fn check_root(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf, Roo
     if !resolved.is_dir() {
         return Err(RootError::Unresolved("not a directory".into()));
     }
+    check_resolved(&resolved, existing)?;
+    Ok(resolved)
+}
+
+/// [`check_root`] for a folder that may not exist yet (security review L4): the app checks a
+/// proposed place before it creates it, so nothing is ever created where a root is refused.
+/// The nearest existing ancestor is resolved and the missing names, plain names only, are put
+/// after it; an existing `candidate` is checked by [`check_root`].
+pub fn check_planned_root(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf, RootError> {
+    if candidate.exists() {
+        return check_root(candidate, existing);
+    }
+    let mut missing = Vec::new();
+    let mut base = candidate;
+    while !base.exists() {
+        let Some(name) = base.file_name() else {
+            return Err(RootError::Unresolved("no existing parent".into()));
+        };
+        missing.push(name.to_owned());
+        base = base
+            .parent()
+            .ok_or_else(|| RootError::Unresolved("no existing parent".into()))?;
+    }
+    // `file_name` is never `..` or `.`, but a candidate such as `a/../b` would still walk; only
+    // plain components are taken.
+    if candidate.components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(RootError::Unresolved("not a plain path".into()));
+    }
+    let mut resolved = canonical(base)?;
+    if !resolved.is_dir() {
+        return Err(RootError::Unresolved("not a directory".into()));
+    }
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+    check_resolved(&resolved, existing)?;
+    Ok(resolved)
+}
+
+/// The rules of [`check_root`] for a resolved path.
+fn check_resolved(resolved: &Path, existing: &[PathBuf]) -> Result<(), RootError> {
     let existing: Vec<String> = existing
         .iter()
         .map(|p| key(&std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
@@ -353,18 +401,124 @@ pub fn check_root(candidate: &Path, existing: &[PathBuf]) -> Result<PathBuf, Roo
         .map(|(p, below)| (key(&std::fs::canonicalize(&p).unwrap_or(p)), below))
         .collect();
     check_key(
-        &key(&resolved),
+        &key(resolved),
         &existing,
         index.as_deref(),
         &system,
         &clouds,
-    )?;
-    Ok(resolved)
+    )
+}
+
+/// The files at `path` a new sync root would upload (ux-concept 6.5): regular files below it,
+/// links and other entries skipped and never followed, names of the built-in ignore list
+/// (`hangar_drive_protocol::name::is_ignored`) left out with everything below them. Counting
+/// stops at `limit`, so a huge tree answers quickly with "at least `limit`".
+pub fn count_files(path: &Path, limit: u64) -> u64 {
+    let mut count = 0u64;
+    let mut stack = vec![(path.to_path_buf(), true)];
+    while let Some((dir, at_root)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if hangar_drive_protocol::name::is_ignored(name, at_root) {
+                continue;
+            }
+            // `file_type` of a directory entry does not follow links.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    // Junctions and other reparse points are not entered.
+                    if std::fs::symlink_metadata(entry.path())
+                        .is_ok_and(|m| m.file_attributes() & 0x400 != 0)
+                    {
+                        continue;
+                    }
+                }
+                stack.push((entry.path(), false));
+            } else if kind.is_file() {
+                count += 1;
+                if count >= limit {
+                    return count;
+                }
+            }
+        }
+    }
+    count
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security review L4: a place that does not exist yet is checked before anything is
+    // created; nothing is created by the check.
+    #[test]
+    fn a_planned_root_is_checked_without_creating_it() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("planned-root");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("taken")).unwrap();
+        let planned = dir.join("new").join("Docs");
+        let resolved = check_planned_root(&planned, &[]).unwrap();
+        assert!(resolved.ends_with(Path::new("new").join("Docs")));
+        assert!(
+            !planned.exists() && !dir.join("new").exists(),
+            "nothing created"
+        );
+        // Below an existing root it overlaps, as an existing folder would.
+        assert_eq!(
+            check_planned_root(&dir.join("taken").join("inner"), &[dir.join("taken")]),
+            Err(RootError::Overlaps)
+        );
+        assert!(matches!(
+            check_planned_root(&dir.join("new").join("..").join("x"), &[]),
+            Err(RootError::Unresolved(_))
+        ));
+        // An existing folder is checked as before.
+        assert!(check_planned_root(&dir.join("taken"), &[]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_are_counted_without_the_ignore_list_and_up_to_a_limit() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("count-files");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub").join(".hangar-drive")).unwrap();
+        std::fs::create_dir_all(dir.join(".hangar-drive")).unwrap();
+        for name in [
+            "a.txt",
+            "b.txt",
+            "Thumbs.db",
+            ".hangar-drive/marker",
+            "sub/c.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // Thumbs.db and the reserved directory at the root are ignored; a directory of that
+        // name below the root is not reserved.
+        std::fs::write(dir.join("sub").join(".hangar-drive").join("d.txt"), b"x").unwrap();
+        assert_eq!(count_files(&dir, 100), 4);
+        assert_eq!(count_files(&dir, 2), 2);
+        assert_eq!(count_files(&dir.join("missing"), 100), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn k(s: &str) -> String {
         key(Path::new(s))

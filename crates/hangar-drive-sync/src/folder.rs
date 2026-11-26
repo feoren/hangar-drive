@@ -267,6 +267,8 @@ pub struct ItemChange {
     pub action: ChangeAction,
     /// From the server (true) or from this disk (false).
     pub incoming: bool,
+    /// The item is a directory.
+    pub dir: bool,
 }
 
 /// What happened to an item.
@@ -310,6 +312,76 @@ pub struct RoundReport {
     pub removed_heads: Vec<RemovedHeadRec>,
 }
 
+/// What a person's action (a restore, "keep this") changed in the folder: every item it
+/// touched with its node before the action, `None` for an item the action made. Undoing the
+/// action ([`FolderSync::revert`]) is a new commit that puts exactly these items back (ADR 0001,
+/// section 5: a restore is a commit), so changes of other devices since stay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoState {
+    items: BTreeMap<ItemId, Option<Node>>,
+}
+
+impl UndoState {
+    /// The items `after` differs from `before` in, with their state in `before`.
+    pub fn between(before: &Tree, after: &Tree) -> Self {
+        let mut items = BTreeMap::new();
+        for (id, node) in before.iter() {
+            if after.get(id) != Some(node) {
+                items.insert(*id, Some(node.clone()));
+            }
+        }
+        for id in after.ids() {
+            if !before.contains(id) {
+                items.insert(*id, None);
+            }
+        }
+        Self { items }
+    }
+
+    /// The state of those of these items that `tree` holds now; an item it lacks is left out,
+    /// so an undo never removes what the server never had.
+    pub fn of(tree: &Tree, items: impl IntoIterator<Item = ItemId>) -> Self {
+        Self {
+            items: items
+                .into_iter()
+                .filter_map(|id| tree.get(&id).map(|node| (id, Some(node.clone()))))
+                .collect(),
+        }
+    }
+
+    /// Adds the items of a later action; an item both touched keeps its state before the first.
+    pub fn merge(&mut self, later: UndoState) {
+        for (id, node) in later.items {
+            self.items.entry(id).or_insert(node);
+        }
+    }
+
+    /// Whether the action changed nothing.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// `tree` with every item back in its state before the action: items the action made leave
+    /// with everything below them, the others take their old node.
+    pub fn apply_to(&self, tree: &Tree) -> Result<Tree, SyncError> {
+        let mut out = tree.clone();
+        for (id, node) in &self.items {
+            if node.is_none() {
+                for below in out.subtree(id) {
+                    out.remove(&below);
+                }
+            }
+        }
+        for (id, node) in &self.items {
+            if let Some(node) = node {
+                out.insert(*id, node.clone());
+            }
+        }
+        out.check().map_err(CodecError::from)?;
+        Ok(out)
+    }
+}
+
 /// Everything a round needs from outside.
 pub struct Ctx<'a> {
     /// The verified account.
@@ -351,6 +423,9 @@ pub struct FolderSync {
     meta: FolderMeta,
     view: FolderView,
     scan_scope: ScanScope,
+    /// What the last commit of a person's action changed ([`FolderSync::publish_tree`]), until
+    /// the engine takes it for an undo; not stored.
+    last_action: Option<UndoState>,
 }
 
 /// What the next scan reads from the disk.
@@ -610,6 +685,7 @@ impl FolderSync {
             },
             view: FolderView::new(*account.id(), folder),
             scan_scope: ScanScope::Full,
+            last_action: None,
         }
     }
 
@@ -641,6 +717,7 @@ impl FolderSync {
             meta,
             view,
             scan_scope: ScanScope::Full,
+            last_action: None,
         }))
     }
 
@@ -1936,11 +2013,16 @@ impl FolderSync {
             } else {
                 path
             };
+            let dir = before
+                .get(id)
+                .or_else(|| p.merged.get(id))
+                .is_some_and(Node::is_dir);
             report.changes.push(ItemChange {
                 item: *id,
                 path,
                 action,
                 incoming: true,
+                dir,
             });
             self.meta.backoff.remove(id);
             self.meta.restore.remove(id);
@@ -1997,6 +2079,7 @@ impl FolderSync {
     /// Publishes `tree` as a normal commit on the current head: the restore of ADR 0001,
     /// section 5 ("a restore is a commit"). Local changes are merged in the next round.
     pub fn publish_tree(&mut self, cx: &mut Ctx<'_>, tree: Tree) -> Result<(), SyncError> {
+        let change = UndoState::between(&self.remote, &tree);
         let p = Plan {
             merged: tree,
             disk: self.local.clone(),
@@ -2008,7 +2091,10 @@ impl FolderSync {
             skip: BTreeSet::new(),
         };
         match self.publish(cx, &p) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.last_action = Some(change);
+                Ok(())
+            }
             Err(PublishFailure::HeadMoved) => Err(SyncError::Net(NetError::Server(
                 hangar_drive_protocol::api::ErrorBody::new(ErrorCode::HeadMoved),
             ))),
@@ -2058,6 +2144,108 @@ impl FolderSync {
         )?;
         self.publish_tree(cx, tree)?;
         Ok(name)
+    }
+
+    /// Restores several items of `commit` that are gone from the current tree, in one commit
+    /// (an incoming delete undone from the activity list, UX 8.1); an item that is back already
+    /// is left as it is, so a newer version is never replaced. Returns the files that came back.
+    pub fn restore_items(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        commit: &CommitId,
+        items: &[ItemId],
+    ) -> Result<u64, SyncError> {
+        self.pull(cx)?;
+        let old = self.tree_at(cx, commit)?;
+        let date = date_label(cx.clock.now_ms(), cx.settings.tz_offset_minutes);
+        let mut tree = self.remote.clone();
+        for item in items {
+            if tree.contains(item) || !old.contains(item) {
+                continue;
+            }
+            tree = graft(
+                &tree,
+                &old,
+                item,
+                &cx.settings.words,
+                &date,
+                &mut EntropyIds(cx.entropy),
+            )?
+            .0;
+        }
+        let back = tree
+            .iter()
+            .filter(|(id, n)| !n.is_dir() && !self.remote.contains(id))
+            .count() as u64;
+        if back > 0 {
+            self.publish_tree(cx, tree)?;
+        }
+        Ok(back)
+    }
+
+    /// What the last commit of a person's action changed, for its undo token; taken once.
+    pub fn take_last_action(&mut self) -> Option<UndoState> {
+        self.last_action.take()
+    }
+
+    /// Undoes a person's action (`undo`): local changes go out first (a "keep this" lives on
+    /// the disk until its round), then a new commit puts the items `undo` names back in their
+    /// state before the action. Nothing of the history is removed.
+    pub fn revert(&mut self, cx: &mut Ctx<'_>, undo: &UndoState) -> Result<(), SyncError> {
+        let report = self.round(cx)?;
+        if report.offline {
+            return Err(SyncError::Net(NetError::Unreachable));
+        }
+        let tree = undo.apply_to(&self.remote)?;
+        if tree == self.remote {
+            return Ok(());
+        }
+        self.publish_tree(cx, tree)?;
+        // The undo itself is not undone again.
+        self.last_action = None;
+        Ok(())
+    }
+
+    /// "Download again" for a folder whose place went missing (UX 8.2): this device forgets
+    /// what it held on disk, so the next round fills the empty place from the server's tree.
+    /// The verified chain, its marks and the history stay, so the folder keeps its protection
+    /// against an older state and its versions (ADR 0001, section 4).
+    pub fn forget_disk(&mut self, store: &mut dyn Store) -> Result<(), SyncError> {
+        let synced: Vec<ItemId> = self.synced.ids().copied().collect();
+        for id in synced {
+            self.synced.remove(&id);
+        }
+        let local: Vec<ItemId> = self.local.ids().copied().collect();
+        for id in local {
+            self.local.remove(&id);
+        }
+        for id in std::mem::take(&mut self.file_ids).into_keys() {
+            self.file_ids_dirty.insert(id, None);
+        }
+        self.meta.sync_base = None;
+        self.meta.deleted_seen.clear();
+        self.meta.held.clear();
+        self.meta.restore.clear();
+        self.meta.approve_deletes = false;
+        self.meta.backoff.clear();
+        self.meta.not_synced.clear();
+        if self.meta.state == FolderState::Stopped(StopReason::MarkerMissing) {
+            self.meta.state = FolderState::Active;
+        }
+        self.scan_scope = ScanScope::Full;
+        self.save(store)
+    }
+
+    /// Syncs again a folder that stopped because it was retired, once it is in the account's
+    /// folder list again (another device brought it back); returns whether it was stopped so.
+    pub fn clear_retired(&mut self, store: &mut dyn Store) -> Result<bool, SyncError> {
+        if self.meta.state != FolderState::Stopped(StopReason::Retired) {
+            return Ok(false);
+        }
+        self.meta.state = FolderState::Active;
+        self.request_full_scan();
+        self.save(store)?;
+        Ok(true)
     }
 
     /// The re-anchor after "the server shows an older state", once the person confirmed

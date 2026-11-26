@@ -73,11 +73,29 @@ describe("settings (UX 11)", () => {
     { version: "0.1.0+12", build: 12 },
   ])("shows $version with build $build as Version 0.1.0-12", async (about) => {
     const { mock } = await renderApp();
-    vi.spyOn(mock, "getAbout").mockResolvedValue(about);
+    vi.spyOn(mock, "getAbout").mockResolvedValue({ ...about, updates: true });
     await click("Einstellungen");
     const line = all('[role="dialog"] .info-line')
       .map((element) => element.textContent)
       .find((content) => content.startsWith("Version "));
     expect(line).toBe("Version 0.1.0-12");
+  });
+});
+
+describe("reset this device", () => {
+  it("asks once in place, then goes back to the welcome", async () => {
+    const { mock } = await renderApp();
+    await click("Einstellungen");
+    expect(text()).toContain("Hilfe");
+    await click("Dieses Gerät zurücksetzen");
+    expect(text()).toContain("Dieses Gerät wirklich zurücksetzen?");
+    expect(document.activeElement?.textContent).toBe("Abbrechen");
+    await click("Abbrechen");
+    expect(mock.calls).not.toContain("resetDevice");
+    expect(document.activeElement?.textContent).toBe("Dieses Gerät zurücksetzen");
+    await click("Dieses Gerät zurücksetzen");
+    await click("Zurücksetzen");
+    expect(mock.calls).toContain("resetDevice");
+    expect(document.querySelector("h1")?.textContent).toBe("Willkommen bei Hangar Drive");
   });
 });

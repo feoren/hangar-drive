@@ -39,7 +39,11 @@
 //!   later with a longer backoff and never blocks the run.
 //! - **Links and reparse points** are reported as such and never followed; files with the
 //!   Windows system attribute are reported as [`EntryType::System`].
-//! - **mtime tolerance:** 2 s on FAT and exFAT volumes, where write times have 2 s resolution.
+//! - **mtime tolerance:** 2 s on FAT and exFAT volumes, where write times have 2 s resolution
+//!   (Windows: the volume's file system name; Linux: `statfs` `f_type` of vfat, msdos and
+//!   exFAT), and 1 s on Linux for WSL's drvfs and other 9p mounts of Windows drives, which report
+//!   whole second modification times (measured, `docs/wiki/pages/sources/
+//!   unix-inode-reuse-measurement.md`). Other volumes and platforms have none.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -173,7 +177,7 @@ impl LocalFs {
             ));
         }
         let root = fs::canonicalize(root).map_err(|e| io_error(&e))?;
-        let tolerance_ms = if volume_is_fat(&root) { 2_000 } else { 0 };
+        let tolerance_ms = volume_tolerance_ms(&root);
         let me = Self {
             root,
             tolerance_ms,
@@ -285,15 +289,34 @@ impl LocalFs {
     }
 
     fn temp_dir(&self) -> Result<PathBuf, FsError> {
-        let dir = self.reserved().join(TEMP_DIR);
-        fs::create_dir_all(&dir).map_err(|e| io_error(&e))?;
-        match dir_info(&dir) {
-            Ok(Some(_)) => Ok(dir),
-            Ok(None) => Err(FsError::CannotSync(
-                "the reserved directory is not a plain directory".into(),
-            )),
-            Err(e) => Err(io_error(&e)),
+        self.reserved_dir(&[TEMP_DIR])
+    }
+
+    /// `.hangar-drive/<parts>` below the root, created one level at a time, with every level
+    /// checked to be a plain directory (no symbolic link, junction or other reparse point,
+    /// read without following it, security review N5). A link at any level, `.hangar-drive`
+    /// itself included, would let a temporary write or a quarantined file land outside the
+    /// root; `create_dir_all` alone follows it.
+    fn reserved_dir(&self, parts: &[&str]) -> Result<PathBuf, FsError> {
+        let mut dir = self.root.clone();
+        for part in std::iter::once(RESERVED_ROOT_DIR).chain(parts.iter().copied()) {
+            dir.push(part);
+            match fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_error(&e)),
+            }
+            match dir_info(&dir) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(FsError::CannotSync(
+                        "the reserved directory is not a plain directory".into(),
+                    ))
+                }
+                Err(e) => return Err(io_error(&e)),
+            }
         }
+        Ok(dir)
     }
 
     /// A new temporary file with a random name (L4). A name that exists is drawn again; it is
@@ -429,8 +452,8 @@ impl LocalFs {
     }
 
     fn quarantine(&self, item: &ItemId, full: &Path) -> Result<(), FsError> {
-        let dir = self.reserved().join(QUARANTINE_DIR).join(item.to_hex());
-        fs::create_dir_all(&dir).map_err(|e| io_error(&e))?;
+        let item = item.to_hex();
+        let dir = self.reserved_dir(&[QUARANTINE_DIR, &item])?;
         let name = full.file_name().ok_or(FsError::NotFound)?;
         let mut target = dir.join(name);
         for n in 1..100u32 {
@@ -853,6 +876,60 @@ pub fn long_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The mtime tolerance of the volume of `path` (module docs).
+#[cfg(windows)]
+fn volume_tolerance_ms(path: &Path) -> i64 {
+    if volume_is_fat(path) {
+        2_000
+    } else {
+        0
+    }
+}
+
+/// The mtime tolerance of the volume of `path` from its `statfs` magic (module docs); none when
+/// `statfs` fails.
+#[cfg(target_os = "linux")]
+fn volume_tolerance_ms(path: &Path) -> i64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    let mut info = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `c_path` is a NUL-terminated string that lives across the call, and `info` points
+    // to writable memory of the size of `struct statfs`, which the call fills on success.
+    if unsafe { libc::statfs(c_path.as_ptr(), info.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: `statfs` returned 0, so it wrote the whole struct; it was zeroed before anyway.
+    let info = unsafe { info.assume_init() };
+    // `f_type` is `__fsword_t`, 64 bits on x86_64 and 32 bits on some other targets.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = info.f_type as i64;
+    tolerance_for_magic(magic)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn volume_tolerance_ms(_path: &Path) -> i64 {
+    0
+}
+
+/// `MSDOS_SUPER_MAGIC` (vfat and msdos), `linux/magic.h`.
+pub const MSDOS_MAGIC: i64 = 0x4d44;
+/// exFAT, `EXFAT_SUPER_MAGIC` of `linux/magic.h`.
+pub const EXFAT_MAGIC: i64 = 0x2011_bab0;
+/// `V9FS_MAGIC`: 9p, which WSL 2 uses for Windows drives (drvfs) under `/mnt`.
+pub const V9FS_MAGIC: i64 = 0x0102_1997;
+
+/// The mtime tolerance in milliseconds for a Linux file system magic (`statfs` `f_type`): 2 s
+/// for FAT and exFAT, 1 s for 9p (WSL's drvfs, whole second times measured), none otherwise.
+pub fn tolerance_for_magic(magic: i64) -> i64 {
+    match magic {
+        MSDOS_MAGIC | EXFAT_MAGIC => 2_000,
+        V9FS_MAGIC => 1_000,
+        _ => 0,
+    }
+}
+
 /// Whether the volume of `path` is FAT or exFAT (2 s write time resolution).
 #[cfg(windows)]
 fn volume_is_fat(path: &Path) -> bool {
@@ -890,11 +967,6 @@ fn volume_is_fat(path: &Path) -> bool {
         .unwrap_or(fs_name.len());
     let name = String::from_utf16_lossy(&fs_name[..end]).to_ascii_uppercase();
     name.contains("FAT")
-}
-
-#[cfg(not(windows))]
-fn volume_is_fat(_path: &Path) -> bool {
-    false
 }
 
 impl FileSystem for LocalFs {
@@ -1107,6 +1179,16 @@ impl FileSystem for LocalFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coarse_file_systems_get_a_tolerance() {
+        assert_eq!(tolerance_for_magic(0x4d44), 2_000, "vfat, msdos");
+        assert_eq!(tolerance_for_magic(0x2011_bab0), 2_000, "exfat");
+        assert_eq!(tolerance_for_magic(0x0102_1997), 1_000, "9p, WSL drvfs");
+        assert_eq!(tolerance_for_magic(0xef53), 0, "ext4");
+        assert_eq!(tolerance_for_magic(0x9123_683e), 0, "btrfs");
+        assert_eq!(tolerance_for_magic(0x794c_7630), 0, "overlayfs");
+    }
 
     #[test]
     fn names_are_checked_before_paths() {

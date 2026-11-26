@@ -23,7 +23,10 @@ const USAGE: &str = "usage: hangar-drive-server [command]
 
   serve                              run the server (default)
   healthcheck                        exit 0 if the local server answers its health check
-  invite [--days N]                  create a single-use invite (default 7 days)
+  invite [--days N] [--pin [--cert FILE | --spki SHA256-HEX]]
+                                     create a single-use invite (default 7 days) and
+                                     print its link; needs HANGAR_DRIVE_PUBLIC_URL;
+                                     --pin adds the SPKI pin of a self-signed certificate
   server-key-number [--cert FILE | --spki SHA256-HEX]
                                      print the server key number devices compare
   status                             accounts, usage, pins and warnings
@@ -136,6 +139,7 @@ async fn serve(config: Config) -> Result<()> {
         account_budget = l.account_budget,
         device_budget = l.device_budget,
         trusted_proxies = config.trusted_proxies.len(),
+        public_url = config.public_url.as_deref().unwrap_or_default(),
         "server ready"
     );
     hangar_drive_server::serve(server, listener, shutdown_signal()).await?;
@@ -159,33 +163,57 @@ async fn invite(config: &Config, args: &[String]) -> Result<()> {
             .filter(|d| (1..=accounts::MAX_INVITE_DAYS).contains(d))
             .ok_or_else(|| anyhow!("--days must be 1 to {}", accounts::MAX_INVITE_DAYS))?,
     };
+    // Checked before the invite exists, so a missing address never leaves an unusable invite.
+    let public_url = config.public_url.as_deref().ok_or_else(|| {
+        anyhow!(
+            "set {} to the address devices reach this server under, for example              https://drive.example.org/",
+            hangar_drive_server::config::PUBLIC_URL_VAR
+        )
+    })?;
+    // Only a self-signed setup needs a pin; a certificate from a public CA must not be pinned,
+    // or its next renewal with a new key would lock every device out (ADR 0001, section 6).
+    let pin = if args.iter().any(|a| a == "--pin") {
+        Some(spki_pin(config, args)?)
+    } else {
+        if flag(args, "--cert").is_some() || flag(args, "--spki").is_some() {
+            bail!("--cert and --spki only go with --pin");
+        }
+        None
+    };
     let (app, _shutdown) = open(config).await?;
     let (token, expires_ms) = accounts::create_invite(&app.db, app.now_ms(), days).await?;
     eprintln!(
-        "Single-use invite, valid for {days} days (until {} UTC). It is shown only now.",
+        "Single-use invite, valid for {days} days (until {} UTC). It is shown only now; send          the whole link, the part after # is the invite.",
         format_ms(expires_ms)
     );
-    println!("{}", token.expose_base64url().as_str());
+    println!(
+        "{}",
+        hangar_drive_server::links::invite_link(public_url, &token, &app.server_id, pin.as_ref())
+    );
     Ok(())
 }
 
-async fn key_number(config: &Config, args: &[String]) -> Result<()> {
-    let pin: [u8; 32] = if let Some(hex) = flag(args, "--spki") {
+/// The SPKI pin from `--spki HEX`, `--cert FILE` or the configured TLS certificate.
+fn spki_pin(config: &Config, args: &[String]) -> Result<[u8; 32]> {
+    if let Some(hex) = flag(args, "--spki") {
         let bytes = decode_hex(hex).ok_or_else(|| {
             anyhow!("--spki takes the SHA-256 of the SubjectPublicKeyInfo as 64 hex digits")
         })?;
-        bytes
+        return bytes
             .try_into()
-            .map_err(|_| anyhow!("--spki takes 32 bytes (64 hex digits)"))?
-    } else {
-        let path = match flag(args, "--cert") {
-            Some(p) => std::path::PathBuf::from(p),
-            None => config.tls.as_ref().map(|t| t.cert.clone()).ok_or_else(|| {
-                anyhow!("give --cert FILE or --spki HEX, or set HANGAR_DRIVE_TLS_CERT")
-            })?,
-        };
-        hangar_drive_server::tls::spki_pin_of_file(&path)?
+            .map_err(|_| anyhow!("--spki takes 32 bytes (64 hex digits)"));
+    }
+    let path = match flag(args, "--cert") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => config.tls.as_ref().map(|t| t.cert.clone()).ok_or_else(|| {
+            anyhow!("give --cert FILE or --spki HEX, or set HANGAR_DRIVE_TLS_CERT")
+        })?,
     };
+    Ok(hangar_drive_server::tls::spki_pin_of_file(&path)?)
+}
+
+async fn key_number(config: &Config, args: &[String]) -> Result<()> {
+    let pin = spki_pin(config, args)?;
     let (app, _shutdown) = open(config).await?;
     let number = server_key_number(&app.server_id, &pin);
     eprintln!(

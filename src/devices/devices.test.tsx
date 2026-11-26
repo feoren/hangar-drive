@@ -13,6 +13,7 @@ import {
   field,
   flush,
   key,
+  maybeButton,
   renderApp,
   text,
   type,
@@ -116,9 +117,9 @@ describe("adding a device (UX 5)", () => {
     mock.controls.pairAnswer = "none";
     await click("Gerät hinzufügen");
     expect(dialogTitle()).toBe("Neues Gerät hinzufügen");
-    expect(document.querySelector("svg.qr")?.getAttribute("aria-label")).toBe(
-      "QR-Code mit dem Kopplungslink",
-    );
+    const qr = document.querySelector("img.qr");
+    expect(qr?.getAttribute("alt")).toBe("QR-Code mit dem Kopplungslink");
+    expect(qr?.getAttribute("src")).toMatch(/^data:image\/svg\+xml;charset=utf-8,%3C/);
     expect(text()).toMatch(/Gültig bis \d\d:\d\d, nur für ein Gerät\./);
     await click("Link kopieren");
     expect(text()).toContain(
@@ -134,7 +135,8 @@ describe("adding a device (UX 5)", () => {
     await wait(30);
     expect(dialogTitle()).toBe("„MacBook“ möchte dazukommen.");
     expect(document.activeElement?.textContent).toBe("Ablehnen");
-    const add = button(/^Hinzufügen$/);
+    expect(text()).toContain("Danach fragt dein System noch einmal nach");
+    const add = button(/^Hinzufügen …$/);
     await click(add);
     expect(mock.calls).not.toContain("answerPairRequest:accept");
     await wait(ARM_DELAY_MS + 50);
@@ -143,16 +145,33 @@ describe("adding a device (UX 5)", () => {
     expect(text()).toContain("„MacBook“ ist jetzt dabei.");
   });
 
-  it("makes the comparison part of the question on the typed path", async () => {
+  // The comparison itself is the native question of the shell (security review L2); the window
+  // shows the numbers but does not ask the same thing first.
+  it("shows the numbers on the typed path and leaves the question to the shell", async () => {
     const { mock } = await openDevices();
     mock.controls.pairAnswer = "typed";
     await click("Gerät hinzufügen");
     await wait(30);
-    expect(text()).toContain("Stimmt sie mit dieser hier überein?");
+    expect(text()).not.toContain("Stimmt sie mit dieser hier überein?");
     expect(all(".number-group")).toHaveLength(6);
-    await click("Nein, abbrechen");
+    expect(maybeButton("Ja, gleiche Zahlen, hinzufügen")).toBeUndefined();
+    await click("Ablehnen");
     expect(mock.calls).toContain("answerPairRequest:decline");
     expect(text()).toContain("Dann füge das Gerät nicht hinzu.");
+  });
+
+  it("does not add the device when the native question is answered with no", async () => {
+    const { mock } = await openDevices();
+    mock.controls.nativeConfirm = "no";
+    await click("Gerät hinzufügen");
+    await wait(ARM_DELAY_MS + 50);
+    await click(button(/^Hinzufügen …$/));
+    expect(mock.calls).toContain("answerPairRequest:accept");
+    expect(text()).not.toContain("ist jetzt dabei");
+    expect(text()).toContain("Dann füge das Gerät nicht hinzu.");
+    expect((await mock.listDevices()).devices.map((device) => device.name)).not.toContain(
+      "MacBook",
+    );
   });
 
   it("declines with Escape", async () => {

@@ -1,15 +1,31 @@
 // Additional device in two steps (UX 4.3): pair with the other device, then choose the folders.
 // Also used for "Pair again" after this device was removed (UX 8.8).
+//
+// Before a pairing link is sent, the window shows the server (its host in punycode) and the
+// account the link leads to and asks once (N2). After joining, it shows the account's devices:
+// a link that leads to a stranger's account shows strangers, and "No" disconnects this device
+// again before any file moves.
 
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
-import type { PairError, PairWaiting } from "../backend/types";
+import type {
+  InspectedLink,
+  LinkError,
+  LinkKind,
+  NameError,
+  PairError,
+  PairInput,
+  PairWaiting,
+} from "../backend/types";
+import { cleanLink, groupHex, linkKind } from "../domain/links";
+import { cleanName, nameProblem } from "../domain/names";
 import { useT, type Translate } from "../i18n";
 import { useBackendEvent } from "../ui/appContext";
 import { useBackend } from "../ui/backendContext";
-import { Feedback, NumberRows } from "../ui/parts";
-import { errorText, useAction } from "../ui/useAsync";
-import { FolderChoiceStep, StepIndicator } from "./common";
+import { DesktopIcon, LaptopIcon } from "../ui/icons";
+import { ArmedButton, Feedback, Loading, NumberRows } from "../ui/parts";
+import { errorText, useAction, useLoad } from "../ui/useAsync";
+import { DeviceNameField, FolderChoiceStep, StepIndicator } from "./common";
 import { LinkField } from "./LinkField";
 
 export function pairErrorText(error: PairError, t: Translate): string {
@@ -33,19 +49,39 @@ export function pairErrorText(error: PairError, t: Translate): string {
   }
 }
 
+/** Why a link could not be read, for the pairing and the recovery field. */
+export function linkErrorText(error: LinkError, notALink: string, t: Translate): string {
+  switch (error) {
+    case "notALink":
+      return notALink;
+    case "damaged":
+      return t("error.link.damaged");
+    case "insecure":
+      return t("error.insecure", { app: t("app.name") });
+  }
+}
+
+type Stage = "pair" | "devices" | "folders";
+
 export function PairFlow({
   titleId,
+  initialLink = "",
+  onSwitch,
   onBack,
   onDone,
 }: {
   readonly titleId?: string;
+  /** A pairing link the OS handed over; the server question comes up at once. */
+  readonly initialLink?: string;
+  readonly onSwitch?: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
   readonly onDone: () => void;
 }) {
   const ownTitle = useId();
   const title = titleId ?? ownTitle;
-  const [paired, setPaired] = useState(false);
-  if (paired) {
+  const [stage, setStage] = useState<Stage>("pair");
+  const [aborted, setAborted] = useState(false);
+  if (stage === "folders") {
     return (
       <FolderChoiceStep
         titleId={title}
@@ -54,12 +90,29 @@ export function PairFlow({
       />
     );
   }
+  if (stage === "devices") {
+    return (
+      <DevicesCheck
+        titleId={title}
+        onYes={() => {
+          setStage("folders");
+        }}
+        onAborted={() => {
+          setAborted(true);
+          setStage("pair");
+        }}
+      />
+    );
+  }
   return (
     <PairStep
       titleId={title}
+      initialLink={aborted ? "" : initialLink}
+      aborted={aborted}
+      onSwitch={onSwitch}
       onBack={onBack}
       onJoined={() => {
-        setPaired(true);
+        setStage("devices");
       }}
     />
   );
@@ -67,10 +120,17 @@ export function PairFlow({
 
 function PairStep({
   titleId,
+  initialLink,
+  aborted,
+  onSwitch,
   onBack,
   onJoined,
 }: {
   readonly titleId: string;
+  readonly initialLink: string;
+  /** The person said "no" to the devices of the last account: say it is undone. */
+  readonly aborted: boolean;
+  readonly onSwitch: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
   readonly onJoined: () => void;
 }) {
@@ -78,12 +138,19 @@ function PairStep({
   const backend = useBackend();
   const app = t("app.name");
   const [typed, setTyped] = useState(false);
-  const [link, setLink] = useState("");
+  const [link, setLink] = useState(initialLink);
   const [server, setServer] = useState("");
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [target, setTarget] = useState<{ link: string; info: InspectedLink } | null>(null);
   const [waiting, setWaiting] = useState<PairWaiting | null>(null);
   const [joined, setJoined] = useState(false);
+  // The name the other device shows in its question; the OS's name until the person changes it.
+  const [defaultName] = useLoad(() => backend.defaultDeviceName(), [backend]);
+  const [name, setName] = useState<string | null>(null);
+  const [refused, setRefused] = useState<NameError | null>(null);
+  const deviceName = name ?? (defaultName.status === "ready" ? defaultName.data : "");
+  const nameReady = nameProblem(deviceName) === null;
   const action = useAction();
   // Set before the call, because the answer can arrive before the call returns.
   const pairing = useRef(false);
@@ -99,23 +166,53 @@ function PairStep({
       setTimeout(onJoined, 900);
     } else {
       setWaiting(null);
+      setTarget(null);
       setError(pairErrorText(event.result.error, t));
     }
   });
 
-  const start = (input: Parameters<typeof backend.startPairing>[0]) => {
+  const start = (input: PairInput) => {
     setError(null);
+    // A link the OS handed over skips the form; a name that is not ready sends the person there.
+    if (!nameReady) {
+      setTarget(null);
+      return;
+    }
     pairing.current = true;
     void action.run(async () => {
-      const result = await backend.startPairing(input);
+      const result = await backend.startPairing(input, cleanName(deviceName));
       if (result.ok) {
         setWaiting((current) => current ?? result.value);
-      } else {
-        pairing.current = false;
-        setError(pairErrorText(result.error, t));
+        return;
       }
+      pairing.current = false;
+      setTarget(null);
+      if (result.error === "blank" || result.error === "edgeWhitespace") setRefused(result.error);
+      else setError(pairErrorText(result.error, t));
     });
   };
+
+  // N2: a link is read offline first; nothing is sent before the person said yes to its server.
+  const inspect = (value: string) => {
+    const clean = cleanLink(value);
+    setError(null);
+    void action.run(async () => {
+      const result = await backend.inspectLink(clean);
+      if (!result.ok) setError(linkErrorText(result.error, t("error.pair.notALink"), t));
+      else if (result.value.kind !== "pair") setError(t("error.pair.notALink"));
+      else setTarget({ link: clean, info: result.value });
+    });
+  };
+
+  // A link the OS handed over goes straight to the question.
+  const opened = useRef(false);
+  useEffect(() => {
+    if (opened.current || linkKind(initialLink) !== "pair") return;
+    opened.current = true;
+    inspect(initialLink);
+    // Runs once for the link the flow was opened with.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (waiting) {
     return (
@@ -158,6 +255,7 @@ function PairStep({
                 await backend.cancelPairing();
                 pairing.current = false;
                 setWaiting(null);
+                setTarget(null);
               });
             }}
           >
@@ -169,18 +267,64 @@ function PairStep({
     );
   }
 
-  const canStart = typed ? server.trim() !== "" && code.trim() !== "" : link.trim() !== "";
+  if (target && target.info.kind !== "invite") {
+    const info = target.info;
+    return (
+      <div className="step-form">
+        <StepIndicator step={1} total={2} />
+        <h1 id={titleId} className="step-title" tabIndex={-1}>
+          {t("pair.check.title")}
+        </h1>
+        <dl className="facts">
+          <dt>{t("pair.check.server")}</dt>
+          <dd>{info.host}</dd>
+          <dt>{t("pair.check.account")}</dt>
+          <dd>{groupHex(info.account)}</dd>
+        </dl>
+        {info.pinned && (
+          <div className="notice" role="note">
+            <p className="notice-title">{t("setup.connect.pinnedTitle")}</p>
+            <p>{t("pair.check.pinned", { app })}</p>
+          </div>
+        )}
+        <p className="step-body">{t("pair.check.body")}</p>
+        {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
+        <div className="step-actions">
+          <button
+            type="button"
+            className="button secondary"
+            data-autofocus
+            autoFocus
+            onClick={() => {
+              setTarget(null);
+            }}
+          >
+            {t("setup.back")}
+          </button>
+          <ArmedButton
+            armKey={`${info.host} ${info.account}`}
+            onClick={() => {
+              start({ kind: "link", link: target.link });
+            }}
+          >
+            {t("pair.check.connect")}
+          </ArmedButton>
+        </div>
+      </div>
+    );
+  }
+
+  const clean = cleanLink(link);
+  const linkReady = clean !== "" && (linkKind(clean) ?? "pair") === "pair";
+  const canStart = nameReady && (typed ? server.trim() !== "" && code.trim() !== "" : linkReady);
   return (
     <form
       className="step-form"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!canStart) return;
-        start(
-          typed
-            ? { kind: "typed", server: server.trim(), code }
-            : { kind: "link", link: link.trim() },
-        );
+        if (!canStart || action.pending) return;
+        if (typed) start({ kind: "typed", server: server.trim(), code });
+        else inspect(clean);
       }}
     >
       <StepIndicator step={1} total={2} />
@@ -188,6 +332,7 @@ function PairStep({
         {t("pair.new.title")}
       </h1>
       <p className="step-body">{t("pair.new.body", { app })}</p>
+      {aborted && <Feedback tone="info">{t("pair.devices.aborted")}</Feedback>}
       {typed ? (
         <>
           <div className="field">
@@ -244,6 +389,7 @@ function PairStep({
         <>
           <LinkField
             label={t("pair.new.label")}
+            expect="pair"
             value={link}
             autoFocus
             placeholder="hangar-drive://pair#…"
@@ -251,9 +397,8 @@ function PairStep({
               setLink(value);
               setError(null);
             }}
-            onScanned={(value) => {
-              start({ kind: "link", link: value });
-            }}
+            onScanned={inspect}
+            onSwitch={onSwitch}
             error={error}
           />
           <button
@@ -268,6 +413,14 @@ function PairStep({
           </button>
         </>
       )}
+      <DeviceNameField
+        value={deviceName}
+        refused={refused}
+        onChange={(next) => {
+          setRefused(null);
+          setName(next);
+        }}
+      />
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
       <div className="step-actions">
         <button type="button" className="button secondary" onClick={onBack}>
@@ -282,5 +435,69 @@ function PairStep({
         </button>
       </div>
     </form>
+  );
+}
+
+/** "Are these your devices?" right after joining, before any folder is chosen (N2). */
+function DevicesCheck({
+  titleId,
+  onYes,
+  onAborted,
+}: {
+  readonly titleId: string;
+  readonly onYes: () => void;
+  readonly onAborted: () => void;
+}) {
+  const t = useT();
+  const backend = useBackend();
+  const [list] = useLoad(() => backend.listDevices(), [backend]);
+  const action = useAction();
+  return (
+    <div className="step-form">
+      <StepIndicator step={1} total={2} />
+      <h1 id={titleId} className="step-title" tabIndex={-1}>
+        {t("pair.devices.title")}
+      </h1>
+      <p className="step-body">{t("pair.devices.body")}</p>
+      {list.status === "loading" && <Loading />}
+      {list.status === "failed" && <Feedback tone="error">{errorText(list.error, t)}</Feedback>}
+      {list.status === "ready" && (
+        <ul className="device-check" aria-label={t("devices.title")}>
+          {list.data.devices.map((device) => (
+            <li key={device.id}>
+              {device.kind === "laptop" ? <LaptopIcon /> : <DesktopIcon />}
+              <span className="row-name">{device.name}</span>
+              {device.isThis && <span className="row-sub">{t("devices.this")}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
+      <div className="step-actions">
+        <button
+          type="button"
+          className="button secondary"
+          disabled={action.pending}
+          onClick={() => {
+            void action.run(async () => {
+              await backend.disconnectThisDevice();
+              onAborted();
+            });
+          }}
+        >
+          {t("pair.confirm.no")}
+        </button>
+        <button
+          type="button"
+          className="button primary"
+          aria-disabled={list.status !== "ready" || action.pending}
+          onClick={() => {
+            if (list.status === "ready" && !action.pending) onYes();
+          }}
+        >
+          {t("pair.devices.yes")}
+        </button>
+      </div>
+    </div>
   );
 }

@@ -25,20 +25,27 @@
 //! anyone who can show a QR code to the person could point the device at another server. The
 //! new device checks the same signature once it has the log ([`check_joined`]).
 //!
-//! # Request tag
+//! # Request tag and sealed name
 //!
 //! ```text
-//! P_mac = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-mac"), 32 bytes)
-//! P_id  = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-id"), 16 bytes)
-//! tag   = HMAC-SHA-256(P_mac, field("hangar-drive/v1/pairing-request") || field(account)
-//!                      || field(new device id) || field(sign key) || field(kem key)
-//!                      || field(proof) || field(name))
+//! P_mac  = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-mac"), 32 bytes)
+//! P_id   = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-id"), 16 bytes)
+//! P_name = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-name"), 32 bytes)
+//! sealed name = nonce (24 random bytes) || XChaCha20-Poly1305(P_name, nonce, name (UTF-8),
+//!               aad = field("hangar-drive/v1/pairing-name") || field(account) || field(new device id))
+//! tag    = HMAC-SHA-256(P_mac, field("hangar-drive/v1/pairing-request") || field(account)
+//!                       || field(new device id) || field(sign key) || field(kem key)
+//!                       || field(proof) || field(sealed name))
 //! ```
 //!
 //! The server routes the request by `P_id` and learns neither P nor anything that lets it forge
-//! the tag. The inviting device checks the tag in constant time, then the proof of possession,
-//! then asks the person `Add device <name>?` with the new device's safety number. The name
-//! passes [`hangar_drive_protocol::name::check_display_name`].
+//! the tag or read the name: device names are sealed records everywhere else (ADR 0001, section
+//! 4), and a request waits on the server until it is answered. Only who holds P (the inviting
+//! device, and the new device that read the offer) can open the name. The key seals one request
+//! of one offer, so a random nonce is ample. The inviting device checks the tag in constant
+//! time, then opens the name, then checks the proof of possession, then asks the person `Add
+//! device <name>?` with the new device's safety number. The name passes
+//! [`hangar_drive_protocol::name::check_display_name`] on both sides.
 //!
 //! # Server URL
 //!
@@ -53,7 +60,9 @@
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hangar_drive_protocol::api::{PairingRequest, MAX_DEVICE_NAME_LEN};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use hangar_drive_protocol::api::{PairingRequest, MAX_DEVICE_NAME_LEN, SEALED_NAME_OVERHEAD};
 use hangar_drive_protocol::ids::{
     AccountId, Blob, DeviceId, LogHash, LogHead, PairingId, ServerId, Signature,
 };
@@ -77,6 +86,9 @@ const LABEL_MAC: &[u8] = b"hangar-drive/v1/pairing-mac";
 const LABEL_ID: &[u8] = b"hangar-drive/v1/pairing-id";
 const LABEL_REQUEST: &[u8] = b"hangar-drive/v1/pairing-request";
 const LABEL_OFFER: &[u8] = b"hangar-drive/v1/pairing-offer";
+const LABEL_NAME: &[u8] = b"hangar-drive/v1/pairing-name";
+/// Bytes of the random nonce in front of a sealed name.
+const NAME_NONCE_LEN: usize = 24;
 const CODE_VERSION: u8 = 1;
 const OFFER_VERSION: u8 = 1;
 const SIGNATURE_LEN: usize = 64;
@@ -177,13 +189,74 @@ impl PairingSecret {
         Ok(PairingId::from_bytes(*id))
     }
 
+    fn name_cipher(&self) -> Result<XChaCha20Poly1305, PairingError> {
+        let key = hkdf::<32>(self.0.as_ref(), &framed(&[LABEL_NAME])).ok_or(PairingError::Key)?;
+        XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| PairingError::Key)
+    }
+
+    /// The new device's name sealed for whoever holds this secret (module docs).
+    fn seal_name(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+        name: &str,
+        entropy: &mut impl Entropy,
+    ) -> Result<Vec<u8>, PairingError> {
+        let mut nonce = [0u8; NAME_NONCE_LEN];
+        entropy.fill(&mut nonce)?;
+        let aad = framed(&[LABEL_NAME, account.as_bytes(), device.as_bytes()]);
+        let ciphertext = self
+            .name_cipher()?
+            .encrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: name.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| PairingError::Key)?;
+        let mut sealed = Vec::with_capacity(name.len() + SEALED_NAME_OVERHEAD);
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+        Ok(sealed)
+    }
+
+    /// Opens a sealed name: [`PairingError::Name`] if it does not open with this secret for
+    /// this account and device, or is not a valid name.
+    fn open_name(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+        sealed: &[u8],
+    ) -> Result<String, PairingError> {
+        if sealed.len() <= SEALED_NAME_OVERHEAD {
+            return Err(PairingError::Name);
+        }
+        let (nonce, ciphertext) = sealed.split_at(NAME_NONCE_LEN);
+        let nonce: [u8; NAME_NONCE_LEN] = nonce.try_into().map_err(|_| PairingError::Name)?;
+        let aad = framed(&[LABEL_NAME, account.as_bytes(), device.as_bytes()]);
+        let plain = self
+            .name_cipher()?
+            .decrypt(
+                &XNonce::from(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| PairingError::Name)?;
+        let name = String::from_utf8(plain).map_err(|_| PairingError::Name)?;
+        check_name(&name)?;
+        Ok(name)
+    }
+
     fn tag(
         &self,
         account: &AccountId,
         device: &DeviceId,
         keys: &DevicePublicKeys,
         proof: &Signature,
-        name: &str,
+        sealed_name: &[u8],
     ) -> Result<[u8; 32], PairingError> {
         let key = hkdf::<32>(self.0.as_ref(), &framed(&[LABEL_MAC])).ok_or(PairingError::Key)?;
         let mut mac = hmac(key.as_ref()).ok_or(PairingError::Key)?;
@@ -194,43 +267,46 @@ impl PairingSecret {
             keys.sign.as_bytes(),
             keys.kem.as_bytes(),
             proof.as_bytes(),
-            name.as_bytes(),
+            sealed_name,
         ] {
             mac_field(&mut mac, part);
         }
         Ok(mac_finish(mac))
     }
 
-    /// The new device's request: its keys, its proof of possession, its name and the tag.
+    /// The new device's request: its keys, its proof of possession, its sealed name and the
+    /// tag. `entropy` gives the name's nonce.
     pub fn request(
         &self,
         identity: &DeviceIdentity,
         account: &AccountId,
         device: DeviceId,
         name: &str,
+        entropy: &mut impl Entropy,
     ) -> Result<PairingRequest, PairingError> {
         check_name(name)?;
         let keys = identity.public_keys();
         let proof = identity.prove(account, &device, false);
-        let tag = self.tag(account, &device, &keys, &proof, name)?;
+        let sealed_name = self.seal_name(account, &device, name, entropy)?;
+        let tag = self.tag(account, &device, &keys, &proof, &sealed_name)?;
         Ok(PairingRequest {
             device,
             sign: keys.sign,
             kem: keys.kem,
             proof,
-            name: name.to_owned(),
+            sealed_name: Blob(sealed_name),
             tag: Blob(tag.to_vec()),
         })
     }
 
     /// The inviting device's check of a request: tag (constant time), name, keys and proof of
-    /// possession. On success the app shows the safety number of the returned keys and asks the
-    /// person before it adds the device to the log.
+    /// possession. On success the app shows the opened name and the safety number of the
+    /// returned keys and asks the person before it adds the device to the log.
     pub fn verify_request(
         &self,
         account: &AccountId,
         request: &PairingRequest,
-    ) -> Result<DevicePublicKeys, PairingError> {
+    ) -> Result<VerifiedRequest, PairingError> {
         let keys = DevicePublicKeys {
             sign: request.sign,
             kem: request.kem,
@@ -240,20 +316,29 @@ impl PairingSecret {
             &request.device,
             &keys,
             &request.proof,
-            &request.name,
+            request.sealed_name.as_bytes(),
         )?;
         if !constant_time_eq(&expected, request.tag.as_bytes()) {
             return Err(PairingError::Tag);
         }
-        check_name(&request.name)?;
+        let name = self.open_name(account, &request.device, request.sealed_name.as_bytes())?;
         if !is_valid_sign_key(&keys.sign)
             || !is_valid_kem_key(&keys.kem)
             || !verify_proof(account, &request.device, &keys, false, &request.proof)
         {
             return Err(PairingError::Keys);
         }
-        Ok(keys)
+        Ok(VerifiedRequest { keys, name })
     }
+}
+
+/// A pairing request the inviting device checked ([`PairingSecret::verify_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRequest {
+    /// The new device's keys.
+    pub keys: DevicePublicKeys,
+    /// Its name, opened and checked.
+    pub name: String,
 }
 
 fn check_name(name: &str) -> Result<(), PairingError> {
@@ -575,11 +660,20 @@ mod tests {
         let secret = PairingSecret::generate(&mut OsEntropy).unwrap();
         let b = dev(2);
         let request = secret
-            .request(&b.identity, &ACCOUNT, b.id, "Laptop")
+            .request(&b.identity, &ACCOUNT, b.id, "Laptop", &mut OsEntropy)
             .unwrap();
         assert_eq!(request.validate(), Ok(()));
-        let keys = secret.verify_request(&ACCOUNT, &request).unwrap();
-        assert_eq!(keys, b.identity.public_keys());
+        let verified = secret.verify_request(&ACCOUNT, &request).unwrap();
+        assert_eq!(verified.keys, b.identity.public_keys());
+        assert_eq!(verified.name, "Laptop");
+        // The name is not in the request in the clear.
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("Laptop"), "{json}");
+        assert!(!request
+            .sealed_name
+            .as_bytes()
+            .windows(6)
+            .any(|w| w == b"Laptop"));
 
         // Another secret (the server guessing), another account, a changed field.
         let other = PairingSecret::generate(&mut OsEntropy).unwrap();
@@ -592,10 +686,30 @@ mod tests {
             Err(PairingError::Tag)
         );
         let mut renamed = request.clone();
-        renamed.name = "Server".into();
+        renamed.sealed_name.0[30] ^= 1;
         assert_eq!(
             secret.verify_request(&ACCOUNT, &renamed),
             Err(PairingError::Tag)
+        );
+        // The name of another request of the same offer (the tag made to match by whoever holds
+        // P) does not open for this device: the device ID is the name's associated data.
+        let c = dev(3);
+        let foreign = secret
+            .request(&c.identity, &ACCOUNT, c.id, "Server", &mut OsEntropy)
+            .unwrap();
+        assert_eq!(
+            secret.open_name(&ACCOUNT, &b.id, foreign.sealed_name.as_bytes()),
+            Err(PairingError::Name)
+        );
+        assert_eq!(
+            other.open_name(&ACCOUNT, &b.id, request.sealed_name.as_bytes()),
+            Err(PairingError::Name)
+        );
+        assert_eq!(
+            secret
+                .open_name(&ACCOUNT, &b.id, request.sealed_name.as_bytes())
+                .as_deref(),
+            Ok("Laptop")
         );
         let mut swapped = request.clone();
         swapped.kem = dev(3).identity.public_keys().kem;
@@ -612,7 +726,7 @@ mod tests {
         for bad in ["a\nb", "", "Lap\u{202e}pot", "a\u{2028}b", "a\u{feff}"] {
             assert_eq!(
                 secret
-                    .request(&b.identity, &ACCOUNT, b.id, bad)
+                    .request(&b.identity, &ACCOUNT, b.id, bad, &mut OsEntropy)
                     .unwrap_err(),
                 PairingError::Name,
                 "{bad:?}"
@@ -626,20 +740,59 @@ mod tests {
         let b = dev(2);
         let keys = b.identity.public_keys();
         let proof = b.identity.prove(&ACCOUNT, &b.id, true);
+        let sealed_name = secret
+            .seal_name(&ACCOUNT, &b.id, "Laptop", &mut OsEntropy)
+            .unwrap();
         let tag = secret
-            .tag(&ACCOUNT, &b.id, &keys, &proof, "Laptop")
+            .tag(&ACCOUNT, &b.id, &keys, &proof, &sealed_name)
             .unwrap();
         let request = PairingRequest {
             device: b.id,
             sign: keys.sign,
             kem: keys.kem,
             proof,
-            name: "Laptop".into(),
+            sealed_name: Blob(sealed_name),
             tag: Blob(tag.to_vec()),
         };
         assert_eq!(
             secret.verify_request(&ACCOUNT, &request),
             Err(PairingError::Keys)
+        );
+    }
+
+    #[test]
+    fn a_sealed_name_that_is_not_a_valid_name_is_refused() {
+        // A request with a valid tag whose sealed name is no valid name (made by someone who
+        // holds P but not the app): refused before the person is asked.
+        let secret = PairingSecret::generate(&mut OsEntropy).unwrap();
+        let b = dev(2);
+        let keys = b.identity.public_keys();
+        let proof = b.identity.prove(&ACCOUNT, &b.id, false);
+        for bad in ["Lap\u{202e}pot", " Laptop", "a\nb"] {
+            let sealed_name = secret
+                .seal_name(&ACCOUNT, &b.id, bad, &mut OsEntropy)
+                .unwrap();
+            let tag = secret
+                .tag(&ACCOUNT, &b.id, &keys, &proof, &sealed_name)
+                .unwrap();
+            let request = PairingRequest {
+                device: b.id,
+                sign: keys.sign,
+                kem: keys.kem,
+                proof,
+                sealed_name: Blob(sealed_name),
+                tag: Blob(tag.to_vec()),
+            };
+            assert_eq!(
+                secret.verify_request(&ACCOUNT, &request),
+                Err(PairingError::Name),
+                "{bad:?}"
+            );
+        }
+        // Too short to hold a name at all.
+        assert_eq!(
+            secret.open_name(&ACCOUNT, &b.id, &[0; SEALED_NAME_OVERHEAD]),
+            Err(PairingError::Name)
         );
     }
 

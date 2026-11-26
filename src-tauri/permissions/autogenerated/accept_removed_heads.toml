@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-accept-removed-heads"
+description = "Enables the accept_removed_heads command without any pre-configured scope."
+commands.allow = ["accept_removed_heads"]
+
+[[permission]]
+identifier = "deny-accept-removed-heads"
+description = "Denies the accept_removed_heads command without any pre-configured scope."
+commands.deny = ["accept_removed_heads"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-keep-both-conflict"
+description = "Enables the keep_both_conflict command without any pre-configured scope."
+commands.allow = ["keep_both_conflict"]
+
+[[permission]]
+identifier = "deny-keep-both-conflict"
+description = "Denies the keep_both_conflict command without any pre-configured scope."
+commands.deny = ["keep_both_conflict"]

@@ -780,6 +780,12 @@ pub async fn detect_burst(
 
 /// `GET /folders/{folder}/commits?after=N`. A head and its side commit share a sequence and are
 /// never split across pages.
+///
+/// A folder this account holds nothing of yet has the empty chain (sequence 0), not
+/// `NotFound` (finding E2E-2, ADR 0001, section 3, "API"): a new folder pulls before its first
+/// upload and commit, and the in-memory server the engine is tested against answers the same.
+/// Folder IDs are random and looked up per account, so the answer tells nothing about another
+/// account's folders.
 pub async fn delta(
     app: &App,
     session: &Session,
@@ -787,9 +793,13 @@ pub async fn delta(
     after: u64,
 ) -> ApiResult<DeltaPage> {
     let mut conn = app.db.acquire().await?;
-    let row = folders::find(&mut conn, session.account_pk, &folder)
-        .await?
-        .ok_or(ErrorCode::NotFound)?;
+    let Some(row) = folders::find(&mut conn, session.account_pk, &folder).await? else {
+        return Ok(DeltaPage {
+            commits: Vec::new(),
+            sequence: 0,
+            more: false,
+        });
+    };
     // Up to half a page of sequences: each has a head and at most one side commit.
     let limit = (MAX_DELTA_PAGE / 2) as u64;
     let rows: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(

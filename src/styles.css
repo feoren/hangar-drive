@@ -2344,3 +2344,57 @@ code.command {
   color: var(--muted);
   line-height: 1.4;
 }
+
+/* A calm notice inside a step or dialog (pinned server, N3): the banner's shape, smaller. */
+.notice {
+  margin-top: 12px;
+  padding: 10px 14px 10px 16px;
+  border-radius: var(--radius-m);
+  border: var(--hairline) solid color-mix(in srgb, var(--warn) 32%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg));
+  box-shadow: inset 3px 0 0 var(--warn);
+  font-size: var(--text-s);
+  line-height: 1.5;
+}
+
+.notice-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+/* Label and value pairs to compare (server and account, the recovery sheet). */
+.facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px var(--space-2);
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-m);
+  background: var(--panel);
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.device-check {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device-check li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}

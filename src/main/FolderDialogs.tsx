@@ -1,9 +1,10 @@
-// Dialogs of the folder rows: stop syncing, delete everywhere, folder number, entries that are
-// never synced, and "Add folder" with the merge question for a folder that is not empty (6.5).
+// Dialogs of the folder rows: stop syncing, folder number, entries that are never synced, and
+// "Add folder" with the merge question for a folder that is not empty (6.5). "Delete everywhere"
+// has no dialog of its own: the shell asks natively (security review L2), see FolderList.
 
 import { useId, useState } from "react";
 
-import type { Folder, FolderId } from "../backend/types";
+import type { Folder, FolderId, FolderPlace } from "../backend/types";
 import { useT } from "../i18n";
 import { useBackend, useSnapshot } from "../ui/backendContext";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
@@ -31,29 +32,6 @@ export function StopFolderDialog({
       onClose={onClose}
     >
       <p>{t("folder.stop.body")}</p>
-    </ConfirmDialog>
-  );
-}
-
-export function DeleteFolderDialog({
-  folder,
-  onClose,
-}: {
-  readonly folder: Folder;
-  readonly onClose: () => void;
-}) {
-  const t = useT();
-  const backend = useBackend();
-  const days = useSnapshot().account?.retentionDays ?? 30;
-  return (
-    <ConfirmDialog
-      title={t("folder.delete.title", { folder: folder.name })}
-      confirmLabel={t("folder.delete.confirm")}
-      danger
-      onConfirm={() => backend.deleteFolderEverywhere(folder.id)}
-      onClose={onClose}
-    >
-      <p>{t("folder.delete.body", { days })}</p>
     </ConfirmDialog>
   );
 }
@@ -135,7 +113,7 @@ export function NotSyncedDialog({
   );
 }
 
-type Pending = { readonly folderId: FolderId; readonly name: string; readonly path: string };
+type Pending = { readonly folderId: FolderId; readonly name: string; readonly place: FolderPlace };
 
 /** "Add folder" (UX 6.3): folders of the other devices first, then any folder here. */
 export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
@@ -146,27 +124,31 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
   const action = useAction();
   const [message, setMessage] = useState<string | null>(null);
   const [merge, setMerge] = useState<Pending | null>(null);
-  const [proposals] = useLoad(() => backend.listAccountFolders(), [backend]);
 
-  const proposedPath = (folderId: FolderId, name: string): string => {
-    if (proposals.status === "ready") {
-      const found = proposals.data.folders.find((folder) => folder.id === folderId);
-      if (found) return found.proposedPath;
-    }
-    const home = snapshot.folders[0]?.path.replace(/[\\/][^\\/]*$/, "");
-    return home ? `${home}\\${name}` : name;
+  /**
+   * The backend proposes the place (and its token) right when the person asks, so a folder that
+   * appeared a moment ago has one too. Without a proposal the person picks the place.
+   */
+  const placeFor = async (folderId: FolderId): Promise<FolderPlace | null> => {
+    const proposals = await backend.listAccountFolders();
+    const found = proposals.folders.find((folder) => folder.id === folderId);
+    if (found) return { path: found.proposedPath, name: found.name, token: found.proposedToken };
+    const picked = await backend.pickFolder({ kind: "account", folderId });
+    if (picked.kind === "refused") setMessage(folderRefusalText(picked.reason, picked.folder, t));
+    return picked.kind === "picked" ? picked : null;
   };
 
   const bring = (folderId: FolderId, name: string) => {
     setMessage(null);
     void action.run(async () => {
-      const path = proposedPath(folderId, name);
-      const count = await backend.countLocalFiles(path);
+      const place = await placeFor(folderId);
+      if (!place) return;
+      const count = await backend.countLocalFiles(place.token);
       if (count > 0) {
-        setMerge({ folderId, name, path });
+        setMerge({ folderId, name, place });
         return;
       }
-      await backend.addAccountFolder(folderId, path);
+      await backend.addAccountFolder(folderId, place.token);
       onClose();
     });
   };
@@ -180,7 +162,7 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
         setMessage(folderRefusalText(result.reason, result.folder, t));
         return;
       }
-      await backend.addFolder(result.path);
+      await backend.addFolder(result.token);
       onClose();
     });
   };
@@ -190,9 +172,9 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
       <MergeDialog
         folderId={merge.folderId}
         folderName={merge.name}
-        path={merge.path}
-        onMerge={async (path) => {
-          await backend.addAccountFolder(merge.folderId, path);
+        place={merge.place}
+        onMerge={async (place) => {
+          await backend.addAccountFolder(merge.folderId, place.token);
           onClose();
         }}
         onClose={() => {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dismiss-suspect"
+description = "Enables the dismiss_suspect command without any pre-configured scope."
+commands.allow = ["dismiss_suspect"]
+
+[[permission]]
+identifier = "deny-dismiss-suspect"
+description = "Denies the dismiss_suspect command without any pre-configured scope."
+commands.deny = ["dismiss_suspect"]

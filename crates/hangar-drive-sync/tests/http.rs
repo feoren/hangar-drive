@@ -133,7 +133,7 @@ fn another_key_aborts_in_the_handshake_before_anything_is_sent() {
     let identity = SessionIdentity {
         account: AccountId::from_bytes([1; 16]),
         device: DeviceId::from_bytes([2; 16]),
-        prover: Box::new(|_, _, _, _| Signature::from_bytes([0; 64])),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([0; 64])),
     };
     let mut server = HttpServer::new(config, Some(identity)).unwrap();
     assert_eq!(server.check_health().unwrap_err(), NetError::PinMismatch);
@@ -213,7 +213,7 @@ fn sign_in_renewal_retries_and_error_codes() {
     let identity = SessionIdentity {
         account: AccountId::from_bytes([1; 16]),
         device: DeviceId::from_bytes([2; 16]),
-        prover: Box::new(|_, _, _, _| Signature::from_bytes([3; 64])),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
     };
     let mut server = HttpServer::new(config, Some(identity)).unwrap();
     // Sign-in, then a 503 retried.
@@ -294,7 +294,7 @@ fn a_silent_event_stream_times_out_and_is_opened_again() {
     let identity = SessionIdentity {
         account: AccountId::from_bytes([1; 16]),
         device: DeviceId::from_bytes([2; 16]),
-        prover: Box::new(|_, _, _, _| Signature::from_bytes([3; 64])),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
     };
     let mut server = HttpServer::new(config, Some(identity)).unwrap();
     let started = std::time::Instant::now();
@@ -343,7 +343,7 @@ fn a_used_challenge_starts_the_sign_in_once_more() {
     let identity = SessionIdentity {
         account: AccountId::from_bytes([1; 16]),
         device: DeviceId::from_bytes([2; 16]),
-        prover: Box::new(|_, _, _, _| Signature::from_bytes([3; 64])),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
     };
     let mut server = HttpServer::new(config, Some(identity)).unwrap();
     assert_eq!(server.feed(0).unwrap().sequence, 2);

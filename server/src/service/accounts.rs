@@ -63,6 +63,32 @@ pub async fn create_invite(
 }
 
 /// `POST /accounts`.
+/// Whether `request` repeats a creation that went through but whose answer the device never got
+/// (finding E2E-1: a retry from the same device must carry on): its invite is used and its
+/// account exists with exactly this signed entry 1. Only the device that made the entry can send
+/// it, and the answer is the server ID, which the challenge tells anyone.
+async fn is_repeat(
+    tx: &mut sqlx::SqliteConnection,
+    request: &CreateAccountRequest,
+) -> ApiResult<bool> {
+    let used: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM invites WHERE token_hash = ? AND used_ms IS NOT NULL")
+            .bind(sha256(request.invite.expose()).as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+    if used.is_none() {
+        return Ok(false);
+    }
+    let first: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT e.entry FROM log_entries e JOIN accounts a ON a.pk = e.account_pk \
+         WHERE a.id = ? AND e.idx = 1",
+    )
+    .bind(request.account.as_bytes().as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(first.as_deref() == Some(request.genesis.as_bytes()))
+}
+
 pub async fn create_account(
     app: &App,
     request: CreateAccountRequest,
@@ -90,6 +116,11 @@ pub async fn create_account(
     .execute(&mut *tx)
     .await?;
     if used.rows_affected() != 1 {
+        if is_repeat(&mut tx, &request).await? {
+            return Ok(CreateAccountResponse {
+                server: app.server_id,
+            });
+        }
         return Err(ErrorCode::InviteInvalid.into());
     }
     if account_by_id(&mut tx, &request.account).await?.is_some() {

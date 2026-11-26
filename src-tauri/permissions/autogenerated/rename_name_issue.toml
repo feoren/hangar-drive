@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rename-name-issue"
+description = "Enables the rename_name_issue command without any pre-configured scope."
+commands.allow = ["rename_name_issue"]
+
+[[permission]]
+identifier = "deny-rename-name-issue"
+description = "Denies the rename_name_issue command without any pre-configured scope."
+commands.deny = ["rename_name_issue"]

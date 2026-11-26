@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-invite"
+description = "Enables the check_invite command without any pre-configured scope."
+commands.allow = ["check_invite"]
+
+[[permission]]
+identifier = "deny-check-invite"
+description = "Denies the check_invite command without any pre-configured scope."
+commands.deny = ["check_invite"]

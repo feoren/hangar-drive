@@ -101,7 +101,7 @@ fn world() -> (Vec<Dev>, ManualClock, FolderSettings) {
             ACCOUNT,
             id,
             &format!("D{}", n + 1),
-            None,
+            &[],
         )
         .unwrap();
         let folder = FolderSync::new(&account, FOLDER, "Docs");

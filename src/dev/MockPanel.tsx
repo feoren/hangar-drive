@@ -6,7 +6,7 @@
 import { useState } from "react";
 
 import { MockBackend, MOCK_INPUTS, type MockControls } from "../backend/mock/mockBackend";
-import { SCENARIOS, isScenarioId } from "../backend/mock/scenarios";
+import { SCENARIOS, START_LINKS, isScenarioId } from "../backend/mock/scenarios";
 import { useBackend } from "../ui/backendContext";
 
 type Options<K extends keyof MockControls> = readonly MockControls[K][];
@@ -30,7 +30,9 @@ const RESTORES: Options<"restore"> = [
   "expired",
   "failed",
 ];
-const SAVES: Options<"save"> = ["saved", "inSync", "cancel"];
+const SAVES: Options<"save"> = ["saved", "inSync", "inCloud", "cancel"];
+const CONFIRMS: Options<"nativeConfirm"> = ["yes", "no"];
+const UPDATES: Options<"update"> = ["installed", "upToDate", "off"];
 const ANSWERS: Options<"pairAnswer"> = ["link", "typed", "none"];
 const NUMBERS: Options<"folderNumber"> = ["number", "offline"];
 const OLDER: Options<"olderCheck"> = ["stillOlder", "resolved"];
@@ -38,8 +40,17 @@ const FAILS = ["none", "notImplemented", "busy", "unexpected"] as const;
 const CLIPBOARDS = {
   invite: MOCK_INPUTS.invite,
   "invite (used)": "https://drive.example.org/join#used",
+  "invite (pinned server)": MOCK_INPUTS.invitePinned,
+  "invite (deep link)": MOCK_INPUTS.inviteDeep,
   pair: MOCK_INPUTS.pair,
+  "pair (pinned server)": MOCK_INPUTS.pairPinned,
+  "pair (punycode host)": MOCK_INPUTS.pairIdn,
+  "pair (stranger's account)": MOCK_INPUTS.pairStranger,
+  "pair (damaged)": "hangar-drive://pair#damaged",
+  "recovery link": MOCK_INPUTS.recoverLink,
+  "recovery link (damaged)": "hangar-drive://recover#damaged",
   "recovery code": "D7KQ M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY",
+  "other text (shell hides it)": "Einkaufsliste: Milch, Brot",
   empty: "",
 } as const;
 
@@ -126,6 +137,8 @@ export default function MockPanel() {
       {select("pick", PICKS, "Next folder pick")}
       {select("restore", RESTORES, "Next restore")}
       {select("save", SAVES, "Next save dialog")}
+      {select("nativeConfirm", CONFIRMS, "Native confirmation")}
+      {select("update", UPDATES, "Update now finds")}
       {select("pairAnswer", ANSWERS, "New device answers via")}
       {select("folderNumber", NUMBERS, "Folder number")}
       {select("olderCheck", OLDER, "Check again")}
@@ -192,10 +205,21 @@ export default function MockPanel() {
         >
           New device answers now
         </button>
+        {(["invite", "pair", "recover"] as const).map((kind) => (
+          <button
+            key={kind}
+            type="button"
+            onClick={() => {
+              mock.openLink(START_LINKS[kind]);
+            }}
+          >
+            OS opens {kind} link
+          </button>
+        ))}
       </div>
       <p className="mock-note">
-        Invite errors: {MOCK_INPUTS.inviteErrors}. Pairing: {MOCK_INPUTS.pairErrors}. Recovery:{" "}
-        {MOCK_INPUTS.recovery}.
+        Invite errors: {MOCK_INPUTS.inviteErrors}. Pairing: {MOCK_INPUTS.pairErrors}. Recovery link:{" "}
+        {MOCK_INPUTS.recoverLinkErrors}. Recovery code: {MOCK_INPUTS.recovery}.
       </p>
     </aside>
   );

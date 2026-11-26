@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 
-import type { NumberRows as Rows, QrMatrix } from "../backend/types";
+import type { NumberRows as Rows } from "../backend/types";
 import { spellOut } from "../domain/codes";
 import { useT } from "../i18n";
 
@@ -136,40 +136,25 @@ export function PathText({
   );
 }
 
-/** A QR code from the backend's module matrix, drawn as one path with crisp edges. */
+/** An SVG document as a `data:` URL for an `<img>` (the CSP allows `img-src data:`). */
+export function svgDataUrl(svg: string): string {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+/**
+ * A QR code from the backend's SVG document, shown as an image: the document never becomes
+ * markup of the page, so nothing in it can run or style the window.
+ */
 export function QrCode({
-  matrix,
+  svg,
   label,
   size = 168,
 }: {
-  readonly matrix: QrMatrix;
+  readonly svg: string;
   readonly label: string;
   readonly size?: number;
 }) {
-  const quiet = 2;
-  const full = matrix.size + quiet * 2;
-  let d = "";
-  for (let y = 0; y < matrix.size; y += 1) {
-    for (let x = 0; x < matrix.size; x += 1) {
-      if (matrix.modules[y * matrix.size + x] === "1") {
-        d += `M${String(x + quiet)} ${String(y + quiet)}h1v1h-1z`;
-      }
-    }
-  }
-  return (
-    <svg
-      className="qr"
-      width={size}
-      height={size}
-      viewBox={`0 0 ${String(full)} ${String(full)}`}
-      role="img"
-      aria-label={label}
-      shapeRendering="crispEdges"
-    >
-      <rect width={full} height={full} fill="#fff" />
-      <path d={d} fill="#000" />
-    </svg>
-  );
+  return <img className="qr" src={svgDataUrl(svg)} width={size} height={size} alt={label} />;
 }
 
 /** A small, calm busy indicator for loading lists; screen readers hear the label once. */

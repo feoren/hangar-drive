@@ -3,7 +3,8 @@
 
 import { useEffect, useId, useState } from "react";
 
-import type { FolderPlace, InviteError, NameError, RecoveryCode } from "../backend/types";
+import type { FolderPlace, InviteError, LinkKind, NameError, RecoveryCode } from "../backend/types";
+import { cleanLink } from "../domain/links";
 import { cleanName, nameProblem } from "../domain/names";
 import { useT, type Translate } from "../i18n";
 import { folderRefusalText } from "../main/BannerArea";
@@ -12,7 +13,7 @@ import { CheckIcon, FolderIcon } from "../ui/icons";
 import { Feedback, Loading, PathText } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
 import { DeviceNameField, StepIndicator } from "./common";
-import { LinkField } from "./LinkField";
+import { LinkField, otherKind } from "./LinkField";
 import { RecoveryCodeStep } from "./RecoveryCodeStep";
 
 export function inviteErrorText(error: InviteError, t: Translate): string {
@@ -33,24 +34,31 @@ export function inviteErrorText(error: InviteError, t: Translate): string {
 type Check =
   | { readonly kind: "idle" }
   | { readonly kind: "checking"; readonly link: string }
-  | { readonly kind: "ok"; readonly link: string; readonly host: string }
+  | { readonly kind: "ok"; readonly link: string; readonly host: string; readonly pinned: boolean }
   | { readonly kind: "error"; readonly link: string; readonly error: InviteError };
 
 /** How long typing has to pause before the link is checked. */
 export const CHECK_DELAY_MS = 350;
 
 export function NewAccountFlow({
+  initialLink = "",
+  onSwitch,
   onBack,
   onFinish,
 }: {
+  /** A link the OS handed over, filled in and checked at once. */
+  readonly initialLink?: string;
+  /** A link of another kind takes the person to its own flow. */
+  readonly onSwitch?: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
-  /** The folder is created; the caller shows "All set". */
-  readonly onFinish: (path: string) => Promise<void>;
+  /** Gets the token of the chosen place; the folder is created, the caller shows "All set". */
+  readonly onFinish: (token: string) => Promise<void>;
 }) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
-  const [link, setLink] = useState("");
+  const [link, setLink] = useState(initialLink);
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [code, setCode] = useState<RecoveryCode | null>(null);
+  const [sentName, setSentName] = useState("");
   const titleId = useId();
 
   if (step === 2 && code) {
@@ -58,6 +66,7 @@ export function NewAccountFlow({
       <RecoveryCodeStep
         code={code}
         titleId={titleId}
+        deviceName={sentName}
         step={<StepIndicator step={2} total={3} />}
         secondary={
           <BackButton
@@ -75,14 +84,16 @@ export function NewAccountFlow({
   if (step === 3) return <FolderStep titleId={titleId} onFinish={onFinish} />;
   return (
     <ConnectStep
+      onSwitch={onSwitch}
       titleId={titleId}
       link={link}
       onLink={setLink}
       deviceName={deviceName}
       onDeviceName={setDeviceName}
       onBack={onBack}
-      onNext={(recovery) => {
+      onNext={(recovery, name) => {
         setCode(recovery);
+        setSentName(name);
         setStep(2);
       }}
     />
@@ -99,6 +110,7 @@ function BackButton({ onClick }: { readonly onClick: () => void }) {
 }
 
 function ConnectStep({
+  onSwitch,
   titleId,
   link,
   onLink,
@@ -107,13 +119,14 @@ function ConnectStep({
   onBack,
   onNext,
 }: {
+  readonly onSwitch: ((kind: LinkKind, link: string) => void) | undefined;
   readonly titleId: string;
   readonly link: string;
   readonly onLink: (link: string) => void;
   readonly deviceName: string | null;
   readonly onDeviceName: (name: string) => void;
   readonly onBack: () => void;
-  readonly onNext: (code: RecoveryCode) => void;
+  readonly onNext: (code: RecoveryCode, deviceName: string) => void;
 }) {
   const t = useT();
   const backend = useBackend();
@@ -121,21 +134,23 @@ function ConnectStep({
   const [defaultName] = useLoad(() => backend.defaultDeviceName(), [backend]);
   const action = useAction();
   const name = deviceName ?? (defaultName.status === "ready" ? defaultName.data : "");
-  const trimmed = link.trim();
+  const sent = cleanLink(link);
+  // A pairing or recovery link is never sent to a server as an invite.
+  const foreign = otherKind(sent, "invite") !== null;
 
   // Checks the invite once typing pauses; a newer link makes older answers irrelevant.
   useEffect(() => {
-    if (trimmed === "") return;
+    if (sent === "" || foreign) return;
     let current = true;
     const timer = setTimeout(() => {
-      if (current) setCheck({ kind: "checking", link: trimmed });
-      backend.checkInvite(trimmed).then(
+      if (current) setCheck({ kind: "checking", link: sent });
+      backend.checkInvite(sent).then(
         (result) => {
           if (!current) return;
           setCheck(
             result.ok
-              ? { kind: "ok", link: trimmed, host: result.value.host }
-              : { kind: "error", link: trimmed, error: result.error },
+              ? { kind: "ok", link: sent, ...result.value }
+              : { kind: "error", link: sent, error: result.error },
           );
         },
         (error: unknown) => {
@@ -150,10 +165,10 @@ function ConnectStep({
       current = false;
       clearTimeout(timer);
     };
-  }, [backend, trimmed]);
+  }, [backend, sent, foreign]);
 
   const state: Check =
-    trimmed === "" || ("link" in check && check.link !== trimmed) ? { kind: "idle" } : check;
+    sent === "" || foreign || ("link" in check && check.link !== sent) ? { kind: "idle" } : check;
   const [refused, setRefused] = useState<NameError | null>(null);
   const ready = state.kind === "ok" && nameProblem(name) === null;
 
@@ -164,11 +179,11 @@ function ConnectStep({
         event.preventDefault();
         if (!ready) return;
         void action.run(async () => {
-          const result = await backend.beginAccount(trimmed, cleanName(name));
-          if (result.ok) onNext(result.value);
+          const result = await backend.beginAccount(sent, cleanName(name));
+          if (result.ok) onNext(result.value, cleanName(name));
           else if (result.error === "blank" || result.error === "edgeWhitespace") {
             setRefused(result.error);
-          } else setCheck({ kind: "error", link: trimmed, error: result.error });
+          } else setCheck({ kind: "error", link: sent, error: result.error });
         });
       }}
     >
@@ -179,8 +194,10 @@ function ConnectStep({
       <p className="step-body">{t("setup.connect.body")}</p>
       <LinkField
         label={t("setup.connect.label")}
+        expect="invite"
         value={link}
         onChange={onLink}
+        onSwitch={onSwitch}
         autoFocus
         placeholder="https://drive.example.org/join#…"
         error={state.kind === "error" ? inviteErrorText(state.error, t) : null}
@@ -195,6 +212,12 @@ function ConnectStep({
           ) : null
         }
       />
+      {state.kind === "ok" && state.pinned && (
+        <div className="notice" role="note">
+          <p className="notice-title">{t("setup.connect.pinnedTitle")}</p>
+          <p>{t("setup.connect.pinned", { app: t("app.name") })}</p>
+        </div>
+      )}
       {state.kind === "ok" && (
         <DeviceNameField
           value={name}
@@ -221,7 +244,7 @@ function FolderStep({
   onFinish,
 }: {
   readonly titleId: string;
-  readonly onFinish: (path: string) => Promise<void>;
+  readonly onFinish: (token: string) => Promise<void>;
 }) {
   const t = useT();
   const backend = useBackend();
@@ -231,8 +254,8 @@ function FolderStep({
   const action = useAction();
   const current = picked ?? (place.status === "ready" ? place.data : null);
   const [existing] = useLoad(
-    () => (current ? backend.countLocalFiles(current.path) : Promise.resolve(0)),
-    [backend, current?.path],
+    () => (current ? backend.countLocalFiles(current.token) : Promise.resolve(0)),
+    [backend, current?.token],
   );
 
   return (
@@ -261,7 +284,7 @@ function FolderStep({
               setMessage(null);
               void action.run(async () => {
                 const result = await backend.pickFolder({ kind: "new" });
-                if (result.kind === "picked") setPicked({ path: result.path, name: result.name });
+                if (result.kind === "picked") setPicked(result);
                 if (result.kind === "refused")
                   setMessage(folderRefusalText(result.reason, result.folder, t));
               });
@@ -287,7 +310,7 @@ function FolderStep({
           aria-disabled={!current || action.pending}
           onClick={() => {
             if (!current) return;
-            void action.run(() => onFinish(current.path));
+            void action.run(() => onFinish(current.token));
           }}
         >
           {t("setup.done")}

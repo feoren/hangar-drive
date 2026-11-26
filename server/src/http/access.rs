@@ -36,6 +36,7 @@ pub enum Handler {
     ReservePairing,
     PostPairing,
     GetPairing,
+    ClosePairing,
     Missing,
     PutObject,
     GetObject,
@@ -155,6 +156,12 @@ pub fn routes() -> Vec<Route> {
             "/api/v1/pairing/{pairing}",
             Call(ApiCall::GetPairing),
             Handler::GetPairing,
+        ),
+        route(
+            Method::DELETE,
+            "/api/v1/pairing/{pairing}",
+            Call(ApiCall::ClosePairing),
+            Handler::ClosePairing,
         ),
         route(
             Method::POST,

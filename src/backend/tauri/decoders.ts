@@ -6,24 +6,32 @@ import type {
   About,
   AccountFolder,
   ActivityEntry,
+  AcceptedHeads,
   BackendEvent,
   ConflictGroup,
+  DeleteOutcome,
   Device,
   DeviceList,
   FolderPlace,
+  InspectedLink,
+  InviteCheck,
   NameIssue,
   NotSyncedEntry,
   NumberRows,
+  PairAnswer,
+  ServerConfirm,
   PairingOffer,
   PairWaiting,
   PickResult,
   RecoveryCode,
+  RecoverySheet,
   RestoreOutcome,
   SaveResult,
   Settings,
   Snapshot,
   Timeline,
   TrashItem,
+  UpdateOutcome,
   VersionTree,
 } from "../types";
 import { isLanguage, type Language } from "../../i18n";
@@ -36,6 +44,7 @@ import {
   nullable,
   num,
   object,
+  orDefault,
   str,
   union,
   type Decoder,
@@ -54,7 +63,7 @@ const folderStatus = union("kind", {
   uploading: { count: num },
   downloading: { count: num },
   paused: {},
-  stopped: { reason: literal("missing", "olderState") },
+  stopped: { reason: literal("missing", "olderState", "removedHeads") },
 });
 
 const fileAction = literal(
@@ -92,6 +101,7 @@ const warning = union("kind", {
   serverDisk: { id: str },
   diskFull: { id: str, needed: num },
   olderState: { id: str, folderId: str, folderName: str },
+  removedHeads: { id: str, folderId: str, folderName: str, devices: array(str), count: num },
   removed: { id: str, by: str },
   updateRequired: { id: str },
   refused: { id: str },
@@ -161,23 +171,44 @@ export function result<T, E extends string>(
   };
 }
 
-export const host = object({ host: str });
+export const inviteCheck = object({ host: str, pinned: bool }) satisfies Decoder<InviteCheck>;
+
+export const inspectedLink = union("kind", {
+  invite: { host: str, pinned: bool },
+  pair: { host: str, account: str, pinned: bool },
+  recover: { host: str, account: str, pinned: bool },
+}) satisfies Decoder<InspectedLink>;
+
+const recoverySheet = object({
+  serverUrl: str,
+  serverId: str,
+  accountId: str,
+  genesisAnchor: str,
+  pin: nullable(str),
+  link: str,
+}) satisfies Decoder<RecoverySheet>;
 
 export const recoveryCode = object({
   groups: array(str),
   checkGroup: num,
+  sheet: recoverySheet,
 }) satisfies Decoder<RecoveryCode>;
 
 export const saveResult = union("kind", {
   saved: { path: str },
   cancelled: {},
   inSyncFolder: {},
+  inCloudFolder: {},
 }) satisfies Decoder<SaveResult>;
 
-export const folderPlace = object({ path: str, name: str }) satisfies Decoder<FolderPlace>;
+export const folderPlace = object({
+  path: str,
+  name: str,
+  token: str,
+}) satisfies Decoder<FolderPlace>;
 
 export const pickResult = union("kind", {
-  picked: { path: str, name: str },
+  picked: { path: str, name: str, token: str },
   cancelled: {},
   refused: {
     reason: literal("network", "root", "system", "nested", "noAccess", "wrongFolder"),
@@ -192,7 +223,13 @@ export const pairWaiting = object({
 
 export const accountFolders = object({
   folders: array(
-    object({ id: str, name: str, size: num, proposedPath: str }) satisfies Decoder<AccountFolder>,
+    object({
+      id: str,
+      name: str,
+      size: num,
+      proposedPath: str,
+      proposedToken: str,
+    }) satisfies Decoder<AccountFolder>,
   ),
   free: num,
 });
@@ -308,7 +345,9 @@ export const pairingOffer = object({
   link: str,
   code: array(str),
   host: str,
+  account: str,
   qr: object({ size: num, modules: str }),
+  qrSvg: str,
   expiresAt: num,
 }) satisfies Decoder<PairingOffer>;
 
@@ -319,7 +358,28 @@ const language: Decoder<Language | "system"> = (value, path) => {
 
 export const settings = object({ autostart: bool, language }) satisfies Decoder<Settings>;
 
-export const about = object({ version: str, build: nullable(num) }) satisfies Decoder<About>;
+/**
+ * `updates` is the proposed field of `get_about`. A shell without it reads as "on": the button
+ * stays, and the "updates are off" refusal hides it after the first try.
+ */
+export const about = object({
+  version: str,
+  build: nullable(num),
+  updates: orDefault(bool, true),
+}) satisfies Decoder<About>;
+
+export const updateOutcome = union("kind", {
+  upToDate: {},
+  installed: { version: str },
+}) satisfies Decoder<UpdateOutcome>;
+
+/**
+ * How the native question of the three commands ended (commands.rs `DeleteOutcome`,
+ * `PairAnswer`, `ServerConfirm`).
+ */
+export const deleteOutcome: Decoder<DeleteOutcome> = literal("deleted", "kept");
+export const pairAnswer: Decoder<PairAnswer> = literal("added", "declined");
+export const serverConfirm: Decoder<ServerConfirm> = literal("confirmed", "declined");
 
 export const undoToken = object({ undoToken: str });
 
@@ -350,7 +410,17 @@ export const event = union("type", {
   },
   focusWarning: { warningId: str },
   trayAction: { actionId: str },
+  removedHeads: {
+    folderId: str,
+    heads: array(object({ commit: str, deviceId: str, deviceName: str, sequence: num })),
+  },
+  openLink: { link: str },
 }) satisfies Decoder<BackendEvent>;
+
+export const acceptedHeads = object({
+  count: num,
+  beforeEntryId: nullable(str),
+}) satisfies Decoder<AcceptedHeads>;
 
 export const nullableStr = nullable(str);
 

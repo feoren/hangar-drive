@@ -54,6 +54,9 @@ pub const HEAVY_REQUESTS_VAR: &str = "HANGAR_DRIVE_HEAVY_REQUESTS";
 pub const UPLOADS_PER_ACCOUNT_VAR: &str = "HANGAR_DRIVE_UPLOADS_PER_ACCOUNT";
 /// Open connections per client address (not counted for trusted proxies).
 pub const CONNECTIONS_PER_IP_VAR: &str = "HANGAR_DRIVE_CONNECTIONS_PER_IP";
+/// The address devices reach the server under (`https://drive.example.org/`), for the invite
+/// links `invite` prints. Optional for serving, required for `invite`.
+pub const PUBLIC_URL_VAR: &str = "HANGAR_DRIVE_PUBLIC_URL";
 
 pub const DEFAULT_PORT: u16 = 8080;
 /// Relative to the working directory; the container image sets `/data`, its volume.
@@ -228,6 +231,9 @@ pub struct Config {
     pub shutdown_grace: Duration,
     /// Concurrency limits of the HTTP layer (findings M4, M5, M6).
     pub concurrency: Concurrency,
+    /// [`PUBLIC_URL_VAR`] in the serialization of the client's URL parser, always with a
+    /// trailing `/`: exactly the base URL a device parses out of an invite link.
+    pub public_url: Option<String>,
 }
 
 /// How much the server works on at once.
@@ -267,6 +273,10 @@ pub enum ConfigError {
     TlsIncomplete,
     #[error("{DEVICE_BUDGET_VAR} must not exceed {ACCOUNT_BUDGET_VAR}")]
     DeviceBudgetAboveAccount,
+    #[error(
+        "{PUBLIC_URL_VAR} must be an https address such as https://drive.example.org/ (http only for localhost), without user name, query or fragment, not {0:?}"
+    )]
+    InvalidPublicUrl(String),
 }
 
 impl Config {
@@ -377,6 +387,9 @@ impl Config {
             }),
             _ => return Err(ConfigError::TlsIncomplete),
         };
+        let public_url = text(PUBLIC_URL_VAR)
+            .map(|value| parse_public_url(&value).ok_or(ConfigError::InvalidPublicUrl(value)))
+            .transpose()?;
         let gc_minutes = number(GC_INTERVAL_VAR, DEFAULT_GC_INTERVAL_MINUTES, 1, 7 * 24 * 60)?;
         let grace = number(SHUTDOWN_GRACE_VAR, DEFAULT_SHUTDOWN_GRACE_SECS, 1, 600)?;
         Ok(Self {
@@ -388,6 +401,7 @@ impl Config {
             gc_interval: Duration::from_secs(u64::from(gc_minutes) * 60),
             shutdown_grace: Duration::from_secs(u64::from(grace)),
             concurrency,
+            public_url,
         })
     }
 
@@ -406,6 +420,21 @@ impl Config {
     pub fn objects_dir(&self) -> PathBuf {
         self.data_dir.join("objects")
     }
+}
+
+/// The public base URL as a device reads it out of an invite link: the client's server URL
+/// check (`https`, or `http` to `localhost`, no user info, query or fragment, ADR 0001,
+/// section 6) and its serialization, with the path ending in `/` so `<base>join` is the page.
+pub fn parse_public_url(text: &str) -> Option<String> {
+    let url = hangar_drive_crypto::pairing::parse_server_url(text).ok()?;
+    let mut base = url.as_str().to_owned();
+    if !base.ends_with('/') {
+        base.push('/');
+    }
+    // The base must read back to itself, so the link the operator hands out names exactly
+    // the address the device then connects to.
+    let again = hangar_drive_crypto::pairing::parse_server_url(&base).ok()?;
+    (again.as_str() == base).then_some(base)
 }
 
 /// `123`, `64MiB`, `50 GiB`; also `K`, `M`, `G`, `T` with the same binary meaning.
@@ -437,6 +466,41 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| OsString::from(value))
         })
+    }
+
+    #[test]
+    fn the_public_url_is_checked_like_the_client_checks_it() {
+        assert_eq!(config(&[]).unwrap().public_url, None);
+        for (given, expected) in [
+            ("https://drive.example.org", "https://drive.example.org/"),
+            ("https://DRIVE.example.org/", "https://drive.example.org/"),
+            ("https://example.org/drive", "https://example.org/drive/"),
+            (
+                "https://example.org:8443/drive/",
+                "https://example.org:8443/drive/",
+            ),
+            ("http://localhost:8080", "http://localhost:8080/"),
+        ] {
+            let c = config(&[(PUBLIC_URL_VAR, given)]).unwrap();
+            assert_eq!(c.public_url.as_deref(), Some(expected), "{given}");
+        }
+        for bad in [
+            "http://drive.example.org/",
+            "https://user@drive.example.org/",
+            "https://drive.example.org/?x=1",
+            "https://drive.example.org/#x",
+            "ftp://drive.example.org/",
+            "drive.example.org",
+            "https:///drive.example.org",
+        ] {
+            assert!(
+                matches!(
+                    config(&[(PUBLIC_URL_VAR, bad)]),
+                    Err(ConfigError::InvalidPublicUrl(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 // produce the error texts of the setup flows (listed in MOCK_INPUTS).
 
 import { normalizeCode } from "../../domain/codes";
+import { linkKind } from "../../domain/links";
 import { strictNameProblem } from "../../domain/names";
 import { windowsNameProblem } from "../../domain/windowsNames";
 import type { Language } from "../../i18n";
@@ -11,11 +12,13 @@ import { pauseUntil, type TrayModel } from "../../tray/trayModel";
 import { BackendError, type BackendErrorCode } from "../errors";
 import type {
   About,
+  AcceptedHeads,
   AccountFolder,
   ActivityEntry,
   Backend,
   BackendEvent,
   ConflictGroup,
+  DeleteOutcome,
   Device,
   DeviceId,
   DeviceList,
@@ -23,12 +26,17 @@ import type {
   FolderId,
   FolderPlace,
   FolderRefusal,
+  InspectedLink,
+  InviteCheck,
   InviteError,
+  LinkError,
   Millis,
   NameError,
   NameIssue,
   NotSyncedEntry,
   NumberRows,
+  PairAnswer,
+  ServerConfirm,
   PairError,
   PairInput,
   PairWaiting,
@@ -38,6 +46,7 @@ import type {
   PickResult,
   RecoverError,
   RecoveryCode,
+  RecoverySheetDocument,
   RenameError,
   RestoreOutcome,
   Result,
@@ -47,26 +56,54 @@ import type {
   Timeline,
   TrashItem,
   Unsubscribe,
+  UpdateOutcome,
   VersionTree,
 } from "../types";
 import * as fx from "./fixtures";
-import { baseState, scenarioState, type MockState, type ScenarioId } from "./scenarios";
+import {
+  baseState,
+  scenarioState,
+  START_LINKS,
+  type MockState,
+  type ScenarioId,
+} from "./scenarios";
 
 /** Inputs that make the setup flows fail, for trying every error text by hand. */
 export const MOCK_INPUTS = {
   invite: "https://drive.example.org/join#k7Qm2xR9",
+  /** Token, server ID and pin: a server without a public certificate (N3). */
+  invitePinned: "https://drive.example.org/join#k7Qm2xR9.9c41d07e.Zp3Q",
+  inviteDeep: START_LINKS.invite,
   inviteErrors: "…#used, …#expired, …#offline, http://…, anything without #",
-  pair: "hangar-drive://pair#Z4mK8q",
-  pairErrors: "…#expired, …#declined, …#toomany, …#other, …#offline",
+  pair: START_LINKS.pair,
+  pairPinned: "hangar-drive://pair#pin",
+  /** A host with a letter outside ASCII, shown in punycode. */
+  pairIdn: "hangar-drive://pair#idn",
+  /** Joins an account with devices the person does not know. */
+  pairStranger: "hangar-drive://pair#stranger",
+  pairErrors: "…#expired, …#declined, …#toomany, …#other, …#offline, …#damaged",
+  recoverLink: START_LINKS.recover,
+  recoverLinkErrors: "…#damaged, …#offline, …#insecure",
   recovery: "any 32 characters; starting with H: other app, 0000…: unknown, 1111…: used",
 } as const;
+
+/** The host of the "idn" pairing link before the window sees it in punycode. */
+const IDN_HOST = "drïve.example.org";
 
 export interface MockControls {
   /** Outcome of the next folder picker. */
   pick: "ok" | "existing" | Exclude<FolderRefusal, "wrongFolder"> | "wrongFolder" | "cancel";
   /** Outcome of the next restore. */
   restore: "done" | "renamed" | "waitBudget" | "noSpace" | "expired" | "failed";
-  save: "saved" | "inSync" | "cancel";
+  save: "saved" | "inSync" | "inCloud" | "cancel";
+  /**
+   * The person's answer to the native confirmation of the shell (security review L2), asked
+   * before a folder is deleted everywhere, before a device is added and before a new server key
+   * is trusted.
+   */
+  nativeConfirm: "yes" | "no";
+  /** What "Update now" finds; "off" is a build without an updater key (`About.updates`). */
+  update: "upToDate" | "installed" | "off";
   /** How a new device answers the next pairing offer of this device. */
   pairAnswer: "link" | "typed" | "none";
   folderNumber: "number" | "offline";
@@ -94,6 +131,8 @@ const DEFAULT_CONTROLS: MockControls = {
   pick: "ok",
   restore: "done",
   save: "saved",
+  nativeConfirm: "yes",
+  update: "installed",
   pairAnswer: "link",
   folderNumber: "number",
   olderCheck: "stillOlder",
@@ -109,6 +148,8 @@ export class MockBackend implements Backend {
   readonly calls: string[] = [];
   /** The last tray model the window sent. */
   tray: TrayModel | null = null;
+  /** The last recovery sheet the window printed or saved. */
+  sheet: RecoverySheetDocument | null = null;
 
   private state: MockState;
   private scenario: ScenarioId;
@@ -123,8 +164,12 @@ export class MockBackend implements Backend {
   private recovery: RecoveryCode | null = null;
   private offer: PairingOffer | null = null;
   private undoTokens = new Map<string, () => void>();
+  /** Places handed out with a token, as the shell keeps them (security review L2). */
+  private places = new Map<string, { path: string; name: string }>();
   private hiddenTrash = new Set<string>();
   private counter = 0;
+  /** Events sent before the window listened, delivered when it subscribes (like the shell). */
+  private held: BackendEvent[] = [];
 
   constructor(options: MockOptions = {}) {
     this.latency = options.latency ?? 0;
@@ -135,6 +180,7 @@ export class MockBackend implements Backend {
     this.scenario = options.scenario ?? "upToDate";
     this.state = scenarioState(this.scenario, this.now());
     this.startTicker();
+    this.announceScenario();
   }
 
   // -------------------------------------------------------------------------------------------
@@ -149,7 +195,21 @@ export class MockBackend implements Backend {
     this.state = scenarioState(id, this.now());
     this.recovery = null;
     this.offer = null;
+    this.places.clear();
     this.emitSnapshot();
+    this.announceScenario();
+  }
+
+  /** The events a scenario starts with: a link the OS handed over, a folder that stopped. */
+  private announceScenario(): void {
+    const { startLink, removedHeads } = this.state;
+    if (startLink) this.emit({ type: "openLink", link: startLink });
+    if (removedHeads) this.emit({ type: "removedHeads", ...removedHeads });
+  }
+
+  /** Simulates the OS handing over a `hangar-drive://` link. */
+  openLink(link: string): void {
+    this.emit({ type: "openLink", link });
   }
 
   setCamera(on: boolean): void {
@@ -210,6 +270,10 @@ export class MockBackend implements Backend {
   }
 
   private emit(event: BackendEvent): void {
+    if (this.listeners.size === 0) {
+      if (event.type === "openLink" || event.type === "removedHeads") this.held.push(event);
+      return;
+    }
     for (const listener of this.listeners) listener(event);
   }
 
@@ -275,6 +339,20 @@ export class MockBackend implements Backend {
     return this.state.folders.find((folder) => folder.id === folderId)?.name ?? folderId;
   }
 
+  /** Hands out a place under a fresh token. */
+  private place(path: string, name: string): FolderPlace {
+    const token = this.id("place");
+    this.places.set(token, { path, name });
+    return { path, name, token };
+  }
+
+  /** The place a token names; an unknown token is refused like the shell does. */
+  private placeOf(token: string, command: string): { path: string; name: string } {
+    const found = this.places.get(token);
+    if (!found) throw new BackendError("unexpected", command, "unknown place token");
+    return found;
+  }
+
   private undoable(revert: () => void): string {
     const token = this.id("undo");
     this.undoTokens.set(token, revert);
@@ -307,6 +385,13 @@ export class MockBackend implements Backend {
 
   subscribe(listener: (event: BackendEvent) => void): Unsubscribe {
     this.listeners.add(listener);
+    const held = this.held;
+    this.held = [];
+    if (held.length > 0) {
+      void Promise.resolve().then(() => {
+        for (const event of held) listener(event);
+      });
+    }
     return () => {
       this.listeners.delete(listener);
     };
@@ -314,12 +399,37 @@ export class MockBackend implements Backend {
 
   async readClipboardText(): Promise<string> {
     await this.call("readClipboardText");
-    return this.controls.clipboard;
+    return readableClipboard(this.controls.clipboard);
   }
 
-  async checkInvite(link: string): Promise<Result<{ host: string }, InviteError>> {
+  async checkInvite(link: string): Promise<Result<InviteCheck, InviteError>> {
     await this.call("checkInvite");
     return parseInvite(link);
+  }
+
+  async inspectLink(link: string): Promise<Result<InspectedLink, LinkError>> {
+    await this.call("inspectLink");
+    // Like the engine's parsers: a link with white space is not a link (the window cleans it).
+    if (hasSpace(link)) return { ok: false, error: "notALink" };
+    const kind = linkKind(link);
+    if (kind === null) return { ok: false, error: "notALink" };
+    if (kind === "invite") {
+      const invite = parseInvite(link);
+      if (invite.ok) return { ok: true, value: { kind, ...invite.value } };
+      return { ok: false, error: invite.error === "insecure" ? "insecure" : "damaged" };
+    }
+    const fragment = (link.split("#")[1] ?? "").toLowerCase();
+    if (fragment === "damaged") return { ok: false, error: "damaged" };
+    if (fragment === "insecure") return { ok: false, error: "insecure" };
+    return {
+      ok: true,
+      value: {
+        kind,
+        host: fragment === "idn" ? new URL(`https://${IDN_HOST}/`).hostname : fx.HOST,
+        account: fragment === "stranger" ? fx.STRANGER_ACCOUNT : fx.ACCOUNT,
+        pinned: fragment === "pin",
+      },
+    };
   }
 
   async defaultDeviceName(): Promise<string> {
@@ -344,16 +454,26 @@ export class MockBackend implements Backend {
     return {
       groups: fx.recoveryCode(this.random),
       checkGroup: 2 + Math.floor(this.random() * 7),
+      sheet: {
+        serverUrl: `https://${fx.HOST}/`,
+        serverId: fx.SERVER_ID,
+        accountId: fx.ACCOUNT,
+        genesisAnchor: fx.GENESIS,
+        pin: null,
+        link: START_LINKS.recover,
+      },
     };
   }
 
-  async printRecoverySheet(): Promise<void> {
+  async printRecoverySheet(document: RecoverySheetDocument): Promise<void> {
     await this.call("printRecoverySheet");
+    this.sheet = document;
   }
 
-  async saveRecoveryFile(): Promise<SaveResult> {
+  async saveRecoveryFile(document: RecoverySheetDocument): Promise<SaveResult> {
     await this.call("saveRecoveryFile");
-    return this.saveResult(`${fx.HOME}\\Documents\\Hangar Drive Wiederherstellung.txt`);
+    this.sheet = document;
+    return this.saveResult(`${fx.HOME}\\Documents\\${document.fileName}`);
   }
 
   private saveResult(path: string): SaveResult {
@@ -362,6 +482,8 @@ export class MockBackend implements Backend {
         return { kind: "saved", path };
       case "inSync":
         return { kind: "inSyncFolder" };
+      case "inCloud":
+        return { kind: "inCloudFolder" };
       case "cancel":
         return { kind: "cancelled" };
     }
@@ -383,7 +505,7 @@ export class MockBackend implements Backend {
 
   async defaultFolderPlace(): Promise<FolderPlace> {
     await this.call("defaultFolderPlace");
-    return { path: `${fx.HOME}\\Hangar Drive`, name: "Hangar Drive" };
+    return this.place(`${fx.HOME}\\Hangar Drive`, "Hangar Drive");
   }
 
   async pickFolder(purpose: PickPurpose): Promise<PickResult> {
@@ -398,10 +520,10 @@ export class MockBackend implements Backend {
         return { kind: "cancelled" };
       case "ok":
         return purpose.kind === "new"
-          ? { kind: "picked", path: `${fx.HOME}\\Projekte 2027`, name: "Projekte 2027" }
-          : { kind: "picked", path: `${fx.HOME}\\Neu`, name: "Neu" };
+          ? { kind: "picked", ...this.place(`${fx.HOME}\\Projekte 2027`, "Projekte 2027") }
+          : { kind: "picked", ...this.place(`${fx.HOME}\\Neu`, "Neu") };
       case "existing":
-        return { kind: "picked", path: `${fx.HOME}\\Bilder`, name: "Bilder" };
+        return { kind: "picked", ...this.place(`${fx.HOME}\\Bilder`, "Bilder") };
       default:
         return {
           kind: "refused",
@@ -411,18 +533,20 @@ export class MockBackend implements Backend {
     }
   }
 
-  async countLocalFiles(path: string): Promise<number> {
+  async countLocalFiles(token: string): Promise<number> {
     await this.call("countLocalFiles");
+    const { path } = this.placeOf(token, "countLocalFiles");
     if (this.timeScale > 0)
       await new Promise((resolve) => setTimeout(resolve, 900 * this.timeScale));
     if (path.endsWith("\\Bilder")) return 214;
     return this.controls.localFiles;
   }
 
-  async finishSetup(path: string): Promise<void> {
+  async finishSetup(token: string): Promise<void> {
     await this.call("finishSetup");
+    const { path, name } = this.placeOf(token, "finishSetup");
+    this.places.delete(token);
     const fresh = baseState(this.now());
-    const name = path.split("\\").pop() ?? "Hangar Drive";
     this.state = {
       ...fresh,
       folders: [
@@ -455,12 +579,20 @@ export class MockBackend implements Backend {
     return this.state.camera ? MOCK_INPUTS.pair : null;
   }
 
-  async startPairing(input: PairInput): Promise<Result<PairWaiting, PairError>> {
+  async startPairing(
+    input: PairInput,
+    deviceName: string,
+  ): Promise<Result<PairWaiting, PairError | NameError>> {
     await this.call("startPairing");
     const parsed =
       input.kind === "link" ? parsePairLink(input.link) : parseTyped(input.server, input.code);
     if (!parsed.ok) return parsed;
+    const nameError = strictNameProblem(deviceName);
+    if (nameError) return { ok: false, error: nameError };
     const outcome = parsed.value;
+    // The account this device joins decides which devices it sees right after (N2).
+    const stranger = input.kind === "link" && input.link.toLowerCase().endsWith("#stranger");
+    this.state.devices = stranger ? fx.strangerDevices(this.now()) : fx.devices(this.now());
     this.later(2500, () => {
       this.emit({
         type: "pairResult",
@@ -478,19 +610,23 @@ export class MockBackend implements Backend {
 
   async listAccountFolders(): Promise<{ folders: AccountFolder[]; free: number }> {
     await this.call("listAccountFolders");
-    return {
-      folders: [
-        {
-          id: "f-main",
-          name: "Hangar Drive",
-          size: 12_400_000_000,
-          proposedPath: `${fx.HOME}\\Hangar Drive`,
-        },
-        { id: "f-photos", name: "Fotos", size: 48_000_000_000, proposedPath: `${fx.HOME}\\Fotos` },
-        { id: "f-music", name: "Musik", size: 18_300_000_000, proposedPath: `${fx.HOME}\\Musik` },
-      ],
-      free: 120_000_000_000,
+    const proposal = (id: string, name: string, size: number): AccountFolder => {
+      const place = this.place(`${fx.HOME}\\${name}`, name);
+      return { id, name, size, proposedPath: place.path, proposedToken: place.token };
     };
+    // The account's folders, and any other folder the other devices have (scenarios add some).
+    const known = [
+      { id: "f-main", name: "Hangar Drive", size: 12_400_000_000 },
+      { id: "f-photos", name: "Fotos", size: 48_000_000_000 },
+      { id: "f-music", name: "Musik", size: 18_300_000_000 },
+    ];
+    const more = this.state.remoteFolders.filter(
+      (folder) => !known.some((item) => item.id === folder.id),
+    );
+    const folders = [...known, ...more].map((folder) =>
+      proposal(folder.id, folder.name, folder.size),
+    );
+    return { folders, free: 120_000_000_000 };
   }
 
   async joinFolders(choices: readonly FolderChoice[]): Promise<void> {
@@ -502,7 +638,7 @@ export class MockBackend implements Backend {
       folders: choices.map((choice) => ({
         id: choice.folderId,
         name: all.find((folder) => folder.id === choice.folderId)?.name ?? choice.folderId,
-        path: choice.path,
+        path: this.placeOf(choice.token, "joinFolders").path,
         status: { kind: "downloading", count: 240 },
         freezeDays: null,
         notSyncedCount: 0,
@@ -524,13 +660,20 @@ export class MockBackend implements Backend {
     ]);
   }
 
-  async recoverAccount(server: string, code: string): Promise<Result<null, RecoverError>> {
+  async recoverAccount(
+    sheet: string,
+    code: string,
+    deviceName: string,
+  ): Promise<Result<null, RecoverError | NameError>> {
     await this.call("recoverAccount");
-    const host = server.trim().toLowerCase();
-    if (host.startsWith("http://") && !host.startsWith("http://localhost")) {
-      return { ok: false, error: "insecure" };
-    }
-    if (host.includes("offline")) return { ok: false, error: "unreachable" };
+    const link = sheet;
+    if (hasSpace(link) || linkKind(link) !== "recover") return { ok: false, error: "unknown" };
+    const fragment = (link.split("#")[1] ?? "").toLowerCase();
+    if (fragment === "insecure") return { ok: false, error: "insecure" };
+    if (fragment === "offline") return { ok: false, error: "unreachable" };
+    if (fragment === "damaged") return { ok: false, error: "unknown" };
+    const nameError = strictNameProblem(deviceName);
+    if (nameError) return { ok: false, error: nameError };
     const clean = normalizeCode(code);
     if (clean.startsWith("H") && clean.length === 32) return { ok: false, error: "otherApp" };
     if (!/^[0-9A-HJKMNP-TV-Z]{32}$/.test(clean)) return { ok: false, error: "typo" };
@@ -604,9 +747,10 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async addFolder(path: string): Promise<void> {
+  async addFolder(token: string): Promise<void> {
     await this.call("addFolder");
-    const name = path.split("\\").pop() ?? path;
+    const { path, name } = this.placeOf(token, "addFolder");
+    this.places.delete(token);
     this.state.folders = [
       ...this.state.folders,
       {
@@ -621,8 +765,10 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async addAccountFolder(folderId: FolderId, path: string): Promise<void> {
+  async addAccountFolder(folderId: FolderId, token: string): Promise<void> {
     await this.call("addAccountFolder");
+    const { path } = this.placeOf(token, "addAccountFolder");
+    this.places.delete(token);
     const remote = this.state.remoteFolders.find((folder) => folder.id === folderId);
     const deleted = this.state.deletedFolders.find((folder) => folder.id === folderId);
     const name = remote?.name ?? deleted?.name ?? folderId;
@@ -657,8 +803,9 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async deleteFolderEverywhere(folderId: FolderId): Promise<void> {
+  async deleteFolderEverywhere(folderId: FolderId): Promise<DeleteOutcome> {
     await this.call("deleteFolderEverywhere");
+    if (this.controls.nativeConfirm === "no") return "kept";
     const folder = this.state.folders.find((item) => item.id === folderId);
     this.state.folders = this.state.folders.filter((item) => item.id !== folderId);
     if (folder) {
@@ -668,6 +815,7 @@ export class MockBackend implements Backend {
       ];
     }
     this.emitSnapshot();
+    return "deleted";
   }
 
   async restoreDeletedFolder(folderId: FolderId): Promise<void> {
@@ -734,6 +882,9 @@ export class MockBackend implements Backend {
           : folder,
       );
       this.emitSnapshot();
+      // The shell relocates the folder at once; the token names nothing to do.
+      this.places.delete(result.token);
+      return { ...result, token: "" };
     }
     return result;
   }
@@ -749,15 +900,17 @@ export class MockBackend implements Backend {
 
   async getServerNumber(): Promise<{ number: NumberRows; command: string }> {
     await this.call("getServerNumber");
-    return { number: fx.numberRows(3041), command: "hangar-drive-server key-number" };
+    return { number: fx.numberRows(3041), command: "hangar-drive-server server-key-number" };
   }
 
-  async confirmServerNumber(): Promise<void> {
+  async confirmServerNumber(): Promise<ServerConfirm> {
     await this.call("confirmServerNumber");
+    if (this.controls.nativeConfirm === "no") return "declined";
     this.state.warnings = this.state.warnings.filter(
       (warning) => warning.kind !== "serverIdentity",
     );
     this.emitSnapshot();
+    return "confirmed";
   }
 
   async fixServerWithOffer(
@@ -802,12 +955,49 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
+  async acceptRemovedHeads(folderId: FolderId): Promise<AcceptedHeads> {
+    await this.call(`acceptRemovedHeads:${folderId}`);
+    const commits = new Set(
+      this.state.removedHeads?.folderId === folderId
+        ? this.state.removedHeads.heads.map((head) => head.commit)
+        : [],
+    );
+    this.state.removedHeads = null;
+    this.state.warnings = this.state.warnings.filter(
+      (warning) => !(warning.kind === "removedHeads" && warning.folderId === folderId),
+    );
+    this.setStatus(folderId, { kind: "upToDate" });
+    this.emitSnapshot();
+    // Newest first: the entry after the oldest taken-in state is the one before all of them.
+    const entries = fx.timeline(this.now(), folderId);
+    const oldest = entries.reduce(
+      (found, entry, index) => (commits.has(entry.id) ? index : found),
+      -1,
+    );
+    const before = oldest === -1 ? undefined : entries[oldest + 1];
+    return { count: commits.size, beforeEntryId: before?.id ?? null };
+  }
+
   async openStorageSettings(): Promise<void> {
     await this.call("openStorageSettings");
   }
 
-  async installUpdate(): Promise<void> {
+  async installUpdate(): Promise<UpdateOutcome> {
     await this.call("installUpdate");
+    if (!this.updatesOn()) {
+      throw new BackendError("updatesOff", "installUpdate", "updates are off");
+    }
+    switch (this.controls.update) {
+      case "off":
+      case "upToDate":
+        return { kind: "upToDate" };
+      case "installed":
+        return { kind: "installed", version: "0.2.0" };
+    }
+  }
+
+  private updatesOn(): boolean {
+    return this.state.updates && this.controls.update !== "off";
   }
 
   async copyErrorReport(): Promise<void> {
@@ -829,7 +1019,7 @@ export class MockBackend implements Backend {
   async saveErrorReport(): Promise<SaveResult> {
     await this.call("saveErrorReport");
     const result = this.saveResult(`${fx.HOME}\\Documents\\Hangar Drive Fehlerbericht.txt`);
-    return result.kind === "inSyncFolder"
+    return result.kind === "inSyncFolder" || result.kind === "inCloudFolder"
       ? { kind: "saved", path: `${fx.HOME}\\Documents\\report.txt` }
       : result;
   }
@@ -1068,6 +1258,15 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
+  async resetDevice(): Promise<void> {
+    await this.call("resetDevice");
+    this.state = scenarioState("setup", this.now());
+    this.recovery = null;
+    this.offer = null;
+    this.places.clear();
+    this.emitSnapshot();
+  }
+
   async disconnectThisDevice(): Promise<void> {
     await this.call("disconnectThisDevice");
     this.state = scenarioState("setup", this.now());
@@ -1077,12 +1276,15 @@ export class MockBackend implements Backend {
   async createPairingOffer(): Promise<PairingOffer> {
     await this.call("createPairingOffer");
     const id = this.id("offer");
+    const qr = fx.fakeQr(this.counter * 97);
     this.offer = {
       id,
       link: `hangar-drive://pair#${id}Q8w3`,
       code: ["7KQ2", "MX9H", "TRW8", "CZB3", "NF6J", "AQ1V", "E5"],
       host: fx.HOST,
-      qr: fx.fakeQr(this.counter * 97),
+      account: fx.ACCOUNT,
+      qr,
+      qrSvg: fx.qrSvg(qr),
       expiresAt: this.now() + 10 * fx.MINUTE,
     };
     const answer = this.controls.pairAnswer;
@@ -1098,9 +1300,13 @@ export class MockBackend implements Backend {
     if (this.offer) this.controls.clipboard = this.offer.link;
   }
 
-  async answerPairRequest(offerId: string, accept: boolean): Promise<void> {
+  async answerPairRequest(offerId: string, accept: boolean): Promise<PairAnswer> {
     await this.call(`answerPairRequest:${accept ? "accept" : "decline"}`);
-    if (!accept || this.offer?.id !== offerId) return;
+    const added = accept && this.controls.nativeConfirm === "yes";
+    if (!added || this.offer?.id !== offerId) {
+      this.offer = null;
+      return "declined";
+    }
     this.offer = null;
     const now = this.now();
     this.state.devices = [
@@ -1116,6 +1322,7 @@ export class MockBackend implements Backend {
     ];
     if (this.state.account) this.state.account = { ...this.state.account, hasOtherDevices: true };
     this.emitSnapshot();
+    return "added";
   }
 
   async renewRecoveryCode(): Promise<RecoveryCode> {
@@ -1143,7 +1350,7 @@ export class MockBackend implements Backend {
 
   async getAbout(): Promise<About> {
     await this.call("getAbout");
-    return { version: "0.1.0", build: null };
+    return { version: "0.1.0", build: null, updates: this.updatesOn() };
   }
 
   // Tray
@@ -1165,27 +1372,65 @@ export class MockBackend implements Backend {
 // ---------------------------------------------------------------------------------------------
 // Magic inputs
 
-function parseInvite(link: string): Result<{ host: string }, InviteError> {
-  const text = link.trim();
-  const match = /^(https?):\/\/([^/#\s]+)[^#\s]*#(\S+)$/i.exec(text);
-  if (!match) return { ok: false, error: "notALink" };
-  const [, scheme = "", host = "", fragment = ""] = match;
-  if (scheme.toLowerCase() === "http" && !host.startsWith("localhost")) {
+/**
+ * What the shell lets the window read from the clipboard (clipboard.rs `readable`): a link of the
+ * app, an invite, or a code; "" for anything else. White space inside a link is allowed here, as
+ * the window removes it.
+ */
+export function readableClipboard(text: string): string {
+  const trimmed = text.trim();
+  const joined = trimmed.replace(/\s+/g, "").toLowerCase();
+  const link =
+    /^hangar-drive:\/\/(join|pair|recover)#/.test(joined) ||
+    (/^https?:\/\//.test(joined) && joined.includes("/join#"));
+  const groups = trimmed.split(/[\s-]+/).filter((group) => group !== "");
+  const letters = groups.join("").length;
+  const code =
+    groups.length > 0 &&
+    groups.every((group) => /^[0-9A-TV-Z]{2,8}$/i.test(group)) &&
+    letters >= 8 &&
+    letters <= 80 &&
+    /\d/.test(trimmed);
+  return link || code ? trimmed : "";
+}
+
+/** Both invite forms; the fragment `<token>.<server ID>.<pin>` marks a pinned server. */
+function parseInvite(link: string): Result<InviteCheck, InviteError> {
+  if (hasSpace(link)) return { ok: false, error: "notALink" };
+  const text = link;
+  const deep = /^hangar-drive:\/\/join#([^@]+)@(\S+)$/i.exec(text);
+  const https = /^(https?:\/\/[^/#]+)[^#]*#(\S+)$/i.exec(text);
+  const [base, fragment] = deep ? [deep[2] ?? "", deep[1] ?? ""] : [https?.[1], https?.[2]];
+  if (base === undefined || fragment === undefined) return { ok: false, error: "notALink" };
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    return { ok: false, error: "notALink" };
+  }
+  if (url.protocol === "http:" && url.hostname !== "localhost") {
     return { ok: false, error: "insecure" };
   }
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    return { ok: false, error: "notALink" };
   if (fragment === "used") return { ok: false, error: "used" };
   if (fragment === "expired") return { ok: false, error: "expired" };
   if (fragment === "offline") return { ok: false, error: "unreachable" };
-  return { ok: true, value: { host } };
+  return { ok: true, value: { host: url.hostname, pinned: fragment.split(".").length >= 3 } };
+}
+
+/** The engine's link parsers refuse white space anywhere; the window removes it first. */
+function hasSpace(link: string): boolean {
+  return /\s/.test(link);
 }
 
 type PairOutcome = "ok" | "declined" | "otherAccount" | "expired";
 
 function parsePairLink(link: string): Result<PairOutcome, PairError> {
-  const match = /^hangar-drive:\/\/pair#(\S+)$/i.exec(link.trim());
+  const match = /^hangar-drive:\/\/pair#(\S+)$/i.exec(link);
   if (!match) return { ok: false, error: "notALink" };
   const fragment = (match[1] ?? "").toLowerCase();
-  if (fragment === "expired") return { ok: false, error: "expired" };
+  if (fragment === "expired" || fragment === "damaged") return { ok: false, error: "expired" };
   if (fragment === "toomany") return { ok: false, error: "tooMany" };
   if (fragment === "offline") return { ok: false, error: "unreachable" };
   if (fragment === "other") return { ok: true, value: "otherAccount" };

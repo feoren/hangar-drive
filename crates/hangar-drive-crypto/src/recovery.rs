@@ -33,16 +33,38 @@
 //! The recovery device sits in the device log with `recovery: true` and receives every epoch
 //! wrap. Its only log entry is adding the new installation as a regular device
 //! ([`crate::devicelog`]); it signs no commits and no records.
+//!
+//! # Sheet (version 2)
+//!
+//! The public part of the printed recovery sheet, also carried by the link
+//! `hangar-drive://recover#<base64url of sheet>`; it never holds the code:
+//!
+//! ```text
+//! sheet = 0x02 || account ID (16) || server ID (16) || genesis (32)
+//!         || pin flag (0x00 or 0x01) || SPKI pin (32, only with flag 0x01) || server URL (UTF-8)
+//! ```
+//!
+//! `genesis` is the hash of the account's first device log entry
+//! ([`crate::devicelog::entry_hash`] at index 1). The recovering installation refuses every log
+//! that does not start with it, so a server cannot hand it another account's log or a log it
+//! made up, and the new device joins exactly the account the sheet was printed for (sync engine
+//! review N1, N6). The pin is the SHA-256 of the server's SubjectPublicKeyInfo for a self-signed
+//! server, so the recovery's first connection is pinned as the pairing's is (ADR 0001,
+//! section 6). The URL is stored in the WHATWG serialization; another spelling is refused, so
+//! one sheet has one byte form. Version 1 (without genesis and pin) was never shipped and is
+//! refused.
 
 use std::fmt;
 
 use thiserror::Error;
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::encoding::{constant_time_eq, framed, hkdf, sha256_framed};
 use crate::entropy::{Entropy, EntropyError};
 use crate::identity::{DeviceIdentity, IdentityError};
-use hangar_drive_protocol::ids::DeviceId;
+use crate::pairing::parse_server_url;
+use hangar_drive_protocol::ids::{AccountId, DeviceId, LogHash, ServerId};
 
 const LABEL_CODE: &[u8] = b"hangar-drive/v1/recovery-code";
 const LABEL_IDENTITY: &[u8] = b"hangar-drive/v1/recovery-identity";
@@ -209,10 +231,152 @@ impl RecoveryCode {
     }
 }
 
+/// The format version of [`RecoverySheet`].
+pub const SHEET_VERSION: u8 = 2;
+const SHEET_FIXED_LEN: usize = 1 + 16 + 16 + 32 + 1;
+
+/// Why sheet bytes were refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SheetError {
+    /// Too short, a bad pin flag, or a URL that is not UTF-8 or not in its one spelling.
+    #[error("the recovery sheet is damaged")]
+    Malformed,
+    /// A version this crate does not read.
+    #[error("recovery sheet version {0} is not supported")]
+    Version(u8),
+    /// The server address is not allowed (`https`, or `http` to the local host only).
+    #[error("the server address is not allowed")]
+    Insecure,
+}
+
+/// The public part of a recovery sheet (module docs, "Sheet").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySheet {
+    /// The server's base URL.
+    pub server_url: Url,
+    /// The server ID.
+    pub server: ServerId,
+    /// The account ID.
+    pub account: AccountId,
+    /// The hash of the account's first device log entry.
+    pub genesis: LogHash,
+    /// The SPKI pin of a self-signed server.
+    pub pin: Option<[u8; 32]>,
+}
+
+impl RecoverySheet {
+    /// The sheet bytes (module docs).
+    pub fn encode(&self) -> Vec<u8> {
+        let url = self.server_url.as_str().as_bytes();
+        let mut out = Vec::with_capacity(SHEET_FIXED_LEN + 32 + url.len());
+        out.push(SHEET_VERSION);
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(self.server.as_bytes());
+        out.extend_from_slice(self.genesis.as_bytes());
+        match &self.pin {
+            Some(pin) => {
+                out.push(1);
+                out.extend_from_slice(pin);
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(url);
+        out
+    }
+
+    /// Reads sheet bytes strictly (module docs).
+    pub fn decode(bytes: &[u8]) -> Result<Self, SheetError> {
+        let version = *bytes.first().ok_or(SheetError::Malformed)?;
+        if version != SHEET_VERSION {
+            return Err(SheetError::Version(version));
+        }
+        if bytes.len() < SHEET_FIXED_LEN + 1 {
+            return Err(SheetError::Malformed);
+        }
+        let account = AccountId::from_slice(&bytes[1..17]).ok_or(SheetError::Malformed)?;
+        let server = ServerId::from_slice(&bytes[17..33]).ok_or(SheetError::Malformed)?;
+        let genesis = LogHash::from_slice(&bytes[33..65]).ok_or(SheetError::Malformed)?;
+        let (pin, rest) = match bytes[65] {
+            0 => (None, &bytes[66..]),
+            1 => {
+                let pin = bytes
+                    .get(66..98)
+                    .and_then(|p| <[u8; 32]>::try_from(p).ok())
+                    .ok_or(SheetError::Malformed)?;
+                (Some(pin), &bytes[98..])
+            }
+            _ => return Err(SheetError::Malformed),
+        };
+        let text = std::str::from_utf8(rest).map_err(|_| SheetError::Malformed)?;
+        if text.is_empty() {
+            return Err(SheetError::Malformed);
+        }
+        let server_url = parse_server_url(text).map_err(|_| SheetError::Insecure)?;
+        if server_url.as_str() != text {
+            return Err(SheetError::Malformed);
+        }
+        Ok(Self {
+            server_url,
+            server,
+            account,
+            genesis,
+            pin,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entropy::{FixedEntropy, OsEntropy};
+
+    fn sheet(pin: Option<[u8; 32]>) -> RecoverySheet {
+        RecoverySheet {
+            server_url: parse_server_url("https://drive.example/").unwrap(),
+            server: ServerId::from_bytes([0x40; 16]),
+            account: AccountId::from_bytes([0x10; 16]),
+            genesis: LogHash::from_bytes([0x77; 32]),
+            pin,
+        }
+    }
+
+    #[test]
+    fn sheets_round_trip_with_and_without_a_pin() {
+        for pin in [None, Some([0xf0; 32])] {
+            let s = sheet(pin);
+            let bytes = s.encode();
+            assert_eq!(bytes[0], SHEET_VERSION);
+            assert_eq!(RecoverySheet::decode(&bytes).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn sheets_are_read_strictly() {
+        let bytes = sheet(Some([1; 32])).encode();
+        // Version 1 had no genesis anchor and is refused.
+        let mut old = bytes.clone();
+        old[0] = 1;
+        assert_eq!(RecoverySheet::decode(&old), Err(SheetError::Version(1)));
+        assert_eq!(RecoverySheet::decode(&[]), Err(SheetError::Malformed));
+        assert_eq!(
+            RecoverySheet::decode(&bytes[..SHEET_FIXED_LEN]),
+            Err(SheetError::Malformed)
+        );
+        let mut flag = bytes.clone();
+        flag[65] = 2;
+        assert_eq!(RecoverySheet::decode(&flag), Err(SheetError::Malformed));
+        // A pin flag without the pin.
+        let mut short = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
+        short[65] = 1;
+        short.extend_from_slice(&[1; 10]);
+        assert_eq!(RecoverySheet::decode(&short), Err(SheetError::Malformed));
+        let mut insecure = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
+        insecure.extend_from_slice(b"http://drive.example/");
+        assert_eq!(RecoverySheet::decode(&insecure), Err(SheetError::Insecure));
+        let mut spelled = sheet(None).encode()[..SHEET_FIXED_LEN].to_vec();
+        spelled.extend_from_slice(b"https://DRIVE.example");
+        assert_eq!(RecoverySheet::decode(&spelled), Err(SheetError::Malformed));
+    }
 
     #[test]
     fn code_round_trips_and_derives_the_same_identity() {

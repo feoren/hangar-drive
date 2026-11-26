@@ -1,21 +1,34 @@
-// Recovery with the sheet (UX 4.4): five screens, one decision each. Enter the sheet, name the
-// device, remove the old devices, keep the new code, choose the folders.
+// Recovery with the sheet (UX 4.4): four screens, one decision each. The sheet (its link pasted
+// or scanned, the code typed, the name of this device), remove the old devices, keep the new
+// code, choose the folders. The link carries server, account and anchor, so nothing else is typed.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
-import type { DeviceId, NameError, RecoverError, RecoveryCode } from "../backend/types";
+import type {
+  DeviceId,
+  InspectedLink,
+  LinkError,
+  LinkKind,
+  NameError,
+  RecoverError,
+  RecoveryCode,
+} from "../backend/types";
 import { cleanName, nameProblem } from "../domain/names";
-import { splitGroups } from "../domain/codes";
+import { normalizeCode, splitGroups } from "../domain/codes";
+import { cleanLink, groupHex } from "../domain/links";
 import { formatRelative } from "../format";
 import { useLanguage, useT, type Translate } from "../i18n";
 import { useBackend, useNow } from "../ui/backendContext";
-import { DesktopIcon, LaptopIcon } from "../ui/icons";
+import { CheckIcon, DesktopIcon, LaptopIcon } from "../ui/icons";
 import { Feedback, Loading } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
 import { DeviceNameField, FolderChoiceStep, StepIndicator } from "./common";
+import { LinkField, otherKind } from "./LinkField";
+import { linkErrorText } from "./PairFlow";
 import { RecoveryCodeStep } from "./RecoveryCodeStep";
+import { CHECK_DELAY_MS } from "./NewAccountFlow";
 
-const TOTAL = 5;
+const TOTAL = 4;
 
 export function recoverErrorText(error: RecoverError, t: Translate): string {
   const app = t("app.name");
@@ -36,15 +49,21 @@ export function recoverErrorText(error: RecoverError, t: Translate): string {
 }
 
 export function RecoverFlow({
+  initialLink = "",
+  onSwitch,
   onBack,
   onDone,
 }: {
+  /** The sheet's link, when the OS handed it over. */
+  readonly initialLink?: string;
+  readonly onSwitch?: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
   readonly onDone: () => void;
 }) {
   const t = useT();
   const [step, setStep] = useState(1);
   const [code, setCode] = useState<RecoveryCode | null>(null);
+  const [deviceName, setDeviceName] = useState("");
   const titleId = useId();
   const indicator = <StepIndicator step={step} total={TOTAL} />;
 
@@ -54,42 +73,36 @@ export function RecoverFlow({
         <SheetStep
           titleId={titleId}
           step={indicator}
+          initialLink={initialLink}
+          onSwitch={onSwitch}
           onBack={onBack}
-          onNext={() => {
+          onNext={(name) => {
+            setDeviceName(name);
             setStep(2);
           }}
         />
       );
     case 2:
       return (
-        <NameStep
-          titleId={titleId}
-          step={indicator}
-          onNext={() => {
-            setStep(3);
-          }}
-        />
-      );
-    case 3:
-      return (
         <CleanupStep
           titleId={titleId}
           step={indicator}
           onNext={(next) => {
             setCode(next);
-            setStep(4);
+            setStep(3);
           }}
         />
       );
-    case 4:
+    case 3:
       return code ? (
         <RecoveryCodeStep
           code={code}
           titleId={titleId}
           step={indicator}
           intro={t("recover.newCode")}
+          deviceName={deviceName}
           onConfirmed={() => {
-            setStep(5);
+            setStep(4);
           }}
         />
       ) : null;
@@ -98,40 +111,97 @@ export function RecoverFlow({
   }
 }
 
+type SheetCheck =
+  | { readonly kind: "idle" }
+  | { readonly kind: "ok"; readonly link: string; readonly info: InspectedLink }
+  | { readonly kind: "error"; readonly link: string; readonly error: LinkError };
+
 function SheetStep({
   titleId,
   step,
+  initialLink,
+  onSwitch,
   onBack,
   onNext,
 }: {
   readonly titleId: string;
   readonly step: React.ReactNode;
+  readonly initialLink: string;
+  readonly onSwitch: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
-  readonly onNext: () => void;
+  readonly onNext: (deviceName: string) => void;
 }) {
   const t = useT();
   const backend = useBackend();
-  const [server, setServer] = useState("");
+  const [link, setLink] = useState(initialLink);
+  const [check, setCheck] = useState<SheetCheck>({ kind: "idle" });
   const [code, setCode] = useState("");
+  const [defaultName] = useLoad(() => backend.defaultDeviceName(), [backend]);
+  const [name, setName] = useState<string | null>(null);
+  const [refused, setRefused] = useState<NameError | null>(null);
   const [error, setError] = useState<string | null>(null);
   const action = useAction();
-  const serverId = useId();
   const codeId = useId();
   const helpId = useId();
   const groups = splitGroups(code);
-  const ready = server.trim() !== "" && code.trim() !== "";
+  const clean = cleanLink(link);
+  const foreign = otherKind(clean, "recover") !== null;
+  const deviceName = name ?? (defaultName.status === "ready" ? defaultName.data : "");
+
+  // The link is read offline while typing pauses; it names server and account before the code.
+  useEffect(() => {
+    if (clean === "" || foreign) return;
+    let current = true;
+    const timer = setTimeout(() => {
+      backend.inspectLink(clean).then(
+        (result) => {
+          if (!current) return;
+          setCheck(
+            result.ok
+              ? { kind: "ok", link: clean, info: result.value }
+              : { kind: "error", link: clean, error: result.error },
+          );
+        },
+        (failure: unknown) => {
+          if (current) {
+            setCheck({ kind: "idle" });
+            console.error("Hangar Drive: reading the sheet's link failed", failure);
+          }
+        },
+      );
+    }, CHECK_DELAY_MS);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  }, [backend, clean, foreign]);
+
+  const state: SheetCheck =
+    clean === "" || foreign || ("link" in check && check.link !== clean) ? { kind: "idle" } : check;
+  const wrongKind = state.kind === "ok" && state.info.kind !== "recover";
+  const linkError =
+    state.kind === "error"
+      ? linkErrorText(state.error, t("error.recover.notALink"), t)
+      : wrongKind
+        ? t("error.recover.notALink")
+        : null;
+  const found = state.kind === "ok" && state.info.kind === "recover" ? state.info : null;
+  const ready = found !== null && code.trim() !== "" && nameProblem(deviceName) === null;
 
   return (
     <form
       className="step-form"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!ready) return;
+        if (!ready || action.pending) return;
         setError(null);
+        const sentName = cleanName(deviceName);
         void action.run(async () => {
-          const result = await backend.recoverAccount(server.trim(), code);
-          if (result.ok) onNext();
-          else setError(recoverErrorText(result.error, t));
+          const result = await backend.recoverAccount(clean, normalizeCode(code), sentName);
+          if (result.ok) onNext(sentName);
+          else if (result.error === "blank" || result.error === "edgeWhitespace") {
+            setRefused(result.error);
+          } else setError(recoverErrorText(result.error, t));
         });
       }}
     >
@@ -140,26 +210,32 @@ function SheetStep({
         {t("recover.title")}
       </h1>
       <p className="step-body">{t("recover.body")}</p>
-      <div className="field">
-        <label htmlFor={serverId} className="field-label">
-          {t("pair.new.serverLabel")}
-        </label>
-        <input
-          id={serverId}
-          className="input"
-          value={server}
-          inputMode="url"
-          autoComplete="off"
-          spellCheck={false}
-          data-autofocus
-          autoFocus
-          placeholder="drive.example.org"
-          onChange={(event) => {
-            setServer(event.target.value);
-            setError(null);
-          }}
-        />
-      </div>
+      <LinkField
+        label={t("recover.linkLabel")}
+        expect="recover"
+        value={link}
+        autoFocus
+        placeholder="hangar-drive://recover#…"
+        onChange={(value) => {
+          setLink(value);
+          setError(null);
+        }}
+        onSwitch={onSwitch}
+        error={linkError}
+        status={
+          found && (
+            <>
+              <p className="field-help ok-text">
+                <CheckIcon size={16} />
+                {t("recover.linkOk", { host: found.host })}
+              </p>
+              <p className="field-help">
+                {t("recover.linkAccount", { account: groupHex(found.account) })}
+              </p>
+            </>
+          )
+        }
+      />
       <div className="field">
         <label htmlFor={codeId} className="field-label">
           {t("recover.codeLabel")}
@@ -182,6 +258,16 @@ function SheetStep({
           {groups.join(" ")}
         </p>
       </div>
+      {found && (
+        <DeviceNameField
+          value={deviceName}
+          refused={refused}
+          onChange={(next) => {
+            setRefused(null);
+            setName(next);
+          }}
+        />
+      )}
       {error && <Feedback tone="error">{error}</Feedback>}
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
       <div className="step-actions">
@@ -189,59 +275,6 @@ function SheetStep({
           {t("setup.back")}
         </button>
         <button type="submit" className="button primary" aria-disabled={!ready || action.pending}>
-          {t("setup.next")}
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function NameStep({
-  titleId,
-  step,
-  onNext,
-}: {
-  readonly titleId: string;
-  readonly step: React.ReactNode;
-  readonly onNext: () => void;
-}) {
-  const t = useT();
-  const backend = useBackend();
-  const [defaultName] = useLoad(() => backend.defaultDeviceName(), [backend]);
-  const [name, setName] = useState<string | null>(null);
-  const [refused, setRefused] = useState<NameError | null>(null);
-  const action = useAction();
-  const value = name ?? (defaultName.status === "ready" ? defaultName.data : "");
-  const blocked = nameProblem(value) !== null;
-  return (
-    <form
-      className="step-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (blocked) return;
-        void action.run(async () => {
-          const result = await backend.setDeviceName(cleanName(value));
-          if (result.ok) onNext();
-          else setRefused(result.error);
-        });
-      }}
-    >
-      {step}
-      <h1 id={titleId} className="step-title" tabIndex={-1}>
-        {t("recover.name.title")}
-      </h1>
-      <DeviceNameField
-        value={value}
-        refused={refused}
-        onChange={(next) => {
-          setRefused(null);
-          setName(next);
-        }}
-      />
-      {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
-      <div className="step-actions">
-        <span />
-        <button type="submit" className="button primary" aria-disabled={blocked || action.pending}>
           {t("setup.next")}
         </button>
       </div>

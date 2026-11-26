@@ -10,9 +10,14 @@
 //!    the sheet names (the server ID is checked at the sign-in). The session may only read the
 //!    log, fetch the recovery device's wrapped keys and make one append
 //!    (`hangar_drive_protocol::api::SessionScope::Recovery`).
-//! 2. **Check:** the verified log must list the recovery device, current, as a recovery device
-//!    with exactly the keys the code derives; otherwise the code belongs to another account or
-//!    was used up (its device removed).
+//! 2. **Check:** the verified log must start with the sheet's genesis anchor (the hash of the
+//!    account's first entry, N1), so the server cannot hand over another account's log or one it
+//!    made up, and it must list the recovery device, current, as a recovery device with exactly
+//!    the keys the code derives; otherwise the code belongs to another account or was used up
+//!    (its device removed). The log is read with a bound on its length (N4). A server refuses a
+//!    removed device's sign-in, so a used code is mostly told by the sign-in itself: its proof,
+//!    made with the code's own key, is answered with `DeviceRemoved` (finding E2E-5), which
+//!    nobody without the code can get.
 //! 3. **Add:** the recovery device unwraps the current epoch's secret and appends one add
 //!    device entry for the new regular device with that secret wrapped to it (`device_wrap`).
 //!    While a rotation is due this is the one exception the log allows (finding M5).
@@ -20,12 +25,12 @@
 //!    (the anchor), and then removes the lost devices and the used recovery device and rotates,
 //!    as any removal (`crate::removal`), and adds a new recovery device for a new code.
 
-use hangar_drive_crypto::devicelog::{AccountState, LogDevice};
+use hangar_drive_crypto::devicelog::{AccountState, LogDevice, MAX_LOG_ENTRIES};
 use hangar_drive_crypto::epoch;
 use hangar_drive_crypto::recovery::RecoveryCode;
 use hangar_drive_crypto::Entropy;
-use hangar_drive_protocol::api::{LogAppendRequest, WrappedKeyEntry};
-use hangar_drive_protocol::ids::{AccountId, Blob, LogHead};
+use hangar_drive_protocol::api::{ErrorCode, LogAppendRequest, WrappedKeyEntry};
+use hangar_drive_protocol::ids::{AccountId, Blob, LogHash, LogHead};
 
 use crate::chunker::DynEntropy;
 use crate::error::SyncError;
@@ -34,7 +39,8 @@ use crate::ports::{NetError, ServerApi};
 /// Why the recovery device could not add the new device.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryError {
-    /// The account's log does not list this code's recovery device at all.
+    /// The account's log does not list this code's recovery device at all, or it does not
+    /// start with the sheet's genesis anchor.
     #[error("the code does not belong to this account")]
     Unknown,
     /// The recovery device was removed: the code was used before.
@@ -52,20 +58,30 @@ impl From<NetError> for RecoveryError {
 }
 
 /// The verified log of `account`, read through `server` (every page, each entry verified).
+///
+/// A server cannot make the client read without end (N4): a log longer than
+/// [`MAX_LOG_ENTRIES`] is refused before any entry of it is read, every page must move the log
+/// forward, and at most [`MAX_LOG_ENTRIES`] pages are read.
 pub fn fetch_log(
     server: &mut dyn ServerApi,
     account: AccountId,
 ) -> Result<AccountState, SyncError> {
+    let protocol = |what: &str| SyncError::Net(NetError::Protocol(what.into()));
     let mut state = AccountState::new(account);
-    loop {
+    for _ in 0..MAX_LOG_ENTRIES {
         let page = server.log(state.len())?;
+        if page.length > MAX_LOG_ENTRIES {
+            return Err(protocol("the log is longer than any log can be"));
+        }
         if page.entries.is_empty() {
             return Ok(state);
         }
         if page.first_index != state.len() + 1 {
-            return Err(SyncError::Net(NetError::Protocol(
-                "log page out of order".into(),
-            )));
+            return Err(protocol("log page out of order"));
+        }
+        let room = MAX_LOG_ENTRIES.saturating_sub(state.len());
+        if u64::try_from(page.entries.len()).unwrap_or(u64::MAX) > room {
+            return Err(protocol("the log is longer than any log can be"));
         }
         for entry in &page.entries {
             state.apply(entry.as_bytes())?;
@@ -74,14 +90,16 @@ pub fn fetch_log(
             return Ok(state);
         }
     }
+    Err(protocol("the log does not end"))
 }
 
 /// Steps 1 to 3 of the module docs: `server` is signed in as the recovery device of `code`.
-/// Adds `device` to `account` and returns the log head after the append, the anchor the new
-/// device joins at.
+/// Adds `device` to `account`, whose first log entry has the hash `genesis`, and returns the log
+/// head after the append, the anchor the new device joins at.
 pub fn add_device_with_code(
     server: &mut dyn ServerApi,
     account: AccountId,
+    genesis: &LogHash,
     code: &RecoveryCode,
     device: LogDevice,
     now_ms: u64,
@@ -93,7 +111,16 @@ pub fn add_device_with_code(
     let recovery = code
         .device_id()
         .map_err(|_| SyncError::Invalid("the recovery device ID"))?;
-    let state = fetch_log(server, account)?;
+    let state = match fetch_log(server, account) {
+        Ok(state) => state,
+        Err(SyncError::Net(e)) if e.code() == Some(ErrorCode::DeviceRemoved) => {
+            return Err(RecoveryError::Used)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if state.hash_at(1) != Some(genesis) {
+        return Err(RecoveryError::Unknown);
+    }
     let record = state.device(&recovery).ok_or(RecoveryError::Unknown)?;
     if !record.recovery || record.keys != identity.public_keys() {
         return Err(RecoveryError::Unknown);
@@ -125,6 +152,10 @@ pub fn add_device_with_code(
         &mut DynEntropy(entropy),
     )
     .map_err(SyncError::from)?;
+    // The head after the append, computed here (security review I1): the anchor the new device
+    // joins at must not be a value the server chose.
+    let mut after = state.clone();
+    let head = after.apply(&addition.entry).map_err(SyncError::from)?;
     let response = server.append_log(&LogAppendRequest {
         entries: vec![Blob(addition.entry.clone())],
         wraps: Vec::new(),
@@ -133,5 +164,145 @@ pub fn add_device_with_code(
             data: Blob(data),
         }),
     })?;
-    Ok(response.head)
+    if response.head != head {
+        return Err(SyncError::Net(NetError::Protocol(
+            "the server's log head after the append is not the one this device computed".into(),
+        ))
+        .into());
+    }
+    Ok(head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hangar_drive_crypto::identity::DeviceIdentity;
+    use hangar_drive_protocol::api::*;
+    use hangar_drive_protocol::ids::*;
+
+    /// A server whose log page claims `length` and repeats one empty-looking page.
+    struct Liar {
+        length: u64,
+        calls: u64,
+    }
+
+    macro_rules! refuse {
+        ($($name:ident($($arg:ty),*) -> $out:ty;)*) => {
+            $(fn $name(&mut self, $(_: $arg),*) -> Result<$out, NetError> {
+                Err(NetError::Unreachable)
+            })*
+        };
+    }
+
+    impl ServerApi for Liar {
+        fn log(&mut self, _after: u64) -> Result<LogPage, NetError> {
+            self.calls += 1;
+            Ok(LogPage {
+                first_index: 1,
+                entries: vec![Blob(vec![1, 2, 3])],
+                length: self.length,
+            })
+        }
+        refuse! {
+            create_account(&CreateAccountRequest) -> CreateAccountResponse;
+            challenge(&AccountId, &DeviceId) -> ChallengeResponse;
+            proof(&AccountId, &DeviceId, &Challenge, &Signature) -> SessionResponse;
+            append_log(&LogAppendRequest) -> LogAppendResponse;
+            epoch_key(Epoch) -> WrappedKeyResponse;
+            record(&RecordKey) -> Option<RecordResponse>;
+            put_record(&RecordKey, &RecordPut) -> ();
+            feed(u64) -> FeedPage;
+            reserve_pairing(&PairingId) -> PairingReservation;
+            post_pairing(&PairingId, &PairingRequest) -> ();
+            get_pairing(&PairingId) -> Option<PairingRequest>;
+            close_pairing(&PairingId) -> ();
+            missing_objects(&FolderId, &[ObjectId]) -> Vec<ObjectId>;
+            put_object(&FolderId, &ObjectId, &[u8]) -> UploadResponse;
+            get_object(&FolderId, &ObjectId) -> Vec<u8>;
+            commit(&FolderId, &CommitRequest) -> CommitResponse;
+            commits(&FolderId, u64) -> DeltaPage;
+            retire(&FolderId) -> ();
+            bring_back(&FolderId) -> ();
+        }
+    }
+
+    /// A server that refuses the recovery device's sign-in with `code`.
+    struct Refusing(ErrorCode);
+
+    impl ServerApi for Refusing {
+        fn log(&mut self, _after: u64) -> Result<LogPage, NetError> {
+            Err(NetError::Server(ErrorBody::new(self.0)))
+        }
+        refuse! {
+            create_account(&CreateAccountRequest) -> CreateAccountResponse;
+            challenge(&AccountId, &DeviceId) -> ChallengeResponse;
+            proof(&AccountId, &DeviceId, &Challenge, &Signature) -> SessionResponse;
+            append_log(&LogAppendRequest) -> LogAppendResponse;
+            epoch_key(Epoch) -> WrappedKeyResponse;
+            record(&RecordKey) -> Option<RecordResponse>;
+            put_record(&RecordKey, &RecordPut) -> ();
+            feed(u64) -> FeedPage;
+            reserve_pairing(&PairingId) -> PairingReservation;
+            post_pairing(&PairingId, &PairingRequest) -> ();
+            get_pairing(&PairingId) -> Option<PairingRequest>;
+            close_pairing(&PairingId) -> ();
+            missing_objects(&FolderId, &[ObjectId]) -> Vec<ObjectId>;
+            put_object(&FolderId, &ObjectId, &[u8]) -> UploadResponse;
+            get_object(&FolderId, &ObjectId) -> Vec<u8>;
+            commit(&FolderId, &CommitRequest) -> CommitResponse;
+            commits(&FolderId, u64) -> DeltaPage;
+            retire(&FolderId) -> ();
+            bring_back(&FolderId) -> ();
+        }
+    }
+
+    // E2E-5: the server tells the removed recovery device so (its own proof), which is "used";
+    // a proof the server refuses as such is not.
+    #[test]
+    fn a_removed_recovery_device_means_the_code_was_used() {
+        let code = RecoveryCode::generate(&mut hangar_drive_crypto::OsEntropy).unwrap();
+        let identity = DeviceIdentity::generate(&mut hangar_drive_crypto::OsEntropy).unwrap();
+        let account = AccountId::from_bytes([1; 16]);
+        let device = LogDevice::of(&identity, &account, DeviceId::from_bytes([2; 16]), false);
+        let run = |code_answer: ErrorCode| {
+            add_device_with_code(
+                &mut Refusing(code_answer),
+                account,
+                &LogHash::from_bytes([3; 32]),
+                &code,
+                device,
+                0,
+                &mut hangar_drive_crypto::OsEntropy,
+            )
+        };
+        assert_eq!(run(ErrorCode::DeviceRemoved), Err(RecoveryError::Used));
+        assert!(matches!(
+            run(ErrorCode::ProofInvalid),
+            Err(RecoveryError::Sync(SyncError::Net(_)))
+        ));
+    }
+
+    // N4: a log longer than any log can be is refused before a single entry is read.
+    #[test]
+    fn a_log_longer_than_the_maximum_is_refused_at_once() {
+        let mut server = Liar {
+            length: MAX_LOG_ENTRIES + 1,
+            calls: 0,
+        };
+        let error = fetch_log(&mut server, AccountId::from_bytes([1; 16])).unwrap_err();
+        assert!(
+            matches!(error, SyncError::Net(NetError::Protocol(_))),
+            "{error:?}"
+        );
+        assert_eq!(server.calls, 1);
+        // Within the bound the entries are verified, and a bad one stops the read.
+        let mut server = Liar {
+            length: 3,
+            calls: 0,
+        };
+        assert!(matches!(
+            fetch_log(&mut server, AccountId::from_bytes([1; 16])),
+            Err(SyncError::Log(_))
+        ));
+    }
 }

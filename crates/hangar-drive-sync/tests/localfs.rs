@@ -366,7 +366,7 @@ fn two_engines_sync_through_real_folders() {
         account_id,
         b_id,
         "Desktop",
-        None,
+        &[],
     )
     .unwrap();
     a.refresh(&mut a_server, &mut a_keys, &mut a_store).unwrap();
@@ -747,4 +747,74 @@ fn names_windows_refuses_are_listed_as_other() {
         .find(|e| e.name.as_deref() == Some("trailing."))
         .unwrap();
     assert_eq!(entry.stat.kind, EntryType::Other);
+}
+
+/// A link at `.hangar-drive` or one of its directories (security review N5): no temporary
+/// write and no quarantined file may land outside the root through it.
+#[cfg(windows)]
+fn link_dir(link: &std::path::Path, target: &std::path::Path) {
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+}
+
+#[cfg(unix)]
+fn link_dir(link: &std::path::Path, target: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[test]
+fn a_linked_reserved_directory_takes_no_temporary_write() {
+    let dir = tmp("reserved-link");
+    let outside = tmp("reserved-link-outside");
+    let fs = LocalFs::new(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(dir.join(".hangar-drive"));
+    link_dir(&dir.join(".hangar-drive"), &outside);
+    assert!(matches!(
+        write(&fs, &p(&["new.txt"]), b"x", None),
+        Err(FsError::CannotSync(_))
+    ));
+    assert!(!dir.join("new.txt").exists());
+    assert_eq!(std::fs::read_dir(&*outside).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_linked_quarantine_takes_nothing_out_of_the_root() {
+    use hangar_drive_protocol::ids::ItemId;
+    let dir = tmp("trash-link");
+    let outside = tmp("trash-link-outside");
+    let fs = LocalFs::new(&dir).unwrap();
+    // A path the shell cannot recycle (beyond MAX_PATH, measured) goes to the quarantine.
+    let mut names: Vec<String> = Vec::new();
+    while fs.root().join(names.join("\\")).as_os_str().len() < 300 {
+        names.push("d".repeat(40));
+    }
+    let mut path = Vec::new();
+    for name in &names {
+        path.push(name.clone());
+        fs.create_dir(&path).unwrap();
+    }
+    path.push("deep.txt".into());
+    write(&fs, &path, b"marker", None).unwrap();
+    let s = fs.stat(&path).unwrap().unwrap();
+    let expect = Expect {
+        size: s.size,
+        mtime_ms: s.mtime_ms,
+        file_id: s.file_id,
+    };
+    std::fs::create_dir_all(dir.join(".hangar-drive")).unwrap();
+    let _ = std::fs::remove_dir_all(dir.join(".hangar-drive").join("trash"));
+    link_dir(&dir.join(".hangar-drive").join("trash"), &outside);
+    let item = ItemId::from_bytes([0x42; 16]);
+    assert!(matches!(
+        fs.trash_file(&item, &path, expect),
+        Err(FsError::CannotSync(_))
+    ));
+    assert!(fs.stat(&path).unwrap().is_some(), "the file stays in place");
+    assert_eq!(std::fs::read_dir(&*outside).unwrap().count(), 0);
 }

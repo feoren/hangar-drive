@@ -10,6 +10,7 @@ import type {
   Millis,
   NameIssue,
   RemoteFolder,
+  RemovedHead,
   ServerNotice,
   Settings,
   Storage,
@@ -38,7 +39,20 @@ export interface MockState {
   conflicts: ConflictGroup[];
   nameIssues: NameIssue[];
   settings: Settings;
+  /** A link the OS hands over at start (`openLink`), held until the window listens. */
+  startLink: string | null;
+  /** Saved states of removed devices that stopped a folder, sent as the `removedHeads` event. */
+  removedHeads: { readonly folderId: string; readonly heads: readonly RemovedHead[] } | null;
+  /** Whether this build can update itself (`About.updates`); false without an updater key. */
+  updates: boolean;
 }
+
+/** Links the deep link scenarios start with. */
+export const START_LINKS = {
+  invite: "hangar-drive://join#k7Qm2xR9@https://drive.example.org/",
+  pair: "hangar-drive://pair#Z4mK8q",
+  recover: "hangar-drive://recover#AQ3f9a12c0sheet",
+} as const;
 
 export const SCENARIOS = [
   { id: "upToDate", label: "Up to date" },
@@ -65,9 +79,17 @@ export const SCENARIOS = [
   { id: "diskFull", label: "Disk full here" },
   { id: "olderState", label: "Server shows older state" },
   { id: "removed", label: "This device was removed" },
+  { id: "removedUnknown", label: "Removed, by an unknown device" },
   { id: "updateRequired", label: "Update required" },
+  { id: "updateOff", label: "Update required, updates off" },
   { id: "refused", label: "Server refuses this device" },
   { id: "suspect", label: "Suspected ransomware" },
+  { id: "removedHeads", label: "Changes from a removed device" },
+  { id: "removedHeadsMany", label: "Changes from two removed devices" },
+  { id: "deepLinkInvite", label: "Setup opened by an invite link" },
+  { id: "deepLinkPair", label: "Setup opened by a pairing link" },
+  { id: "deepLinkRecover", label: "Setup opened by a recovery link" },
+  { id: "deepLinkDone", label: "Link opened on a set-up device" },
   { id: "many", label: "Several problems at once" },
 ] as const;
 
@@ -108,6 +130,44 @@ export function baseState(now: Millis): MockState {
     conflicts: fx.conflicts(now),
     nameIssues: fx.nameIssues(),
     settings: { autostart: true, language: "system" },
+    startLink: null,
+    removedHeads: null,
+    updates: true,
+  };
+}
+
+function setupState(state: MockState): void {
+  state.setup = "needed";
+  state.folders = [];
+  state.activity = [];
+  state.account = null;
+  state.storage = null;
+  state.sync.lastSync = null;
+  state.sync.lastFile = null;
+}
+
+/** Changes of removed devices stopped "Fotos"; the removed devices are gone from the list. */
+function removedHeadsState(state: MockState, devices: readonly string[]): void {
+  state.devices = state.devices.filter((device) => device.name !== fx.REMOVED_DEVICE);
+  state.warnings = [
+    {
+      kind: "removedHeads",
+      id: "w-heads",
+      folderId: "f-photos",
+      folderName: "Fotos",
+      devices,
+      count: devices.length + 1,
+    },
+  ];
+  setFolderStatus(state, "f-photos", { kind: "stopped", reason: "removedHeads" });
+  state.removedHeads = {
+    folderId: "f-photos",
+    heads: devices.map((name, index) => ({
+      commit: index === 0 ? "t2" : "t4",
+      deviceId: `d-removed-${String(index)}`,
+      deviceName: name,
+      sequence: 40 - index,
+    })),
   };
 }
 
@@ -164,13 +224,7 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
     case "upToDate":
       break;
     case "setup":
-      state.setup = "needed";
-      state.folders = [];
-      state.activity = [];
-      state.account = null;
-      state.storage = null;
-      state.sync.lastSync = null;
-      state.sync.lastFile = null;
+      setupState(state);
       break;
     case "empty":
       state.folders = [];
@@ -260,14 +314,43 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
     case "removed":
       state.warnings = [{ kind: "removed", id: "w-removed", by: fx.OTHER_DEVICE }];
       break;
+    case "removedUnknown":
+      // The server answered `deviceRemoved` at sign-in; who removed it is not known.
+      state.warnings = [{ kind: "removed", id: "w-removed", by: "" }];
+      break;
     case "updateRequired":
       state.warnings = [{ kind: "updateRequired", id: "w-update" }];
+      break;
+    case "updateOff":
+      state.warnings = [{ kind: "updateRequired", id: "w-update" }];
+      state.updates = false;
       break;
     case "refused":
       state.warnings = [{ kind: "refused", id: "w-refused" }];
       break;
     case "suspect":
       state.warnings = [warn.suspect()];
+      break;
+    case "removedHeads":
+      removedHeadsState(state, [fx.REMOVED_DEVICE]);
+      break;
+    case "removedHeadsMany":
+      removedHeadsState(state, [fx.REMOVED_DEVICE, ""]);
+      break;
+    case "deepLinkInvite":
+      setupState(state);
+      state.startLink = START_LINKS.invite;
+      break;
+    case "deepLinkPair":
+      setupState(state);
+      state.startLink = START_LINKS.pair;
+      break;
+    case "deepLinkRecover":
+      setupState(state);
+      state.startLink = START_LINKS.recover;
+      break;
+    case "deepLinkDone":
+      state.startLink = START_LINKS.invite;
       break;
     case "many":
       state.warnings = [conflictsBanner, warn.missing(), warn.massDelete(), namesBanner];

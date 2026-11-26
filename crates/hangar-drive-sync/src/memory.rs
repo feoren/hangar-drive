@@ -4,7 +4,8 @@
 //!   operations a simulated person performs.
 //! - [`MemServer`]: the server API over one shared [`ServerState`], with the server's checks
 //!   from `hangar-drive-crypto` (log batches, commit signatures, compare-and-swap, side commits,
-//!   reference deltas) and fault injection (offline, lost replies, small pages).
+//!   reference deltas) and fault injection (offline, lost replies, small pages, refused commits,
+//!   a server key other than the pinned one).
 //! - [`MemStore`]: the local index; clones share the data, so a "restarted" device reads what
 //!   the previous instance wrote.
 //! - [`ManualClock`], [`SeededRandom`], [`MemKeychain`].
@@ -123,6 +124,36 @@ impl Keychain for MemKeychain {
     fn delete(&mut self, key: &str) -> Result<(), KeychainError> {
         self.0.remove(key);
         Ok(())
+    }
+}
+
+impl MemKeychain {
+    /// The names stored, for tests that check what is left (security review L1).
+    pub fn keys(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
+}
+
+/// A [`MemKeychain`] a test keeps a handle to while an engine owns the port.
+#[derive(Debug, Default, Clone)]
+pub struct SharedKeychain(Rc<RefCell<MemKeychain>>);
+
+impl SharedKeychain {
+    /// The names stored now.
+    pub fn keys(&self) -> Vec<String> {
+        self.0.borrow().keys()
+    }
+}
+
+impl Keychain for SharedKeychain {
+    fn load(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+        self.0.borrow().load(key)
+    }
+    fn store(&mut self, key: &str, secret: &[u8]) -> Result<(), KeychainError> {
+        self.0.borrow_mut().store(key, secret)
+    }
+    fn delete(&mut self, key: &str) -> Result<(), KeychainError> {
+        self.0.borrow_mut().delete(key)
     }
 }
 
@@ -719,6 +750,11 @@ impl Store for MemStore {
             .insert(key.to_owned(), value.to_vec());
         Ok(())
     }
+
+    fn delete_account_value(&mut self, key: &str) -> Result<(), StoreError> {
+        self.0.borrow_mut().account.remove(key);
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -747,6 +783,12 @@ pub struct ServerState {
     pub page_size: usize,
     /// Answer "base expired" to every side commit.
     pub expire_bases: bool,
+    /// While set, every commit is refused with this code (a used up upload budget, say).
+    pub refuse_commits: Option<ErrorCode>,
+    /// The SPKI pin of the key the server presents. A connection pinned to another key fails
+    /// every call with [`NetError::PinMismatch`] and reports this one as seen (ADR 0001,
+    /// section 6, "Pin rotation"); `None` presents whatever a connection pinned.
+    pub presented_pin: Option<[u8; 32]>,
     server: ServerId,
     account: Option<AccountId>,
     log: Vec<Vec<u8>>,
@@ -768,6 +810,8 @@ impl ServerState {
             lose_next_commit_reply: false,
             page_size: hangar_drive_protocol::api::MAX_DELTA_PAGE,
             expire_bases: false,
+            refuse_commits: None,
+            presented_pin: None,
             server: ServerId::from_bytes([0x5e; 16]),
             account: None,
             log: Vec::new(),
@@ -872,6 +916,7 @@ impl ServerState {
 pub struct MemServer {
     shared: Rc<RefCell<ServerState>>,
     device: DeviceId,
+    pin: Option<[u8; 32]>,
 }
 
 impl MemServer {
@@ -882,9 +927,27 @@ impl MemServer {
 
     /// The connection of `device`.
     pub fn connect(shared: &Rc<RefCell<ServerState>>, device: DeviceId) -> Self {
+        Self::connect_pinned(shared, device, None)
+    }
+
+    /// The connection of `device` pinned to the server key `pin` (none: any key).
+    pub fn connect_pinned(
+        shared: &Rc<RefCell<ServerState>>,
+        device: DeviceId,
+        pin: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             shared: Rc::clone(shared),
             device,
+            pin,
+        }
+    }
+
+    /// The presented key, when it is not the one this connection pinned.
+    fn other_key(&self, s: &ServerState) -> Option<[u8; 32]> {
+        match (self.pin, s.presented_pin) {
+            (Some(pinned), Some(presented)) if pinned != presented => Some(presented),
+            _ => None,
         }
     }
 
@@ -898,6 +961,9 @@ impl MemServer {
         s.calls += 1;
         if !s.online {
             return Err(NetError::Unreachable);
+        }
+        if self.other_key(&s).is_some() {
+            return Err(NetError::PinMismatch);
         }
         Ok(s)
     }
@@ -1116,6 +1182,12 @@ impl ServerApi for MemServer {
         }
     }
 
+    fn close_pairing(&mut self, id: &PairingId) -> Result<(), NetError> {
+        let mut s = self.enter()?;
+        s.pairing.remove(id);
+        Ok(())
+    }
+
     fn missing_objects(
         &mut self,
         folder: &FolderId,
@@ -1166,6 +1238,9 @@ impl ServerApi for MemServer {
             .map_err(|_| refuse(ErrorCode::BadRequest))?;
         let state = s.state.clone().ok_or(refuse(ErrorCode::NotFound))?;
         let expire_bases = s.expire_bases;
+        if let Some(code) = s.refuse_commits {
+            return Err(refuse(code));
+        }
         let f = s.folders.entry(*folder).or_default();
         if f.retired {
             return Err(refuse(ErrorCode::FolderRetired));
@@ -1302,6 +1377,23 @@ impl ServerApi for MemServer {
         s.folders.entry(*folder).or_default().retired = true;
         s.push_feed(FeedChange::FolderRetired { folder: *folder });
         Ok(())
+    }
+
+    fn bring_back(&mut self, folder: &FolderId) -> Result<(), NetError> {
+        let mut s = self.enter()?;
+        let f = s
+            .folders
+            .get_mut(folder)
+            .filter(|f| f.retired)
+            .ok_or(refuse(ErrorCode::BadRequest))?;
+        f.retired = false;
+        // ADR 0001, section 3: undoing a retirement is announced as a new folder.
+        s.push_feed(FeedChange::FolderCreated { folder: *folder });
+        Ok(())
+    }
+
+    fn seen_pin(&self) -> Option<[u8; 32]> {
+        self.other_key(&self.shared.borrow())
     }
 }
 

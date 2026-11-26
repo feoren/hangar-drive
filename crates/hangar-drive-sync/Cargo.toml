@@ -109,3 +109,11 @@ libc = "0.2"
 # The crate itself with its test doubles, for the integration tests and the simulation under
 # `tests/`, which link the library without `cfg(test)`.
 hangar-drive-sync = { path = ".", features = ["test-support"] }
+# The real sync server for the end-to-end test (`tests/e2e_server.rs`): it is built and served in
+# the test process with the same `build` and `serve` the binary runs, on a real socket and a data
+# folder under `tests/.tmp/`. This repository, MIT; a dev-dependency only, so the app never links
+# the server.
+hangar-drive-server = { path = "../../server" }
+# The runtime the server's `serve` needs in that test. MIT, tokio-rs; the version and features
+# the server already uses, so the lock file gains no crate.
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }

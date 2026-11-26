@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ignore-name-issue"
+description = "Enables the ignore_name_issue command without any pre-configured scope."
+commands.allow = ["ignore_name_issue"]
+
+[[permission]]
+identifier = "deny-ignore-name-issue"
+description = "Denies the ignore_name_issue command without any pre-configured scope."
+commands.deny = ["ignore_name_issue"]

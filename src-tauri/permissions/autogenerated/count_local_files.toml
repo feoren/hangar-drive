@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-count-local-files"
+description = "Enables the count_local_files command without any pre-configured scope."
+commands.allow = ["count_local_files"]
+
+[[permission]]
+identifier = "deny-count-local-files"
+description = "Denies the count_local_files command without any pre-configured scope."
+commands.deny = ["count_local_files"]

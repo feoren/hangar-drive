@@ -172,7 +172,7 @@ impl World {
                 ACCOUNT,
                 d.id,
                 &d.name.clone(),
-                None,
+                &[],
             )
             .expect("join");
             d.account = Some(account);

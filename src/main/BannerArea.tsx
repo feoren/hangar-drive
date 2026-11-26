@@ -1,16 +1,18 @@
 // The banner area (UX 6.3): at most one banner, the most urgent; the others are counted on it
 // and can be stepped through. Banners are the only place where problems appear in the window.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 
-import type { FocusRequest } from "../App";
+import type { FocusRequest, HeadsRequest } from "../App";
 import { formatSince, formatSize } from "../format";
 import { shownWarnings, tone, type ShownWarning } from "../domain/warnings";
 import { useLanguage, useT, type Translate } from "../i18n";
+import { errorCode } from "../backend/errors";
 import type { Backend } from "../backend/types";
+import { headsBody } from "../problems/RemovedHeadsDialog";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Feedback } from "../ui/parts";
-import { errorText, useAction } from "../ui/useAsync";
+import { errorText, useAction, useLoad } from "../ui/useAsync";
 import type { Open } from "./openDialog";
 
 interface BannerButton {
@@ -27,6 +29,12 @@ interface BannerContent {
   readonly buttons: readonly BannerButton[];
 }
 
+/**
+ * Whether this build can update itself: unknown until `getAbout` answered, "off" without an
+ * updater key (then "Update now" is hidden instead of failing).
+ */
+export type UpdatesState = "unknown" | "on" | "off";
+
 function content(
   warning: ShownWarning,
   t: Translate,
@@ -34,6 +42,7 @@ function content(
   open: Open,
   since: (ms: number) => string,
   size: (bytes: number) => string,
+  updates: { readonly state: UpdatesState; readonly turnedOff: () => void },
 ): BannerContent {
   const app = t("app.name");
   const copyReport: BannerButton = {
@@ -79,10 +88,26 @@ function content(
           },
         ],
       };
+    case "removedHeads":
+      return {
+        title: t("heads.title"),
+        body: headsBody(warning, t),
+        buttons: [
+          {
+            label: t("deletes.decide"),
+            primary: true,
+            onClick: () => {
+              open({ kind: "removedHeads", warning });
+            },
+          },
+        ],
+      };
     case "removed":
       return {
         title: null,
-        body: t("removed.body", { device: warning.by }),
+        // The server's `deviceRemoved` at sign-in does not say who removed this device.
+        body:
+          warning.by === "" ? t("removed.bodyUnknown") : t("removed.body", { device: warning.by }),
         buttons: [
           {
             label: t("removed.repair"),
@@ -115,6 +140,14 @@ function content(
         ],
       };
     case "updateRequired":
+      if (updates.state !== "on") {
+        return {
+          title: null,
+          body:
+            updates.state === "off" ? t("update.bodyManual", { app }) : t("update.body", { app }),
+          buttons: [],
+        };
+      }
       return {
         title: null,
         body: t("update.body", { app }),
@@ -123,8 +156,17 @@ function content(
             label: t("update.now"),
             primary: true,
             onClick: async () => {
-              await backend.installUpdate();
-              return null;
+              try {
+                const outcome = await backend.installUpdate();
+                return outcome.kind === "upToDate"
+                  ? t("update.upToDate")
+                  : t("update.installed", { version: outcome.version, app });
+              } catch (error) {
+                // A build without an updater key: no error, the button just goes away.
+                if (errorCode(error) !== "updatesOff") throw error;
+                updates.turnedOff();
+                return null;
+              }
             },
           },
         ],
@@ -291,7 +333,19 @@ export function folderRefusalText(
   }
 }
 
-export function BannerArea({ open, focus }: { readonly open: Open; readonly focus: FocusRequest }) {
+export function BannerArea({
+  open,
+  focus,
+  heads,
+  region,
+}: {
+  readonly open: Open;
+  readonly focus: FocusRequest;
+  /** The last `removedHeads` event: its question comes to the front once the warning is there. */
+  readonly heads: HeadsRequest | null;
+  /** The banner element, so the window can put the focus back on it. */
+  readonly region: RefObject<HTMLDivElement | null>;
+}) {
   const t = useT();
   const language = useLanguage();
   const backend = useBackend();
@@ -301,8 +355,22 @@ export function BannerArea({ open, focus }: { readonly open: Open; readonly focu
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ id: string; text: string } | null>(null);
   const action = useAction();
-  const region = useRef<HTMLDivElement>(null);
   const autoOpened = useRef(new Set<string>());
+  const handledHeads = useRef(0);
+  // Only a needed update asks whether this build can update itself.
+  const needsUpdate = warnings.some((item) => item.kind === "updateRequired");
+  const [about] = useLoad(
+    () => (needsUpdate ? backend.getAbout() : Promise.resolve(null)),
+    [backend, needsUpdate],
+  );
+  const [refusedUpdate, setRefusedUpdate] = useState(false);
+  const updates: UpdatesState = refusedUpdate
+    ? "off"
+    : about.status === "loading"
+      ? "unknown"
+      : about.status === "ready" && about.data?.updates === false
+        ? "off"
+        : "on";
 
   const index = Math.max(
     0,
@@ -319,18 +387,36 @@ export function BannerArea({ open, focus }: { readonly open: Open; readonly focu
   }
   useEffect(() => {
     if (focus.at > 0) region.current?.focus();
-  }, [focus.at]);
+  }, [focus.at, region]);
 
-  // Many deletions need a decision, so they also open their dialog once (UX 8.1).
+  // Many deletions and changes of a removed device need a decision, so they also open their
+  // dialog once (UX 8.1, 8.9); a new `removedHeads` event opens its question again.
   useEffect(() => {
-    for (const item of warnings) {
-      if (item.kind === "massDelete" && !autoOpened.current.has(item.id)) {
+    if (heads && heads.at !== handledHeads.current) {
+      const item = warnings.find(
+        (warning) => warning.kind === "removedHeads" && warning.folderId === heads.folderId,
+      );
+      if (item?.kind === "removedHeads") {
+        handledHeads.current = heads.at;
         autoOpened.current.add(item.id);
-        open({ kind: "massDelete", warning: item });
+        open({ kind: "removedHeads", warning: item, auto: true });
+        return;
+      }
+    }
+    for (const item of warnings) {
+      if (autoOpened.current.has(item.id)) continue;
+      if (item.kind === "massDelete") {
+        autoOpened.current.add(item.id);
+        open({ kind: "massDelete", warning: item, auto: true });
+        break;
+      }
+      if (item.kind === "removedHeads") {
+        autoOpened.current.add(item.id);
+        open({ kind: "removedHeads", warning: item, auto: true });
         break;
       }
     }
-  }, [warnings, open]);
+  }, [warnings, open, heads]);
 
   if (!warning) {
     return feedback ? (
@@ -347,6 +433,12 @@ export function BannerArea({ open, focus }: { readonly open: Open; readonly focu
     open,
     (ms) => formatSince(language, ms, now),
     (bytes) => formatSize(language, bytes),
+    {
+      state: updates,
+      turnedOff: () => {
+        setRefusedUpdate(true);
+      },
+    },
   );
   const others = warnings.length - 1;
   const kind = tone(warning);

@@ -34,6 +34,8 @@ use tokio::task::JoinHandle;
 
 pub const START_MS: u64 = 1_800_000_000_000;
 pub const DAY_MS: u64 = 86_400_000;
+/// The base URL the test devices sign their session proofs for.
+pub const TEST_URL: &str = "https://drive.example/";
 
 pub fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
@@ -65,6 +67,8 @@ pub struct Options {
     pub header_timeout: Option<Duration>,
     pub tls: bool,
     pub concurrency: Concurrency,
+    /// `HANGAR_DRIVE_PUBLIC_URL`, which `serve` needs; the test devices sign for [`TEST_URL`].
+    pub public_url: &'static str,
 }
 
 impl Default for Options {
@@ -78,6 +82,7 @@ impl Default for Options {
             header_timeout: None,
             tls: false,
             concurrency: Concurrency::default(),
+            public_url: TEST_URL,
         }
     }
 }
@@ -115,6 +120,7 @@ impl TestServer {
             ));
         }
         vars.push(("HANGAR_DRIVE_SHUTDOWN_GRACE_SECS", "3".into()));
+        vars.push(("HANGAR_DRIVE_PUBLIC_URL", options.public_url.to_owned()));
         let mut config = Config::from_lookup(|name| {
             vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.into())
         })
@@ -451,6 +457,7 @@ impl Account {
         let challenge: ChallengeResponse = reply.json();
         let signature = device.identity.prove_session(
             &challenge.server,
+            TEST_URL,
             &self.id,
             &device.id,
             &challenge.challenge,
@@ -462,6 +469,7 @@ impl Account {
                     account: self.id,
                     device: device.id,
                     challenge: challenge.challenge,
+                    server_url: TEST_URL.into(),
                     signature,
                 },
             )

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-keep-conflict-version"
+description = "Enables the keep_conflict_version command without any pre-configured scope."
+commands.allow = ["keep_conflict_version"]
+
+[[permission]]
+identifier = "deny-keep-conflict-version"
+description = "Denies the keep_conflict_version command without any pre-configured scope."
+commands.deny = ["keep_conflict_version"]

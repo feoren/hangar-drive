@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pause-folder"
+description = "Enables the pause_folder command without any pre-configured scope."
+commands.allow = ["pause_folder"]
+
+[[permission]]
+identifier = "deny-pause-folder"
+description = "Denies the pause_folder command without any pre-configured scope."
+commands.deny = ["pause_folder"]

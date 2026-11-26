@@ -25,6 +25,30 @@ export const HOME = "C:\\Users\\Alex";
 
 export const THIS_DEVICE = "Arbeitslaptop";
 export const OTHER_DEVICE = "Büro-PC";
+/** A device this account removed; its changes stop a folder in the "removedHeads" scenario. */
+export const REMOVED_DEVICE = "Alter Laptop";
+
+/** IDs of the example account, lowercase hex as the backend sends them. */
+export const ACCOUNT = "3f9a12c08b7e44d1a0b2c3d4e5f60718";
+export const SERVER_ID = "9c41d07e2ab35f68c1e0d4b7a3925f16";
+export const GENESIS = "e7b2049c55a1d3f8b6c0e91a24d7f35c8b19a6e0d2c4f7a3b5e8d1c6f0a9b2e4";
+/** The account behind the pairing link "...#stranger": an account the person does not know. */
+export const STRANGER_ACCOUNT = "c0ffee00d15ea5e0ba5eba11deadbeef";
+
+/** Devices of that unknown account, as this device sees them right after joining. */
+export function strangerDevices(now: Millis): Device[] {
+  return [
+    { id: "d-this", name: THIS_DEVICE, kind: "laptop", isThis: true, lastSeen: now, added: now },
+    {
+      id: "d-x1",
+      name: "DESKTOP-7Q2KF0M",
+      kind: "desktop",
+      isThis: false,
+      lastSeen: now - 2 * HOUR,
+      added: now - 3 * DAY,
+    },
+  ];
+}
 
 export function folders(): Folder[] {
   return [
@@ -144,7 +168,7 @@ export function devices(now: Millis): Device[] {
     },
     {
       id: "d-old",
-      name: "Alter Laptop",
+      name: REMOVED_DEVICE,
       kind: "laptop",
       isThis: false,
       lastSeen: now - 104 * DAY,
@@ -420,6 +444,27 @@ export function numberRows(seed: number): NumberRows {
     groups.push(String(value % 100000).padStart(5, "0"));
   }
   return { groups };
+}
+
+/** A matrix as the SVG document the engine sends next to it (`PairingOffer.qrSvg`). */
+export function qrSvg(matrix: QrMatrix): string {
+  const quiet = 4;
+  const full = matrix.size + quiet * 2;
+  let d = "";
+  for (let y = 0; y < matrix.size; y += 1) {
+    for (let x = 0; x < matrix.size; x += 1) {
+      if (matrix.modules[y * matrix.size + x] === "1") {
+        d += `M${String(x + quiet)} ${String(y + quiet)}h1v1h-1z`;
+      }
+    }
+  }
+  const box = String(full);
+  return (
+    `<?xml version="1.0" standalone="yes"?>` +
+    `<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="${box}" height="${box}" ` +
+    `viewBox="0 0 ${box} ${box}" shape-rendering="crispEdges">` +
+    `<rect width="${box}" height="${box}" fill="#ffffff"/><path d="${d}" fill="#000000"/></svg>`
+  );
 }
 
 /** A pattern that looks like a QR code (finder patterns, timing, noise); not decodable. */

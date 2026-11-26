@@ -4,6 +4,7 @@
 
 import { useId, useState } from "react";
 
+import { cleanLink } from "../domain/links";
 import { useT } from "../i18n";
 import { useBackend } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
@@ -11,19 +12,26 @@ import { ArmedButton, Feedback, Loading, NumberRows } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
 import { LinkField } from "../setup/LinkField";
 
-export function ServerScanDialog({ onClose }: { readonly onClose: () => void }) {
+export function ServerScanDialog({
+  initialLink,
+  onClose,
+}: {
+  /** A pairing link the OS handed over; the person still confirms it with the button. */
+  readonly initialLink?: string | undefined;
+  readonly onClose: () => void;
+}) {
   const t = useT();
   const backend = useBackend();
   const titleId = useId();
   const action = useAction();
-  const [link, setLink] = useState("");
+  const [link, setLink] = useState(initialLink ?? "");
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
 
   const submit = (value: string) => {
     setError(null);
     void action.run(async () => {
-      const result = await backend.fixServerWithOffer(value);
+      const result = await backend.fixServerWithOffer(cleanLink(value));
       if (result.ok) {
         setDone(true);
         return;
@@ -62,6 +70,7 @@ export function ServerScanDialog({ onClose }: { readonly onClose: () => void }) 
           <p className="dialog-body">{t("server.fix.scanBody", { app: t("app.name") })}</p>
           <LinkField
             label={t("pair.new.label")}
+            expect="pair"
             value={link}
             onChange={(value) => {
               setLink(value);
@@ -148,8 +157,8 @@ export function ServerCompareDialog({ onClose }: { readonly onClose: () => void 
               armKey={loaded.data.number.groups.join("")}
               onClick={() => {
                 void action.run(async () => {
-                  await backend.confirmServerNumber();
-                  setAnswer("yes");
+                  const outcome = await backend.confirmServerNumber();
+                  setAnswer(outcome === "confirmed" ? "yes" : "no");
                 });
               }}
             >

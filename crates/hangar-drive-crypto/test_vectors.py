@@ -465,6 +465,7 @@ MTIME = 1_700_000_000_000
 EXPIRES = ISSUED_AT + 600_000
 FOLDERS_NONCE = counting(0xC8, 24)
 NAMES_NONCE = counting(0xD8, 24)
+PAIRING_NAME_NONCE = counting(0xE8, 24)
 # Names whose case keys differ between the three keys of the name policy (src/vectors.rs).
 CASE_NAMES = [
     "CAFÉ",
@@ -751,14 +752,24 @@ def compute():
     out["recovery.sign_public"] = ed25519_public(okm[:32]).hex()
     out["recovery.kem_public"] = x25519_public(okm[32:]).hex()
     out["recovery.device_id"] = hkdf(RECOVERY_ENTROPY, framed(label("recovery-device-id")), 16).hex()
+    # Recovery sheet, version 2: account, server, the create entry's hash as the genesis anchor,
+    # the pin flag with the optional SPKI pin, then the URL in the WHATWG serialization.
+    sheet_head = b"\x02" + ACCOUNT + SERVER + create_hash
+    out["recovery.sheet"] = (sheet_head + b"\x01" + SPKI_PIN + b"https://drive.example/").hex()
+    out["recovery.sheet_unpinned"] = (sheet_head + b"\x00" + b"https://drive.example/").hex()
 
-    # Pairing: code, routing ID, request tag and offer.
+    # Pairing: code, routing ID, the sealed name, the request tag over it, and the offer.
     out["pairing.code"] = crockford_code("pairing-code", PAIRING_SECRET)
     out["pairing.id"] = hkdf(PAIRING_SECRET, framed(label("pairing-id")), 16).hex()
+    name_key = hkdf(PAIRING_SECRET, framed(label("pairing-name")), 32)
+    sealed_name = PAIRING_NAME_NONCE + xchacha20poly1305_seal(
+        name_key, PAIRING_NAME_NONCE, b"Laptop", framed(label("pairing-name"), ACCOUNT, DEVICE)
+    )
+    out["pairing.sealed_name"] = sealed_name.hex()
     mac_key = hkdf(PAIRING_SECRET, framed(label("pairing-mac")), 32)
     out["pairing.tag"] = hmac_sha256(
         mac_key,
-        framed(label("pairing-request"), ACCOUNT, DEVICE, sign_pub, kem_pub, proof, b"Laptop"),
+        framed(label("pairing-request"), ACCOUNT, DEVICE, sign_pub, kem_pub, proof, sealed_name),
     ).hex()
     # The offer carries the URL in the WHATWG serialization and the inviter's signature.
     offer = b"\x01" + framed(
@@ -771,7 +782,10 @@ def compute():
     # Session proof and server key number.
     out["session.proof"] = ed25519_sign(
         sign_seed,
-        framed(label("session-proof"), SERVER, ACCOUNT, DEVICE, sign_pub, CHALLENGE, u16(1)),
+        framed(
+            label("session-proof"), SERVER, b"https://drive.example/", ACCOUNT, DEVICE, sign_pub,
+            CHALLENGE, u16(1),
+        ),
     ).hex()
     out["identity.server_key_number"] = safety_number(
         sha256(framed(label("server-key-number"), SERVER, SPKI_PIN))

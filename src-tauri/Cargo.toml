@@ -15,13 +15,111 @@ crate-type = ["rlib"]
 # Generates the app context and the permission files of capabilities/ (official Tauri crate,
 # MIT/Apache-2.0).
 tauri-build = { version = "2.7", features = [] }
+# Rasterizes the tray icons of src/tray/icons/*.svg at build time (build.rs), so the window's
+# icon geometry (src/tray/icons.ts) stays the one source and no PNG has to be kept in sync by
+# hand. Build time only, not part of the binary. linebender (the maintained home of resvg),
+# Apache-2.0 OR MIT; without default features: no text, fonts or raster images, only the
+# path renderer (usvg, tiny-skia under BSD-3-Clause, strict-num, kurbo, roxmltree, svgtypes).
+# Alternative: PNGs generated once and committed, which drift from the SVGs unnoticed.
+resvg = { version = "0.50", default-features = false }
 
 [dependencies]
-# The desktop shell: window, WebView and the IPC the frontend may use (capabilities/). Official
-# Tauri 2 crate, MIT/Apache-2.0, the same version as Hangar.
-tauri = { version = "2.12", features = [] }
+# The desktop shell: window, WebView, IPC (capabilities/) and the tray icon (`tray-icon`, the
+# tauri-apps tray-icon crate, MIT/Apache-2.0; its menu code, muda, is in the build anyway).
+# Official Tauri 2 crate, the same version as the sister app.
+tauri = { version = "2.12", features = ["tray-icon"] }
+# The sync engine and its real ports (index, file system, server). This repository, MIT.
+hangar-drive-sync = { path = "../crates/hangar-drive-sync" }
+# The operating system's randomness for the engine (`OsEntropy`). This repository, MIT.
+hangar-drive-crypto.workspace = true
+# The device name rule (`check_display_name`) and the protocol version for the error report.
+# This repository, MIT.
+hangar-drive-protocol.workspace = true
+# The window's JSON and the settings file. MIT/Apache-2.0, see the workspace manifest.
+serde.workspace = true
+serde_json.workspace = true
+# Error types of the shell's modules (project rule). MIT/Apache-2.0, see the workspace manifest.
+thiserror.workspace = true
+# Secrets the engine keeps (device identity, epoch secrets) in the OS keychain: Windows
+# Credential Manager, macOS Keychain, Secret Service on Linux, exactly as the sister app does.
+# The maintained successor of keyring 3 (keyring-core plus one store crate per platform);
+# MIT/Apache-2.0. On Windows only bindings to the Credential Manager; on Linux zbus (pure Rust
+# D-Bus, no libdbus). Alternative: one hand-written binding per platform (wincred, Security
+# framework, D-Bus), three times the code the crate already maintains.
+keyring = "4.2"
+# keyring's own API for the Windows store's `persistence` modifier (Local instead of the
+# roaming Enterprise default, so the device identity never leaves this machine). Already in the
+# tree through keyring, same maintainers, MIT/Apache-2.0.
+keyring-core = "1"
+# Secret bytes are wiped once used. RustCrypto, MIT/Apache-2.0; already in the tree.
+zeroize = "1"
+# The platform's config, home and documents folders (settings file, default sync folder, the
+# proposed place of the recovery file). MIT/Apache-2.0; already in the tree through Tauri and
+# the sync crate, the same version.
+dirs = "7"
+# Folder picker and save dialog (ux-concept 4.2, 9). Official Tauri plugin, MIT/Apache-2.0,
+# plugins-workspace; used from Rust only, so the window gets no dialog permission.
+tauri-plugin-dialog = "2.8"
+# Desktop notifications (ux-concept 6.4). Official Tauri plugin, MIT/Apache-2.0; used from
+# Rust only (no JS permission).
+tauri-plugin-notification = "2.8"
+# Start at sign-in, on by default (ux-concept 3, 11). Official Tauri plugin, MIT/Apache-2.0;
+# adds auto-launch (MIT) and on Windows the registry Run key.
+tauri-plugin-autostart = "2.5"
+# Paste on click and copy with clearing after one minute (ux-concept 4.2); codes and links are
+# written with `write_secret`, out of the clipboard history and the cloud clipboard (security
+# review M1). Official Tauri plugin, MIT/Apache-2.0; adds arboard (MIT/Apache-2.0, 1Password).
+# Used from Rust only.
+tauri-plugin-clipboard-manager = "2.5"
+# One Hangar Drive per user session: two instances on one index and one sync folder would
+# fight over every file. A second start hands its arguments (a `hangar-drive://` link) to the
+# running app. Official Tauri plugin, MIT/Apache-2.0, as in the sister app; `deep-link` forwards
+# the links of a second start.
+tauri-plugin-single-instance = { version = "2.5", features = ["deep-link"] }
+# `hangar-drive://join`, `pair` and `recover` links (ux-concept 4.2, 4.3, 4.4): registers the
+# scheme (on Windows and Linux at start, on macOS through the bundle) and delivers opened links.
+# Official Tauri plugin, MIT/Apache-2.0.
+tauri-plugin-deep-link = "2.6"
+# The QR code of a pairing offer (ux-concept 5), drawn as SVG for the window. kennytm,
+# MIT/Apache-2.0, maintained; without default features (no `image`), only the encoder and its
+# SVG renderer. Alternative: a hand-written QR encoder (Reed-Solomon, masking), easy to get
+# subtly wrong.
+qrcode = { version = "0.15", default-features = false, features = ["std", "svg"] }
+# Signed in-app updates (security review, decision of the main agent): installs an update only
+# when its minisign signature verifies against the public key in tauri.conf.json; registered
+# only once the owner put that key there (src/updater.rs). Official Tauri plugin,
+# Apache-2.0 OR MIT, plugins-workspace; adds minisign-verify (MIT) and reqwest with rustls on
+# ring, both already in the tree through the sync crate. Without `system-proxy`; `zip` stays for
+# the macOS `.app.tar.gz` bundles. Alternative: an own download and signature check, which is
+# the update path's most security-critical code written a second time.
+tauri-plugin-updater = { version = "2.14", default-features = false, features = ["rustls-tls", "zip"] }
+
+[target.'cfg(windows)'.dependencies]
+# Taskbar theme (registry), free disk space and volume labels, the user's locale, the time zone
+# offset, and the file manager through the shell API (`SHOpenFolderAndSelectItems`,
+# `ShellExecuteW` with COM, security review L5). MIT/Apache-2.0, Microsoft; already in the tree
+# at this version through Tauri and the sync crate, so only features are added.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Registry",
+  "Win32_System_Time",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Free disk space (`statvfs`), the host name and the time zone offset (`localtime_r`).
+# MIT/Apache-2.0, the Rust project; already in the tree through the sync crate.
+libc = "0.2"
 
 [dev-dependencies]
 # The version test reads tauri.conf.json and package.json. MIT/Apache-2.0, see the workspace
 # manifest; already in the tree through Tauri.
 serde_json.workspace = true
+# The engine's in-memory ports, so the command layer's tests run a real engine thread against
+# a simulated server. This repository, MIT; tests only.
+hangar-drive-sync = { path = "../crates/hangar-drive-sync", features = ["test-support"] }

@@ -77,16 +77,30 @@ const de = {
   "setup.connect.scan": "Mit Kamera scannen",
   "setup.connect.checking": "Einladung wird geprüft …",
   "setup.connect.ok": "Verbunden mit {host}",
+  "setup.connect.pinnedTitle": "Server mit eigenem Zertifikat",
+  "setup.connect.pinned":
+    "Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt.",
+  "link.isInvite": "Das ist ein Einladungslink. Damit richtest du ein neues Konto ein.",
+  "link.isPair": "Das ist ein Kopplungslink von einem deiner Geräte.",
+  "link.isRecover": "Das ist der Link von deinem Wiederherstellungsblatt.",
+  "link.toInvite": "Neues Konto einrichten",
+  "link.toPair": "Stattdessen koppeln",
+  "link.toRecover": "Mit dem Blatt einrichten",
+  "link.needPair": "Hier gehört ein Kopplungslink hin.",
+  "link.notNeeded.title": "Dieses Gerät ist schon eingerichtet",
+  "link.notNeeded.body":
+    "Hier brauchst du den Link nicht. Öffne ihn auf dem Gerät, das du neu einrichten willst.",
   "setup.deviceName.label": "Name dieses Geräts",
   "setup.deviceName.help": "So erkennst du es später in der Geräteliste.",
   "name.blank": "Der Name ist leer. Gib einen Namen mit sichtbaren Zeichen ein.",
   "name.edgeWhitespace": "Der Name darf nicht mit einem Leerzeichen beginnen oder enden.",
-  "setup.pasteEmpty": "In der Zwischenablage ist gerade kein Text.",
+  "setup.pasteNoLink": "In der Zwischenablage ist kein Link von {app}.",
   "recovery.title": "Dein Wiederherstellungscode",
   "recovery.body":
     "Wenn du alle Geräte verlierst, holt dieser Code deine Dateien zurück. Es gibt keinen anderen Weg, auch nicht über den Betreiber.",
   "recovery.print": "Drucken",
   "recovery.save": "Als Datei speichern",
+  "recovery.saveElsewhere": "Anderen Ort wählen",
   "recovery.copy": "Kopieren",
   "recovery.copied": "Kopiert. Er wird nach 1 Minute aus der Zwischenablage entfernt.",
   "recovery.saved": "Gespeichert: {path}",
@@ -101,6 +115,24 @@ const de = {
   "recovery.check.showAgain": "Code noch mal ansehen",
   "recovery.groupLabel": "Gruppe {index}: {chars}",
   "recovery.codeLabel": "Wiederherstellungscode, 8 Gruppen",
+  "sheet.more": "Was noch auf dem Blatt steht",
+  "sheet.title": "{app}: Wiederherstellungsblatt",
+  "sheet.serverId": "Server-Kennung",
+  "sheet.accountId": "Konto-Kennung",
+  "sheet.anchor": "Prüfwert des Kontos",
+  "sheet.pin": "Prüfwert des Servers",
+  "sheet.link": "Link zum Einfügen",
+  "sheet.date": "Erstellt am",
+  "sheet.device": "Gerät",
+  "sheet.note.what":
+    "Mit diesem Code holst du deine Dateien zurück, wenn du alle Geräte verloren hast.",
+  "sheet.note.access":
+    "Wer den Code hat, kann zusammen mit deinem Server alle deine Dateien lesen. Bewahre das Blatt auf wie einen Haustürschlüssel.",
+  "sheet.note.gone":
+    "Ohne diesen Code und ohne eines deiner Geräte lassen sich deine Dateien nicht mehr öffnen, auch nicht über den Betreiber.",
+  "sheet.note.how":
+    "So geht es: Installiere {app}, wähle „{door}“, füge den Link ein oder scanne den QR-Code und tippe den Code ab.",
+  "sheet.fileName": "{app} Wiederherstellungsblatt.txt",
   "folder.setup.title": "Wo sollen deine Dateien liegen?",
   "folder.setup.body":
     "Alles, was du in diesen Ordner legst, ist auch auf deinen anderen Geräten. Weitere Ordner kannst du später hinzufügen.",
@@ -156,29 +188,49 @@ const de = {
   "pair.add.expired": "Dieser Code ist abgelaufen.",
   "pair.add.renew": "Neuen Code erzeugen",
   "pair.confirm.title": "„{device}“ möchte dazukommen.",
-  "pair.confirm.add": "Hinzufügen",
+  "pair.confirm.add": "Hinzufügen …",
   "pair.confirm.decline": "Ablehnen",
   "pair.confirm.body":
     "Auf dem neuen Gerät steht jetzt eine Zahlenreihe. Stimmt sie mit dieser hier überein?",
   "pair.confirm.yes": "Ja, gleiche Zahlen, hinzufügen",
   "pair.confirm.no": "Nein, abbrechen",
+  "pair.request.body":
+    "Danach fragt dein System noch einmal nach und zeigt diese Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt.",
   "pair.mismatch":
     "Dann füge das Gerät nicht hinzu. Starte auf dem neuen Gerät noch mal von vorn. Passiert das wieder, sprich mit dem Betreiber deines Servers.",
   "pair.added": "„{device}“ ist jetzt dabei.",
   "pair.joined": "Gekoppelt. Gleich geht es weiter.",
+  "pair.check.title": "Mit diesem Server verbinden?",
+  "pair.check.body":
+    "Vergleiche Server und Konto mit deinem anderen Gerät. Dort stehen sie unter Geräte, dann Gerät hinzufügen.",
+  "pair.check.server": "Server",
+  "pair.check.account": "Konto",
+  "pair.check.connect": "Verbinden",
+  "pair.check.pinned":
+    "Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt.",
+  "pair.add.target": "Server {host}, Konto {account}",
+  "pair.devices.title": "Das sind deine Geräte?",
+  "pair.devices.body":
+    "Dieses Gerät ist jetzt mit dem Konto verbunden. Kennst du die Geräte nicht, brich ab: Dann wird es wieder getrennt, bevor Dateien übertragen werden.",
+  "pair.devices.yes": "Ja, das sind meine",
+  "pair.devices.aborted":
+    "Abgebrochen. Dieses Gerät ist wieder getrennt, es wurden keine Dateien übertragen.",
   "safety.label": "Sicherheitsnummer",
   "safety.group": "Gruppe {index}: {digits}",
 
   // Recovery with the sheet (UX 13.3)
   "recover.title": "Mit dem Wiederherstellungsblatt einrichten",
-  "recover.body": "Gib die Serveradresse und den Code von deinem Blatt ein.",
+  "recover.body":
+    "Füge den Link von deinem Blatt ein oder scanne den QR-Code darauf. Den Code tippst du ab.",
   "recover.codeLabel": "Wiederherstellungscode",
-  "recover.name.title": "Wie soll dieses Gerät heißen?",
   "recover.cleanup.title": "Alte Geräte entfernen",
   "recover.cleanup.body":
     "Diese Geräte gehören noch zu deinem Konto. Entferne die, die du nicht mehr hast.",
   "recover.cleanup.remove": "„{device}“ entfernen",
   "recover.newCode": "Der alte Code ist jetzt verbraucht. Hier ist dein neuer.",
+  "recover.linkLabel": "Link vom Blatt",
+  "recover.linkOk": "Gefunden: {host}",
+  "recover.linkAccount": "Konto {account}",
 
   // Tray (UX 13.4)
   "tray.state.upToDate": "Alles aktuell",
@@ -233,6 +285,7 @@ const de = {
   "folder.status.stopped": "Angehalten: {reason}",
   "folder.reason.missing": "Ordner nicht gefunden",
   "folder.reason.olderState": "älterer Stand auf dem Server",
+  "folder.reason.removedHeads": "Änderungen eines entfernten Geräts",
   "folder.menu.open": "Im Explorer öffnen",
   "folder.menu.versions": "Frühere Versionen",
   "folder.menu.trash": "Papierkorb",
@@ -258,6 +311,7 @@ const de = {
   "folder.delete.confirm": "Überall löschen",
   "folder.deleted.section": "Gelöschte Ordner",
   "folder.deleted.restore": "Zurückholen",
+  "folder.deleted.done": "„{folder}“ ist gelöscht.",
   "folder.deleted.daysLeft.one": "noch {days} Tag",
   "folder.deleted.daysLeft.other": "noch {days} Tage",
   "activity.changed": "geändert",
@@ -294,6 +348,7 @@ const de = {
   "conflict.banner.other": "{count} Dateien gibt es in zwei Fassungen",
   "conflict.view": "Ansehen",
   "conflict.version": "Fassung von {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Beide öffnen",
   "conflict.keepThis": "Diese behalten",
   "conflict.keepBoth": "Beide behalten",
@@ -346,6 +401,20 @@ const de = {
   "deletes.restored.other": "{count} Dateien sind wieder da.",
   "deletes.done.one": "{count} Datei ist jetzt auch auf deinen anderen Geräten gelöscht.",
   "deletes.done.other": "{count} Dateien sind jetzt auch auf deinen anderen Geräten gelöscht.",
+  "heads.title": "Änderungen von einem entfernten Gerät",
+  "heads.body":
+    "In „{folder}“ sind Änderungen von „{device}“ angekommen, obwohl das Gerät nicht mehr zu deinem Konto gehört.",
+  "heads.bodyMany.one":
+    "In „{folder}“ sind Änderungen von {count} Gerät angekommen, das nicht mehr zu deinem Konto gehört.",
+  "heads.bodyMany.other":
+    "In „{folder}“ sind Änderungen von {count} Geräten angekommen, die nicht mehr zu deinem Konto gehören.",
+  "heads.advice":
+    "Am sichersten machst du sie rückgängig. Bis du dich entscheidest, wartet der Ordner.",
+  "heads.undo": "Ansehen und rückgängig machen",
+  "heads.accept": "Übernehmen",
+  "heads.accepted": "Übernommen. „{folder}“ wird wieder synchronisiert.",
+  "heads.undoLater": "Doch rückgängig machen",
+  "removedHeads.title": "Änderungen des entfernten Geräts „{device}“ in „{folder}“",
   "missing.title": "„{folder}“ ist nicht mehr da",
   "missing.body":
     "{app} hat den Ordner angehalten. Auf dem Server und auf deinen anderen Geräten ist nichts gelöscht.",
@@ -435,12 +504,19 @@ const de = {
     "Öffne diesen Ordner auf einem anderen Gerät und vergleiche die Zahlen. Sind sie gleich, ist alles in Ordnung.",
   "removed.body":
     "Dieses Gerät wurde von „{device}“ entfernt. Deine Dateien bleiben hier, werden aber nicht mehr synchronisiert.",
+  "removed.bodyUnknown":
+    "Dieses Gerät wurde aus deinem Konto entfernt. Deine Dateien bleiben hier, werden aber nicht mehr synchronisiert.",
   "removed.repair": "Wieder koppeln",
   "removed.notMe": "Das war ich nicht",
   "removed.notMeBody":
     "Dann hat jemand Zugriff auf eines deiner Geräte. Richte {app} mit deinem Wiederherstellungsblatt neu ein und entferne dabei die Geräte, die du nicht kennst.",
   "update.body": "{app} braucht ein Update, um weiter zu synchronisieren.",
   "update.now": "Jetzt aktualisieren",
+  "update.bodyManual":
+    "{app} braucht ein Update, um weiter zu synchronisieren. Installiere die neue Version, dann geht es von selbst weiter.",
+  "update.upToDate": "Es gibt noch keine neuere Version. Versuch es später noch einmal.",
+  "update.installed":
+    "Version {version} ist installiert. Starte {app} neu, falls es nicht von selbst neu startet.",
   "refused.body": "Dein Server lässt dieses Gerät nicht mehr herein.",
 
   // Restore (UX 13.8)
@@ -510,6 +586,7 @@ const de = {
   "restore.otherVersion": "Andere Version wählen",
   "restore.beforeDevice": "Stand vor Änderungen von …",
   "restore.beforeDeviceEntry": "Vor den Änderungen von „{device}“",
+  "restore.beforeDevice.finding": "Wird gesucht …",
   "trash.title": "Papierkorb von „{folder}“",
   "trash.search": "Suchen",
   "trash.deleted": "gelöscht {when}, {device}",
@@ -590,6 +667,13 @@ const de = {
   "settings.reportHelp":
     "Enthält Versionen, Zustände und Fehlercodes. Keine Dateinamen, keine Inhalte, keine Schlüssel.",
   "settings.reportPreview": "Das steht im Fehlerbericht",
+  "reset.action": "Dieses Gerät zurücksetzen",
+  "reset.help":
+    "Für einen Neuanfang: {app} vergisst dein Konto auf diesem Gerät. Deine Dateien bleiben hier.",
+  "reset.question": "Dieses Gerät wirklich zurücksetzen?",
+  "reset.body":
+    "{app} hört hier auf zu synchronisieren und vergisst das Konto. Danach kannst du ein neues Konto einrichten oder dieses Gerät wieder hinzufügen.",
+  "reset.confirm": "Zurücksetzen",
   "settings.localNote":
     "Deine Dateien liegen auf diesem Computer unverschlüsselt. Schalte die Laufwerksverschlüsselung deines Systems ein.",
   "settings.serverNote":
@@ -621,6 +705,9 @@ const de = {
     "Dieser Server ist nicht verschlüsselt erreichbar. {app} verbindet sich nur über https.",
   "error.pair.notALink":
     "Das ist kein Kopplungslink. Kopiere ihn auf dem anderen Gerät unter Geräte und dann Gerät hinzufügen.",
+  "error.link.damaged": "Der Link ist unvollständig. Kopiere ihn noch einmal ganz.",
+  "error.recover.notALink":
+    "Das ist nicht der Link von deinem Blatt. Er beginnt mit hangar-drive://recover#.",
   "error.pair.expired":
     "Dieser Code ist abgelaufen oder wurde schon benutzt. Erzeuge auf dem anderen Gerät einen neuen.",
   "error.pair.typo": "Im Code ist ein Tippfehler. Vergleiche ihn Zeichen für Zeichen.",
@@ -639,6 +726,8 @@ const de = {
   "error.recovery.otherApp": "Das ist ein Code für Hangar. Hier gehört der Code für {app} hin.",
   "error.recovery.savedInSync":
     "Speichere den Code nicht in einem synchronisierten Ordner, sonst liegt er neben den Dateien, die er öffnet. Wähle einen anderen Ort.",
+  "error.recovery.savedInCloud":
+    "Dieser Ordner wird mit einer Cloud synchronisiert. Speichere das Blatt lieber an einem Ort, der nur auf diesem Gerät liegt, zum Beispiel in „Downloads“ oder auf einem USB-Stick.",
   "error.folder.network": "Netzlaufwerke gehen nicht. Wähle einen Ordner auf diesem Computer.",
   "error.folder.root": "Ein ganzes Laufwerk geht nicht. Wähle einen Ordner darauf.",
   "error.folder.system": "Dieser Ordner gehört zum System. Wähle einen eigenen Ordner.",
@@ -700,16 +789,30 @@ const en: Dictionary = {
   "setup.connect.scan": "Scan with camera",
   "setup.connect.checking": "Checking the invite …",
   "setup.connect.ok": "Connected to {host}",
+  "setup.connect.pinnedTitle": "A server with its own certificate",
+  "setup.connect.pinned":
+    "This server has no public certificate. {app} trusts it because the link says so. Only accept the link if it comes straight from the person who runs your server.",
+  "link.isInvite": "This is an invite link. It sets up a new account.",
+  "link.isPair": "This is a pairing link from one of your devices.",
+  "link.isRecover": "This is the link from your recovery sheet.",
+  "link.toInvite": "Set up a new account",
+  "link.toPair": "Pair instead",
+  "link.toRecover": "Set up with the sheet",
+  "link.needPair": "This needs a pairing link.",
+  "link.notNeeded.title": "This device is already set up",
+  "link.notNeeded.body":
+    "You do not need this link here. Open it on the device you want to set up.",
   "setup.deviceName.label": "Name of this device",
   "setup.deviceName.help": "This is how you will recognize it in your device list.",
   "name.blank": "The name is empty. Enter a name with visible characters.",
   "name.edgeWhitespace": "The name cannot start or end with a space.",
-  "setup.pasteEmpty": "There is no text on the clipboard right now.",
+  "setup.pasteNoLink": "There is no {app} link on the clipboard.",
   "recovery.title": "Your recovery code",
   "recovery.body":
     "If you lose all your devices, this code gets your files back. There is no other way, not even through the operator.",
   "recovery.print": "Print",
   "recovery.save": "Save as file",
+  "recovery.saveElsewhere": "Choose another place",
   "recovery.copy": "Copy",
   "recovery.copied": "Copied. It will be removed from the clipboard after 1 minute.",
   "recovery.saved": "Saved: {path}",
@@ -723,6 +826,23 @@ const en: Dictionary = {
   "recovery.check.showAgain": "Show the code again",
   "recovery.groupLabel": "Group {index}: {chars}",
   "recovery.codeLabel": "Recovery code, 8 groups",
+  "sheet.more": "What else is on the sheet",
+  "sheet.title": "{app}: recovery sheet",
+  "sheet.serverId": "Server ID",
+  "sheet.accountId": "Account ID",
+  "sheet.anchor": "Account check value",
+  "sheet.pin": "Server check value",
+  "sheet.link": "Link to paste",
+  "sheet.date": "Created on",
+  "sheet.device": "Device",
+  "sheet.note.what": "This code brings your files back if you lose all your devices.",
+  "sheet.note.access":
+    "Whoever has the code can read all your files together with your server. Keep this sheet like a house key.",
+  "sheet.note.gone":
+    "Without this code and without any of your devices, your files can no longer be opened, not even through the operator.",
+  "sheet.note.how":
+    "How it works: install {app}, choose “{door}”, paste the link or scan the QR code, then type the code.",
+  "sheet.fileName": "{app} recovery sheet.txt",
   "folder.setup.title": "Where should your files live?",
   "folder.setup.body":
     "Everything you put in this folder is on your other devices too. You can add more folders later.",
@@ -776,27 +896,45 @@ const en: Dictionary = {
   "pair.add.expired": "This code has expired.",
   "pair.add.renew": "Create a new code",
   "pair.confirm.title": "“{device}” wants to join.",
-  "pair.confirm.add": "Add",
+  "pair.confirm.add": "Add …",
   "pair.confirm.decline": "Decline",
   "pair.confirm.body": "The new device now shows a row of numbers. Does it match this one?",
   "pair.confirm.yes": "Yes, same numbers, add it",
   "pair.confirm.no": "No, cancel",
+  "pair.request.body":
+    "Your system then asks once more and shows this row of numbers. Only say yes if the new device shows the same one.",
   "pair.mismatch":
     "Then do not add the device. Start over on the new device. If it happens again, talk to the person who runs your server.",
   "pair.added": "“{device}” has been added.",
   "pair.joined": "Paired. Just a moment.",
+  "pair.check.title": "Connect to this server?",
+  "pair.check.body":
+    "Compare server and account with your other device. It shows them under Devices, then Add device.",
+  "pair.check.server": "Server",
+  "pair.check.account": "Account",
+  "pair.check.connect": "Connect",
+  "pair.check.pinned":
+    "This server has no public certificate. {app} trusts it because the link says so.",
+  "pair.add.target": "Server {host}, account {account}",
+  "pair.devices.title": "Are these your devices?",
+  "pair.devices.body":
+    "This device is now connected to the account. If you do not know these devices, cancel: it is then disconnected before any files move.",
+  "pair.devices.yes": "Yes, these are mine",
+  "pair.devices.aborted": "Cancelled. This device is disconnected again, and no files were moved.",
   "safety.label": "Safety number",
   "safety.group": "Group {index}: {digits}",
 
   "recover.title": "Set up with your recovery sheet",
-  "recover.body": "Enter the server address and the code from your sheet.",
+  "recover.body": "Paste the link from your sheet or scan the QR code on it. Then type the code.",
   "recover.codeLabel": "Recovery code",
-  "recover.name.title": "What should this device be called?",
   "recover.cleanup.title": "Remove old devices",
   "recover.cleanup.body":
     "These devices still belong to your account. Remove the ones you no longer have.",
   "recover.cleanup.remove": "Remove “{device}”",
   "recover.newCode": "The old code is used up now. Here is your new one.",
+  "recover.linkLabel": "Link from the sheet",
+  "recover.linkOk": "Found: {host}",
+  "recover.linkAccount": "Account {account}",
 
   "tray.state.upToDate": "Up to date",
   "tray.state.restUpToDate": "Everything else is up to date",
@@ -849,6 +987,7 @@ const en: Dictionary = {
   "folder.status.stopped": "Stopped: {reason}",
   "folder.reason.missing": "folder not found",
   "folder.reason.olderState": "older state on the server",
+  "folder.reason.removedHeads": "changes from a removed device",
   "folder.menu.open": "Show in Explorer",
   "folder.menu.versions": "Earlier versions",
   "folder.menu.trash": "Trash",
@@ -874,6 +1013,7 @@ const en: Dictionary = {
   "folder.delete.confirm": "Delete everywhere",
   "folder.deleted.section": "Deleted folders",
   "folder.deleted.restore": "Bring back",
+  "folder.deleted.done": "“{folder}” has been deleted.",
   "folder.deleted.daysLeft.one": "{days} day left",
   "folder.deleted.daysLeft.other": "{days} days left",
   "activity.changed": "changed",
@@ -908,6 +1048,7 @@ const en: Dictionary = {
   "conflict.banner.other": "{count} files exist in two versions",
   "conflict.view": "View",
   "conflict.version": "Version from {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Open both",
   "conflict.keepThis": "Keep this one",
   "conflict.keepBoth": "Keep both",
@@ -959,6 +1100,19 @@ const en: Dictionary = {
   "deletes.restored.other": "{count} files are back.",
   "deletes.done.one": "{count} file is now deleted on your other devices too.",
   "deletes.done.other": "{count} files are now deleted on your other devices too.",
+  "heads.title": "Changes from a removed device",
+  "heads.body":
+    "Changes from “{device}” arrived in “{folder}”, although that device no longer belongs to your account.",
+  "heads.bodyMany.one":
+    "Changes from {count} device that no longer belongs to your account arrived in “{folder}”.",
+  "heads.bodyMany.other":
+    "Changes from {count} devices that no longer belong to your account arrived in “{folder}”.",
+  "heads.advice": "Undoing them is the safest choice. Until you decide, the folder waits.",
+  "heads.undo": "Review and undo",
+  "heads.accept": "Accept",
+  "heads.accepted": "Accepted. “{folder}” syncs again.",
+  "heads.undoLater": "Undo after all",
+  "removedHeads.title": "Changes from the removed device “{device}” in “{folder}”",
   "missing.title": "“{folder}” is gone",
   "missing.body":
     "{app} has paused the folder. Nothing was deleted on the server or on your other devices.",
@@ -1046,12 +1200,19 @@ const en: Dictionary = {
   "freeze.compareBody":
     "Open this folder on another device and compare the numbers. If they are the same, everything is fine.",
   "removed.body": "This device was removed by “{device}”. Your files stay here but no longer sync.",
+  "removed.bodyUnknown":
+    "This device was removed from your account. Your files stay here but no longer sync.",
   "removed.repair": "Pair again",
   "removed.notMe": "That was not me",
   "removed.notMeBody":
     "Then someone has access to one of your devices. Set up {app} again with your recovery sheet and remove the devices you do not recognize.",
   "update.body": "{app} needs an update to keep syncing.",
   "update.now": "Update now",
+  "update.bodyManual":
+    "{app} needs an update to keep syncing. Install the new version and it carries on by itself.",
+  "update.upToDate": "There is no newer version yet. Try again later.",
+  "update.installed":
+    "Version {version} is installed. Restart {app} if it does not restart by itself.",
   "refused.body": "Your server no longer lets this device in.",
 
   "restore.title": "Earlier versions of “{folder}”",
@@ -1120,6 +1281,7 @@ const en: Dictionary = {
   "restore.otherVersion": "Choose another version",
   "restore.beforeDevice": "State before changes from …",
   "restore.beforeDeviceEntry": "Before the changes from “{device}”",
+  "restore.beforeDevice.finding": "Searching …",
   "trash.title": "Trash of “{folder}”",
   "trash.search": "Search",
   "trash.deleted": "deleted {when}, {device}",
@@ -1196,6 +1358,12 @@ const en: Dictionary = {
   "settings.reportHelp":
     "Contains versions, states and error codes. No file names, no contents, no keys.",
   "settings.reportPreview": "What the error report contains",
+  "reset.action": "Reset this device",
+  "reset.help": "To start over: {app} forgets your account on this device. Your files stay here.",
+  "reset.question": "Really reset this device?",
+  "reset.body":
+    "{app} stops syncing here and forgets the account. Afterwards you can set up a new account or add this device again.",
+  "reset.confirm": "Reset",
   "settings.localNote":
     "Your files are stored unencrypted on this computer. Turn on your system’s drive encryption.",
   "settings.serverNote":
@@ -1223,6 +1391,9 @@ const en: Dictionary = {
   "error.insecure": "This server cannot be reached securely. {app} only connects over https.",
   "error.pair.notALink":
     "That is not a pairing link. Copy it on the other device under Devices, then Add device.",
+  "error.link.damaged": "The link is incomplete. Copy all of it again.",
+  "error.recover.notALink":
+    "That is not the link from your sheet. It starts with hangar-drive://recover#.",
   "error.pair.expired":
     "This code has expired or was already used. Create a new one on the other device.",
   "error.pair.typo": "There is a typo in the code. Compare it character by character.",
@@ -1239,6 +1410,8 @@ const en: Dictionary = {
   "error.recovery.otherApp": "That is a code for Hangar. This needs the code for {app}.",
   "error.recovery.savedInSync":
     "Do not save the code in a synced folder, or it sits next to the files it opens. Choose another place.",
+  "error.recovery.savedInCloud":
+    "This folder syncs with a cloud. Better save the sheet somewhere that stays on this device only, for example in “Downloads” or on a USB stick.",
   "error.folder.network": "Network drives do not work. Choose a folder on this computer.",
   "error.folder.root": "A whole drive does not work. Choose a folder on it.",
   "error.folder.system": "This folder belongs to the system. Choose a folder of your own.",
@@ -1278,16 +1451,30 @@ const el: Dictionary = {
   "setup.connect.scan": "Σάρωση με την κάμερα",
   "setup.connect.checking": "Έλεγχος της πρόσκλησης …",
   "setup.connect.ok": "Συνδέθηκε με {host}",
+  "setup.connect.pinnedTitle": "Διακομιστής με δικό του πιστοποιητικό",
+  "setup.connect.pinned":
+    "Αυτός ο διακομιστής δεν έχει δημόσιο πιστοποιητικό. Το {app} τον εμπιστεύεται επειδή το ορίζει ο σύνδεσμος. Δέξου τον σύνδεσμο μόνο αν έρχεται απευθείας από τον διαχειριστή του διακομιστή σου.",
+  "link.isInvite": "Αυτός είναι σύνδεσμος πρόσκλησης. Με αυτόν δημιουργείς νέο λογαριασμό.",
+  "link.isPair": "Αυτός είναι σύνδεσμος σύζευξης από μία από τις συσκευές σου.",
+  "link.isRecover": "Αυτός είναι ο σύνδεσμος από το φύλλο ανάκτησής σου.",
+  "link.toInvite": "Δημιουργία νέου λογαριασμού",
+  "link.toPair": "Σύζευξη αντί γι’ αυτό",
+  "link.toRecover": "Ρύθμιση με το φύλλο",
+  "link.needPair": "Εδώ χρειάζεται σύνδεσμος σύζευξης.",
+  "link.notNeeded.title": "Αυτή η συσκευή έχει ήδη ρυθμιστεί",
+  "link.notNeeded.body":
+    "Εδώ δεν χρειάζεσαι τον σύνδεσμο. Άνοιξέ τον στη συσκευή που θέλεις να ρυθμίσεις.",
   "setup.deviceName.label": "Όνομα αυτής της συσκευής",
   "setup.deviceName.help": "Έτσι θα την αναγνωρίζεις στη λίστα των συσκευών σου.",
   "name.blank": "Το όνομα είναι κενό. Γράψε ένα όνομα με ορατούς χαρακτήρες.",
   "name.edgeWhitespace": "Το όνομα δεν μπορεί να αρχίζει ή να τελειώνει με κενό.",
-  "setup.pasteEmpty": "Δεν υπάρχει κείμενο στο πρόχειρο αυτή τη στιγμή.",
+  "setup.pasteNoLink": "Δεν υπάρχει σύνδεσμος του {app} στο πρόχειρο.",
   "recovery.title": "Ο κωδικός ανάκτησής σου",
   "recovery.body":
     "Αν χάσεις όλες τις συσκευές σου, αυτός ο κωδικός σού επιστρέφει τα αρχεία σου. Δεν υπάρχει άλλος τρόπος, ούτε μέσω του διαχειριστή.",
   "recovery.print": "Εκτύπωση",
   "recovery.save": "Αποθήκευση ως αρχείο",
+  "recovery.saveElsewhere": "Επιλογή άλλου σημείου",
   "recovery.copy": "Αντιγραφή",
   "recovery.copied": "Αντιγράφηκε. Θα αφαιρεθεί από το πρόχειρο σε 1 λεπτό.",
   "recovery.saved": "Αποθηκεύτηκε: {path}",
@@ -1302,6 +1489,24 @@ const el: Dictionary = {
   "recovery.check.showAgain": "Εμφάνιση του κωδικού ξανά",
   "recovery.groupLabel": "Ομάδα {index}: {chars}",
   "recovery.codeLabel": "Κωδικός ανάκτησης, 8 ομάδες",
+  "sheet.more": "Τι άλλο υπάρχει στο φύλλο",
+  "sheet.title": "{app}: φύλλο ανάκτησης",
+  "sheet.serverId": "Αναγνωριστικό διακομιστή",
+  "sheet.accountId": "Αναγνωριστικό λογαριασμού",
+  "sheet.anchor": "Τιμή ελέγχου λογαριασμού",
+  "sheet.pin": "Τιμή ελέγχου διακομιστή",
+  "sheet.link": "Σύνδεσμος για επικόλληση",
+  "sheet.date": "Δημιουργήθηκε στις",
+  "sheet.device": "Συσκευή",
+  "sheet.note.what":
+    "Με αυτόν τον κωδικό παίρνεις πίσω τα αρχεία σου, αν χάσεις όλες τις συσκευές σου.",
+  "sheet.note.access":
+    "Όποιος έχει τον κωδικό μπορεί, μαζί με τον διακομιστή σου, να διαβάσει όλα τα αρχεία σου. Φύλαξε το φύλλο σαν το κλειδί του σπιτιού σου.",
+  "sheet.note.gone":
+    "Χωρίς αυτόν τον κωδικό και χωρίς καμία από τις συσκευές σου, τα αρχεία σου δεν ανοίγουν πια, ούτε μέσω του διαχειριστή.",
+  "sheet.note.how":
+    "Πώς γίνεται: εγκατάστησε το {app}, επίλεξε «{door}», επικόλλησε τον σύνδεσμο ή σάρωσε τον κωδικό QR και πληκτρολόγησε τον κωδικό.",
+  "sheet.fileName": "{app} φύλλο ανάκτησης.txt",
   "folder.setup.title": "Πού να βρίσκονται τα αρχεία σου;",
   "folder.setup.body":
     "Ό,τι βάζεις σε αυτόν τον φάκελο υπάρχει και στις άλλες συσκευές σου. Μπορείς να προσθέσεις κι άλλους φακέλους αργότερα.",
@@ -1354,26 +1559,46 @@ const el: Dictionary = {
   "pair.add.expired": "Αυτός ο κωδικός έχει λήξει.",
   "pair.add.renew": "Δημιουργία νέου κωδικού",
   "pair.confirm.title": "Η συσκευή «{device}» θέλει να προστεθεί.",
-  "pair.confirm.add": "Προσθήκη",
+  "pair.confirm.add": "Προσθήκη …",
   "pair.confirm.decline": "Απόρριψη",
   "pair.confirm.body": "Η νέα συσκευή δείχνει τώρα μια σειρά αριθμών. Ταιριάζει με αυτήν εδώ;",
   "pair.confirm.yes": "Ναι, ίδιοι αριθμοί, προσθήκη",
   "pair.confirm.no": "Όχι, ακύρωση",
+  "pair.request.body":
+    "Μετά το σύστημά σου ρωτά άλλη μία φορά και δείχνει αυτή τη σειρά αριθμών. Πες ναι μόνο αν η νέα συσκευή δείχνει την ίδια.",
   "pair.mismatch":
     "Τότε μην προσθέσεις τη συσκευή. Ξεκίνα από την αρχή στη νέα συσκευή. Αν συμβεί ξανά, μίλησε με το άτομο που διαχειρίζεται τον διακομιστή σου.",
   "pair.added": "Η συσκευή «{device}» προστέθηκε.",
   "pair.joined": "Η σύζευξη έγινε. Μια στιγμή.",
+  "pair.check.title": "Σύνδεση με αυτόν τον διακομιστή;",
+  "pair.check.body":
+    "Σύγκρινε διακομιστή και λογαριασμό με την άλλη συσκευή σου. Εκεί εμφανίζονται στις Συσκευές και μετά Προσθήκη συσκευής.",
+  "pair.check.server": "Διακομιστής",
+  "pair.check.account": "Λογαριασμός",
+  "pair.check.connect": "Σύνδεση",
+  "pair.check.pinned":
+    "Αυτός ο διακομιστής δεν έχει δημόσιο πιστοποιητικό. Το {app} τον εμπιστεύεται επειδή το ορίζει ο σύνδεσμος.",
+  "pair.add.target": "Διακομιστής {host}, λογαριασμός {account}",
+  "pair.devices.title": "Αυτές είναι οι συσκευές σου;",
+  "pair.devices.body":
+    "Αυτή η συσκευή συνδέθηκε τώρα με τον λογαριασμό. Αν δεν αναγνωρίζεις αυτές τις συσκευές, ακύρωσε: τότε αποσυνδέεται ξανά πριν μεταφερθούν αρχεία.",
+  "pair.devices.yes": "Ναι, είναι δικές μου",
+  "pair.devices.aborted":
+    "Ακυρώθηκε. Αυτή η συσκευή αποσυνδέθηκε ξανά και δεν μεταφέρθηκαν αρχεία.",
   "safety.label": "Αριθμός ασφαλείας",
   "safety.group": "Ομάδα {index}: {digits}",
   "recover.title": "Ρύθμιση με το φύλλο ανάκτησης",
-  "recover.body": "Γράψε τη διεύθυνση του διακομιστή και τον κωδικό από το φύλλο σου.",
+  "recover.body":
+    "Επικόλλησε τον σύνδεσμο από το φύλλο σου ή σάρωσε τον κωδικό QR του. Μετά πληκτρολόγησε τον κωδικό.",
   "recover.codeLabel": "Κωδικός ανάκτησης",
-  "recover.name.title": "Πώς να λέγεται αυτή η συσκευή;",
   "recover.cleanup.title": "Αφαίρεση παλιών συσκευών",
   "recover.cleanup.body":
     "Αυτές οι συσκευές ανήκουν ακόμα στον λογαριασμό σου. Αφαίρεσε όσες δεν έχεις πια.",
   "recover.cleanup.remove": "Αφαίρεση της «{device}»",
   "recover.newCode": "Ο παλιός κωδικός χρησιμοποιήθηκε. Ορίστε ο νέος σου κωδικός.",
+  "recover.linkLabel": "Σύνδεσμος από το φύλλο",
+  "recover.linkOk": "Βρέθηκε: {host}",
+  "recover.linkAccount": "Λογαριασμός {account}",
   "tray.state.upToDate": "Ενημερωμένο",
   "tray.state.restUpToDate": "Όλα τα υπόλοιπα είναι ενημερωμένα",
   "tray.state.syncing.one": "Συγχρονισμός {count} αρχείου",
@@ -1424,6 +1649,7 @@ const el: Dictionary = {
   "folder.status.stopped": "Σταμάτησε: {reason}",
   "folder.reason.missing": "ο φάκελος δεν βρέθηκε",
   "folder.reason.olderState": "παλαιότερη κατάσταση στον διακομιστή",
+  "folder.reason.removedHeads": "αλλαγές από συσκευή που αφαιρέθηκε",
   "folder.menu.open": "Εμφάνιση στην Εξερεύνηση",
   "folder.menu.versions": "Προηγούμενες εκδόσεις",
   "folder.menu.trash": "Κάδος",
@@ -1449,6 +1675,7 @@ const el: Dictionary = {
   "folder.delete.confirm": "Διαγραφή παντού",
   "folder.deleted.section": "Διαγραμμένοι φάκελοι",
   "folder.deleted.restore": "Επαναφορά",
+  "folder.deleted.done": "Ο φάκελος «{folder}» διαγράφηκε.",
   "folder.deleted.daysLeft.one": "Απομένει {days} ημέρα",
   "folder.deleted.daysLeft.other": "Απομένουν {days} ημέρες",
   "activity.changed": "άλλαξε",
@@ -1483,6 +1710,7 @@ const el: Dictionary = {
   "conflict.banner.other": "{count} αρχεία υπάρχουν σε δύο εκδοχές",
   "conflict.view": "Προβολή",
   "conflict.version": "Εκδοχή από {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Άνοιγμα και των δύο",
   "conflict.keepThis": "Κράτα αυτή",
   "conflict.keepBoth": "Κράτα και τις δύο",
@@ -1533,6 +1761,20 @@ const el: Dictionary = {
   "deletes.restored.other": "{count} αρχεία επέστρεψαν.",
   "deletes.done.one": "{count} αρχείο διαγράφηκε τώρα και στις άλλες συσκευές σου.",
   "deletes.done.other": "{count} αρχεία διαγράφηκαν τώρα και στις άλλες συσκευές σου.",
+  "heads.title": "Αλλαγές από συσκευή που αφαιρέθηκε",
+  "heads.body":
+    "Στο «{folder}» έφτασαν αλλαγές από τη συσκευή «{device}», αν και δεν ανήκει πια στον λογαριασμό σου.",
+  "heads.bodyMany.one":
+    "Στο «{folder}» έφτασαν αλλαγές από {count} συσκευή που δεν ανήκει πια στον λογαριασμό σου.",
+  "heads.bodyMany.other":
+    "Στο «{folder}» έφτασαν αλλαγές από {count} συσκευές που δεν ανήκουν πια στον λογαριασμό σου.",
+  "heads.advice":
+    "Το πιο ασφαλές είναι να τις αναιρέσεις. Μέχρι να αποφασίσεις, ο φάκελος περιμένει.",
+  "heads.undo": "Προβολή και αναίρεση",
+  "heads.accept": "Αποδοχή",
+  "heads.accepted": "Έγινε αποδοχή. Το «{folder}» συγχρονίζεται ξανά.",
+  "heads.undoLater": "Αναίρεση τελικά",
+  "removedHeads.title": "Αλλαγές από τη συσκευή «{device}» που αφαιρέθηκε στο «{folder}»",
   "missing.title": "Ο φάκελος «{folder}» δεν υπάρχει πια",
   "missing.body":
     "Το {app} έθεσε τον φάκελο σε παύση. Δεν διαγράφηκε τίποτα στον διακομιστή ή στις άλλες συσκευές σου.",
@@ -1622,12 +1864,19 @@ const el: Dictionary = {
     "Άνοιξε αυτόν τον φάκελο σε άλλη συσκευή και σύγκρινε τους αριθμούς. Αν είναι ίδιοι, όλα είναι εντάξει.",
   "removed.body":
     "Αυτή η συσκευή αφαιρέθηκε από τη συσκευή «{device}». Τα αρχεία σου μένουν εδώ, αλλά δεν συγχρονίζονται πια.",
+  "removed.bodyUnknown":
+    "Αυτή η συσκευή αφαιρέθηκε από τον λογαριασμό σου. Τα αρχεία σου μένουν εδώ, αλλά δεν συγχρονίζονται πια.",
   "removed.repair": "Νέα σύζευξη",
   "removed.notMe": "Δεν ήμουν εγώ",
   "removed.notMeBody":
     "Τότε κάποιος έχει πρόσβαση σε μία από τις συσκευές σου. Ρύθμισε ξανά το {app} με το φύλλο ανάκτησης και αφαίρεσε τις συσκευές που δεν αναγνωρίζεις.",
   "update.body": "Το {app} χρειάζεται ενημέρωση για να συνεχίσει τον συγχρονισμό.",
   "update.now": "Ενημέρωση τώρα",
+  "update.bodyManual":
+    "Το {app} χρειάζεται ενημέρωση για να συνεχίσει τον συγχρονισμό. Εγκατάστησε τη νέα έκδοση και θα συνεχίσει μόνο του.",
+  "update.upToDate": "Δεν υπάρχει ακόμα νεότερη έκδοση. Δοκίμασε ξανά αργότερα.",
+  "update.installed":
+    "Η έκδοση {version} εγκαταστάθηκε. Επανεκκίνησε το {app}, αν δεν ξεκινήσει μόνο του.",
   "refused.body": "Ο διακομιστής σου δεν δέχεται πια αυτή τη συσκευή.",
   "restore.title": "Προηγούμενες εκδόσεις του «{folder}»",
   "restore.tab.versions": "Εκδόσεις",
@@ -1697,6 +1946,7 @@ const el: Dictionary = {
   "restore.otherVersion": "Επιλογή άλλης έκδοσης",
   "restore.beforeDevice": "Κατάσταση πριν από αλλαγές από …",
   "restore.beforeDeviceEntry": "Πριν από τις αλλαγές από «{device}»",
+  "restore.beforeDevice.finding": "Αναζήτηση …",
   "trash.title": "Κάδος του «{folder}»",
   "trash.search": "Αναζήτηση",
   "trash.deleted": "διαγράφηκε {when}, {device}",
@@ -1774,6 +2024,13 @@ const el: Dictionary = {
   "settings.reportHelp":
     "Περιέχει εκδόσεις, καταστάσεις και κωδικούς σφάλματος. Χωρίς ονόματα αρχείων, χωρίς περιεχόμενα, χωρίς κλειδιά.",
   "settings.reportPreview": "Τι περιέχει η αναφορά σφάλματος",
+  "reset.action": "Επαναφορά αυτής της συσκευής",
+  "reset.help":
+    "Για νέα αρχή: το {app} ξεχνά τον λογαριασμό σου σε αυτή τη συσκευή. Τα αρχεία σου μένουν εδώ.",
+  "reset.question": "Σίγουρα επαναφορά αυτής της συσκευής;",
+  "reset.body":
+    "Το {app} σταματά τον συγχρονισμό εδώ και ξεχνά τον λογαριασμό. Μετά μπορείς να δημιουργήσεις νέο λογαριασμό ή να προσθέσεις ξανά αυτή τη συσκευή.",
+  "reset.confirm": "Επαναφορά",
   "settings.localNote":
     "Τα αρχεία σου αποθηκεύονται χωρίς κρυπτογράφηση σε αυτόν τον υπολογιστή. Ενεργοποίησε την κρυπτογράφηση δίσκου του συστήματός σου.",
   "settings.serverNote":
@@ -1802,6 +2059,9 @@ const el: Dictionary = {
     "Δεν είναι δυνατή η ασφαλής σύνδεση με αυτόν τον διακομιστή. Το {app} συνδέεται μόνο μέσω https.",
   "error.pair.notALink":
     "Αυτό δεν είναι σύνδεσμος σύζευξης. Αντίγραψέ τον στην άλλη συσκευή από τις Συσκευές και μετά Προσθήκη συσκευής.",
+  "error.link.damaged": "Ο σύνδεσμος είναι ελλιπής. Αντίγραψέ τον ξανά ολόκληρο.",
+  "error.recover.notALink":
+    "Αυτός δεν είναι ο σύνδεσμος από το φύλλο σου. Ξεκινά με hangar-drive://recover#.",
   "error.pair.expired":
     "Αυτός ο κωδικός έχει λήξει ή έχει ήδη χρησιμοποιηθεί. Δημιούργησε έναν νέο στην άλλη συσκευή.",
   "error.pair.typo": "Ο κωδικός έχει ένα τυπογραφικό λάθος. Σύγκρινέ τον χαρακτήρα προς χαρακτήρα.",
@@ -1820,6 +2080,8 @@ const el: Dictionary = {
     "Αυτός είναι κωδικός για το Hangar. Εδώ χρειάζεται ο κωδικός για το {app}.",
   "error.recovery.savedInSync":
     "Μην αποθηκεύεις τον κωδικό σε φάκελο που συγχρονίζεται, αλλιώς θα βρίσκεται δίπλα στα αρχεία που ξεκλειδώνει. Επίλεξε άλλο σημείο.",
+  "error.recovery.savedInCloud":
+    "Αυτός ο φάκελος συγχρονίζεται με ένα cloud. Καλύτερα αποθήκευσε το φύλλο σε ένα σημείο που μένει μόνο σε αυτή τη συσκευή, για παράδειγμα στις «Λήψεις» ή σε ένα USB stick.",
   "error.folder.network":
     "Οι μονάδες δικτύου δεν λειτουργούν. Επίλεξε έναν φάκελο σε αυτόν τον υπολογιστή.",
   "error.folder.root":
@@ -1862,16 +2124,30 @@ const es: Dictionary = {
   "setup.connect.scan": "Escanear con la cámara",
   "setup.connect.checking": "Comprobando la invitación …",
   "setup.connect.ok": "Conectado a {host}",
+  "setup.connect.pinnedTitle": "Un servidor con certificado propio",
+  "setup.connect.pinned":
+    "Este servidor no tiene un certificado público. {app} confía en él porque así lo indica el enlace. Acepta el enlace solo si te llega directamente del administrador de tu servidor.",
+  "link.isInvite": "Esto es un enlace de invitación. Con él creas una cuenta nueva.",
+  "link.isPair": "Esto es un enlace de vinculación de uno de tus dispositivos.",
+  "link.isRecover": "Este es el enlace de tu hoja de recuperación.",
+  "link.toInvite": "Crear una cuenta nueva",
+  "link.toPair": "Vincular en su lugar",
+  "link.toRecover": "Configurar con la hoja",
+  "link.needPair": "Aquí va un enlace de vinculación.",
+  "link.notNeeded.title": "Este dispositivo ya está configurado",
+  "link.notNeeded.body":
+    "Aquí no necesitas el enlace. Ábrelo en el dispositivo que quieras configurar.",
   "setup.deviceName.label": "Nombre de este dispositivo",
   "setup.deviceName.help": "Así lo reconocerás en tu lista de dispositivos.",
   "name.blank": "El nombre está vacío. Escribe un nombre con caracteres visibles.",
   "name.edgeWhitespace": "El nombre no puede empezar ni terminar con un espacio.",
-  "setup.pasteEmpty": "Ahora mismo no hay texto en el portapapeles.",
+  "setup.pasteNoLink": "En el portapapeles no hay ningún enlace de {app}.",
   "recovery.title": "Tu código de recuperación",
   "recovery.body":
     "Si pierdes todos tus dispositivos, este código te devuelve tus archivos. No hay otra forma, ni siquiera a través del administrador.",
   "recovery.print": "Imprimir",
   "recovery.save": "Guardar como archivo",
+  "recovery.saveElsewhere": "Elegir otro lugar",
   "recovery.copy": "Copiar",
   "recovery.copied": "Copiado. Se borrará del portapapeles en 1 minuto.",
   "recovery.saved": "Guardado: {path}",
@@ -1885,6 +2161,23 @@ const es: Dictionary = {
   "recovery.check.showAgain": "Mostrar el código otra vez",
   "recovery.groupLabel": "Grupo {index}: {chars}",
   "recovery.codeLabel": "Código de recuperación, 8 grupos",
+  "sheet.more": "Qué más hay en la hoja",
+  "sheet.title": "{app}: hoja de recuperación",
+  "sheet.serverId": "ID del servidor",
+  "sheet.accountId": "ID de la cuenta",
+  "sheet.anchor": "Valor de control de la cuenta",
+  "sheet.pin": "Valor de control del servidor",
+  "sheet.link": "Enlace para pegar",
+  "sheet.date": "Creada el",
+  "sheet.device": "Dispositivo",
+  "sheet.note.what": "Con este código recuperas tus archivos si pierdes todos tus dispositivos.",
+  "sheet.note.access":
+    "Quien tenga el código puede leer todos tus archivos junto con tu servidor. Guarda esta hoja como la llave de tu casa.",
+  "sheet.note.gone":
+    "Sin este código y sin ninguno de tus dispositivos, tus archivos ya no se pueden abrir, ni siquiera a través del administrador.",
+  "sheet.note.how":
+    "Cómo se hace: instala {app}, elige «{door}», pega el enlace o escanea el código QR y escribe el código.",
+  "sheet.fileName": "{app} hoja de recuperación.txt",
   "folder.setup.title": "¿Dónde quieres guardar tus archivos?",
   "folder.setup.body":
     "Todo lo que pongas en esta carpeta estará también en tus otros dispositivos. Puedes añadir más carpetas después.",
@@ -1941,27 +2234,46 @@ const es: Dictionary = {
   "pair.add.expired": "Este código ha caducado.",
   "pair.add.renew": "Crear un código nuevo",
   "pair.confirm.title": "«{device}» quiere unirse.",
-  "pair.confirm.add": "Añadir",
+  "pair.confirm.add": "Añadir …",
   "pair.confirm.decline": "Rechazar",
   "pair.confirm.body":
     "El dispositivo nuevo muestra ahora una fila de números. ¿Coincide con esta?",
   "pair.confirm.yes": "Sí, los mismos números, añadir",
   "pair.confirm.no": "No, cancelar",
+  "pair.request.body":
+    "Después, tu sistema te lo pregunta otra vez y muestra esta fila de números. Di que sí solo si el nuevo dispositivo muestra la misma.",
   "pair.mismatch":
     "Entonces no añadas el dispositivo. Empieza de nuevo en el dispositivo nuevo. Si vuelve a pasar, habla con la persona que gestiona tu servidor.",
   "pair.added": "Se ha añadido «{device}».",
   "pair.joined": "Vinculado. Un momento.",
+  "pair.check.title": "¿Conectar con este servidor?",
+  "pair.check.body":
+    "Compara el servidor y la cuenta con tu otro dispositivo. Allí aparecen en Dispositivos y luego Añadir dispositivo.",
+  "pair.check.server": "Servidor",
+  "pair.check.account": "Cuenta",
+  "pair.check.connect": "Conectar",
+  "pair.check.pinned":
+    "Este servidor no tiene un certificado público. {app} confía en él porque así lo indica el enlace.",
+  "pair.add.target": "Servidor {host}, cuenta {account}",
+  "pair.devices.title": "¿Son estos tus dispositivos?",
+  "pair.devices.body":
+    "Este dispositivo ya está conectado a la cuenta. Si no reconoces estos dispositivos, cancela: se desconectará antes de que se transfiera ningún archivo.",
+  "pair.devices.yes": "Sí, son míos",
+  "pair.devices.aborted":
+    "Cancelado. Este dispositivo se ha desconectado de nuevo y no se transfirió ningún archivo.",
   "safety.label": "Número de seguridad",
   "safety.group": "Grupo {index}: {digits}",
   "recover.title": "Configurar con tu hoja de recuperación",
-  "recover.body": "Introduce la dirección del servidor y el código de tu hoja.",
+  "recover.body": "Pega el enlace de tu hoja o escanea su código QR. Luego escribe el código.",
   "recover.codeLabel": "Código de recuperación",
-  "recover.name.title": "¿Cómo quieres llamar a este dispositivo?",
   "recover.cleanup.title": "Quitar dispositivos antiguos",
   "recover.cleanup.body":
     "Estos dispositivos siguen perteneciendo a tu cuenta. Quita los que ya no tengas.",
   "recover.cleanup.remove": "Quitar «{device}»",
   "recover.newCode": "El código antiguo ya está usado. Aquí tienes el nuevo.",
+  "recover.linkLabel": "Enlace de la hoja",
+  "recover.linkOk": "Encontrado: {host}",
+  "recover.linkAccount": "Cuenta {account}",
   "tray.state.upToDate": "Al día",
   "tray.state.restUpToDate": "Todo lo demás está al día",
   "tray.state.syncing.one": "Sincronizando {count} archivo",
@@ -2016,6 +2328,7 @@ const es: Dictionary = {
   "folder.status.stopped": "Detenida: {reason}",
   "folder.reason.missing": "no se encuentra la carpeta",
   "folder.reason.olderState": "estado más antiguo en el servidor",
+  "folder.reason.removedHeads": "cambios de un dispositivo eliminado",
   "folder.menu.open": "Mostrar en el Explorador",
   "folder.menu.versions": "Versiones anteriores",
   "folder.menu.trash": "Papelera",
@@ -2043,6 +2356,7 @@ const es: Dictionary = {
   "folder.delete.confirm": "Eliminar en todas partes",
   "folder.deleted.section": "Carpetas eliminadas",
   "folder.deleted.restore": "Recuperar",
+  "folder.deleted.done": "«{folder}» se ha eliminado.",
   "folder.deleted.daysLeft.one": "Queda {days} día",
   "folder.deleted.daysLeft.many": "Quedan {days} de días",
   "folder.deleted.daysLeft.other": "Quedan {days} días",
@@ -2084,6 +2398,7 @@ const es: Dictionary = {
   "conflict.banner.other": "{count} archivos existen en dos versiones",
   "conflict.view": "Ver",
   "conflict.version": "Versión de {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Abrir las dos",
   "conflict.keepThis": "Quedarme con esta",
   "conflict.keepBoth": "Conservar las dos",
@@ -2145,6 +2460,21 @@ const es: Dictionary = {
   "deletes.done.one": "{count} archivo se ha eliminado también en tus otros dispositivos.",
   "deletes.done.many": "{count} de archivos se han eliminado también en tus otros dispositivos.",
   "deletes.done.other": "{count} archivos se han eliminado también en tus otros dispositivos.",
+  "heads.title": "Cambios de un dispositivo eliminado",
+  "heads.body":
+    "Han llegado a «{folder}» cambios de «{device}», aunque ese dispositivo ya no pertenece a tu cuenta.",
+  "heads.bodyMany.one":
+    "Han llegado a «{folder}» cambios de {count} dispositivo que ya no pertenece a tu cuenta.",
+  "heads.bodyMany.many":
+    "Han llegado a «{folder}» cambios de {count} de dispositivos que ya no pertenecen a tu cuenta.",
+  "heads.bodyMany.other":
+    "Han llegado a «{folder}» cambios de {count} dispositivos que ya no pertenecen a tu cuenta.",
+  "heads.advice": "Lo más seguro es deshacerlos. Hasta que decidas, la carpeta espera.",
+  "heads.undo": "Revisar y deshacer",
+  "heads.accept": "Aceptar",
+  "heads.accepted": "Aceptado. «{folder}» vuelve a sincronizarse.",
+  "heads.undoLater": "Deshacer de todos modos",
+  "removedHeads.title": "Cambios del dispositivo eliminado «{device}» en «{folder}»",
   "missing.title": "«{folder}» ya no está",
   "missing.body":
     "{app} ha pausado la carpeta. No se ha eliminado nada en el servidor ni en tus otros dispositivos.",
@@ -2239,12 +2569,18 @@ const es: Dictionary = {
     "Abre esta carpeta en otro dispositivo y compara los números. Si son iguales, todo está bien.",
   "removed.body":
     "«{device}» ha quitado este dispositivo. Tus archivos se quedan aquí, pero ya no se sincronizan.",
+  "removed.bodyUnknown":
+    "Este dispositivo se ha quitado de tu cuenta. Tus archivos se quedan aquí, pero ya no se sincronizan.",
   "removed.repair": "Vincular de nuevo",
   "removed.notMe": "No he sido yo",
   "removed.notMeBody":
     "Entonces alguien tiene acceso a uno de tus dispositivos. Vuelve a configurar {app} con tu hoja de recuperación y quita los dispositivos que no reconozcas.",
   "update.body": "{app} necesita una actualización para seguir sincronizando.",
   "update.now": "Actualizar ahora",
+  "update.bodyManual":
+    "{app} necesita una actualización para seguir sincronizando. Instala la nueva versión y seguirá por sí solo.",
+  "update.upToDate": "Todavía no hay una versión más nueva. Vuelve a intentarlo más tarde.",
+  "update.installed": "La versión {version} está instalada. Reinicia {app} si no se reinicia solo.",
   "refused.body": "Tu servidor ya no deja entrar a este dispositivo.",
   "restore.title": "Versiones anteriores de «{folder}»",
   "restore.tab.versions": "Versiones",
@@ -2320,6 +2656,7 @@ const es: Dictionary = {
   "restore.otherVersion": "Elegir otra versión",
   "restore.beforeDevice": "Estado antes de los cambios de …",
   "restore.beforeDeviceEntry": "Antes de los cambios de «{device}»",
+  "restore.beforeDevice.finding": "Buscando …",
   "trash.title": "Papelera de «{folder}»",
   "trash.search": "Buscar",
   "trash.deleted": "eliminado {when}, {device}",
@@ -2403,6 +2740,13 @@ const es: Dictionary = {
   "settings.reportHelp":
     "Contiene versiones, estados y códigos de error. Ningún nombre de archivo, ningún contenido, ninguna clave.",
   "settings.reportPreview": "Qué contiene el informe de errores",
+  "reset.action": "Restablecer este dispositivo",
+  "reset.help":
+    "Para empezar de cero: {app} olvida tu cuenta en este dispositivo. Tus archivos se quedan aquí.",
+  "reset.question": "¿Seguro que quieres restablecer este dispositivo?",
+  "reset.body":
+    "{app} deja de sincronizar aquí y olvida la cuenta. Después puedes crear una cuenta nueva o volver a añadir este dispositivo.",
+  "reset.confirm": "Restablecer",
   "settings.localNote":
     "Tus archivos se guardan sin cifrar en este ordenador. Activa el cifrado de disco de tu sistema.",
   "settings.serverNote":
@@ -2430,6 +2774,8 @@ const es: Dictionary = {
     "No se puede acceder a este servidor de forma segura. {app} solo se conecta por https.",
   "error.pair.notALink":
     "Eso no es un enlace de vinculación. Cópialo en el otro dispositivo en Dispositivos y luego Añadir dispositivo.",
+  "error.link.damaged": "El enlace está incompleto. Vuelve a copiarlo entero.",
+  "error.recover.notALink": "Ese no es el enlace de tu hoja. Empieza por hangar-drive://recover#.",
   "error.pair.expired":
     "Este código ha caducado o ya se ha usado. Crea uno nuevo en el otro dispositivo.",
   "error.pair.typo": "Hay una errata en el código. Compáralo carácter por carácter.",
@@ -2446,6 +2792,8 @@ const es: Dictionary = {
   "error.recovery.otherApp": "Ese es un código para Hangar. Aquí hace falta el código de {app}.",
   "error.recovery.savedInSync":
     "No guardes el código en una carpeta sincronizada, o estará junto a los archivos que abre. Elige otro lugar.",
+  "error.recovery.savedInCloud":
+    "Esta carpeta se sincroniza con una nube. Mejor guarda la hoja en un lugar que solo esté en este dispositivo, por ejemplo en «Descargas» o en una memoria USB.",
   "error.folder.network": "Las unidades de red no funcionan. Elige una carpeta de este ordenador.",
   "error.folder.root": "Una unidad entera no funciona. Elige una carpeta dentro de ella.",
   "error.folder.system": "Esta carpeta pertenece al sistema. Elige una carpeta tuya.",
@@ -2485,16 +2833,30 @@ const fr: Dictionary = {
   "setup.connect.scan": "Scanner avec la caméra",
   "setup.connect.checking": "Vérification de l’invitation …",
   "setup.connect.ok": "Connecté à {host}",
+  "setup.connect.pinnedTitle": "Un serveur avec son propre certificat",
+  "setup.connect.pinned":
+    "Ce serveur n’a pas de certificat public. {app} lui fait confiance parce que le lien l’indique. N’accepte le lien que s’il vient directement de l’administrateur de ton serveur.",
+  "link.isInvite": "C’est un lien d’invitation. Il sert à créer un nouveau compte.",
+  "link.isPair": "C’est un lien d’association d’un de tes appareils.",
+  "link.isRecover": "C’est le lien de ta feuille de récupération.",
+  "link.toInvite": "Créer un nouveau compte",
+  "link.toPair": "Associer plutôt",
+  "link.toRecover": "Configurer avec la feuille",
+  "link.needPair": "Ici, il faut un lien d’association.",
+  "link.notNeeded.title": "Cet appareil est déjà configuré",
+  "link.notNeeded.body":
+    "Tu n’as pas besoin de ce lien ici. Ouvre-le sur l’appareil que tu veux configurer.",
   "setup.deviceName.label": "Nom de cet appareil",
   "setup.deviceName.help": "C’est ainsi que tu le reconnaîtras dans ta liste d’appareils.",
   "name.blank": "Le nom est vide. Saisis un nom avec des caractères visibles.",
   "name.edgeWhitespace": "Le nom ne peut pas commencer ni finir par une espace.",
-  "setup.pasteEmpty": "Le presse-papiers ne contient pas de texte pour le moment.",
+  "setup.pasteNoLink": "Le presse-papiers ne contient aucun lien {app}.",
   "recovery.title": "Ton code de récupération",
   "recovery.body":
     "Si tu perds tous tes appareils, ce code te rend tes fichiers. Il n’y a pas d’autre moyen, pas même en passant par l’administrateur.",
   "recovery.print": "Imprimer",
   "recovery.save": "Enregistrer comme fichier",
+  "recovery.saveElsewhere": "Choisir un autre endroit",
   "recovery.copy": "Copier",
   "recovery.copied": "Copié. Il sera retiré du presse-papiers dans 1 minute.",
   "recovery.saved": "Enregistré : {path}",
@@ -2508,6 +2870,23 @@ const fr: Dictionary = {
   "recovery.check.showAgain": "Afficher à nouveau le code",
   "recovery.groupLabel": "Groupe {index} : {chars}",
   "recovery.codeLabel": "Code de récupération, 8 groupes",
+  "sheet.more": "Ce qui figure aussi sur la feuille",
+  "sheet.title": "{app} : feuille de récupération",
+  "sheet.serverId": "Identifiant du serveur",
+  "sheet.accountId": "Identifiant du compte",
+  "sheet.anchor": "Valeur de contrôle du compte",
+  "sheet.pin": "Valeur de contrôle du serveur",
+  "sheet.link": "Lien à coller",
+  "sheet.date": "Créée le",
+  "sheet.device": "Appareil",
+  "sheet.note.what": "Ce code te rend tes fichiers si tu perds tous tes appareils.",
+  "sheet.note.access":
+    "Qui a le code peut lire tous tes fichiers avec ton serveur. Garde cette feuille comme une clé de maison.",
+  "sheet.note.gone":
+    "Sans ce code et sans aucun de tes appareils, tes fichiers ne peuvent plus être ouverts, pas même par l’administrateur.",
+  "sheet.note.how":
+    "Comment faire : installe {app}, choisis « {door} », colle le lien ou scanne le code QR, puis saisis le code.",
+  "sheet.fileName": "{app} feuille de récupération.txt",
   "folder.setup.title": "Où ranger tes fichiers ?",
   "folder.setup.body":
     "Tout ce que tu mets dans ce dossier se retrouve aussi sur tes autres appareils. Tu pourras ajouter d’autres dossiers plus tard.",
@@ -2564,27 +2943,46 @@ const fr: Dictionary = {
   "pair.add.expired": "Ce code a expiré.",
   "pair.add.renew": "Créer un nouveau code",
   "pair.confirm.title": "« {device} » demande à être ajouté.",
-  "pair.confirm.add": "Ajouter",
+  "pair.confirm.add": "Ajouter …",
   "pair.confirm.decline": "Refuser",
   "pair.confirm.body":
     "Le nouvel appareil affiche maintenant une suite de chiffres. Est-elle identique à celle-ci ?",
   "pair.confirm.yes": "Oui, mêmes chiffres, ajouter",
   "pair.confirm.no": "Non, annuler",
+  "pair.request.body":
+    "Ton système te le redemande ensuite et affiche cette suite de chiffres. Ne dis oui que si le nouvel appareil affiche la même.",
   "pair.mismatch":
     "Alors n’ajoute pas l’appareil. Recommence sur le nouvel appareil. Si cela se reproduit, parles-en à la personne qui gère ton serveur.",
   "pair.added": "« {device} » a été ajouté.",
   "pair.joined": "Associé. Un instant.",
+  "pair.check.title": "Se connecter à ce serveur ?",
+  "pair.check.body":
+    "Compare le serveur et le compte avec ton autre appareil. Ils y figurent sous Appareils, puis Ajouter un appareil.",
+  "pair.check.server": "Serveur",
+  "pair.check.account": "Compte",
+  "pair.check.connect": "Se connecter",
+  "pair.check.pinned":
+    "Ce serveur n’a pas de certificat public. {app} lui fait confiance parce que le lien l’indique.",
+  "pair.add.target": "Serveur {host}, compte {account}",
+  "pair.devices.title": "Ce sont bien tes appareils ?",
+  "pair.devices.body":
+    "Cet appareil est maintenant connecté au compte. Si tu ne reconnais pas ces appareils, annule : il sera déconnecté avant tout transfert de fichiers.",
+  "pair.devices.yes": "Oui, ce sont les miens",
+  "pair.devices.aborted":
+    "Annulé. Cet appareil est de nouveau déconnecté, aucun fichier n’a été transféré.",
   "safety.label": "Numéro de sécurité",
   "safety.group": "Groupe {index} : {digits}",
   "recover.title": "Configurer avec ta feuille de récupération",
-  "recover.body": "Saisis l’adresse du serveur et le code de ta feuille.",
+  "recover.body": "Colle le lien de ta feuille ou scanne son code QR. Saisis ensuite le code.",
   "recover.codeLabel": "Code de récupération",
-  "recover.name.title": "Quel nom pour cet appareil ?",
   "recover.cleanup.title": "Retirer les anciens appareils",
   "recover.cleanup.body":
     "Ces appareils font encore partie de ton compte. Retire ceux que tu n’as plus.",
   "recover.cleanup.remove": "Retirer « {device} »",
   "recover.newCode": "L’ancien code est désormais utilisé. Voici ton nouveau code.",
+  "recover.linkLabel": "Lien de la feuille",
+  "recover.linkOk": "Trouvé : {host}",
+  "recover.linkAccount": "Compte {account}",
   "tray.state.upToDate": "À jour",
   "tray.state.restUpToDate": "Tout le reste est à jour",
   "tray.state.syncing.one": "Synchronisation de {count} fichier",
@@ -2639,6 +3037,7 @@ const fr: Dictionary = {
   "folder.status.stopped": "Arrêté : {reason}",
   "folder.reason.missing": "dossier introuvable",
   "folder.reason.olderState": "état plus ancien sur le serveur",
+  "folder.reason.removedHeads": "modifications d’un appareil retiré",
   "folder.menu.open": "Afficher dans l’Explorateur",
   "folder.menu.versions": "Versions précédentes",
   "folder.menu.trash": "Corbeille",
@@ -2666,6 +3065,7 @@ const fr: Dictionary = {
   "folder.delete.confirm": "Supprimer partout",
   "folder.deleted.section": "Dossiers supprimés",
   "folder.deleted.restore": "Récupérer",
+  "folder.deleted.done": "« {folder} » a été supprimé.",
   "folder.deleted.daysLeft.one": "Encore {days} jour",
   "folder.deleted.daysLeft.many": "Encore {days} de jours",
   "folder.deleted.daysLeft.other": "Encore {days} jours",
@@ -2706,6 +3106,7 @@ const fr: Dictionary = {
   "conflict.banner.other": "{count} fichiers existent en deux versions",
   "conflict.view": "Voir",
   "conflict.version": "Version de {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Ouvrir les deux",
   "conflict.keepThis": "Garder celle-ci",
   "conflict.keepBoth": "Garder les deux",
@@ -2769,6 +3170,21 @@ const fr: Dictionary = {
     "{count} de fichiers sont maintenant supprimés aussi sur tes autres appareils.",
   "deletes.done.other":
     "{count} fichiers sont maintenant supprimés aussi sur tes autres appareils.",
+  "heads.title": "Modifications d’un appareil retiré",
+  "heads.body":
+    "Des modifications de « {device} » sont arrivées dans « {folder} », alors que cet appareil ne fait plus partie de ton compte.",
+  "heads.bodyMany.one":
+    "Des modifications de {count} appareil qui ne fait plus partie de ton compte sont arrivées dans « {folder} ».",
+  "heads.bodyMany.many":
+    "Des modifications de {count} d’appareils qui ne font plus partie de ton compte sont arrivées dans « {folder} ».",
+  "heads.bodyMany.other":
+    "Des modifications de {count} appareils qui ne font plus partie de ton compte sont arrivées dans « {folder} ».",
+  "heads.advice": "Le plus sûr est de les annuler. Tant que tu n’as pas décidé, le dossier attend.",
+  "heads.undo": "Voir et annuler",
+  "heads.accept": "Accepter",
+  "heads.accepted": "Accepté. « {folder} » se synchronise de nouveau.",
+  "heads.undoLater": "Annuler quand même",
+  "removedHeads.title": "Modifications de l’appareil retiré « {device} » dans « {folder} »",
   "missing.title": "« {folder} » a disparu",
   "missing.body":
     "{app} a mis le dossier en pause. Rien n’a été supprimé sur le serveur ni sur tes autres appareils.",
@@ -2864,12 +3280,19 @@ const fr: Dictionary = {
     "Ouvre ce dossier sur un autre appareil et compare les chiffres. S’ils sont identiques, tout va bien.",
   "removed.body":
     "Cet appareil a été retiré par « {device} ». Tes fichiers restent ici, mais ne sont plus synchronisés.",
+  "removed.bodyUnknown":
+    "Cet appareil a été retiré de ton compte. Tes fichiers restent ici, mais ne sont plus synchronisés.",
   "removed.repair": "Associer à nouveau",
   "removed.notMe": "Ce n’était pas moi",
   "removed.notMeBody":
     "Alors quelqu’un a accès à l’un de tes appareils. Configure à nouveau {app} avec ta feuille de récupération et retire les appareils que tu ne reconnais pas.",
   "update.body": "{app} a besoin d’une mise à jour pour continuer à synchroniser.",
   "update.now": "Mettre à jour",
+  "update.bodyManual":
+    "{app} a besoin d’une mise à jour pour continuer à synchroniser. Installe la nouvelle version, puis tout reprend tout seul.",
+  "update.upToDate": "Il n’y a pas encore de version plus récente. Réessaie plus tard.",
+  "update.installed":
+    "La version {version} est installée. Redémarre {app} s’il ne redémarre pas tout seul.",
   "refused.body": "Ton serveur n’accepte plus cet appareil.",
   "restore.title": "Versions précédentes de « {folder} »",
   "restore.tab.versions": "Versions",
@@ -2947,6 +3370,7 @@ const fr: Dictionary = {
   "restore.otherVersion": "Choisir une autre version",
   "restore.beforeDevice": "État avant les modifications de …",
   "restore.beforeDeviceEntry": "Avant les modifications de « {device} »",
+  "restore.beforeDevice.finding": "Recherche …",
   "trash.title": "Corbeille de « {folder} »",
   "trash.search": "Rechercher",
   "trash.deleted": "supprimé {when}, {device}",
@@ -3029,6 +3453,13 @@ const fr: Dictionary = {
   "settings.reportHelp":
     "Contient les versions, les états et les codes d’erreur. Pas de noms de fichiers, pas de contenus, pas de clés.",
   "settings.reportPreview": "Contenu du rapport d’erreur",
+  "reset.action": "Réinitialiser cet appareil",
+  "reset.help":
+    "Pour repartir de zéro : {app} oublie ton compte sur cet appareil. Tes fichiers restent ici.",
+  "reset.question": "Vraiment réinitialiser cet appareil ?",
+  "reset.body":
+    "{app} arrête de synchroniser ici et oublie le compte. Ensuite, tu peux créer un nouveau compte ou ajouter à nouveau cet appareil.",
+  "reset.confirm": "Réinitialiser",
   "settings.localNote":
     "Tes fichiers sont stockés sans chiffrement sur cet ordinateur. Active le chiffrement de disque de ton système.",
   "settings.serverNote":
@@ -3057,6 +3488,9 @@ const fr: Dictionary = {
     "Impossible de joindre ce serveur de façon sécurisée. {app} se connecte uniquement en https.",
   "error.pair.notALink":
     "Ce n’est pas un lien d’association. Copie-le sur l’autre appareil sous Appareils, puis Ajouter un appareil.",
+  "error.link.damaged": "Le lien est incomplet. Copie-le de nouveau en entier.",
+  "error.recover.notALink":
+    "Ce n’est pas le lien de ta feuille. Il commence par hangar-drive://recover#.",
   "error.pair.expired":
     "Ce code a expiré ou a déjà été utilisé. Crées-en un nouveau sur l’autre appareil.",
   "error.pair.typo": "Le code contient une faute de frappe. Compare-le caractère par caractère.",
@@ -3074,6 +3508,8 @@ const fr: Dictionary = {
   "error.recovery.otherApp": "C’est un code pour Hangar. Ici, il faut le code pour {app}.",
   "error.recovery.savedInSync":
     "N’enregistre pas le code dans un dossier synchronisé, sinon il se trouve à côté des fichiers qu’il ouvre. Choisis un autre endroit.",
+  "error.recovery.savedInCloud":
+    "Ce dossier est synchronisé avec un cloud. Enregistre plutôt la feuille à un endroit qui reste sur cet appareil, par exemple dans « Téléchargements » ou sur une clé USB.",
   "error.folder.network":
     "Les lecteurs réseau ne fonctionnent pas. Choisis un dossier sur cet ordinateur.",
   "error.folder.root": "Un lecteur entier ne fonctionne pas. Choisis un dossier dessus.",
@@ -3113,16 +3549,29 @@ const it: Dictionary = {
   "setup.connect.scan": "Scansiona con la fotocamera",
   "setup.connect.checking": "Controllo l’invito …",
   "setup.connect.ok": "Collegato a {host}",
+  "setup.connect.pinnedTitle": "Un server con un certificato proprio",
+  "setup.connect.pinned":
+    "Questo server non ha un certificato pubblico. {app} si fida perché lo indica il link. Accetta il link solo se arriva direttamente dal gestore del tuo server.",
+  "link.isInvite": "Questo è un link di invito. Serve a creare un nuovo account.",
+  "link.isPair": "Questo è un link di abbinamento di uno dei tuoi dispositivi.",
+  "link.isRecover": "Questo è il link del tuo foglio di recupero.",
+  "link.toInvite": "Crea un nuovo account",
+  "link.toPair": "Abbina invece",
+  "link.toRecover": "Configura con il foglio",
+  "link.needPair": "Qui serve un link di abbinamento.",
+  "link.notNeeded.title": "Questo dispositivo è già configurato",
+  "link.notNeeded.body": "Qui il link non ti serve. Aprilo sul dispositivo che vuoi configurare.",
   "setup.deviceName.label": "Nome di questo dispositivo",
   "setup.deviceName.help": "Così lo riconoscerai nell’elenco dei dispositivi.",
   "name.blank": "Il nome è vuoto. Scrivi un nome con caratteri visibili.",
   "name.edgeWhitespace": "Il nome non può iniziare o finire con uno spazio.",
-  "setup.pasteEmpty": "Al momento non c’è testo negli appunti.",
+  "setup.pasteNoLink": "Negli appunti non c’è un link di {app}.",
   "recovery.title": "Il tuo codice di recupero",
   "recovery.body":
     "Se perdi tutti i tuoi dispositivi, questo codice ti restituisce i tuoi file. Non c’è altro modo, nemmeno tramite il gestore.",
   "recovery.print": "Stampa",
   "recovery.save": "Salva come file",
+  "recovery.saveElsewhere": "Scegli un altro posto",
   "recovery.copy": "Copia",
   "recovery.copied": "Copiato. Verrà rimosso dagli appunti dopo 1 minuto.",
   "recovery.saved": "Salvato: {path}",
@@ -3136,6 +3585,23 @@ const it: Dictionary = {
   "recovery.check.showAgain": "Mostra di nuovo il codice",
   "recovery.groupLabel": "Gruppo {index}: {chars}",
   "recovery.codeLabel": "Codice di recupero, 8 gruppi",
+  "sheet.more": "Cos’altro c’è sul foglio",
+  "sheet.title": "{app}: foglio di recupero",
+  "sheet.serverId": "ID del server",
+  "sheet.accountId": "ID dell’account",
+  "sheet.anchor": "Valore di controllo dell’account",
+  "sheet.pin": "Valore di controllo del server",
+  "sheet.link": "Link da incollare",
+  "sheet.date": "Creato il",
+  "sheet.device": "Dispositivo",
+  "sheet.note.what": "Con questo codice recuperi i tuoi file se perdi tutti i tuoi dispositivi.",
+  "sheet.note.access":
+    "Chi ha il codice può leggere tutti i tuoi file insieme al tuo server. Custodisci questo foglio come una chiave di casa.",
+  "sheet.note.gone":
+    "Senza questo codice e senza nessuno dei tuoi dispositivi, i tuoi file non si possono più aprire, nemmeno tramite il gestore.",
+  "sheet.note.how":
+    "Come fare: installa {app}, scegli «{door}», incolla il link o scansiona il codice QR, poi digita il codice.",
+  "sheet.fileName": "{app} foglio di recupero.txt",
   "folder.setup.title": "Dove vuoi tenere i tuoi file?",
   "folder.setup.body":
     "Tutto ciò che metti in questa cartella si trova anche sugli altri tuoi dispositivi. Puoi aggiungere altre cartelle in seguito.",
@@ -3193,27 +3659,47 @@ const it: Dictionary = {
   "pair.add.expired": "Questo codice è scaduto.",
   "pair.add.renew": "Crea un nuovo codice",
   "pair.confirm.title": "«{device}» vuole unirsi.",
-  "pair.confirm.add": "Aggiungi",
+  "pair.confirm.add": "Aggiungi …",
   "pair.confirm.decline": "Rifiuta",
   "pair.confirm.body": "Il nuovo dispositivo ora mostra una fila di numeri. Corrisponde a questa?",
   "pair.confirm.yes": "Sì, stessi numeri, aggiungi",
   "pair.confirm.no": "No, annulla",
+  "pair.request.body":
+    "Poi il tuo sistema te lo chiede di nuovo e mostra questa serie di numeri. Di’ di sì solo se il nuovo dispositivo mostra la stessa.",
   "pair.mismatch":
     "Allora non aggiungere il dispositivo. Ricomincia sul nuovo dispositivo. Se succede di nuovo, parlane con chi gestisce il tuo server.",
   "pair.added": "«{device}» è stato aggiunto.",
   "pair.joined": "Abbinato. Un attimo.",
+  "pair.check.title": "Collegarsi a questo server?",
+  "pair.check.body":
+    "Confronta server e account con l’altro dispositivo. Lì li trovi in Dispositivi, poi Aggiungi dispositivo.",
+  "pair.check.server": "Server",
+  "pair.check.account": "Account",
+  "pair.check.connect": "Collega",
+  "pair.check.pinned":
+    "Questo server non ha un certificato pubblico. {app} si fida perché lo indica il link.",
+  "pair.add.target": "Server {host}, account {account}",
+  "pair.devices.title": "Sono questi i tuoi dispositivi?",
+  "pair.devices.body":
+    "Questo dispositivo ora è collegato all’account. Se non riconosci questi dispositivi, annulla: verrà scollegato prima che venga trasferito qualsiasi file.",
+  "pair.devices.yes": "Sì, sono miei",
+  "pair.devices.aborted":
+    "Annullato. Questo dispositivo è di nuovo scollegato e non è stato trasferito nessun file.",
   "safety.label": "Numero di sicurezza",
   "safety.group": "Gruppo {index}: {digits}",
 
   "recover.title": "Configura con il foglio di recupero",
-  "recover.body": "Inserisci l’indirizzo del server e il codice del tuo foglio.",
+  "recover.body":
+    "Incolla il link del tuo foglio o scansiona il suo codice QR. Poi digita il codice.",
   "recover.codeLabel": "Codice di recupero",
-  "recover.name.title": "Come vuoi chiamare questo dispositivo?",
   "recover.cleanup.title": "Rimuovi i vecchi dispositivi",
   "recover.cleanup.body":
     "Questi dispositivi appartengono ancora al tuo account. Rimuovi quelli che non hai più.",
   "recover.cleanup.remove": "Rimuovi «{device}»",
   "recover.newCode": "Il vecchio codice ora non vale più. Ecco quello nuovo.",
+  "recover.linkLabel": "Link del foglio",
+  "recover.linkOk": "Trovato: {host}",
+  "recover.linkAccount": "Account {account}",
 
   "tray.state.upToDate": "Tutto aggiornato",
   "tray.state.restUpToDate": "Tutto il resto è aggiornato",
@@ -3270,6 +3756,7 @@ const it: Dictionary = {
   "folder.status.stopped": "Fermata: {reason}",
   "folder.reason.missing": "cartella non trovata",
   "folder.reason.olderState": "stato più vecchio sul server",
+  "folder.reason.removedHeads": "modifiche da un dispositivo rimosso",
   "folder.menu.open": "Mostra in Esplora file",
   "folder.menu.versions": "Versioni precedenti",
   "folder.menu.trash": "Cestino",
@@ -3297,6 +3784,7 @@ const it: Dictionary = {
   "folder.delete.confirm": "Elimina ovunque",
   "folder.deleted.section": "Cartelle eliminate",
   "folder.deleted.restore": "Recupera",
+  "folder.deleted.done": "«{folder}» è stata eliminata.",
   "folder.deleted.daysLeft.one": "Ancora {days} giorno",
   "folder.deleted.daysLeft.many": "Ancora {days} di giorni",
   "folder.deleted.daysLeft.other": "Ancora {days} giorni",
@@ -3338,6 +3826,7 @@ const it: Dictionary = {
   "conflict.banner.other": "{count} file esistono in due versioni",
   "conflict.view": "Mostra",
   "conflict.version": "Versione da {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Apri entrambe",
   "conflict.keepThis": "Tieni questa",
   "conflict.keepBoth": "Tieni entrambe",
@@ -3400,6 +3889,22 @@ const it: Dictionary = {
   "deletes.done.one": "{count} file ora è eliminato anche sugli altri tuoi dispositivi.",
   "deletes.done.many": "{count} di file ora sono eliminati anche sugli altri tuoi dispositivi.",
   "deletes.done.other": "{count} file ora sono eliminati anche sugli altri tuoi dispositivi.",
+  "heads.title": "Modifiche da un dispositivo rimosso",
+  "heads.body":
+    "In «{folder}» sono arrivate modifiche da «{device}», anche se quel dispositivo non fa più parte del tuo account.",
+  "heads.bodyMany.one":
+    "In «{folder}» sono arrivate modifiche da {count} dispositivo che non fa più parte del tuo account.",
+  "heads.bodyMany.many":
+    "In «{folder}» sono arrivate modifiche da {count} di dispositivi che non fanno più parte del tuo account.",
+  "heads.bodyMany.other":
+    "In «{folder}» sono arrivate modifiche da {count} dispositivi che non fanno più parte del tuo account.",
+  "heads.advice":
+    "La scelta più sicura è annullarle. Finché non decidi, la cartella resta in attesa.",
+  "heads.undo": "Rivedi e annulla",
+  "heads.accept": "Accetta",
+  "heads.accepted": "Accettato. «{folder}» viene di nuovo sincronizzata.",
+  "heads.undoLater": "Annulla comunque",
+  "removedHeads.title": "Modifiche dal dispositivo rimosso «{device}» in «{folder}»",
   "missing.title": "«{folder}» non c’è più",
   "missing.body":
     "{app} ha messo in pausa la cartella. Non è stato eliminato nulla sul server né sugli altri tuoi dispositivi.",
@@ -3495,12 +4000,19 @@ const it: Dictionary = {
     "Apri questa cartella su un altro dispositivo e confronta i numeri. Se sono uguali, è tutto a posto.",
   "removed.body":
     "Questo dispositivo è stato rimosso da «{device}». I tuoi file restano qui ma non vengono più sincronizzati.",
+  "removed.bodyUnknown":
+    "Questo dispositivo è stato rimosso dal tuo account. I tuoi file restano qui ma non vengono più sincronizzati.",
   "removed.repair": "Abbina di nuovo",
   "removed.notMe": "Non sono stato io",
   "removed.notMeBody":
     "Allora qualcuno ha accesso a uno dei tuoi dispositivi. Configura di nuovo {app} con il foglio di recupero e rimuovi i dispositivi che non riconosci.",
   "update.body": "{app} ha bisogno di un aggiornamento per continuare a sincronizzare.",
   "update.now": "Aggiorna ora",
+  "update.bodyManual":
+    "{app} ha bisogno di un aggiornamento per continuare a sincronizzare. Installa la nuova versione e riprenderà da solo.",
+  "update.upToDate": "Non c’è ancora una versione più recente. Riprova più tardi.",
+  "update.installed":
+    "La versione {version} è installata. Riavvia {app} se non si riavvia da solo.",
   "refused.body": "Il tuo server non fa più entrare questo dispositivo.",
 
   "restore.title": "Versioni precedenti di «{folder}»",
@@ -3579,6 +4091,7 @@ const it: Dictionary = {
   "restore.otherVersion": "Scegli un’altra versione",
   "restore.beforeDevice": "Stato prima delle modifiche da …",
   "restore.beforeDeviceEntry": "Prima delle modifiche da «{device}»",
+  "restore.beforeDevice.finding": "Ricerca in corso …",
   "trash.title": "Cestino di «{folder}»",
   "trash.search": "Cerca",
   "trash.deleted": "eliminato {when}, {device}",
@@ -3664,6 +4177,13 @@ const it: Dictionary = {
   "settings.reportHelp":
     "Contiene versioni, stati e codici di errore. Nessun nome di file, nessun contenuto, nessuna chiave.",
   "settings.reportPreview": "Cosa contiene il rapporto errori",
+  "reset.action": "Reimposta questo dispositivo",
+  "reset.help":
+    "Per ricominciare da capo: {app} dimentica il tuo account su questo dispositivo. I tuoi file restano qui.",
+  "reset.question": "Vuoi davvero reimpostare questo dispositivo?",
+  "reset.body":
+    "{app} smette di sincronizzare qui e dimentica l’account. Dopo puoi creare un nuovo account o aggiungere di nuovo questo dispositivo.",
+  "reset.confirm": "Reimposta",
   "settings.localNote":
     "Su questo computer i tuoi file sono salvati senza crittografia. Attiva la crittografia del disco del tuo sistema.",
   "settings.serverNote":
@@ -3692,6 +4212,9 @@ const it: Dictionary = {
     "Questo server non è raggiungibile in modo sicuro. {app} si collega solo tramite https.",
   "error.pair.notALink":
     "Questo non è un link di abbinamento. Copialo sull’altro dispositivo in Dispositivi, poi Aggiungi dispositivo.",
+  "error.link.damaged": "Il link è incompleto. Copialo di nuovo per intero.",
+  "error.recover.notALink":
+    "Questo non è il link del tuo foglio. Inizia con hangar-drive://recover#.",
   "error.pair.expired":
     "Questo codice è scaduto o è già stato usato. Creane uno nuovo sull’altro dispositivo.",
   "error.pair.typo": "C’è un errore di battitura nel codice. Confrontalo carattere per carattere.",
@@ -3709,6 +4232,8 @@ const it: Dictionary = {
   "error.recovery.otherApp": "Questo è un codice per Hangar. Qui serve il codice per {app}.",
   "error.recovery.savedInSync":
     "Non salvare il codice in una cartella sincronizzata, altrimenti sta accanto ai file che apre. Scegli un altro posto.",
+  "error.recovery.savedInCloud":
+    "Questa cartella è sincronizzata con un cloud. Meglio salvare il foglio in un posto che resta solo su questo dispositivo, per esempio in «Download» o su una chiavetta USB.",
   "error.folder.network":
     "Le unità di rete non funzionano. Scegli una cartella su questo computer.",
   "error.folder.root": "Un’unità intera non funziona. Scegli una cartella al suo interno.",
@@ -3748,16 +4273,30 @@ const ja: Dictionary = {
   "setup.connect.scan": "カメラで読み取る",
   "setup.connect.checking": "招待を確認しています…",
   "setup.connect.ok": "{host} に接続しました",
+  "setup.connect.pinnedTitle": "独自の証明書を使うサーバー",
+  "setup.connect.pinned":
+    "このサーバーには公開の証明書がありません。リンクで指定されているため、{app} はこのサーバーを信頼します。サーバーの管理者から直接受け取ったリンクだけを使ってください。",
+  "link.isInvite": "これは招待リンクです。新しいアカウントを作成するためのものです。",
+  "link.isPair": "これは別のデバイスからのペアリングリンクです。",
+  "link.isRecover": "これは復元シートのリンクです。",
+  "link.toInvite": "新しいアカウントを作成",
+  "link.toPair": "ペアリングに切り替える",
+  "link.toRecover": "シートで設定",
+  "link.needPair": "ここにはペアリングリンクを入力してください。",
+  "link.notNeeded.title": "このデバイスは設定済みです",
+  "link.notNeeded.body":
+    "このデバイスではこのリンクは不要です。設定したいデバイスで開いてください。",
   "setup.deviceName.label": "このデバイスの名前",
   "setup.deviceName.help": "デバイスの一覧ではこの名前で表示されます。",
   "name.blank": "名前が空です。表示される文字で名前を入力してください。",
   "name.edgeWhitespace": "名前の先頭と末尾にスペースは使えません。",
-  "setup.pasteEmpty": "クリップボードにテキストがありません。",
+  "setup.pasteNoLink": "クリップボードに {app} のリンクがありません。",
   "recovery.title": "復元コード",
   "recovery.body":
     "すべてのデバイスを失っても、このコードがあればファイルを取り戻せます。ほかに方法はなく、管理者にもできません。",
   "recovery.print": "印刷",
   "recovery.save": "ファイルに保存",
+  "recovery.saveElsewhere": "別の場所を選ぶ",
   "recovery.copy": "コピー",
   "recovery.copied": "コピーしました。1分後にクリップボードから消去されます。",
   "recovery.saved": "保存しました：{path}",
@@ -3771,6 +4310,23 @@ const ja: Dictionary = {
   "recovery.check.showAgain": "コードをもう一度表示",
   "recovery.groupLabel": "グループ {index}：{chars}",
   "recovery.codeLabel": "復元コード（8グループ）",
+  "sheet.more": "シートに記載されるそのほかの内容",
+  "sheet.title": "{app}：復元シート",
+  "sheet.serverId": "サーバー ID",
+  "sheet.accountId": "アカウント ID",
+  "sheet.anchor": "アカウントの確認値",
+  "sheet.pin": "サーバーの確認値",
+  "sheet.link": "貼り付け用のリンク",
+  "sheet.date": "作成日",
+  "sheet.device": "デバイス",
+  "sheet.note.what": "すべてのデバイスを失ったときは、このコードでファイルを取り戻せます。",
+  "sheet.note.access":
+    "このコードとサーバーのデータがあれば、すべてのファイルを読むことができます。このシートは家の鍵と同じように保管してください。",
+  "sheet.note.gone":
+    "このコードもデバイスもない場合、ファイルは二度と開けません。管理者にも開けません。",
+  "sheet.note.how":
+    "手順：{app} をインストールし、「{door}」を選び、リンクを貼り付けるか QR コードを読み取って、コードを入力します。",
+  "sheet.fileName": "{app} 復元シート.txt",
   "folder.setup.title": "ファイルをどこに置きますか？",
   "folder.setup.body":
     "このフォルダーに入れたものは、ほかのデバイスにも入ります。フォルダーはあとで追加できます。",
@@ -3821,27 +4377,47 @@ const ja: Dictionary = {
   "pair.add.expired": "このコードは期限切れです。",
   "pair.add.renew": "新しいコードを作成",
   "pair.confirm.title": "「{device}」が参加しようとしています。",
-  "pair.confirm.add": "追加",
+  "pair.confirm.add": "追加…",
   "pair.confirm.decline": "拒否",
   "pair.confirm.body": "新しいデバイスに数字の列が表示されています。この数字と一致しますか？",
   "pair.confirm.yes": "はい、同じ数字です。追加します",
   "pair.confirm.no": "いいえ、キャンセル",
+  "pair.request.body":
+    "このあとシステムがもう一度確認し、この数字の列を表示します。新しいデバイスに同じ数字が表示されている場合のみ「はい」を選んでください。",
   "pair.mismatch":
     "その場合はデバイスを追加しないでください。新しいデバイスで最初からやり直してください。再び起きる場合は、サーバーの管理者に相談してください。",
   "pair.added": "「{device}」を追加しました。",
   "pair.joined": "ペアリングしました。少しお待ちください。",
+  "pair.check.title": "このサーバーに接続しますか？",
+  "pair.check.body":
+    "サーバーとアカウントを別のデバイスと見比べてください。別のデバイスでは「デバイス」の「デバイスを追加」に表示されます。",
+  "pair.check.server": "サーバー",
+  "pair.check.account": "アカウント",
+  "pair.check.connect": "接続",
+  "pair.check.pinned":
+    "このサーバーには公開の証明書がありません。リンクで指定されているため、{app} はこのサーバーを信頼します。",
+  "pair.add.target": "サーバー {host}、アカウント {account}",
+  "pair.devices.title": "これらのデバイスに心当たりはありますか？",
+  "pair.devices.body":
+    "このデバイスはアカウントに接続されました。心当たりのないデバイスがあればキャンセルしてください。ファイルが転送される前に接続が解除されます。",
+  "pair.devices.yes": "はい、自分のデバイスです",
+  "pair.devices.aborted":
+    "キャンセルしました。このデバイスの接続は解除され、ファイルは転送されていません。",
   "safety.label": "安全番号",
   "safety.group": "グループ {index}：{digits}",
 
   "recover.title": "復元シートで設定",
-  "recover.body": "サーバーのアドレスとシートに書かれたコードを入力してください。",
+  "recover.body":
+    "シートのリンクを貼り付けるか、シートの QR コードを読み取ってください。そのあとコードを入力します。",
   "recover.codeLabel": "復元コード",
-  "recover.name.title": "このデバイスの名前",
   "recover.cleanup.title": "古いデバイスを削除",
   "recover.cleanup.body":
     "これらのデバイスはまだアカウントに登録されています。手元にないものを削除してください。",
   "recover.cleanup.remove": "「{device}」を削除",
   "recover.newCode": "古いコードは使用済みになりました。新しいコードはこちらです。",
+  "recover.linkLabel": "シートのリンク",
+  "recover.linkOk": "見つかりました：{host}",
+  "recover.linkAccount": "アカウント {account}",
 
   "tray.state.upToDate": "最新の状態です",
   "tray.state.restUpToDate": "ほかはすべて最新の状態です",
@@ -3890,6 +4466,7 @@ const ja: Dictionary = {
   "folder.status.stopped": "停止中：{reason}",
   "folder.reason.missing": "フォルダーが見つかりません",
   "folder.reason.olderState": "サーバーの状態が古くなっています",
+  "folder.reason.removedHeads": "削除したデバイスからの変更",
   "folder.menu.open": "エクスプローラーで表示",
   "folder.menu.versions": "以前の版",
   "folder.menu.trash": "ごみ箱",
@@ -3913,6 +4490,7 @@ const ja: Dictionary = {
   "folder.delete.confirm": "すべてで削除",
   "folder.deleted.section": "削除したフォルダー",
   "folder.deleted.restore": "元に戻す",
+  "folder.deleted.done": "「{folder}」を削除しました。",
   "folder.deleted.daysLeft.other": "残り {days} 日",
   "activity.changed": "変更",
   "activity.added": "新規",
@@ -3942,6 +4520,7 @@ const ja: Dictionary = {
   "conflict.banner.other": "{count} 個のファイルに2つの版があります",
   "conflict.view": "表示",
   "conflict.version": "{device} の版、{time}",
+  "conflict.versionSize": "{version}、{size}",
   "conflict.openBoth": "両方を開く",
   "conflict.keepThis": "こちらを残す",
   "conflict.keepBoth": "両方を残す",
@@ -3981,6 +4560,17 @@ const ja: Dictionary = {
   "deletes.decide": "選ぶ",
   "deletes.restored.other": "{count} 個のファイルが戻りました。",
   "deletes.done.other": "{count} 個のファイルをほかのデバイスでも削除しました。",
+  "heads.title": "削除したデバイスからの変更",
+  "heads.body":
+    "「{device}」はもうこのアカウントのデバイスではありませんが、「{folder}」にその変更が届きました。",
+  "heads.bodyMany.other":
+    "このアカウントにもう属していない {count} 台のデバイスからの変更が「{folder}」に届きました。",
+  "heads.advice": "変更を元に戻すのが最も安全です。決めるまで、フォルダーは待機します。",
+  "heads.undo": "確認して元に戻す",
+  "heads.accept": "受け入れる",
+  "heads.accepted": "受け入れました。「{folder}」の同期を再開します。",
+  "heads.undoLater": "やはり元に戻す",
+  "removedHeads.title": "削除したデバイス「{device}」から「{folder}」への変更",
   "missing.title": "「{folder}」が見つかりません",
   "missing.body":
     "{app} はこのフォルダーを一時停止しました。サーバーとほかのデバイスでは何も削除されていません。",
@@ -4064,12 +4654,19 @@ const ja: Dictionary = {
     "別のデバイスでこのフォルダーを開き、数字を照合してください。同じなら問題ありません。",
   "removed.body":
     "このデバイスは「{device}」によって削除されました。ファイルはここに残りますが、同期はされなくなります。",
+  "removed.bodyUnknown":
+    "このデバイスはアカウントから削除されました。ファイルはここに残りますが、同期はされなくなります。",
   "removed.repair": "再びペアリング",
   "removed.notMe": "自分ではありません",
   "removed.notMeBody":
     "その場合、誰かがあなたのデバイスのどれかにアクセスしています。復元シートで {app} を設定し直し、見覚えのないデバイスを削除してください。",
   "update.body": "同期を続けるには {app} の更新が必要です。",
   "update.now": "今すぐ更新",
+  "update.bodyManual":
+    "同期を続けるには {app} の更新が必要です。新しいバージョンをインストールすると、自動的に再開します。",
+  "update.upToDate": "新しいバージョンはまだありません。しばらくしてからもう一度お試しください。",
+  "update.installed":
+    "バージョン {version} をインストールしました。{app} が自動で再起動しない場合は、再起動してください。",
   "refused.body": "サーバーがこのデバイスの接続を許可しなくなりました。",
 
   "restore.title": "「{folder}」の以前の版",
@@ -4131,6 +4728,7 @@ const ja: Dictionary = {
   "restore.otherVersion": "別の版を選ぶ",
   "restore.beforeDevice": "次のデバイスによる変更の前の状態…",
   "restore.beforeDeviceEntry": "「{device}」による変更の前",
+  "restore.beforeDevice.finding": "検索しています…",
   "trash.title": "「{folder}」のごみ箱",
   "trash.search": "検索",
   "trash.deleted": "{when} に削除、{device}",
@@ -4202,6 +4800,13 @@ const ja: Dictionary = {
   "settings.reportHelp":
     "バージョン、状態、エラーコードが含まれます。ファイル名、内容、鍵は含まれません。",
   "settings.reportPreview": "エラーレポートの内容",
+  "reset.action": "このデバイスをリセット",
+  "reset.help":
+    "最初からやり直すには：{app} はこのデバイス上のアカウント情報を消去します。ファイルはここに残ります。",
+  "reset.question": "このデバイスをリセットしますか？",
+  "reset.body":
+    "{app} はここでの同期を停止し、アカウント情報を消去します。その後、新しいアカウントを作成するか、このデバイスをもう一度追加できます。",
+  "reset.confirm": "リセット",
   "settings.localNote":
     "このコンピューターではファイルは暗号化されずに保存されます。システムのドライブ暗号化をオンにしてください。",
   "settings.serverNote":
@@ -4230,6 +4835,9 @@ const ja: Dictionary = {
   "error.insecure": "このサーバーには安全に接続できません。{app} は https でのみ接続します。",
   "error.pair.notALink":
     "ペアリングリンクではありません。ほかのデバイスの「デバイス」から「デバイスを追加」でコピーしてください。",
+  "error.link.damaged": "リンクが不完全です。もう一度すべてコピーしてください。",
+  "error.recover.notALink":
+    "シートのリンクではありません。シートのリンクは hangar-drive://recover# で始まります。",
   "error.pair.expired":
     "このコードは期限切れか、すでに使われています。ほかのデバイスで新しいコードを作成してください。",
   "error.pair.typo": "コードに入力ミスがあります。1文字ずつ照合してください。",
@@ -4247,6 +4855,8 @@ const ja: Dictionary = {
   "error.recovery.otherApp": "これは Hangar のコードです。ここでは {app} のコードが必要です。",
   "error.recovery.savedInSync":
     "同期するフォルダーにコードを保存しないでください。開く対象のファイルのすぐ隣に置くことになります。別の場所を選んでください。",
+  "error.recovery.savedInCloud":
+    "このフォルダーはクラウドと同期されています。シートは、このデバイスだけにある場所（「ダウンロード」や USB メモリなど）に保存してください。",
   "error.folder.network":
     "ネットワークドライブは使えません。このコンピューター上のフォルダーを選んでください。",
   "error.folder.root": "ドライブ全体は使えません。その中のフォルダーを選んでください。",
@@ -4287,16 +4897,30 @@ const pl: Dictionary = {
   "setup.connect.scan": "Zeskanuj aparatem",
   "setup.connect.checking": "Sprawdzam zaproszenie …",
   "setup.connect.ok": "Połączono z {host}",
+  "setup.connect.pinnedTitle": "Serwer z własnym certyfikatem",
+  "setup.connect.pinned":
+    "Ten serwer nie ma publicznego certyfikatu. {app} ufa mu, bo tak określa link. Przyjmij link tylko wtedy, gdy pochodzi bezpośrednio od administratora twojego serwera.",
+  "link.isInvite": "To jest link z zaproszeniem. Służy do założenia nowego konta.",
+  "link.isPair": "To jest link parowania z jednego z twoich urządzeń.",
+  "link.isRecover": "To jest link z twojej karty odzyskiwania.",
+  "link.toInvite": "Załóż nowe konto",
+  "link.toPair": "Zamiast tego sparuj",
+  "link.toRecover": "Skonfiguruj z kartą",
+  "link.needPair": "Tutaj potrzebny jest link parowania.",
+  "link.notNeeded.title": "To urządzenie jest już skonfigurowane",
+  "link.notNeeded.body":
+    "Tutaj ten link nie jest potrzebny. Otwórz go na urządzeniu, które chcesz skonfigurować.",
   "setup.deviceName.label": "Nazwa tego urządzenia",
   "setup.deviceName.help": "Po tej nazwie rozpoznasz je na liście urządzeń.",
   "name.blank": "Nazwa jest pusta. Wpisz nazwę z widocznymi znakami.",
   "name.edgeWhitespace": "Nazwa nie może zaczynać się ani kończyć spacją.",
-  "setup.pasteEmpty": "W schowku nie ma teraz żadnego tekstu.",
+  "setup.pasteNoLink": "W schowku nie ma linku {app}.",
   "recovery.title": "Twój kod odzyskiwania",
   "recovery.body":
     "Jeśli stracisz wszystkie urządzenia, ten kod przywróci ci twoje pliki. Nie ma innej drogi, nawet przez administratora.",
   "recovery.print": "Drukuj",
   "recovery.save": "Zapisz jako plik",
+  "recovery.saveElsewhere": "Wybierz inne miejsce",
   "recovery.copy": "Kopiuj",
   "recovery.copied": "Skopiowano. Za 1 minutę zniknie ze schowka.",
   "recovery.saved": "Zapisano: {path}",
@@ -4310,6 +4934,23 @@ const pl: Dictionary = {
   "recovery.check.showAgain": "Pokaż kod jeszcze raz",
   "recovery.groupLabel": "Grupa {index}: {chars}",
   "recovery.codeLabel": "Kod odzyskiwania, 8 grup",
+  "sheet.more": "Co jeszcze jest na karcie",
+  "sheet.title": "{app}: karta odzyskiwania",
+  "sheet.serverId": "Identyfikator serwera",
+  "sheet.accountId": "Identyfikator konta",
+  "sheet.anchor": "Wartość kontrolna konta",
+  "sheet.pin": "Wartość kontrolna serwera",
+  "sheet.link": "Link do wklejenia",
+  "sheet.date": "Utworzono",
+  "sheet.device": "Urządzenie",
+  "sheet.note.what": "Tym kodem odzyskasz swoje pliki, jeśli stracisz wszystkie urządzenia.",
+  "sheet.note.access":
+    "Kto ma ten kod, może razem z twoim serwerem czytać wszystkie twoje pliki. Przechowuj tę kartę jak klucz do domu.",
+  "sheet.note.gone":
+    "Bez tego kodu i bez żadnego z twoich urządzeń twoich plików nie da się już otworzyć, nawet przez administratora.",
+  "sheet.note.how":
+    "Jak to zrobić: zainstaluj {app}, wybierz „{door}”, wklej link albo zeskanuj kod QR i wpisz kod.",
+  "sheet.fileName": "{app} karta odzyskiwania.txt",
   "folder.setup.title": "Gdzie mają być twoje pliki?",
   "folder.setup.body":
     "Wszystko, co umieścisz w tym folderze, znajdzie się też na twoich innych urządzeniach. Później możesz dodać kolejne foldery.",
@@ -4371,27 +5012,46 @@ const pl: Dictionary = {
   "pair.add.expired": "Ten kod wygasł.",
   "pair.add.renew": "Utwórz nowy kod",
   "pair.confirm.title": "„{device}” chce dołączyć.",
-  "pair.confirm.add": "Dodaj",
+  "pair.confirm.add": "Dodaj …",
   "pair.confirm.decline": "Odrzuć",
   "pair.confirm.body": "Nowe urządzenie pokazuje teraz ciąg liczb. Czy zgadza się z tym tutaj?",
   "pair.confirm.yes": "Tak, te same liczby, dodaj",
   "pair.confirm.no": "Nie, anuluj",
+  "pair.request.body":
+    "Potem system zapyta jeszcze raz i pokaże ten ciąg liczb. Zgódź się tylko wtedy, gdy nowe urządzenie pokazuje ten sam.",
   "pair.mismatch":
     "W takim razie nie dodawaj urządzenia. Zacznij od nowa na nowym urządzeniu. Jeśli to się powtórzy, porozmawiaj z osobą, która prowadzi twój serwer.",
   "pair.added": "Dodano „{device}”.",
   "pair.joined": "Sparowano. Chwileczkę.",
+  "pair.check.title": "Połączyć z tym serwerem?",
+  "pair.check.body":
+    "Porównaj serwer i konto z drugim urządzeniem. Znajdziesz je tam w sekcji Urządzenia, a potem Dodaj urządzenie.",
+  "pair.check.server": "Serwer",
+  "pair.check.account": "Konto",
+  "pair.check.connect": "Połącz",
+  "pair.check.pinned":
+    "Ten serwer nie ma publicznego certyfikatu. {app} ufa mu, bo tak określa link.",
+  "pair.add.target": "Serwer {host}, konto {account}",
+  "pair.devices.title": "Czy to twoje urządzenia?",
+  "pair.devices.body":
+    "To urządzenie jest teraz połączone z kontem. Jeśli nie znasz tych urządzeń, anuluj: zostanie ono odłączone, zanim jakiekolwiek pliki zostaną przesłane.",
+  "pair.devices.yes": "Tak, to moje",
+  "pair.devices.aborted":
+    "Anulowano. To urządzenie jest znowu odłączone i żadne pliki nie zostały przesłane.",
   "safety.label": "Numer bezpieczeństwa",
   "safety.group": "Grupa {index}: {digits}",
 
   "recover.title": "Konfiguracja z kartą odzyskiwania",
-  "recover.body": "Wpisz adres serwera i kod ze swojej karty.",
+  "recover.body": "Wklej link ze swojej karty albo zeskanuj z niej kod QR. Potem wpisz kod.",
   "recover.codeLabel": "Kod odzyskiwania",
-  "recover.name.title": "Jak ma się nazywać to urządzenie?",
   "recover.cleanup.title": "Usuń stare urządzenia",
   "recover.cleanup.body":
     "Te urządzenia nadal należą do twojego konta. Usuń te, których już nie masz.",
   "recover.cleanup.remove": "Usuń „{device}”",
   "recover.newCode": "Stary kod jest już zużyty. Oto twój nowy.",
+  "recover.linkLabel": "Link z karty",
+  "recover.linkOk": "Znaleziono: {host}",
+  "recover.linkAccount": "Konto {account}",
 
   "tray.state.upToDate": "Wszystko aktualne",
   "tray.state.restUpToDate": "Cała reszta jest aktualna",
@@ -4452,6 +5112,7 @@ const pl: Dictionary = {
   "folder.status.stopped": "Zatrzymany: {reason}",
   "folder.reason.missing": "nie znaleziono folderu",
   "folder.reason.olderState": "starszy stan na serwerze",
+  "folder.reason.removedHeads": "zmiany z usuniętego urządzenia",
   "folder.menu.open": "Pokaż w Eksploratorze",
   "folder.menu.versions": "Wcześniejsze wersje",
   "folder.menu.trash": "Kosz",
@@ -4481,6 +5142,7 @@ const pl: Dictionary = {
   "folder.delete.confirm": "Usuń wszędzie",
   "folder.deleted.section": "Usunięte foldery",
   "folder.deleted.restore": "Przywróć",
+  "folder.deleted.done": "Usunięto „{folder}”.",
   "folder.deleted.daysLeft.one": "Został {days} dzień",
   "folder.deleted.daysLeft.few": "Zostały {days} dni",
   "folder.deleted.daysLeft.many": "Zostało {days} dni",
@@ -4529,6 +5191,7 @@ const pl: Dictionary = {
   "conflict.banner.other": "{count} pliku ma dwie wersje",
   "conflict.view": "Zobacz",
   "conflict.version": "Wersja z urządzenia {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Otwórz obie",
   "conflict.keepThis": "Zachowaj tę",
   "conflict.keepBoth": "Zachowaj obie",
@@ -4602,6 +5265,23 @@ const pl: Dictionary = {
   "deletes.done.few": "Usunięto {count} pliki także na twoich innych urządzeniach.",
   "deletes.done.many": "Usunięto {count} plików także na twoich innych urządzeniach.",
   "deletes.done.other": "Usunięto {count} pliku także na twoich innych urządzeniach.",
+  "heads.title": "Zmiany z usuniętego urządzenia",
+  "heads.body":
+    "Do „{folder}” dotarły zmiany z urządzenia „{device}”, chociaż nie należy ono już do twojego konta.",
+  "heads.bodyMany.one":
+    "Do „{folder}” dotarły zmiany z {count} urządzenia, które nie należy już do twojego konta.",
+  "heads.bodyMany.few":
+    "Do „{folder}” dotarły zmiany z {count} urządzeń, które nie należą już do twojego konta.",
+  "heads.bodyMany.many":
+    "Do „{folder}” dotarły zmiany z {count} urządzeń, które nie należą już do twojego konta.",
+  "heads.bodyMany.other":
+    "Do „{folder}” dotarły zmiany z {count} urządzenia, które nie należą już do twojego konta.",
+  "heads.advice": "Najbezpieczniej jest je cofnąć. Dopóki nie zdecydujesz, folder czeka.",
+  "heads.undo": "Przejrzyj i cofnij",
+  "heads.accept": "Zaakceptuj",
+  "heads.accepted": "Zaakceptowano. „{folder}” znów się synchronizuje.",
+  "heads.undoLater": "Jednak cofnij",
+  "removedHeads.title": "Zmiany z usuniętego urządzenia „{device}” w „{folder}”",
   "missing.title": "Folder „{folder}” zniknął",
   "missing.body":
     "{app} wstrzymuje ten folder. Nic nie zostało usunięte ani na serwerze, ani na twoich innych urządzeniach.",
@@ -4703,12 +5383,19 @@ const pl: Dictionary = {
     "Otwórz ten folder na innym urządzeniu i porównaj liczby. Jeśli są takie same, wszystko jest w porządku.",
   "removed.body":
     "To urządzenie zostało usunięte przez „{device}”. Twoje pliki zostają tutaj, ale nie są już synchronizowane.",
+  "removed.bodyUnknown":
+    "To urządzenie zostało usunięte z twojego konta. Twoje pliki zostają tutaj, ale nie są już synchronizowane.",
   "removed.repair": "Sparuj ponownie",
   "removed.notMe": "To nie ja",
   "removed.notMeBody":
     "W takim razie ktoś ma dostęp do jednego z twoich urządzeń. Skonfiguruj {app} od nowa z kartą odzyskiwania i usuń urządzenia, których nie rozpoznajesz.",
   "update.body": "{app} potrzebuje aktualizacji, aby dalej synchronizować.",
   "update.now": "Aktualizuj teraz",
+  "update.bodyManual":
+    "{app} potrzebuje aktualizacji, aby dalej synchronizować. Zainstaluj nową wersję, a synchronizacja ruszy sama.",
+  "update.upToDate": "Nie ma jeszcze nowszej wersji. Spróbuj ponownie później.",
+  "update.installed":
+    "Wersja {version} jest zainstalowana. Uruchom {app} ponownie, jeśli nie uruchomi się samo.",
   "refused.body": "Twój serwer nie wpuszcza już tego urządzenia.",
 
   "restore.title": "Wcześniejsze wersje folderu „{folder}”",
@@ -4791,6 +5478,7 @@ const pl: Dictionary = {
   "restore.otherVersion": "Wybierz inną wersję",
   "restore.beforeDevice": "Stan sprzed zmian z urządzenia …",
   "restore.beforeDeviceEntry": "Przed zmianami z urządzenia „{device}”",
+  "restore.beforeDevice.finding": "Wyszukiwanie …",
   "trash.title": "Kosz folderu „{folder}”",
   "trash.search": "Szukaj",
   "trash.deleted": "usunięto {when}, {device}",
@@ -4882,6 +5570,13 @@ const pl: Dictionary = {
   "settings.reportHelp":
     "Zawiera wersje, stany i kody błędów. Bez nazw plików, bez zawartości, bez kluczy.",
   "settings.reportPreview": "Co zawiera raport o błędzie",
+  "reset.action": "Zresetuj to urządzenie",
+  "reset.help":
+    "Aby zacząć od nowa: {app} zapomni twoje konto na tym urządzeniu. Twoje pliki zostaną tutaj.",
+  "reset.question": "Na pewno zresetować to urządzenie?",
+  "reset.body":
+    "{app} przestanie tu synchronizować i zapomni konto. Potem możesz założyć nowe konto albo ponownie dodać to urządzenie.",
+  "reset.confirm": "Zresetuj",
   "settings.localNote":
     "Na tym komputerze twoje pliki są zapisane bez szyfrowania. Włącz szyfrowanie dysku w swoim systemie.",
   "settings.serverNote":
@@ -4911,6 +5606,9 @@ const pl: Dictionary = {
     "Z tym serwerem nie da się połączyć bezpiecznie. {app} łączy się tylko przez https.",
   "error.pair.notALink":
     "To nie jest link parowania. Skopiuj go na drugim urządzeniu w sekcji Urządzenia, a potem Dodaj urządzenie.",
+  "error.link.damaged": "Link jest niepełny. Skopiuj go jeszcze raz w całości.",
+  "error.recover.notALink":
+    "To nie jest link z twojej karty. Zaczyna się od hangar-drive://recover#.",
   "error.pair.expired": "Ten kod wygasł albo został już użyty. Utwórz nowy na drugim urządzeniu.",
   "error.pair.typo": "W kodzie jest literówka. Porównaj go znak po znaku.",
   "error.pair.declined": "Drugie urządzenie odrzuciło prośbę. Jeśli to pomyłka, zacznij od nowa.",
@@ -4926,6 +5624,8 @@ const pl: Dictionary = {
   "error.recovery.otherApp": "To kod dla aplikacji Hangar. Tutaj potrzebny jest kod dla {app}.",
   "error.recovery.savedInSync":
     "Nie zapisuj kodu w synchronizowanym folderze, bo leżałby obok plików, które otwiera. Wybierz inne miejsce.",
+  "error.recovery.savedInCloud":
+    "Ten folder jest synchronizowany z chmurą. Lepiej zapisz arkusz w miejscu, które jest tylko na tym urządzeniu, na przykład w „Pobranych” albo na pendrivie.",
   "error.folder.network": "Dyski sieciowe nie działają. Wybierz folder na tym komputerze.",
   "error.folder.root": "Cały dysk nie zadziała. Wybierz folder na nim.",
   "error.folder.system": "Ten folder należy do systemu. Wybierz własny folder.",
@@ -4965,16 +5665,30 @@ const pt: Dictionary = {
   "setup.connect.scan": "Escanear com a câmera",
   "setup.connect.checking": "Verificando o convite …",
   "setup.connect.ok": "Conectado a {host}",
+  "setup.connect.pinnedTitle": "Um servidor com certificado próprio",
+  "setup.connect.pinned":
+    "Este servidor não tem um certificado público. O {app} confia nele porque o link determina isso. Só aceite o link se ele vier diretamente do administrador do seu servidor.",
+  "link.isInvite": "Este é um link de convite. Com ele você cria uma conta nova.",
+  "link.isPair": "Este é um link de pareamento de um dos seus dispositivos.",
+  "link.isRecover": "Este é o link da sua folha de recuperação.",
+  "link.toInvite": "Criar uma conta nova",
+  "link.toPair": "Parear em vez disso",
+  "link.toRecover": "Configurar com a folha",
+  "link.needPair": "Aqui vai um link de pareamento.",
+  "link.notNeeded.title": "Este dispositivo já está configurado",
+  "link.notNeeded.body":
+    "Você não precisa deste link aqui. Abra-o no dispositivo que quer configurar.",
   "setup.deviceName.label": "Nome deste dispositivo",
   "setup.deviceName.help": "É assim que você vai reconhecê-lo na sua lista de dispositivos.",
   "name.blank": "O nome está vazio. Digite um nome com caracteres visíveis.",
   "name.edgeWhitespace": "O nome não pode começar nem terminar com espaço.",
-  "setup.pasteEmpty": "Não há texto na área de transferência agora.",
+  "setup.pasteNoLink": "Não há nenhum link do {app} na área de transferência.",
   "recovery.title": "Seu código de recuperação",
   "recovery.body":
     "Se você perder todos os seus dispositivos, este código traz seus arquivos de volta. Não existe outro jeito, nem mesmo pelo administrador.",
   "recovery.print": "Imprimir",
   "recovery.save": "Salvar como arquivo",
+  "recovery.saveElsewhere": "Escolher outro lugar",
   "recovery.copy": "Copiar",
   "recovery.copied": "Copiado. Ele será apagado da área de transferência em 1 minuto.",
   "recovery.saved": "Salvo: {path}",
@@ -4988,6 +5702,24 @@ const pt: Dictionary = {
   "recovery.check.showAgain": "Mostrar o código de novo",
   "recovery.groupLabel": "Grupo {index}: {chars}",
   "recovery.codeLabel": "Código de recuperação, 8 grupos",
+  "sheet.more": "O que mais está na folha",
+  "sheet.title": "{app}: folha de recuperação",
+  "sheet.serverId": "ID do servidor",
+  "sheet.accountId": "ID da conta",
+  "sheet.anchor": "Valor de verificação da conta",
+  "sheet.pin": "Valor de verificação do servidor",
+  "sheet.link": "Link para colar",
+  "sheet.date": "Criada em",
+  "sheet.device": "Dispositivo",
+  "sheet.note.what":
+    "Com este código você recupera seus arquivos se perder todos os seus dispositivos.",
+  "sheet.note.access":
+    "Quem tiver o código pode ler todos os seus arquivos junto com o seu servidor. Guarde esta folha como a chave de casa.",
+  "sheet.note.gone":
+    "Sem este código e sem nenhum dos seus dispositivos, seus arquivos não podem mais ser abertos, nem mesmo pelo administrador.",
+  "sheet.note.how":
+    "Como fazer: instale o {app}, escolha “{door}”, cole o link ou escaneie o código QR e digite o código.",
+  "sheet.fileName": "{app} folha de recuperação.txt",
   "folder.setup.title": "Onde seus arquivos devem ficar?",
   "folder.setup.body":
     "Tudo o que você colocar nesta pasta também vai estar nos seus outros dispositivos. Você pode adicionar mais pastas depois.",
@@ -5045,28 +5777,47 @@ const pt: Dictionary = {
   "pair.add.expired": "Este código expirou.",
   "pair.add.renew": "Criar um novo código",
   "pair.confirm.title": "“{device}” quer entrar.",
-  "pair.confirm.add": "Adicionar",
+  "pair.confirm.add": "Adicionar …",
   "pair.confirm.decline": "Recusar",
   "pair.confirm.body":
     "O novo dispositivo agora mostra uma sequência de números. Ela é igual a esta?",
   "pair.confirm.yes": "Sim, os números são iguais, adicionar",
   "pair.confirm.no": "Não, cancelar",
+  "pair.request.body":
+    "Depois, seu sistema pergunta mais uma vez e mostra esta sequência de números. Só diga sim se o novo dispositivo mostrar a mesma.",
   "pair.mismatch":
     "Então não adicione o dispositivo. Comece de novo no novo dispositivo. Se acontecer outra vez, fale com quem cuida do seu servidor.",
   "pair.added": "“{device}” foi adicionado.",
   "pair.joined": "Pareado. Só um momento.",
+  "pair.check.title": "Conectar a este servidor?",
+  "pair.check.body":
+    "Compare o servidor e a conta com o seu outro dispositivo. Lá eles aparecem em Dispositivos, depois Adicionar dispositivo.",
+  "pair.check.server": "Servidor",
+  "pair.check.account": "Conta",
+  "pair.check.connect": "Conectar",
+  "pair.check.pinned":
+    "Este servidor não tem um certificado público. O {app} confia nele porque o link determina isso.",
+  "pair.add.target": "Servidor {host}, conta {account}",
+  "pair.devices.title": "Estes são os seus dispositivos?",
+  "pair.devices.body":
+    "Este dispositivo agora está conectado à conta. Se você não reconhece estes dispositivos, cancele: ele será desconectado antes de qualquer arquivo ser transferido.",
+  "pair.devices.yes": "Sim, são meus",
+  "pair.devices.aborted":
+    "Cancelado. Este dispositivo foi desconectado de novo e nenhum arquivo foi transferido.",
   "safety.label": "Número de segurança",
   "safety.group": "Grupo {index}: {digits}",
 
   "recover.title": "Configurar com sua folha de recuperação",
-  "recover.body": "Digite o endereço do servidor e o código da sua folha.",
+  "recover.body": "Cole o link da sua folha ou escaneie o código QR dela. Depois digite o código.",
   "recover.codeLabel": "Código de recuperação",
-  "recover.name.title": "Qual vai ser o nome deste dispositivo?",
   "recover.cleanup.title": "Remover dispositivos antigos",
   "recover.cleanup.body":
     "Estes dispositivos ainda fazem parte da sua conta. Remova os que você não tem mais.",
   "recover.cleanup.remove": "Remover “{device}”",
   "recover.newCode": "O código antigo já foi usado. Aqui está o seu novo código.",
+  "recover.linkLabel": "Link da folha",
+  "recover.linkOk": "Encontrado: {host}",
+  "recover.linkAccount": "Conta {account}",
 
   "tray.state.upToDate": "Tudo em dia",
   "tray.state.restUpToDate": "O resto está em dia",
@@ -5123,6 +5874,7 @@ const pt: Dictionary = {
   "folder.status.stopped": "Parada: {reason}",
   "folder.reason.missing": "pasta não encontrada",
   "folder.reason.olderState": "estado mais antigo no servidor",
+  "folder.reason.removedHeads": "alterações de um dispositivo removido",
   "folder.menu.open": "Mostrar no Explorador",
   "folder.menu.versions": "Versões anteriores",
   "folder.menu.trash": "Lixeira",
@@ -5150,6 +5902,7 @@ const pt: Dictionary = {
   "folder.delete.confirm": "Excluir em todos",
   "folder.deleted.section": "Pastas excluídas",
   "folder.deleted.restore": "Trazer de volta",
+  "folder.deleted.done": "“{folder}” foi excluída.",
   "folder.deleted.daysLeft.one": "Falta {days} dia",
   "folder.deleted.daysLeft.many": "Faltam {days} de dias",
   "folder.deleted.daysLeft.other": "Faltam {days} dias",
@@ -5191,6 +5944,7 @@ const pt: Dictionary = {
   "conflict.banner.other": "{count} arquivos estão em duas versões",
   "conflict.view": "Ver",
   "conflict.version": "Versão de {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Abrir as duas",
   "conflict.keepThis": "Ficar com esta",
   "conflict.keepBoth": "Ficar com as duas",
@@ -5255,6 +6009,21 @@ const pt: Dictionary = {
     "{count} de arquivos agora também foram excluídos nos seus outros dispositivos.",
   "deletes.done.other":
     "{count} arquivos agora também foram excluídos nos seus outros dispositivos.",
+  "heads.title": "Alterações de um dispositivo removido",
+  "heads.body":
+    "Chegaram a “{folder}” alterações de “{device}”, embora esse dispositivo não pertença mais à sua conta.",
+  "heads.bodyMany.one":
+    "Chegaram a “{folder}” alterações de {count} dispositivo que não pertence mais à sua conta.",
+  "heads.bodyMany.many":
+    "Chegaram a “{folder}” alterações de {count} de dispositivos que não pertencem mais à sua conta.",
+  "heads.bodyMany.other":
+    "Chegaram a “{folder}” alterações de {count} dispositivos que não pertencem mais à sua conta.",
+  "heads.advice": "O mais seguro é desfazê-las. Até você decidir, a pasta fica esperando.",
+  "heads.undo": "Revisar e desfazer",
+  "heads.accept": "Aceitar",
+  "heads.accepted": "Aceito. “{folder}” volta a ser sincronizada.",
+  "heads.undoLater": "Desfazer mesmo assim",
+  "removedHeads.title": "Alterações do dispositivo removido “{device}” em “{folder}”",
   "missing.title": "“{folder}” sumiu",
   "missing.body":
     "O {app} pausou a pasta. Nada foi excluído no servidor nem nos seus outros dispositivos.",
@@ -5349,12 +6118,19 @@ const pt: Dictionary = {
     "Abra esta pasta em outro dispositivo e compare os números. Se forem iguais, está tudo certo.",
   "removed.body":
     "Este dispositivo foi removido por “{device}”. Seus arquivos ficam aqui, mas não são mais sincronizados.",
+  "removed.bodyUnknown":
+    "Este dispositivo foi removido da sua conta. Seus arquivos ficam aqui, mas não são mais sincronizados.",
   "removed.repair": "Parear de novo",
   "removed.notMe": "Não fui eu",
   "removed.notMeBody":
     "Então alguém tem acesso a um dos seus dispositivos. Configure o {app} de novo com sua folha de recuperação e remova os dispositivos que você não reconhece.",
   "update.body": "O {app} precisa de uma atualização para continuar sincronizando.",
   "update.now": "Atualizar agora",
+  "update.bodyManual":
+    "O {app} precisa de uma atualização para continuar sincronizando. Instale a nova versão e ele continua sozinho.",
+  "update.upToDate": "Ainda não há uma versão mais nova. Tente de novo mais tarde.",
+  "update.installed":
+    "A versão {version} está instalada. Reinicie o {app} se ele não reiniciar sozinho.",
   "refused.body": "Seu servidor não aceita mais este dispositivo.",
 
   "restore.title": "Versões anteriores de “{folder}”",
@@ -5433,6 +6209,7 @@ const pt: Dictionary = {
   "restore.otherVersion": "Escolher outra versão",
   "restore.beforeDevice": "Estado antes das alterações de …",
   "restore.beforeDeviceEntry": "Antes das alterações de “{device}”",
+  "restore.beforeDevice.finding": "Procurando …",
   "trash.title": "Lixeira de “{folder}”",
   "trash.search": "Buscar",
   "trash.deleted": "excluído {when}, {device}",
@@ -5517,6 +6294,13 @@ const pt: Dictionary = {
   "settings.reportHelp":
     "Contém versões, estados e códigos de erro. Nenhum nome de arquivo, nenhum conteúdo, nenhuma chave.",
   "settings.reportPreview": "O que o relatório de erro contém",
+  "reset.action": "Redefinir este dispositivo",
+  "reset.help":
+    "Para recomeçar: o {app} esquece sua conta neste dispositivo. Seus arquivos ficam aqui.",
+  "reset.question": "Redefinir mesmo este dispositivo?",
+  "reset.body":
+    "O {app} para de sincronizar aqui e esquece a conta. Depois você pode criar uma conta nova ou adicionar este dispositivo de novo.",
+  "reset.confirm": "Redefinir",
   "settings.localNote":
     "Seus arquivos ficam sem criptografia neste computador. Ative a criptografia de disco do seu sistema.",
   "settings.serverNote":
@@ -5545,6 +6329,9 @@ const pt: Dictionary = {
     "Não é possível acessar este servidor com segurança. O {app} só se conecta por https.",
   "error.pair.notALink":
     "Isso não é um link de pareamento. Copie-o no outro dispositivo em Dispositivos, depois Adicionar dispositivo.",
+  "error.link.damaged": "O link está incompleto. Copie-o de novo por inteiro.",
+  "error.recover.notALink":
+    "Esse não é o link da sua folha. Ele começa com hangar-drive://recover#.",
   "error.pair.expired": "Este código expirou ou já foi usado. Crie um novo no outro dispositivo.",
   "error.pair.typo": "Há um erro de digitação no código. Compare caractere por caractere.",
   "error.pair.declined": "O outro dispositivo recusou. Comece de novo se foi um engano.",
@@ -5561,6 +6348,8 @@ const pt: Dictionary = {
   "error.recovery.otherApp": "Esse é um código do Hangar. Aqui é preciso o código do {app}.",
   "error.recovery.savedInSync":
     "Não salve o código em uma pasta sincronizada, senão ele fica junto dos arquivos que ele abre. Escolha outro lugar.",
+  "error.recovery.savedInCloud":
+    "Esta pasta é sincronizada com uma nuvem. É melhor salvar a folha num lugar que fica só neste dispositivo, por exemplo em “Downloads” ou num pen drive.",
   "error.folder.network": "Unidades de rede não funcionam. Escolha uma pasta neste computador.",
   "error.folder.root": "Uma unidade inteira não funciona. Escolha uma pasta dentro dela.",
   "error.folder.system": "Esta pasta é do sistema. Escolha uma pasta sua.",
@@ -5601,16 +6390,30 @@ const ru: Dictionary = {
   "setup.connect.scan": "Сканировать камерой",
   "setup.connect.checking": "Проверяю приглашение …",
   "setup.connect.ok": "Подключено к {host}",
+  "setup.connect.pinnedTitle": "Сервер с собственным сертификатом",
+  "setup.connect.pinned":
+    "У этого сервера нет публичного сертификата. {app} доверяет ему, потому что так указано в ссылке. Принимай ссылку, только если она пришла напрямую от администратора твоего сервера.",
+  "link.isInvite": "Это ссылка-приглашение. С ней создаётся новая учётная запись.",
+  "link.isPair": "Это ссылка для привязки с одного из твоих устройств.",
+  "link.isRecover": "Это ссылка с твоего листа восстановления.",
+  "link.toInvite": "Создать новую учётную запись",
+  "link.toPair": "Лучше привязать",
+  "link.toRecover": "Настроить по листу",
+  "link.needPair": "Здесь нужна ссылка для привязки.",
+  "link.notNeeded.title": "Это устройство уже настроено",
+  "link.notNeeded.body":
+    "Здесь эта ссылка не нужна. Открой её на устройстве, которое хочешь настроить.",
   "setup.deviceName.label": "Название этого устройства",
   "setup.deviceName.help": "По нему ты узнаешь устройство в своём списке устройств.",
   "name.blank": "Имя пустое. Введи имя с видимыми символами.",
   "name.edgeWhitespace": "Имя не может начинаться или заканчиваться пробелом.",
-  "setup.pasteEmpty": "Сейчас в буфере обмена нет текста.",
+  "setup.pasteNoLink": "В буфере обмена нет ссылки {app}.",
   "recovery.title": "Твой код восстановления",
   "recovery.body":
     "Если ты потеряешь все свои устройства, этот код вернёт тебе файлы. Другого способа нет, даже через администратора.",
   "recovery.print": "Распечатать",
   "recovery.save": "Сохранить как файл",
+  "recovery.saveElsewhere": "Выбрать другое место",
   "recovery.copy": "Копировать",
   "recovery.copied": "Скопировано. Через 1 минуту код будет удалён из буфера обмена.",
   "recovery.saved": "Сохранено: {path}",
@@ -5624,6 +6427,23 @@ const ru: Dictionary = {
   "recovery.check.showAgain": "Показать код ещё раз",
   "recovery.groupLabel": "Группа {index}: {chars}",
   "recovery.codeLabel": "Код восстановления, 8 групп",
+  "sheet.more": "Что ещё есть на листе",
+  "sheet.title": "{app}: лист восстановления",
+  "sheet.serverId": "Идентификатор сервера",
+  "sheet.accountId": "Идентификатор учётной записи",
+  "sheet.anchor": "Контрольное значение учётной записи",
+  "sheet.pin": "Контрольное значение сервера",
+  "sheet.link": "Ссылка для вставки",
+  "sheet.date": "Создан",
+  "sheet.device": "Устройство",
+  "sheet.note.what": "С этим кодом ты вернёшь свои файлы, если потеряешь все устройства.",
+  "sheet.note.access":
+    "У кого есть этот код, тот вместе с твоим сервером может читать все твои файлы. Храни этот лист как ключ от дома.",
+  "sheet.note.gone":
+    "Без этого кода и без любого из твоих устройств файлы больше не открыть, даже через администратора.",
+  "sheet.note.how":
+    "Как это сделать: установи {app}, выбери «{door}», вставь ссылку или отсканируй QR-код и введи код.",
+  "sheet.fileName": "{app} лист восстановления.txt",
   "folder.setup.title": "Где будут храниться твои файлы?",
   "folder.setup.body":
     "Всё, что ты положишь в эту папку, появится и на других твоих устройствах. Позже можно добавить ещё папки.",
@@ -5685,27 +6505,45 @@ const ru: Dictionary = {
   "pair.add.expired": "Срок действия этого кода истёк.",
   "pair.add.renew": "Создать новый код",
   "pair.confirm.title": "«{device}» хочет присоединиться.",
-  "pair.confirm.add": "Добавить",
+  "pair.confirm.add": "Добавить …",
   "pair.confirm.decline": "Отклонить",
   "pair.confirm.body": "Новое устройство сейчас показывает ряд чисел. Он совпадает с этим?",
   "pair.confirm.yes": "Да, числа те же, добавить",
   "pair.confirm.no": "Нет, отменить",
+  "pair.request.body":
+    "Затем система спросит ещё раз и покажет этот ряд чисел. Соглашайся, только если новое устройство показывает тот же ряд.",
   "pair.mismatch":
     "Тогда не добавляй устройство. Начни заново на новом устройстве. Если это повторится, поговори с человеком, который обслуживает твой сервер.",
   "pair.added": "Устройство «{device}» добавлено.",
   "pair.joined": "Привязано. Минутку.",
+  "pair.check.title": "Подключиться к этому серверу?",
+  "pair.check.body":
+    "Сравни сервер и учётную запись со своим другим устройством. Там они показаны в разделе Устройства, затем Добавить устройство.",
+  "pair.check.server": "Сервер",
+  "pair.check.account": "Учётная запись",
+  "pair.check.connect": "Подключить",
+  "pair.check.pinned":
+    "У этого сервера нет публичного сертификата. {app} доверяет ему, потому что так указано в ссылке.",
+  "pair.add.target": "Сервер {host}, учётная запись {account}",
+  "pair.devices.title": "Это твои устройства?",
+  "pair.devices.body":
+    "Это устройство теперь подключено к учётной записи. Если ты не узнаёшь эти устройства, отмени: тогда оно будет отключено до того, как начнут передаваться файлы.",
+  "pair.devices.yes": "Да, это мои",
+  "pair.devices.aborted": "Отменено. Это устройство снова отключено, файлы не передавались.",
   "safety.label": "Номер безопасности",
   "safety.group": "Группа {index}: {digits}",
 
   "recover.title": "Настройка с листом восстановления",
-  "recover.body": "Введи адрес сервера и код со своего листа.",
+  "recover.body": "Вставь ссылку со своего листа или отсканируй QR-код на нём. Потом введи код.",
   "recover.codeLabel": "Код восстановления",
-  "recover.name.title": "Как назвать это устройство?",
   "recover.cleanup.title": "Удали старые устройства",
   "recover.cleanup.body":
     "Эти устройства всё ещё привязаны к твоей учётной записи. Удали те, которых у тебя больше нет.",
   "recover.cleanup.remove": "Удалить «{device}»",
   "recover.newCode": "Старый код теперь использован. Вот твой новый.",
+  "recover.linkLabel": "Ссылка с листа",
+  "recover.linkOk": "Найдено: {host}",
+  "recover.linkAccount": "Учётная запись {account}",
 
   "tray.state.upToDate": "Всё актуально",
   "tray.state.restUpToDate": "Всё остальное актуально",
@@ -5766,6 +6604,7 @@ const ru: Dictionary = {
   "folder.status.stopped": "Остановлено: {reason}",
   "folder.reason.missing": "папка не найдена",
   "folder.reason.olderState": "на сервере более старое состояние",
+  "folder.reason.removedHeads": "изменения с удалённого устройства",
   "folder.menu.open": "Показать в Проводнике",
   "folder.menu.versions": "Предыдущие версии",
   "folder.menu.trash": "Корзина",
@@ -5795,6 +6634,7 @@ const ru: Dictionary = {
   "folder.delete.confirm": "Удалить везде",
   "folder.deleted.section": "Удалённые папки",
   "folder.deleted.restore": "Вернуть",
+  "folder.deleted.done": "Папка «{folder}» удалена.",
   "folder.deleted.daysLeft.one": "Остался {days} день",
   "folder.deleted.daysLeft.few": "Осталось {days} дня",
   "folder.deleted.daysLeft.many": "Осталось {days} дней",
@@ -5842,6 +6682,7 @@ const ru: Dictionary = {
   "conflict.banner.other": "{count} файла существуют в двух версиях",
   "conflict.view": "Посмотреть",
   "conflict.version": "Версия с устройства {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "Открыть обе",
   "conflict.keepThis": "Оставить эту",
   "conflict.keepBoth": "Оставить обе",
@@ -5915,6 +6756,23 @@ const ru: Dictionary = {
   "deletes.done.few": "{count} файла теперь удалены и на других твоих устройствах.",
   "deletes.done.many": "{count} файлов теперь удалены и на других твоих устройствах.",
   "deletes.done.other": "{count} файла теперь удалены и на других твоих устройствах.",
+  "heads.title": "Изменения с удалённого устройства",
+  "heads.body":
+    "В «{folder}» пришли изменения с устройства «{device}», хотя оно больше не относится к твоей учётной записи.",
+  "heads.bodyMany.one":
+    "В «{folder}» пришли изменения с {count} устройства, которое больше не относится к твоей учётной записи.",
+  "heads.bodyMany.few":
+    "В «{folder}» пришли изменения с {count} устройств, которые больше не относятся к твоей учётной записи.",
+  "heads.bodyMany.many":
+    "В «{folder}» пришли изменения с {count} устройств, которые больше не относятся к твоей учётной записи.",
+  "heads.bodyMany.other":
+    "В «{folder}» пришли изменения с {count} устройства, которые больше не относятся к твоей учётной записи.",
+  "heads.advice": "Безопаснее всего их отменить. Пока ты не решишь, папка ждёт.",
+  "heads.undo": "Посмотреть и отменить",
+  "heads.accept": "Принять",
+  "heads.accepted": "Принято. «{folder}» снова синхронизируется.",
+  "heads.undoLater": "Всё же отменить",
+  "removedHeads.title": "Изменения с удалённого устройства «{device}» в «{folder}»",
   "missing.title": "Папка «{folder}» пропала",
   "missing.body":
     "{app} приостановил эту папку. Ни на сервере, ни на других твоих устройствах ничего не удалено.",
@@ -6014,12 +6872,19 @@ const ru: Dictionary = {
     "Открой эту папку на другом устройстве и сравни числа. Если они совпадают, всё в порядке.",
   "removed.body":
     "Устройство «{device}» удалило это устройство. Твои файлы остаются здесь, но больше не синхронизируются.",
+  "removed.bodyUnknown":
+    "Это устройство удалено из твоей учётной записи. Твои файлы остаются здесь, но больше не синхронизируются.",
   "removed.repair": "Привязать снова",
   "removed.notMe": "Это не я",
   "removed.notMeBody":
     "Значит, кто-то имеет доступ к одному из твоих устройств. Настрой {app} заново с листом восстановления и удали устройства, которые ты не узнаёшь.",
   "update.body": "Чтобы синхронизация продолжалась, {app} нужно обновить.",
   "update.now": "Обновить сейчас",
+  "update.bodyManual":
+    "Чтобы синхронизация продолжалась, {app} нужно обновить. Установи новую версию, и всё продолжится само.",
+  "update.upToDate": "Новой версии пока нет. Попробуй позже.",
+  "update.installed":
+    "Версия {version} установлена. Перезапусти {app}, если он не перезапустится сам.",
   "refused.body": "Твой сервер больше не пускает это устройство.",
 
   "restore.title": "Предыдущие версии «{folder}»",
@@ -6102,6 +6967,7 @@ const ru: Dictionary = {
   "restore.otherVersion": "Выбрать другую версию",
   "restore.beforeDevice": "Состояние до изменений с устройства …",
   "restore.beforeDeviceEntry": "До изменений с устройства «{device}»",
+  "restore.beforeDevice.finding": "Идёт поиск …",
   "trash.title": "Корзина «{folder}»",
   "trash.search": "Поиск",
   "trash.deleted": "удалено {when}, {device}",
@@ -6194,6 +7060,13 @@ const ru: Dictionary = {
   "settings.reportHelp":
     "Содержит версии, состояния и коды ошибок. Никаких имён файлов, никакого содержимого, никаких ключей.",
   "settings.reportPreview": "Что содержит отчёт об ошибке",
+  "reset.action": "Сбросить это устройство",
+  "reset.help":
+    "Чтобы начать заново: {app} забудет твою учётную запись на этом устройстве. Твои файлы останутся здесь.",
+  "reset.question": "Точно сбросить это устройство?",
+  "reset.body":
+    "{app} перестанет синхронизировать здесь и забудет учётную запись. Потом можно создать новую учётную запись или снова добавить это устройство.",
+  "reset.confirm": "Сбросить",
   "settings.localNote":
     "На этом компьютере твои файлы хранятся в незашифрованном виде. Включи шифрование диска в своей системе.",
   "settings.serverNote":
@@ -6222,6 +7095,9 @@ const ru: Dictionary = {
     "К этому серверу нельзя подключиться безопасно. {app} подключается только по https.",
   "error.pair.notALink":
     "Это не ссылка для привязки. Скопируй её на другом устройстве в разделе Устройства, затем Добавить устройство.",
+  "error.link.damaged": "Ссылка неполная. Скопируй её ещё раз целиком.",
+  "error.recover.notALink":
+    "Это не ссылка с твоего листа. Она начинается с hangar-drive://recover#.",
   "error.pair.expired":
     "Срок действия кода истёк, или он уже использован. Создай новый на другом устройстве.",
   "error.pair.typo": "В коде опечатка. Сравни его символ за символом.",
@@ -6238,6 +7114,8 @@ const ru: Dictionary = {
   "error.recovery.otherApp": "Это код для Hangar. Здесь нужен код для {app}.",
   "error.recovery.savedInSync":
     "Не сохраняй код в синхронизируемой папке, иначе он будет лежать рядом с файлами, которые открывает. Выбери другое место.",
+  "error.recovery.savedInCloud":
+    "Эта папка синхронизируется с облаком. Лучше сохрани лист там, где он останется только на этом устройстве, например в «Загрузках» или на флешке.",
   "error.folder.network": "Сетевые диски не подходят. Выбери папку на этом компьютере.",
   "error.folder.root": "Целый диск не подходит. Выбери папку на нём.",
   "error.folder.system": "Эта папка принадлежит системе. Выбери свою собственную папку.",
@@ -6276,16 +7154,29 @@ const tr: Dictionary = {
   "setup.connect.scan": "Kamerayla tara",
   "setup.connect.checking": "Davet kontrol ediliyor …",
   "setup.connect.ok": "Bağlandı: {host}",
+  "setup.connect.pinnedTitle": "Kendi sertifikası olan bir sunucu",
+  "setup.connect.pinned":
+    "Bu sunucunun herkese açık bir sertifikası yok. {app} ona bağlantı öyle belirttiği için güveniyor. Bağlantıyı yalnızca doğrudan sunucunun yöneticisinden geldiyse kabul et.",
+  "link.isInvite": "Bu bir davet bağlantısı. Onunla yeni bir hesap kurarsın.",
+  "link.isPair": "Bu, cihazlarından birinden gelen bir eşleştirme bağlantısı.",
+  "link.isRecover": "Bu, kurtarma kâğıdındaki bağlantı.",
+  "link.toInvite": "Yeni hesap kur",
+  "link.toPair": "Bunun yerine eşleştir",
+  "link.toRecover": "Kâğıtla kur",
+  "link.needPair": "Buraya bir eşleştirme bağlantısı gerekiyor.",
+  "link.notNeeded.title": "Bu cihaz zaten kurulu",
+  "link.notNeeded.body": "Bu bağlantıya burada ihtiyacın yok. Onu kurmak istediğin cihazda aç.",
   "setup.deviceName.label": "Bu cihazın adı",
   "setup.deviceName.help": "Cihaz listende onu bu adla tanıyacaksın.",
   "name.blank": "Ad boş. Görünür karakterlerden oluşan bir ad yaz.",
   "name.edgeWhitespace": "Ad boşlukla başlayamaz veya bitemez.",
-  "setup.pasteEmpty": "Panoda şu an metin yok.",
+  "setup.pasteNoLink": "Panoda {app} bağlantısı yok.",
   "recovery.title": "Kurtarma kodun",
   "recovery.body":
     "Tüm cihazlarını kaybedersen dosyalarını bu kod geri getirir. Başka bir yolu yok, yönetici aracılığıyla bile.",
   "recovery.print": "Yazdır",
   "recovery.save": "Dosya olarak kaydet",
+  "recovery.saveElsewhere": "Başka bir yer seç",
   "recovery.copy": "Kopyala",
   "recovery.copied": "Kopyalandı. 1 dakika sonra panodan silinecek.",
   "recovery.saved": "Kaydedildi: {path}",
@@ -6299,6 +7190,23 @@ const tr: Dictionary = {
   "recovery.check.showAgain": "Kodu tekrar göster",
   "recovery.groupLabel": "Grup {index}: {chars}",
   "recovery.codeLabel": "Kurtarma kodu, 8 grup",
+  "sheet.more": "Kâğıtta başka neler var",
+  "sheet.title": "{app}: kurtarma kâğıdı",
+  "sheet.serverId": "Sunucu kimliği",
+  "sheet.accountId": "Hesap kimliği",
+  "sheet.anchor": "Hesap kontrol değeri",
+  "sheet.pin": "Sunucu kontrol değeri",
+  "sheet.link": "Yapıştırılacak bağlantı",
+  "sheet.date": "Oluşturulma tarihi",
+  "sheet.device": "Cihaz",
+  "sheet.note.what": "Tüm cihazlarını kaybedersen bu kodla dosyalarını geri alırsın.",
+  "sheet.note.access":
+    "Kodu olan kişi, sunucunla birlikte tüm dosyalarını okuyabilir. Bu kâğıdı ev anahtarın gibi sakla.",
+  "sheet.note.gone":
+    "Bu kod ve cihazlarından hiçbiri olmadan dosyaların artık açılamaz, yönetici aracılığıyla bile.",
+  "sheet.note.how":
+    "Nasıl yapılır: {app} uygulamasını kur, “{door}” seçeneğini seç, bağlantıyı yapıştır ya da QR kodunu tara ve kodu yaz.",
+  "sheet.fileName": "{app} kurtarma kâğıdı.txt",
   "folder.setup.title": "Dosyaların nerede dursun?",
   "folder.setup.body":
     "Bu klasöre koyduğun her şey diğer cihazlarında da olur. Daha sonra başka klasörler de ekleyebilirsin.",
@@ -6352,26 +7260,46 @@ const tr: Dictionary = {
   "pair.add.expired": "Bu kodun süresi doldu.",
   "pair.add.renew": "Yeni kod oluştur",
   "pair.confirm.title": "“{device}” katılmak istiyor.",
-  "pair.confirm.add": "Ekle",
+  "pair.confirm.add": "Ekle …",
   "pair.confirm.decline": "Reddet",
   "pair.confirm.body": "Yeni cihaz şimdi bir sayı dizisi gösteriyor. Buradakiyle aynı mı?",
   "pair.confirm.yes": "Evet, sayılar aynı, ekle",
   "pair.confirm.no": "Hayır, iptal et",
+  "pair.request.body":
+    "Ardından sistemin bir kez daha sorar ve bu sayı dizisini gösterir. Yalnızca yeni cihaz aynısını gösteriyorsa evet de.",
   "pair.mismatch":
     "O zaman cihazı ekleme. Yeni cihazda baştan başla. Yine olursa sunucunu yöneten kişiyle konuş.",
   "pair.added": "“{device}” eklendi.",
   "pair.joined": "Eşleştirildi. Bir saniye.",
+  "pair.check.title": "Bu sunucuya bağlanılsın mı?",
+  "pair.check.body":
+    "Sunucuyu ve hesabı diğer cihazınla karşılaştır. Orada Cihazlar, sonra Cihaz ekle altında görünürler.",
+  "pair.check.server": "Sunucu",
+  "pair.check.account": "Hesap",
+  "pair.check.connect": "Bağlan",
+  "pair.check.pinned":
+    "Bu sunucunun herkese açık bir sertifikası yok. {app} ona bağlantı öyle belirttiği için güveniyor.",
+  "pair.add.target": "Sunucu {host}, hesap {account}",
+  "pair.devices.title": "Bunlar senin cihazların mı?",
+  "pair.devices.body":
+    "Bu cihaz artık hesaba bağlı. Bu cihazları tanımıyorsan iptal et: o zaman hiçbir dosya aktarılmadan bağlantısı kesilir.",
+  "pair.devices.yes": "Evet, bunlar benim",
+  "pair.devices.aborted":
+    "İptal edildi. Bu cihazın bağlantısı yeniden kesildi ve hiçbir dosya aktarılmadı.",
   "safety.label": "Güvenlik numarası",
   "safety.group": "Grup {index}: {digits}",
 
   "recover.title": "Kurtarma kâğıdınla kur",
-  "recover.body": "Sunucu adresini ve kâğıdındaki kodu gir.",
+  "recover.body":
+    "Kâğıdındaki bağlantıyı yapıştır ya da üzerindeki QR kodunu tara. Sonra kodu yaz.",
   "recover.codeLabel": "Kurtarma kodu",
-  "recover.name.title": "Bu cihazın adı ne olsun?",
   "recover.cleanup.title": "Eski cihazları kaldır",
   "recover.cleanup.body": "Bu cihazlar hâlâ hesabına bağlı. Artık sende olmayanları kaldır.",
   "recover.cleanup.remove": "“{device}” cihazını kaldır",
   "recover.newCode": "Eski kod artık kullanıldı. İşte yeni kodun.",
+  "recover.linkLabel": "Kâğıttaki bağlantı",
+  "recover.linkOk": "Bulundu: {host}",
+  "recover.linkAccount": "Hesap {account}",
 
   "tray.state.upToDate": "Güncel",
   "tray.state.restUpToDate": "Geri kalan her şey güncel",
@@ -6424,6 +7352,7 @@ const tr: Dictionary = {
   "folder.status.stopped": "Durdu: {reason}",
   "folder.reason.missing": "klasör bulunamadı",
   "folder.reason.olderState": "sunucuda daha eski durum",
+  "folder.reason.removedHeads": "kaldırılan bir cihazdan gelen değişiklikler",
   "folder.menu.open": "Dosya Gezgini’nde göster",
   "folder.menu.versions": "Önceki sürümler",
   "folder.menu.trash": "Çöp kutusu",
@@ -6449,6 +7378,7 @@ const tr: Dictionary = {
   "folder.delete.confirm": "Her yerde sil",
   "folder.deleted.section": "Silinen klasörler",
   "folder.deleted.restore": "Geri getir",
+  "folder.deleted.done": "“{folder}” silindi.",
   "folder.deleted.daysLeft.one": "{days} gün kaldı",
   "folder.deleted.daysLeft.other": "{days} gün kaldı",
   "activity.changed": "değişti",
@@ -6483,6 +7413,7 @@ const tr: Dictionary = {
   "conflict.banner.other": "{count} dosyanın iki sürümü var",
   "conflict.view": "Görüntüle",
   "conflict.version": "Sürüm: {device}, {time}",
+  "conflict.versionSize": "{version}, {size}",
   "conflict.openBoth": "İkisini de aç",
   "conflict.keepThis": "Bunu sakla",
   "conflict.keepBoth": "İkisini de sakla",
@@ -6534,6 +7465,19 @@ const tr: Dictionary = {
   "deletes.restored.other": "{count} dosya geri geldi.",
   "deletes.done.one": "{count} dosya artık diğer cihazlarında da silindi.",
   "deletes.done.other": "{count} dosya artık diğer cihazlarında da silindi.",
+  "heads.title": "Kaldırılan bir cihazdan değişiklikler",
+  "heads.body":
+    "“{device}” artık hesabına ait olmadığı hâlde “{folder}” klasörüne ondan değişiklikler geldi.",
+  "heads.bodyMany.one":
+    "Artık hesabına ait olmayan {count} cihazdan “{folder}” klasörüne değişiklikler geldi.",
+  "heads.bodyMany.other":
+    "Artık hesabına ait olmayan {count} cihazdan “{folder}” klasörüne değişiklikler geldi.",
+  "heads.advice": "En güvenlisi onları geri almak. Sen karar verene kadar klasör bekler.",
+  "heads.undo": "İncele ve geri al",
+  "heads.accept": "Kabul et",
+  "heads.accepted": "Kabul edildi. “{folder}” yeniden eşitleniyor.",
+  "heads.undoLater": "Yine de geri al",
+  "removedHeads.title": "Kaldırılan “{device}” cihazından “{folder}” klasöründe değişiklikler",
   "missing.title": "“{folder}” bulunamıyor",
   "missing.body":
     "{app} klasörü duraklattı. Sunucuda veya diğer cihazlarında hiçbir şey silinmedi.",
@@ -6621,12 +7565,19 @@ const tr: Dictionary = {
     "Bu klasörü başka bir cihazda aç ve sayıları karşılaştır. Aynıysa her şey yolunda.",
   "removed.body":
     "Bu cihaz “{device}” tarafından kaldırıldı. Dosyaların burada kalır ama artık eşitlenmez.",
+  "removed.bodyUnknown":
+    "Bu cihaz hesabından kaldırıldı. Dosyaların burada kalır ama artık eşitlenmez.",
   "removed.repair": "Yeniden eşleştir",
   "removed.notMe": "Bu ben değildim",
   "removed.notMeBody":
     "O zaman biri cihazlarından birine erişebiliyor. {app} uygulamasını kurtarma kâğıdınla yeniden kur ve tanımadığın cihazları kaldır.",
   "update.body": "{app} eşitlemeye devam etmek için güncellenmeli.",
   "update.now": "Şimdi güncelle",
+  "update.bodyManual":
+    "{app} eşitlemeye devam etmek için güncellenmeli. Yeni sürümü kur, gerisi kendiliğinden devam eder.",
+  "update.upToDate": "Henüz daha yeni bir sürüm yok. Daha sonra yeniden dene.",
+  "update.installed":
+    "{version} sürümü kuruldu. {app} kendiliğinden yeniden başlamazsa yeniden başlat.",
   "refused.body": "Sunucun bu cihazı artık içeri almıyor.",
 
   "restore.title": "“{folder}” için önceki sürümler",
@@ -6694,6 +7645,7 @@ const tr: Dictionary = {
   "restore.otherVersion": "Başka bir sürüm seç",
   "restore.beforeDevice": "Şu cihazın değişikliklerinden önceki durum …",
   "restore.beforeDeviceEntry": "“{device}” değişikliklerinden önce",
+  "restore.beforeDevice.finding": "Aranıyor …",
   "trash.title": "“{folder}” çöp kutusu",
   "trash.search": "Ara",
   "trash.deleted": "silindi: {when}, {device}",
@@ -6770,6 +7722,13 @@ const tr: Dictionary = {
   "settings.reportHelp":
     "Sürümleri, durumları ve hata kodlarını içerir. Dosya adı yok, içerik yok, anahtar yok.",
   "settings.reportPreview": "Hata raporunda neler var",
+  "reset.action": "Bu cihazı sıfırla",
+  "reset.help":
+    "Baştan başlamak için: {app} bu cihazdaki hesabını unutur. Dosyaların burada kalır.",
+  "reset.question": "Bu cihaz gerçekten sıfırlansın mı?",
+  "reset.body":
+    "{app} burada eşitlemeyi bırakır ve hesabı unutur. Sonra yeni bir hesap kurabilir ya da bu cihazı yeniden ekleyebilirsin.",
+  "reset.confirm": "Sıfırla",
   "settings.localNote":
     "Dosyaların bu bilgisayarda şifrelenmeden saklanır. Sisteminin sürücü şifrelemesini aç.",
   "settings.serverNote": "Sunucuda dosyaların şifreli. Yönetici ne adları ne de içerikleri görür.",
@@ -6797,6 +7756,9 @@ const tr: Dictionary = {
     "Bu sunucuya güvenli şekilde ulaşılamıyor. {app} yalnızca https üzerinden bağlanır.",
   "error.pair.notALink":
     "Bu bir eşleştirme bağlantısı değil. Onu diğer cihazda Cihazlar, sonra Cihaz ekle altında kopyala.",
+  "error.link.damaged": "Bağlantı eksik. Onu bir kez daha tamamen kopyala.",
+  "error.recover.notALink":
+    "Bu, kâğıdındaki bağlantı değil. O bağlantı hangar-drive://recover# ile başlar.",
   "error.pair.expired":
     "Bu kodun süresi doldu veya zaten kullanıldı. Diğer cihazda yeni bir kod oluştur.",
   "error.pair.typo": "Kodda bir yazım hatası var. Karakter karakter karşılaştır.",
@@ -6813,6 +7775,8 @@ const tr: Dictionary = {
   "error.recovery.otherApp": "Bu, Hangar için bir kod. Burada {app} kodu gerekiyor.",
   "error.recovery.savedInSync":
     "Kodu eşitlenen bir klasöre kaydetme, yoksa açtığı dosyaların hemen yanında durur. Başka bir yer seç.",
+  "error.recovery.savedInCloud":
+    "Bu klasör bir bulutla eşitleniyor. Sayfayı yalnızca bu cihazda kalan bir yere kaydetmen daha iyi, örneğin “İndirilenler” klasörüne ya da bir USB belleğe.",
   "error.folder.network": "Ağ sürücüleri çalışmaz. Bu bilgisayarda bir klasör seç.",
   "error.folder.root": "Bütün bir sürücü olmaz. İçinde bir klasör seç.",
   "error.folder.system": "Bu klasör sisteme ait. Kendine ait bir klasör seç.",
@@ -6849,16 +7813,29 @@ const zh: Dictionary = {
   "setup.connect.scan": "用相机扫描",
   "setup.connect.checking": "正在检查邀请…",
   "setup.connect.ok": "已连接到 {host}",
+  "setup.connect.pinnedTitle": "使用自有证书的服务器",
+  "setup.connect.pinned":
+    "此服务器没有公开证书。{app} 信任它，是因为链接中这样指定。只有当链接直接来自服务器管理员时才接受它。",
+  "link.isInvite": "这是邀请链接，用于创建新账户。",
+  "link.isPair": "这是来自其他设备的配对链接。",
+  "link.isRecover": "这是恢复单上的链接。",
+  "link.toInvite": "创建新账户",
+  "link.toPair": "改为配对",
+  "link.toRecover": "用恢复单设置",
+  "link.needPair": "此处需要配对链接。",
+  "link.notNeeded.title": "此设备已设置完成",
+  "link.notNeeded.body": "此处不需要这个链接。请在要设置的设备上打开它。",
   "setup.deviceName.label": "此设备的名称",
   "setup.deviceName.help": "在设备列表中会以此名称显示。",
   "name.blank": "名称为空。请输入包含可见字符的名称。",
   "name.edgeWhitespace": "名称不能以空格开头或结尾。",
-  "setup.pasteEmpty": "剪贴板中目前没有文本。",
+  "setup.pasteNoLink": "剪贴板中没有 {app} 链接。",
   "recovery.title": "恢复码",
   "recovery.body":
     "如果所有设备都丢失了，可以用这个恢复码找回文件。没有其他办法，管理员也无法帮忙。",
   "recovery.print": "打印",
   "recovery.save": "保存为文件",
+  "recovery.saveElsewhere": "选择其他位置",
   "recovery.copy": "复制",
   "recovery.copied": "已复制。1 分钟后将从剪贴板中清除。",
   "recovery.saved": "已保存：{path}",
@@ -6872,6 +7849,21 @@ const zh: Dictionary = {
   "recovery.check.showAgain": "再次显示恢复码",
   "recovery.groupLabel": "第 {index} 组：{chars}",
   "recovery.codeLabel": "恢复码，共 8 组",
+  "sheet.more": "恢复单上的其他内容",
+  "sheet.title": "{app}：恢复单",
+  "sheet.serverId": "服务器 ID",
+  "sheet.accountId": "账户 ID",
+  "sheet.anchor": "账户校验值",
+  "sheet.pin": "服务器校验值",
+  "sheet.link": "用于粘贴的链接",
+  "sheet.date": "创建日期",
+  "sheet.device": "设备",
+  "sheet.note.what": "如果所有设备都丢失了，可以用这个恢复码找回文件。",
+  "sheet.note.access":
+    "持有恢复码的人结合服务器即可读取所有文件。请像保管家门钥匙一样保管这张恢复单。",
+  "sheet.note.gone": "没有这个恢复码，也没有任何设备时，文件将无法再打开，管理员也无能为力。",
+  "sheet.note.how": "操作方法：安装 {app}，选择“{door}”，粘贴链接或扫描二维码，然后输入恢复码。",
+  "sheet.fileName": "{app} 恢复单.txt",
   "folder.setup.title": "文件放在哪里？",
   "folder.setup.body": "放入此文件夹的所有内容也会出现在其他设备上。以后可以添加更多文件夹。",
   "folder.setup.change": "更改",
@@ -6918,26 +7910,42 @@ const zh: Dictionary = {
   "pair.add.expired": "此配对码已过期。",
   "pair.add.renew": "生成新的配对码",
   "pair.confirm.title": "“{device}”请求加入。",
-  "pair.confirm.add": "添加",
+  "pair.confirm.add": "添加…",
   "pair.confirm.decline": "拒绝",
   "pair.confirm.body": "新设备上现在显示一行数字。是否与这里的一致？",
   "pair.confirm.yes": "是，数字相同，添加",
   "pair.confirm.no": "否，取消",
+  "pair.request.body":
+    "接下来系统会再询问一次，并显示这串数字。只有新设备显示的数字相同时，才选择“是”。",
   "pair.mismatch":
     "那就不要添加这台设备。请在新设备上重新开始。如果再次出现这种情况，请联系服务器管理员。",
   "pair.added": "已添加“{device}”。",
   "pair.joined": "已配对，请稍候。",
+  "pair.check.title": "连接到此服务器吗？",
+  "pair.check.body": "请将服务器和账户与其他设备上的信息对照。它们显示在“设备”，“添加设备”中。",
+  "pair.check.server": "服务器",
+  "pair.check.account": "账户",
+  "pair.check.connect": "连接",
+  "pair.check.pinned": "此服务器没有公开证书。{app} 信任它，是因为链接中这样指定。",
+  "pair.add.target": "服务器 {host}，账户 {account}",
+  "pair.devices.title": "认识这些设备吗？",
+  "pair.devices.body":
+    "此设备现已连接到该账户。如果不认识这些设备，请取消：在传输任何文件之前，此设备会再次断开。",
+  "pair.devices.yes": "是的，都是我的",
+  "pair.devices.aborted": "已取消。此设备已再次断开，没有传输任何文件。",
   "safety.label": "安全码",
   "safety.group": "第 {index} 组：{digits}",
 
   "recover.title": "使用恢复单进行设置",
-  "recover.body": "输入恢复单上的服务器地址和恢复码。",
+  "recover.body": "粘贴恢复单上的链接，或扫描上面的二维码。然后输入恢复码。",
   "recover.codeLabel": "恢复码",
-  "recover.name.title": "此设备叫什么名字？",
   "recover.cleanup.title": "移除旧设备",
   "recover.cleanup.body": "这些设备仍属于此账户。请移除已经不再使用的设备。",
   "recover.cleanup.remove": "移除“{device}”",
   "recover.newCode": "旧恢复码现已失效。这是新的恢复码。",
+  "recover.linkLabel": "恢复单上的链接",
+  "recover.linkOk": "已找到：{host}",
+  "recover.linkAccount": "账户 {account}",
 
   "tray.state.upToDate": "已是最新",
   "tray.state.restUpToDate": "其余内容均已是最新",
@@ -6986,6 +7994,7 @@ const zh: Dictionary = {
   "folder.status.stopped": "已停止：{reason}",
   "folder.reason.missing": "找不到文件夹",
   "folder.reason.olderState": "服务器上的状态较旧",
+  "folder.reason.removedHeads": "来自已移除设备的更改",
   "folder.menu.open": "在资源管理器中显示",
   "folder.menu.versions": "早期版本",
   "folder.menu.trash": "回收站",
@@ -7006,6 +8015,7 @@ const zh: Dictionary = {
   "folder.delete.confirm": "全部删除",
   "folder.deleted.section": "已删除的文件夹",
   "folder.deleted.restore": "找回",
+  "folder.deleted.done": "已删除“{folder}”。",
   "folder.deleted.daysLeft.other": "还剩 {days} 天",
   "activity.changed": "已更改",
   "activity.added": "新增",
@@ -7034,6 +8044,7 @@ const zh: Dictionary = {
   "conflict.banner.other": "{count} 个文件有两个版本",
   "conflict.view": "查看",
   "conflict.version": "来自 {device} 的版本，{time}",
+  "conflict.versionSize": "{version}，{size}",
   "conflict.openBoth": "同时打开",
   "conflict.keepThis": "保留此版本",
   "conflict.keepBoth": "两个都保留",
@@ -7070,6 +8081,15 @@ const zh: Dictionary = {
   "deletes.decide": "决定",
   "deletes.restored.other": "{count} 个文件已恢复。",
   "deletes.done.other": "{count} 个文件现在也已从其他设备上删除。",
+  "heads.title": "来自已移除设备的更改",
+  "heads.body": "“{device}”已不属于该账户，但它的更改仍到达了“{folder}”。",
+  "heads.bodyMany.other": "{count} 台已不属于该账户的设备的更改到达了“{folder}”。",
+  "heads.advice": "最安全的做法是撤销这些更改。在做出决定之前，文件夹会一直等待。",
+  "heads.undo": "查看并撤销",
+  "heads.accept": "接受",
+  "heads.accepted": "已接受。“{folder}”恢复同步。",
+  "heads.undoLater": "仍然撤销",
+  "removedHeads.title": "已移除设备“{device}”对“{folder}”的更改",
   "missing.title": "“{folder}”不见了",
   "missing.body": "{app} 已暂停此文件夹。服务器和其他设备上没有删除任何内容。",
   "missing.find": "查找文件夹",
@@ -7143,12 +8163,16 @@ const zh: Dictionary = {
   "freeze.compare": "核对文件夹编号",
   "freeze.compareBody": "在另一台设备上打开此文件夹并核对数字。如果相同，就一切正常。",
   "removed.body": "此设备已被“{device}”移除。文件仍保留在这里，但不再同步。",
+  "removed.bodyUnknown": "此设备已从账户中移除。文件仍保留在这里，但不再同步。",
   "removed.repair": "重新配对",
   "removed.notMe": "不是我操作的",
   "removed.notMeBody":
     "这说明有人能访问其中某台设备。请用恢复单重新设置 {app}，并移除不认识的设备。",
   "update.body": "{app} 需要更新才能继续同步。",
   "update.now": "立即更新",
+  "update.bodyManual": "{app} 需要更新才能继续同步。安装新版本后会自动继续。",
+  "update.upToDate": "暂时还没有更新的版本。请稍后再试。",
+  "update.installed": "已安装版本 {version}。如果 {app} 没有自动重启，请手动重启。",
   "refused.body": "服务器已不再允许此设备连接。",
 
   "restore.title": "“{folder}”的早期版本",
@@ -7207,6 +8231,7 @@ const zh: Dictionary = {
   "restore.otherVersion": "选择其他版本",
   "restore.beforeDevice": "以下设备更改之前的状态…",
   "restore.beforeDeviceEntry": "“{device}”更改之前",
+  "restore.beforeDevice.finding": "正在查找…",
   "trash.title": "“{folder}”的回收站",
   "trash.search": "搜索",
   "trash.deleted": "{when} 删除，{device}",
@@ -7270,6 +8295,11 @@ const zh: Dictionary = {
   "settings.saveReport": "保存错误报告",
   "settings.reportHelp": "包含版本、状态和错误代码。不含文件名、内容或密钥。",
   "settings.reportPreview": "错误报告包含哪些内容",
+  "reset.action": "重置此设备",
+  "reset.help": "如需重新开始：{app} 会在此设备上忘记你的账户。文件仍保留在这里。",
+  "reset.question": "确定要重置此设备吗？",
+  "reset.body": "{app} 会停止在这里同步并忘记该账户。之后可以设置新账户，或再次添加此设备。",
+  "reset.confirm": "重置",
   "settings.localNote": "文件在这台电脑上以未加密的形式存储。请开启系统的磁盘加密。",
   "settings.serverNote": "文件在服务器上是加密的。管理员既看不到文件名，也看不到内容。",
 
@@ -7292,6 +8322,8 @@ const zh: Dictionary = {
   "error.invite.unreachable": "链接中的服务器没有响应。请检查网络连接，或询问管理员。",
   "error.insecure": "无法安全地连接此服务器。{app} 只通过 https 连接。",
   "error.pair.notALink": "这不是配对链接。请在其他设备上的“设备”，“添加设备”中复制。",
+  "error.link.damaged": "链接不完整。请重新完整复制。",
+  "error.recover.notALink": "这不是恢复单上的链接。恢复单上的链接以 hangar-drive://recover# 开头。",
   "error.pair.expired": "此配对码已过期或已被使用。请在其他设备上生成新的配对码。",
   "error.pair.typo": "配对码中有输入错误。请逐个字符核对。",
   "error.pair.declined": "其他设备拒绝了请求。如果是误操作，请重新开始。",
@@ -7304,6 +8336,8 @@ const zh: Dictionary = {
   "error.recovery.otherApp": "这是 Hangar 的恢复码。这里需要 {app} 的恢复码。",
   "error.recovery.savedInSync":
     "不要把恢复码保存在同步的文件夹中，否则它就和它能打开的文件放在了一起。请选择其他位置。",
+  "error.recovery.savedInCloud":
+    "此文件夹会与云端同步。最好把这张表保存到只在这台设备上的位置，例如“下载”文件夹或 U 盘。",
   "error.folder.network": "不支持网络驱动器。请选择这台电脑上的文件夹。",
   "error.folder.root": "不能使用整个驱动器。请选择其中的一个文件夹。",
   "error.folder.system": "此文件夹属于系统。请选择自己的文件夹。",

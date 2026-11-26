@@ -9,8 +9,9 @@
 //!
 //! `<invite>` is `<token>[.<server ID>[.<pin>]]`: the 16 byte token in base64url (22
 //! characters), the server ID in lowercase hex (32), the SHA-256 of the server's
-//! SubjectPublicKeyInfo in base64url (43). `<sheet>` is base64url of
-//! `0x01 || account ID (16) || server ID (16) || server URL (UTF-8)`.
+//! SubjectPublicKeyInfo in base64url (43). `<sheet>` is base64url of the recovery sheet's bytes,
+//! version 2 (`hangar_drive_crypto::recovery::RecoverySheet`: account ID, server ID, the genesis
+//! anchor, the optional SPKI pin and the server URL).
 //!
 //! Every parser is strict: surrounding white space is trimmed and nothing else is forgiven.
 //! No query, no user info, no white space or second `#` inside, canonical base64url and hex
@@ -19,14 +20,15 @@
 //! link is at most [`MAX_LINK_LEN`] characters. Anything else is [`LinkError`], never a
 //! partly read link.
 
-use hangar_drive_protocol::ids::{base64url, from_base64url, AccountId, InviteToken, ServerId};
+pub use hangar_drive_crypto::recovery::RecoverySheet;
+use hangar_drive_crypto::recovery::SheetError;
+use hangar_drive_protocol::ids::{base64url, from_base64url, InviteToken, ServerId};
 use reqwest::Url;
 
 /// The longest link the parsers read.
 pub const MAX_LINK_LEN: usize = 8192;
 /// The deep link scheme.
 pub const SCHEME: &str = "hangar-drive";
-const SHEET_VERSION: u8 = 1;
 
 /// Why a text is not a link of the expected kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -64,17 +66,6 @@ impl PartialEq for InviteLink {
             && self.pin == other.pin
             && self.token.expose_base64url().as_str() == other.token.expose_base64url().as_str()
     }
-}
-
-/// The public part of a recovery sheet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoverySheet {
-    /// The server's base URL.
-    pub server_url: Url,
-    /// The server ID.
-    pub server: ServerId,
-    /// The account ID.
-    pub account: AccountId,
 }
 
 fn clean(text: &str) -> Result<&str, LinkError> {
@@ -222,32 +213,16 @@ pub fn parse_pairing_link(text: &str) -> Result<Vec<u8>, LinkError> {
 
 /// The recovery link of a sheet; the code is never part of it.
 pub fn recovery_link(sheet: &RecoverySheet) -> String {
-    let mut bytes = vec![SHEET_VERSION];
-    bytes.extend_from_slice(sheet.account.as_bytes());
-    bytes.extend_from_slice(sheet.server.as_bytes());
-    bytes.extend_from_slice(sheet.server_url.as_str().as_bytes());
-    format!("{SCHEME}://recover#{}", base64url(&bytes))
+    format!("{SCHEME}://recover#{}", base64url(&sheet.encode()))
 }
 
 /// The sheet of a recovery link.
 pub fn parse_recovery_link(text: &str) -> Result<RecoverySheet, LinkError> {
     let text = clean(text)?;
     let bytes = from_base64url(deep_fragment(text, "recover")?).ok_or(LinkError::Malformed)?;
-    if bytes.len() < 1 + 16 + 16 + 1 || bytes[0] != SHEET_VERSION {
-        return Err(LinkError::Malformed);
-    }
-    let account = AccountId::from_slice(&bytes[1..17]).ok_or(LinkError::Malformed)?;
-    let server = ServerId::from_slice(&bytes[17..33]).ok_or(LinkError::Malformed)?;
-    let url = std::str::from_utf8(&bytes[33..]).map_err(|_| LinkError::Malformed)?;
-    let server_url = server_url(url)?;
-    // One spelling per sheet: the URL as the parser writes it.
-    if server_url.as_str() != url {
-        return Err(LinkError::Malformed);
-    }
-    Ok(RecoverySheet {
-        server_url,
-        server,
-        account,
+    RecoverySheet::decode(&bytes).map_err(|e| match e {
+        SheetError::Insecure => LinkError::Insecure,
+        SheetError::Malformed | SheetError::Version(_) => LinkError::Malformed,
     })
 }
 
@@ -360,34 +335,38 @@ mod tests {
 
     #[test]
     fn recovery_links_carry_the_sheet_without_the_code() {
-        let sheet = RecoverySheet {
-            server_url: Url::parse("https://drive.example.org/").unwrap(),
-            server: server(),
-            account: AccountId::from_bytes([0xac; 16]),
-        };
-        let link = recovery_link(&sheet);
-        assert_eq!(parse_recovery_link(&link).unwrap(), sheet);
-        // Another version, a short payload, an address that is not allowed.
+        use hangar_drive_protocol::ids::{AccountId, LogHash};
+        for pin in [None, Some([3u8; 32])] {
+            let sheet = RecoverySheet {
+                server_url: Url::parse("https://drive.example.org/").unwrap(),
+                server: server(),
+                account: AccountId::from_bytes([0xac; 16]),
+                genesis: LogHash::from_bytes([0x61; 32]),
+                pin,
+            };
+            let link = recovery_link(&sheet);
+            assert!(link.starts_with("hangar-drive://recover#"));
+            assert_eq!(parse_recovery_link(&link).unwrap(), sheet);
+        }
         let mut bytes = vec![2u8];
         bytes.extend_from_slice(&[0xac; 16]);
         bytes.extend_from_slice(&[0x5e; 16]);
-        bytes.extend_from_slice(b"https://drive.example.org/");
-        let other = format!("hangar-drive://recover#{}", base64url(&bytes));
-        assert_eq!(parse_recovery_link(&other), Err(LinkError::Malformed));
-        bytes[0] = 1;
-        let short = format!("hangar-drive://recover#{}", base64url(&bytes[..33]));
-        assert_eq!(parse_recovery_link(&short), Err(LinkError::Malformed));
-        let mut insecure = bytes[..33].to_vec();
+        bytes.extend_from_slice(&[0x61; 32]);
+        bytes.push(0);
+        let link = |b: &[u8]| format!("hangar-drive://recover#{}", base64url(b));
+        let mut insecure = bytes.clone();
         insecure.extend_from_slice(b"http://drive.example.org/");
         assert_eq!(
-            parse_recovery_link(&format!("hangar-drive://recover#{}", base64url(&insecure))),
+            parse_recovery_link(&link(&insecure)),
             Err(LinkError::Insecure)
         );
-        // A second spelling of the same address is refused.
-        let mut spelled = bytes[..33].to_vec();
-        spelled.extend_from_slice(b"https://DRIVE.example.org");
+        // Version 1, without the genesis anchor, and a short payload.
+        let mut old = bytes.clone();
+        old[0] = 1;
+        old.extend_from_slice(b"https://drive.example.org/");
+        assert_eq!(parse_recovery_link(&link(&old)), Err(LinkError::Malformed));
         assert_eq!(
-            parse_recovery_link(&format!("hangar-drive://recover#{}", base64url(&spelled))),
+            parse_recovery_link(&link(&bytes[..33])),
             Err(LinkError::Malformed)
         );
         assert_eq!(

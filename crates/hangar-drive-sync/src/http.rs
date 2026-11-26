@@ -25,11 +25,13 @@
 //! - **Pin state:** the SPKI pin itself is stored in the local index with the engine's settings
 //!   (`engine::Persisted`, key `engine`), not in this client; the client only reports a
 //!   mismatch, and the flag is cleared by the next request that succeeds, so a mismatch seen
-//!   once (a captive portal, a proxy) does not stick to a healthy connection.
+//!   once (a captive portal, a proxy) does not stick to a healthy connection. With the flag the
+//!   client keeps the pin of the key it was shown ([`ServerApi::seen_pin`]), for the server key
+//!   number the person compares with the server CLI; it never connects with that key on its
+//!   own (ADR 0001, section 6, "Pin rotation").
 
 use std::io::{BufRead, BufReader, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use hangar_drive_protocol::api::{
@@ -149,17 +151,38 @@ pub fn endpoint(base: &Url, path: &str, after: Option<u64>) -> Url {
     url
 }
 
+/// The pin of a key a server presented instead of the pinned one, shared by the verifier and
+/// the client (module docs, "Pin state").
+#[derive(Debug, Default)]
+pub struct Mismatch(Mutex<Option<[u8; 32]>>);
+
+impl Mismatch {
+    fn lock(&self) -> MutexGuard<'_, Option<[u8; 32]>> {
+        // The value is a plain pin; one written by a thread that panicked is still whole.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, pin: Option<[u8; 32]>) {
+        *self.lock() = pin;
+    }
+
+    /// The presented key's pin while the last handshake failed on the pin.
+    pub fn seen(&self) -> Option<[u8; 32]> {
+        *self.lock()
+    }
+}
+
 /// Verifies the server certificate only by its SPKI pin (module docs).
 #[derive(Debug)]
 pub struct PinVerifier {
     pin: [u8; 32],
-    mismatch: Arc<AtomicBool>,
+    mismatch: Arc<Mismatch>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl PinVerifier {
-    /// A verifier for `pin`; `mismatch` is set when a server presents another key.
-    pub fn new(pin: [u8; 32], mismatch: Arc<AtomicBool>) -> Self {
+    /// A verifier for `pin`; `mismatch` takes the pin of another key a server presents.
+    pub fn new(pin: [u8; 32], mismatch: Arc<Mismatch>) -> Self {
         Self {
             pin,
             mismatch,
@@ -193,7 +216,7 @@ impl ServerCertVerifier for PinVerifier {
         if constant_time_eq(&pin, &self.pin) {
             Ok(ServerCertVerified::assertion())
         } else {
-            self.mismatch.store(true, Ordering::SeqCst);
+            self.mismatch.set(Some(pin));
             Err(rustls::Error::General(
                 "the server key does not match the pin".into(),
             ))
@@ -234,7 +257,7 @@ impl ServerCertVerifier for PinVerifier {
 /// The TLS configuration: TLS 1.3 with the pin verifier, or with the platform verifier.
 pub fn tls_config(
     pin: Option<[u8; 32]>,
-    mismatch: Arc<AtomicBool>,
+    mismatch: Arc<Mismatch>,
 ) -> Result<rustls::ClientConfig, NetError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
@@ -257,8 +280,9 @@ pub fn tls_config(
 }
 
 /// Signs the session challenge with the device key (the app passes
-/// `DeviceIdentity::prove_session`).
-pub type Prover = Box<dyn Fn(&ServerId, &AccountId, &DeviceId, &Challenge) -> Signature + Send>;
+/// `DeviceIdentity::prove_session`); the second argument is the base URL the client connects to.
+pub type Prover =
+    Box<dyn Fn(&ServerId, &str, &AccountId, &DeviceId, &Challenge) -> Signature + Send>;
 
 /// Who signs in.
 pub struct SessionIdentity {
@@ -275,7 +299,7 @@ pub struct HttpServer {
     config: ServerConfig,
     client: Client,
     events: Client,
-    mismatch: Arc<AtomicBool>,
+    mismatch: Arc<Mismatch>,
     identity: Option<SessionIdentity>,
     token: Option<SessionToken>,
 }
@@ -299,7 +323,7 @@ enum Body {
 impl HttpServer {
     /// A client for `config`; `identity` signs in (none before an account exists).
     pub fn new(config: ServerConfig, identity: Option<SessionIdentity>) -> Result<Self, NetError> {
-        let mismatch = Arc::new(AtomicBool::new(false));
+        let mismatch = Arc::new(Mismatch::default());
         // The blocking client applies its timeout to the answer's head and to every single read
         // of the body (reqwest 0.13.5, `blocking/client.rs` `execute_request` and
         // `blocking/response.rs` `Read::read`), so for the event stream it is a read timeout.
@@ -344,7 +368,7 @@ impl HttpServer {
     }
 
     fn send_error(&self, e: &reqwest::Error) -> NetError {
-        if self.mismatch.load(Ordering::SeqCst) {
+        if self.mismatch.seen().is_some() {
             return NetError::PinMismatch;
         }
         let text = format!("{e:?}").to_ascii_lowercase();
@@ -397,7 +421,7 @@ impl HttpServer {
             let error = match result {
                 Ok(resp) if resp.status().is_success() => {
                     // A connection that passed the handshake ends an earlier mismatch.
-                    self.mismatch.store(false, Ordering::SeqCst);
+                    self.mismatch.set(None);
                     return Ok(resp);
                 }
                 Ok(resp)
@@ -487,8 +511,14 @@ impl HttpServer {
                 api::ErrorCode::Unauthorized,
             )));
         };
-        let signature =
-            (identity.prover)(&challenge.server, &account, &device, &challenge.challenge);
+        let server_url = hangar_drive_crypto::session::base_url(&self.config.url);
+        let signature = (identity.prover)(
+            &challenge.server,
+            &server_url,
+            &account,
+            &device,
+            &challenge.challenge,
+        );
         let session: SessionResponse = self.call(
             Method::POST,
             api::PROOF_PATH,
@@ -497,6 +527,7 @@ impl HttpServer {
                 account,
                 device,
                 challenge: challenge.challenge,
+                server_url,
                 signature,
             })?,
             false,
@@ -530,7 +561,7 @@ impl HttpServer {
             }
             return Err(error_of(resp));
         }
-        self.mismatch.store(false, Ordering::SeqCst);
+        self.mismatch.set(None);
         parse_sse(BufReader::new(resp), &mut on_sequence)
     }
 
@@ -718,6 +749,7 @@ impl ServerApi for HttpServer {
                 account: *account,
                 device: *device,
                 challenge: *challenge,
+                server_url: hangar_drive_crypto::session::base_url(&self.config.url),
                 signature: *signature,
             })?,
             false,
@@ -772,6 +804,10 @@ impl ServerApi for HttpServer {
             Err(e) if e.code() == Some(api::ErrorCode::NotFound) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    fn close_pairing(&mut self, id: &PairingId) -> Result<(), NetError> {
+        self.call_empty(Method::DELETE, &api::pairing_path(id), Body::None, true)
     }
 
     fn missing_objects(
@@ -841,6 +877,14 @@ impl ServerApi for HttpServer {
 
     fn retire(&mut self, folder: &FolderId) -> Result<(), NetError> {
         self.call_empty(Method::POST, &api::retire_path(folder), Body::None, true)
+    }
+
+    fn bring_back(&mut self, folder: &FolderId) -> Result<(), NetError> {
+        self.call_empty(Method::DELETE, &api::retire_path(folder), Body::None, true)
+    }
+
+    fn seen_pin(&self) -> Option<[u8; 32]> {
+        self.mismatch.seen()
     }
 }
 

@@ -320,6 +320,16 @@ pub async fn get_pairing(
     Ok(Json(pairing::get(&app, &s, id).await?).into_response())
 }
 
+pub async fn close_pairing(
+    State(app): State<AppState>,
+    Authed(s): Authed,
+    params: PathParams,
+) -> ApiResult<Response> {
+    let id = pairing_id(&params)?;
+    pairing::close(&app, &s, id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 pub async fn missing(
     State(app): State<AppState>,
     Authed(s): Authed,

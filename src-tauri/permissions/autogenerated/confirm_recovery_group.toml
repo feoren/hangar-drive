@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-confirm-recovery-group"
+description = "Enables the confirm_recovery_group command without any pre-configured scope."
+commands.allow = ["confirm_recovery_group"]
+
+[[permission]]
+identifier = "deny-confirm-recovery-group"
+description = "Denies the confirm_recovery_group command without any pre-configured scope."
+commands.deny = ["confirm_recovery_group"]

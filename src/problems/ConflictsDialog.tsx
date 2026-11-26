@@ -111,11 +111,13 @@ function ConflictCard({
             <span className="version-text">
               <span className="version-name">{version.name}</span>
               <span className="version-sub">
-                {t("conflict.version", {
-                  device: version.device,
-                  time: formatRelative(language, version.modified, now),
+                {t("conflict.versionSize", {
+                  version: t("conflict.version", {
+                    device: version.device,
+                    time: formatRelative(language, version.modified, now),
+                  }),
+                  size: formatSize(language, version.size),
                 })}
-                , {formatSize(language, version.size)}
               </span>
             </span>
             <button

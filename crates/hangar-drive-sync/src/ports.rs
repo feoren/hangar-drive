@@ -458,6 +458,9 @@ pub trait ServerApi {
     fn post_pairing(&mut self, id: &PairingId, request: &PairingRequest) -> Result<(), NetError>;
     /// `GET /pairing/{id}` (the inviting device); `None` while nobody answered.
     fn get_pairing(&mut self, id: &PairingId) -> Result<Option<PairingRequest>, NetError>;
+    /// `DELETE /pairing/{id}` (the inviting device, once the person answered): the request
+    /// leaves the server. Closing a slot that is gone is no error.
+    fn close_pairing(&mut self, id: &PairingId) -> Result<(), NetError>;
     /// `POST /folders/{folder}/objects/missing`.
     fn missing_objects(
         &mut self,
@@ -483,6 +486,16 @@ pub trait ServerApi {
     fn commits(&mut self, folder: &FolderId, after: u64) -> Result<DeltaPage, NetError>;
     /// `POST /folders/{folder}/retire`.
     fn retire(&mut self, folder: &FolderId) -> Result<(), NetError>;
+    /// `DELETE /folders/{folder}/retire`: brings a retired folder back within the retention
+    /// window (ADR 0001, section 3, "Folder list").
+    fn bring_back(&mut self, folder: &FolderId) -> Result<(), NetError>;
+    /// The SPKI pin of the key the server presented when the last call ended with
+    /// [`NetError::PinMismatch`], so the person can compare its server key number with the
+    /// server CLI (ADR 0001, section 6, "Pin rotation"). Learnt from the aborted handshake; it is
+    /// never trusted until the person confirmed it. `None` when no mismatch was seen.
+    fn seen_pin(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -590,6 +603,8 @@ pub trait Store {
     fn account_value(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
     /// Stores a value of the account state.
     fn put_account_value(&mut self, key: &str, value: &[u8]) -> Result<(), StoreError>;
+    /// Deletes a value of the account state; deleting what is not there is not an error.
+    fn delete_account_value(&mut self, key: &str) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]

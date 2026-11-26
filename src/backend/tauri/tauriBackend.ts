@@ -15,13 +15,17 @@ import { BackendError } from "../errors";
 import type {
   Backend,
   BackendEvent,
+  DeleteOutcome,
   DeviceId,
   FolderChoice,
   FolderId,
   Millis,
+  PairAnswer,
   PairInput,
   PauseDuration,
   PickPurpose,
+  RecoverySheetDocument,
+  ServerConfirm,
   Unsubscribe,
 } from "../types";
 import type { Decoder } from "./decode";
@@ -126,7 +130,14 @@ export class TauriBackend implements Backend {
     return this.call(
       "checkInvite",
       { link },
-      d.result(d.host, "notALink", "used", "expired", "unreachable", "insecure"),
+      d.result(d.inviteCheck, "notALink", "used", "expired", "unreachable", "insecure"),
+    );
+  }
+  inspectLink(link: string) {
+    return this.call(
+      "inspectLink",
+      { link },
+      d.result(d.inspectedLink, "notALink", "damaged", "insecure"),
     );
   }
   defaultDeviceName() {
@@ -148,11 +159,11 @@ export class TauriBackend implements Backend {
       ),
     );
   }
-  async printRecoverySheet() {
-    await this.run("printRecoverySheet");
+  async printRecoverySheet(document: RecoverySheetDocument) {
+    await this.run("printRecoverySheet", { document });
   }
-  saveRecoveryFile() {
-    return this.call("saveRecoveryFile", {}, d.saveResult);
+  saveRecoveryFile(document: RecoverySheetDocument) {
+    return this.call("saveRecoveryFile", { document }, d.saveResult);
   }
   async copyRecoveryCode() {
     await this.run("copyRecoveryCode");
@@ -166,17 +177,21 @@ export class TauriBackend implements Backend {
   pickFolder(purpose: PickPurpose) {
     return this.call("pickFolder", { purpose }, d.pickResult);
   }
-  countLocalFiles(path: string) {
-    return this.call("countLocalFiles", { path }, d.num);
+  countLocalFiles(token: string) {
+    return this.call("countLocalFiles", { token }, d.num);
   }
-  async finishSetup(path: string) {
-    await this.run("finishSetup", { path });
+  async finishSetup(token: string) {
+    await this.run("finishSetup", { token });
   }
   scanWithCamera() {
     return this.call("scanWithCamera", {}, d.nullableStr);
   }
-  startPairing(input: PairInput) {
-    return this.call("startPairing", { input }, d.result(d.pairWaiting, ...PAIR_ERRORS));
+  startPairing(input: PairInput, deviceName: string) {
+    return this.call(
+      "startPairing",
+      { input, deviceName },
+      d.result(d.pairWaiting, ...PAIR_ERRORS, "blank", "edgeWhitespace"),
+    );
   }
   async cancelPairing() {
     await this.run("cancelPairing");
@@ -187,11 +202,21 @@ export class TauriBackend implements Backend {
   async joinFolders(choices: readonly FolderChoice[]) {
     await this.run("joinFolders", { choices });
   }
-  recoverAccount(server: string, code: string) {
+  recoverAccount(sheet: string, code: string, deviceName: string) {
     return this.call(
       "recoverAccount",
-      { server, code },
-      d.result(d.nothing, "typo", "unknown", "used", "otherApp", "unreachable", "insecure"),
+      { sheet, code, deviceName },
+      d.result(
+        d.nothing,
+        "typo",
+        "unknown",
+        "used",
+        "otherApp",
+        "unreachable",
+        "insecure",
+        "blank",
+        "edgeWhitespace",
+      ),
     );
   }
   setDeviceName(name: string) {
@@ -202,6 +227,9 @@ export class TauriBackend implements Backend {
   }
   finishRecoveryCleanup(remove: readonly DeviceId[]) {
     return this.call("finishRecoveryCleanup", { remove }, d.recoveryCode);
+  }
+  async resetDevice() {
+    await this.run("resetDevice");
   }
 
   async openFolder(folderId: FolderId | null, path?: string) {
@@ -225,17 +253,18 @@ export class TauriBackend implements Backend {
   async resumeFolder(folderId: FolderId) {
     await this.run("resumeFolder", { folderId });
   }
-  async addFolder(path: string) {
-    await this.run("addFolder", { path });
+  async addFolder(token: string) {
+    await this.run("addFolder", { token });
   }
-  async addAccountFolder(folderId: FolderId, path: string) {
-    await this.run("addAccountFolder", { folderId, path });
+  async addAccountFolder(folderId: FolderId, token: string) {
+    await this.run("addAccountFolder", { folderId, token });
   }
   async stopFolder(folderId: FolderId) {
     await this.run("stopFolder", { folderId });
   }
-  async deleteFolderEverywhere(folderId: FolderId) {
-    await this.run("deleteFolderEverywhere", { folderId });
+  /** The shell asks once more in a native dialog and answers how it ended. */
+  deleteFolderEverywhere(folderId: FolderId): Promise<DeleteOutcome> {
+    return this.call("deleteFolderEverywhere", { folderId }, d.deleteOutcome);
   }
   async restoreDeletedFolder(folderId: FolderId) {
     await this.run("restoreDeletedFolder", { folderId });
@@ -265,8 +294,9 @@ export class TauriBackend implements Backend {
   getServerNumber() {
     return this.call("getServerNumber", {}, d.serverNumber);
   }
-  async confirmServerNumber() {
-    await this.run("confirmServerNumber");
+  /** Confirming asks once more in a native dialog with the number; the shell answers how. */
+  confirmServerNumber(): Promise<ServerConfirm> {
+    return this.call("confirmServerNumber", {}, d.serverConfirm);
   }
   fixServerWithOffer(link: string) {
     return this.call(
@@ -284,11 +314,14 @@ export class TauriBackend implements Backend {
   async dismissSuspect(warningId: string) {
     await this.run("dismissSuspect", { warningId });
   }
+  acceptRemovedHeads(folderId: FolderId) {
+    return this.call("acceptRemovedHeads", { folderId }, d.acceptedHeads);
+  }
   async openStorageSettings() {
     await this.run("openStorageSettings");
   }
-  async installUpdate() {
-    await this.run("installUpdate");
+  installUpdate() {
+    return this.call("installUpdate", {}, d.updateOutcome);
   }
   async copyErrorReport() {
     await this.run("copyErrorReport");
@@ -379,8 +412,9 @@ export class TauriBackend implements Backend {
   async copyPairingLink(offerId: string) {
     await this.run("copyPairingLink", { offerId });
   }
-  async answerPairRequest(offerId: string, accept: boolean) {
-    await this.run("answerPairRequest", { offerId, accept });
+  /** Accepting asks once more in a native dialog; the shell answers how it ended. */
+  answerPairRequest(offerId: string, accept: boolean): Promise<PairAnswer> {
+    return this.call("answerPairRequest", { offerId, accept }, d.pairAnswer);
   }
   renewRecoveryCode() {
     return this.call("renewRecoveryCode", {}, d.recoveryCode);
@@ -421,10 +455,23 @@ const PAIR_ERRORS = [
   "insecure",
 ] as const;
 
-/** The Rust side may reject with `{ code: "busy" | "locked" }`; anything else is unexpected. */
-function codeOf(error: unknown): "busy" | "locked" | "unexpected" {
-  if (typeof error === "object" && error !== null && "code" in error) {
-    if (error.code === "busy" || error.code === "locked") return error.code;
+/** The start of the message `install_update` rejects with while updates are off (updater.rs). */
+const UPDATES_OFF = "updates are off";
+
+/**
+ * The Rust side rejects with `{ code, kind, message }`: `code` "busy" or "locked" is kept, the
+ * "updates are off" refusal becomes "updatesOff", anything else is unexpected.
+ */
+export function codeOf(error: unknown): "busy" | "locked" | "updatesOff" | "unexpected" {
+  if (typeof error === "object" && error !== null) {
+    if ("code" in error && (error.code === "busy" || error.code === "locked")) return error.code;
+    if (
+      "message" in error &&
+      typeof error.message === "string" &&
+      error.message.startsWith(UPDATES_OFF)
+    ) {
+      return "updatesOff";
+    }
   }
   return "unexpected";
 }

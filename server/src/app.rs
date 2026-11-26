@@ -25,6 +25,11 @@ pub struct App {
     pub disk: Arc<dyn DiskSpace>,
     pub limits: Limits,
     pub server_id: ServerId,
+    /// `HANGAR_DRIVE_PUBLIC_URL` (`Config::public_url`): a session proof must name it, so a host
+    /// that relays a sign-in under this server's ID is refused. `serve` does not start without
+    /// it ([`crate::build`]); only the admin commands, which serve nothing, run without it, and
+    /// a proof is then refused, never checked against the URL the device signed.
+    pub public_url: Option<String>,
     pub trusted_proxies: Vec<IpNet>,
     pub limiter: RateLimiter,
     pub events: Arc<EventHub>,

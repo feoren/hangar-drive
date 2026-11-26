@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-account-folder"
+description = "Enables the add_account_folder command without any pre-configured scope."
+commands.allow = ["add_account_folder"]
+
+[[permission]]
+identifier = "deny-add-account-folder"
+description = "Denies the add_account_folder command without any pre-configured scope."
+commands.deny = ["add_account_folder"]

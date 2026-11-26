@@ -3,7 +3,8 @@
 import { act } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { MOCK_INPUTS } from "../backend/mock/mockBackend";
+import { MOCK_INPUTS, MockBackend } from "../backend/mock/mockBackend";
+import { TauriBackend } from "../backend/tauri/tauriBackend";
 import {
   all,
   button,
@@ -13,9 +14,11 @@ import {
   field,
   flush,
   renderApp,
+  renderWith,
   text,
   type,
 } from "../test/harness";
+import { ARM_DELAY_MS } from "../ui/parts";
 
 afterEach(() => {
   cleanup();
@@ -70,6 +73,14 @@ describe("new account", () => {
     mock.controls.save = "inSync";
     await click("Als Datei speichern");
     expect(text()).toContain("Speichere den Code nicht in einem synchronisierten Ordner");
+    mock.controls.save = "inCloud";
+    await click("Anderen Ort wählen");
+    expect(text()).toContain("Dieser Ordner wird mit einer Cloud synchronisiert.");
+    expect(text()).toContain("zum Beispiel in „Downloads“ oder auf einem USB-Stick.");
+    mock.controls.save = "saved";
+    await click("Anderen Ort wählen");
+    expect(text()).toContain("Gespeichert: C:\\Users\\Alex\\Documents");
+    expect(text()).not.toContain("Dieser Ordner wird mit einer Cloud synchronisiert.");
     await click("Drucken");
     expect(mock.calls).toContain("printRecoverySheet");
 
@@ -111,12 +122,19 @@ describe("new account", () => {
     expect(button("Weiter").getAttribute("aria-disabled")).toBe("true");
   });
 
-  it("says when the clipboard is empty", async () => {
+  // The shell only hands over a link or code of the app (security review L2); anything else
+  // arrives as "", like an empty clipboard.
+  it.each([
+    ["empty", ""],
+    ["other text", "Einkaufsliste: Milch, Brot"],
+  ])("says calmly that there is no link on the clipboard: %s", async (_, clipboard) => {
     const { mock } = await renderApp("setup");
-    mock.controls.clipboard = "";
+    mock.controls.clipboard = clipboard;
     await click("Mit Einladungslink starten");
     await click("Einfügen");
-    expect(text()).toContain("In der Zwischenablage ist gerade kein Text.");
+    expect(text()).toContain("In der Zwischenablage ist kein Link von Hangar Drive.");
+    expect(field("Einladungslink").value).toBe("");
+    expect(all(".error-text").every((element) => element.textContent === "")).toBe(true);
   });
 
   it("goes back from step 2 to step 1", async () => {
@@ -170,16 +188,63 @@ describe("folder step", () => {
 });
 
 describe("additional device", () => {
-  it("pairs with a link and chooses the folders", async () => {
-    // A little simulated time, so the waiting screen is visible before the other device answers.
-    const { mock } = await renderApp("setup", { timeScale: 0.04 });
+  /** From the welcome screen through the server question (N2) up to the waiting screen. */
+  async function pastServerQuestion(link: string = MOCK_INPUTS.pair, timeScale = 0.04) {
+    const harness = await renderApp("setup", { timeScale });
+    harness.mock.controls.clipboard = link;
+    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+    await click("Einfügen");
+    expect(heading()).toBe("Mit diesem Server verbinden?");
+    await wait(ARM_DELAY_MS + 50);
+    await click("Verbinden");
+    return harness;
+  }
+
+  it("asks before connecting: server in punycode, account, connect held back", async () => {
+    const { mock } = await renderApp("setup");
+    mock.controls.clipboard = MOCK_INPUTS.pairIdn;
+    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+    await click("Einfügen");
+    expect(heading()).toBe("Mit diesem Server verbinden?");
+    expect(text()).toContain("xn--drve-6pa.example.org");
+    expect(text()).toContain("3f9a 12c0 8b7e 44d1 a0b2 c3d4 e5f6 0718");
+    expect(document.activeElement?.textContent).toBe("Zurück");
+    expect(button("Verbinden").getAttribute("aria-disabled")).toBe("true");
+    await click("Verbinden");
+    expect(mock.calls).not.toContain("startPairing");
+    await wait(ARM_DELAY_MS + 50);
+    expect(button("Verbinden").getAttribute("aria-disabled")).toBe("false");
+    await click("Verbinden");
+    expect(mock.calls).toContain("startPairing");
+  });
+
+  it("goes back from the server question without sending anything", async () => {
+    const { mock } = await renderApp("setup");
     mock.controls.clipboard = MOCK_INPUTS.pair;
     await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
-    expect(text()).toContain("Schritt 1 von 2");
     await click("Einfügen");
+    await click("Zurück");
+    expect(heading()).toBe("Mit deinem anderen Gerät koppeln");
+    expect(mock.calls).not.toContain("startPairing");
+  });
+
+  it("warns calmly when the pairing link pins a server", async () => {
+    const { mock } = await renderApp("setup");
+    mock.controls.clipboard = MOCK_INPUTS.pairPinned;
+    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+    await click("Einfügen");
+    expect(text()).toContain("Dieser Server hat kein öffentliches Zertifikat.");
+    expect(document.querySelector(".notice")?.getAttribute("role")).toBe("note");
+  });
+
+  it("pairs with a link, shows the account's devices and chooses the folders", async () => {
+    const { mock } = await pastServerQuestion();
     expect(text()).toContain("Bestätige jetzt auf deinem anderen Gerät.");
     expect(button("Zahlen anzeigen")).toBeTruthy();
     await wait(1100);
+    expect(heading()).toBe("Das sind deine Geräte?");
+    expect(text()).toContain("Büro-PC");
+    await click("Ja, das sind meine");
     expect(heading()).toBe("Welche Ordner sollen auf dieses Gerät?");
     expect(text()).toContain("Auf diesem Computer sind 120 GB frei.");
     const boxes = all('.choice-list input[type="checkbox"]');
@@ -188,6 +253,73 @@ describe("additional device", () => {
     await wait(200);
     expect(mock.calls).toContain("joinFolders");
     expect(heading()).toBe("Alles aktuell");
+  });
+
+  it("disconnects again when the devices are strangers", async () => {
+    const { mock } = await pastServerQuestion(MOCK_INPUTS.pairStranger);
+    await wait(1100);
+    expect(heading()).toBe("Das sind deine Geräte?");
+    expect(text()).toContain("DESKTOP-7Q2KF0M");
+    await click("Nein, abbrechen");
+    expect(mock.calls).toContain("disconnectThisDevice");
+    expect(mock.calls).not.toContain("joinFolders");
+    expect(heading()).toBe("Mit deinem anderen Gerät koppeln");
+    expect(text()).toContain("Abgebrochen. Dieses Gerät ist wieder getrennt");
+  });
+
+  it("disconnects for real on the Tauri path when the devices are strangers", async () => {
+    // The window on the real bridge: every command goes through `invoke` by its snake_case name
+    // and comes back through the decoders, answered by the mock as the shell would.
+    const mock = new MockBackend({ scenario: "setup", timeScale: 0.04 });
+    await mock.setLanguage("de");
+    mock.controls.clipboard = MOCK_INPUTS.pairStranger;
+    const invoked: string[] = [];
+    const json = (value: unknown): unknown => JSON.parse(JSON.stringify(value ?? null));
+    const text = (value: unknown): string => (typeof value === "string" ? value : "");
+    const routes: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+      get_snapshot: () => mock.getSnapshot(),
+      get_settings: () => mock.getSettings(),
+      update_tray: () => Promise.resolve(null),
+      read_clipboard_text: () => mock.readClipboardText(),
+      inspect_link: (args) => mock.inspectLink(text(args.link)),
+      default_device_name: () => mock.defaultDeviceName(),
+      start_pairing: (args) => {
+        const input = args.input;
+        const link =
+          typeof input === "object" && input !== null && "link" in input ? text(input.link) : "";
+        return mock.startPairing({ kind: "link", link }, text(args.deviceName));
+      },
+      list_devices: () => mock.listDevices(),
+      disconnect_this_device: () => mock.disconnectThisDevice(),
+    };
+    const tauri = new TauriBackend(
+      async (command, args) => {
+        invoked.push(command);
+        const route = routes[command];
+        if (!route) throw new Error(`command ${command} not found`);
+        return json(await route(args ?? {}));
+      },
+      (_channel, handler) =>
+        Promise.resolve(
+          mock.subscribe((event) => {
+            handler(json(event));
+          }),
+        ),
+    );
+    await renderWith(tauri);
+    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+    await click("Einfügen");
+    expect(heading()).toBe("Mit diesem Server verbinden?");
+    await wait(ARM_DELAY_MS + 50);
+    await click("Verbinden");
+    await wait(1100);
+    expect(heading()).toBe("Das sind deine Geräte?");
+    expect(invoked).not.toContain("disconnect_this_device");
+    await click("Nein, abbrechen");
+    expect(invoked).toContain("disconnect_this_device");
+    expect(invoked).not.toContain("join_folders");
+    expect(heading()).toBe("Mit deinem anderen Gerät koppeln");
+    expect(document.body.textContent).toContain("Abgebrochen. Dieses Gerät ist wieder getrennt");
   });
 
   it("shows the numbers at once on the typed path", async () => {
@@ -201,28 +333,59 @@ describe("additional device", () => {
     expect(all(".number-group")).toHaveLength(6);
   });
 
+  it("explains a typed text that is not a pairing link", async () => {
+    const { mock } = await renderApp("setup");
+    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+    await type(field("Kopplungslink"), "nope");
+    await click("Koppeln");
+    expect(text()).toContain("Das ist kein Kopplungslink.");
+    expect(mock.calls).not.toContain("startPairing");
+  });
+
+  it.each([["hangar-drive://pair#damaged", "Der Link ist unvollständig."]])(
+    "explains a link it cannot read: %s",
+    async (link, message) => {
+      const { mock } = await renderApp("setup");
+      mock.controls.clipboard = link;
+      await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
+      await click("Einfügen");
+      expect(text()).toContain(message);
+      expect(mock.calls).not.toContain("startPairing");
+    },
+  );
+
   it.each([
-    ["nope", "Das ist kein Kopplungslink."],
     ["hangar-drive://pair#expired", "Dieser Code ist abgelaufen oder wurde schon benutzt."],
     ["hangar-drive://pair#toomany", "Zu viele Versuche."],
     ["hangar-drive://pair#declined", "Das andere Gerät hat abgelehnt."],
     ["hangar-drive://pair#other", "Dieser Code gehört zu einem anderen Konto."],
   ])("explains a failed pairing with %s", async (link, message) => {
-    const { mock } = await renderApp("setup");
-    mock.controls.clipboard = link;
-    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
-    await click("Einfügen");
-    await wait(50);
+    await pastServerQuestion(link);
+    await wait(150);
     expect(text()).toContain(message);
   });
 
-  it("warns when the folders do not fit and asks before merging", async () => {
+  it("names a link of another kind and switches to its flow", async () => {
     const { mock } = await renderApp("setup");
-    mock.controls.clipboard = MOCK_INPUTS.pair;
-    mock.controls.localFiles = 3;
+    mock.controls.clipboard = MOCK_INPUTS.invite;
     await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
     await click("Einfügen");
+    expect(text()).toContain("Das ist ein Einladungslink.");
+    expect(button("Koppeln").getAttribute("aria-disabled")).toBe("true");
+    expect(mock.calls).not.toContain("inspectLink");
+    await click("Neues Konto einrichten");
+    expect(heading()).toBe("Mit deinem Server verbinden");
+    expect(field("Einladungslink").value).toBe(MOCK_INPUTS.invite);
+    await wait(400);
+    expect(text()).toContain("Verbunden mit drive.example.org");
+  });
+
+  it("warns when the folders do not fit and asks before merging", async () => {
+    const { mock } = await pastServerQuestion(MOCK_INPUTS.pair, 0);
+    mock.controls.localFiles = 3;
     await wait(1100);
+    await click("Ja, das sind meine");
+    await wait(100);
     expect(text()).toContain("Auf diesem Computer sind 120 GB frei.");
     await click("Fertig");
     expect(dialogTitle()).toBe("In diesem Ordner liegen schon 3 Dateien");
@@ -235,28 +398,102 @@ describe("additional device", () => {
   });
 
   it("cannot finish without a folder", async () => {
-    const { mock } = await renderApp("setup");
-    mock.controls.clipboard = MOCK_INPUTS.pair;
-    await click("Ich nutze Hangar Drive schon auf einem anderen Gerät");
-    await click("Einfügen");
+    await pastServerQuestion();
     await wait(1100);
+    await click("Ja, das sind meine");
     for (const box of all('.choice-list input[type="checkbox"]')) await click(box);
     expect(text()).toContain("Wähle mindestens einen Ordner.");
     expect(button("Fertig").getAttribute("aria-disabled")).toBe("true");
   });
 });
 
-describe("recovery with the sheet", () => {
-  it("runs through the five screens", async () => {
+describe("invite with a pin (N3)", () => {
+  it("warns calmly that the server is trusted without a public certificate", async () => {
     const { mock } = await renderApp("setup");
+    mock.controls.clipboard = MOCK_INPUTS.invitePinned;
+    await click("Mit Einladungslink starten");
+    await click("Einfügen");
+    await wait(400);
+    expect(text()).toContain("Server mit eigenem Zertifikat");
+    expect(text()).toContain("Nimm den Link nur an, wenn er direkt vom Betreiber");
+    expect(button("Weiter").getAttribute("aria-disabled")).toBe("false");
+  });
+
+  it("shows no warning for a server with a public certificate", async () => {
+    await renderApp("setup");
+    await click("Mit Einladungslink starten");
+    await click("Einfügen");
+    await wait(400);
+    expect(document.querySelector(".notice")).toBeNull();
+  });
+
+  it("reads the deep link form of an invite", async () => {
+    const { mock } = await renderApp("setup");
+    mock.controls.clipboard = MOCK_INPUTS.inviteDeep;
+    await click("Mit Einladungslink starten");
+    await click("Einfügen");
+    await wait(400);
+    expect(text()).toContain("Verbunden mit drive.example.org");
+  });
+
+  it("does not send a pairing link to the server as an invite", async () => {
+    const { mock } = await renderApp("setup");
+    mock.controls.clipboard = MOCK_INPUTS.pair;
+    await click("Mit Einladungslink starten");
+    await click("Einfügen");
+    await wait(400);
+    expect(text()).toContain("Das ist ein Kopplungslink von einem deiner Geräte.");
+    expect(mock.calls).not.toContain("checkInvite");
+    await click("Stattdessen koppeln");
+    expect(heading()).toBe("Mit diesem Server verbinden?");
+  });
+});
+
+describe("links from the OS", () => {
+  it.each([
+    ["deepLinkInvite", "Mit deinem Server verbinden"],
+    ["deepLinkPair", "Mit diesem Server verbinden?"],
+    ["deepLinkRecover", "Mit dem Wiederherstellungsblatt einrichten"],
+  ] as const)("open the right door: %s", async (scenario, title) => {
+    const { mock } = await renderApp(scenario);
+    await wait(400);
+    expect(heading()).toBe(title);
+    expect(mock.calls).toContain("showWindow");
+    expect(mock.calls).not.toContain("startPairing");
+  });
+
+  it("fills in an invite that arrives while the welcome screen is open", async () => {
+    const { mock } = await renderApp("setup");
+    act(() => {
+      mock.openLink(MOCK_INPUTS.inviteDeep);
+    });
+    await wait(400);
+    expect(heading()).toBe("Mit deinem Server verbinden");
+    expect(text()).toContain("Verbunden mit drive.example.org");
+  });
+});
+
+describe("recovery with the sheet", () => {
+  const CODE = "d7kq-m2xp-9h4t-rw8c-zb3n-f6ja-q1ve-k5sy";
+
+  async function enterSheet(link: string, code = CODE) {
+    const harness = await renderApp("setup");
     await click("Kein Gerät mehr da? Wiederherstellungsblatt nutzen");
-    expect(text()).toContain("Schritt 1 von 5");
-    await type(field("Serveradresse"), "drive.example.org");
-    await type(field("Wiederherstellungscode"), "d7kq-m2xp-9h4t-rw8c-zb3n-f6ja-q1ve-k5sy");
+    await type(field("Link vom Blatt"), link);
+    await wait(400);
+    await type(field("Wiederherstellungscode"), code);
+    return harness;
+  }
+
+  it("runs through the four screens with the link from the sheet", async () => {
+    const { mock } = await enterSheet(MOCK_INPUTS.recoverLink);
+    expect(text()).toContain("Schritt 1 von 4");
+    expect(text()).toContain("Gefunden: drive.example.org");
+    expect(text()).toContain("Konto 3f9a 12c0");
     expect(text()).toContain("D7KQ M2XP 9H4T");
+    expect(field("Name dieses Geräts").value).toBe("Arbeitslaptop");
     await click("Weiter");
-    expect(heading()).toBe("Wie soll dieses Gerät heißen?");
-    await click("Weiter");
+    expect(mock.calls).toContain("recoverAccount");
     expect(heading()).toBe("Alte Geräte entfernen");
     expect(all('.choice-list input[type="checkbox"]')).toHaveLength(3);
     await click(all('.choice-list input[type="checkbox"]')[0] ?? document.body);
@@ -271,17 +508,69 @@ describe("recovery with the sheet", () => {
     expect(heading()).toBe("Welche Ordner sollen auf dieses Gerät?");
   });
 
+  it("takes a link that broke over lines", async () => {
+    await enterSheet("hangar-drive://recover#AQ3f9a\n  12c0sheet");
+    expect(text()).toContain("Gefunden: drive.example.org");
+  });
+
+  it.each([
+    ["drive.example.org", "Das ist nicht der Link von deinem Blatt."],
+    ["hangar-drive://recover#damaged", "Der Link ist unvollständig."],
+    ["hangar-drive://recover#insecure", "Dieser Server ist nicht verschlüsselt erreichbar."],
+  ])("explains a sheet link it cannot read: %s", async (link, message) => {
+    await enterSheet(link);
+    expect(text()).toContain(message);
+    expect(button("Weiter").getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("names a pairing link and switches to pairing", async () => {
+    await enterSheet(MOCK_INPUTS.pair);
+    expect(text()).toContain("Das ist ein Kopplungslink");
+    await click("Stattdessen koppeln");
+    expect(heading()).toBe("Mit diesem Server verbinden?");
+  });
+
   it.each([
     ["D7KQ", "Im Code ist ein Tippfehler."],
     ["H7KQ M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY", "Das ist ein Code für Hangar."],
     ["0000 M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY", "Dieser Code gehört zu keinem Konto"],
     ["1111 M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY", "Dieser Code wurde ersetzt."],
   ])("explains a bad code %s", async (code, message) => {
-    await renderApp("setup");
-    await click("Kein Gerät mehr da? Wiederherstellungsblatt nutzen");
-    await type(field("Serveradresse"), "drive.example.org");
-    await type(field("Wiederherstellungscode"), code);
+    await enterSheet(MOCK_INPUTS.recoverLink, code);
     await click("Weiter");
     expect(text()).toContain(message);
+  });
+});
+
+describe("recovery sheet, version 2", () => {
+  it("prints and saves the sheet with server, IDs, anchor and link, worded in German", async () => {
+    const { mock } = await renderApp("setup");
+    await click("Mit Einladungslink starten");
+    await click("Einfügen");
+    await wait(400);
+    await click("Weiter");
+    await click("Was noch auf dem Blatt steht");
+    expect(text()).toContain("https://drive.example.org/");
+    expect(text()).toContain(MOCK_INPUTS.recoverLink);
+    await click("Drucken");
+    const sheet = mock.sheet;
+    expect(sheet?.title).toBe("Hangar Drive: Wiederherstellungsblatt");
+    expect(sheet?.language).toBe("de-DE");
+    expect(sheet?.qrLink).toBe(MOCK_INPUTS.recoverLink);
+    const labels = sheet?.fields.map((entry) => entry.label) ?? [];
+    expect(labels).toEqual([
+      "Wiederherstellungscode",
+      "Server",
+      "Server-Kennung",
+      "Konto-Kennung",
+      "Prüfwert des Kontos",
+      "Link zum Einfügen",
+      "Erstellt am",
+      "Gerät",
+    ]);
+    expect(sheet?.fields.at(-1)?.value).toBe("Arbeitslaptop");
+    expect(sheet?.notes.join(" ")).not.toMatch(/D7KQ|[0-9A-Z]{4} [0-9A-Z]{4}/);
+    await click("Als Datei speichern");
+    expect(text()).toContain("Hangar Drive Wiederherstellungsblatt.txt");
   });
 });

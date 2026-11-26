@@ -15,6 +15,7 @@ pub mod disk;
 pub mod error;
 pub mod events;
 pub mod http;
+pub mod links;
 pub mod probe;
 pub mod service;
 pub mod store;
@@ -61,6 +62,14 @@ pub enum StartError {
     Tls(#[from] tls::TlsError),
     #[error(transparent)]
     Lock(#[from] LockError),
+    #[error(
+        "{var} is not set. Set it to the address devices reach this server under, for example \
+         {var}=https://drive.example.org/ (http://localhost:8080/ only for a test on this \
+         machine): every sign-in is bound to it, so a host that relays sign-ins under this \
+         server's ID is refused",
+        var = config::PUBLIC_URL_VAR
+    )]
+    PublicUrlMissing,
 }
 
 /// Why the data folder lock was not taken.
@@ -161,6 +170,7 @@ pub async fn open_app(
         disk,
         limits: config.limits,
         server_id,
+        public_url: config.public_url.clone(),
         trusted_proxies: config.trusted_proxies.clone(),
         limiter: deps.limiter,
         events: EventHub::new(),
@@ -179,8 +189,12 @@ pub async fn open_app(
     Ok((app, shutdown))
 }
 
-/// Builds the server for `config`.
+/// Builds the server for `config`. Refuses without [`Config::public_url`]: the session proofs
+/// are bound to that address (ADR 0001, section 6, "Server URL").
 pub async fn build(config: &Config, deps: Deps) -> Result<Server, StartError> {
+    if config.public_url.is_none() {
+        return Err(StartError::PublicUrlMissing);
+    }
     let gc_job = deps.gc_job;
     let lock = DataDirLock::acquire(&config.data_dir)?;
     let (app, shutdown) = open_app(config, deps).await?;

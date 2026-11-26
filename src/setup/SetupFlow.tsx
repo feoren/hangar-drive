@@ -1,7 +1,12 @@
 // First start (UX 4): three doors, because there are exactly three situations. A new account, an
-// additional device, or the recovery sheet when no device is left.
+// additional device, or the recovery sheet when no device is left. A link from the OS or a link of
+// another kind pasted into a field opens the door it belongs to, with the link filled in.
 
 import { useState } from "react";
+
+import type { IncomingLink } from "../App";
+import type { LinkKind } from "../backend/types";
+import { cleanLink, linkKind } from "../domain/links";
 
 import { useT } from "../i18n";
 import { useBackend } from "../ui/backendContext";
@@ -14,31 +19,51 @@ import { RecoverFlow } from "./RecoverFlow";
 
 type Door = "welcome" | "new" | "pair" | "recover" | "ready";
 
+const DOOR: Record<LinkKind, Door> = { invite: "new", pair: "pair", recover: "recover" };
+
 export function SetupFlow({
+  link,
   onHold,
   onFinished,
 }: {
+  /** The last link the OS handed over while the setup was on screen. */
+  readonly link: IncomingLink | null;
   /** Keeps the setup on screen after the account exists, for the "All set" screen. */
   readonly onHold: (hold: boolean) => void;
   readonly onFinished: () => void;
 }) {
   const backend = useBackend();
   const [door, setDoor] = useState<Door>("welcome");
+  // The link a door starts with, and a counter so a new link opens the door afresh.
+  const [start, setStart] = useState<{ link: string; round: number }>({ link: "", round: 0 });
+  const [handled, setHandled] = useState(0);
+  const go = (kind: LinkKind, text: string) => {
+    setDoor(DOOR[kind]);
+    setStart((last) => ({ link: cleanLink(text), round: last.round + 1 }));
+  };
+  if (link && link.at !== handled) {
+    setHandled(link.at);
+    const kind = linkKind(link.link);
+    if (kind && door !== "ready") go(kind, link.link);
+  }
   const welcome = () => {
     setDoor("welcome");
+    setStart((last) => ({ link: "", round: last.round + 1 }));
   };
 
   return (
     <div className="setup">
-      <main className="setup-page" key={door}>
+      <main className="setup-page" key={`${door}-${String(start.round)}`}>
         {door === "welcome" && <Welcome onChoose={setDoor} />}
         {door === "new" && (
           <NewAccountFlow
+            initialLink={start.link}
+            onSwitch={go}
             onBack={welcome}
-            onFinish={async (path) => {
+            onFinish={async (token) => {
               onHold(true);
               try {
-                await backend.finishSetup(path);
+                await backend.finishSetup(token);
                 setDoor("ready");
               } catch (error) {
                 onHold(false);
@@ -47,8 +72,17 @@ export function SetupFlow({
             }}
           />
         )}
-        {door === "pair" && <PairFlow onBack={welcome} onDone={onFinished} />}
-        {door === "recover" && <RecoverFlow onBack={welcome} onDone={onFinished} />}
+        {door === "pair" && (
+          <PairFlow initialLink={start.link} onSwitch={go} onBack={welcome} onDone={onFinished} />
+        )}
+        {door === "recover" && (
+          <RecoverFlow
+            initialLink={start.link}
+            onSwitch={go}
+            onBack={welcome}
+            onDone={onFinished}
+          />
+        )}
         {door === "ready" && <Ready onDone={onFinished} />}
       </main>
     </div>

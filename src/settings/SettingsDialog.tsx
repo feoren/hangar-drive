@@ -1,7 +1,8 @@
 // Settings (UX 11): only "Start at sign-in" and the language. Below them, not settings but
-// information: the account and "About", with the error report and the two honest notes.
+// information: the account and "About", with the error report and the two honest notes, and
+// "Help" with "Reset this device" for starting over.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { HANGAR_DRIVE_BUILD } from "../buildInfo";
 import { formatSize } from "../format";
@@ -136,6 +137,13 @@ export function SettingsDialog({ onClose }: { readonly onClose: () => void }) {
           <p className="info-line">{t("settings.localNote")}</p>
           <ErrorReport />
         </section>
+
+        <section className="settings-group" aria-labelledby={`${titleId}-help`}>
+          <h3 id={`${titleId}-help`} className="section-label">
+            {t("help.title")}
+          </h3>
+          <ResetDevice />
+        </section>
       </div>
       <div className="dialog-actions">
         <button type="button" className="button secondary" onClick={onClose}>
@@ -217,6 +225,76 @@ function ErrorReport() {
         </>
       )}
       {saved && <Feedback>{t("common.saved", { path: saved })}</Feedback>}
+      {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
+    </div>
+  );
+}
+
+/**
+ * "Reset this device": forgets the account here, the files stay. Asked once, in place, because
+ * it cannot be undone from this device; afterwards the snapshot says the setup is needed and the
+ * window shows the welcome.
+ */
+function ResetDevice() {
+  const t = useT();
+  const backend = useBackend();
+  const action = useAction();
+  const [asking, setAsking] = useState(false);
+  const bodyId = useId();
+  const app = t("app.name");
+  const cancel = useRef<HTMLButtonElement>(null);
+  const start = useRef<HTMLButtonElement>(null);
+  const [asked, setAsked] = useState(false);
+  // The focus follows the question in and back out, so it never falls to the page.
+  useEffect(() => {
+    if (asking) cancel.current?.focus();
+    else if (asked) start.current?.focus();
+  }, [asking, asked]);
+  return (
+    <div className="report">
+      <p className="setting-help">{t("reset.help", { app })}</p>
+      {asking ? (
+        <div role="group" aria-labelledby={bodyId}>
+          <p id={bodyId} className="field-label">
+            {t("reset.question")}
+          </p>
+          <p className="setting-help">{t("reset.body", { app })}</p>
+          <div className="group-actions">
+            <button
+              ref={cancel}
+              type="button"
+              className="button secondary"
+              onClick={() => {
+                setAsking(false);
+              }}
+            >
+              {t("common.cancel")}
+            </button>
+            <button
+              type="button"
+              className="button danger"
+              disabled={action.pending}
+              onClick={() => {
+                void action.run(() => backend.resetDevice());
+              }}
+            >
+              {t("reset.confirm")}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          ref={start}
+          type="button"
+          className="button secondary"
+          onClick={() => {
+            setAsked(true);
+            setAsking(true);
+          }}
+        >
+          {t("reset.action")}
+        </button>
+      )}
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
     </div>
   );

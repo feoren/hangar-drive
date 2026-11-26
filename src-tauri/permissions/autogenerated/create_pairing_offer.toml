@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-pairing-offer"
+description = "Enables the create_pairing_offer command without any pre-configured scope."
+commands.allow = ["create_pairing_offer"]
+
+[[permission]]
+identifier = "deny-create-pairing-offer"
+description = "Denies the create_pairing_offer command without any pre-configured scope."
+commands.deny = ["create_pairing_offer"]

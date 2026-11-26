@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-with-camera"
+description = "Enables the scan_with_camera command without any pre-configured scope."
+commands.allow = ["scan_with_camera"]
+
+[[permission]]
+identifier = "deny-scan-with-camera"
+description = "Denies the scan_with_camera command without any pre-configured scope."
+commands.deny = ["scan_with_camera"]

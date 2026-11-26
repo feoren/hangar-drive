@@ -19,17 +19,29 @@ export type OpenDialog =
     }
   | { readonly kind: "conflicts" }
   | { readonly kind: "names" }
-  | { readonly kind: "massDelete"; readonly warning: Extract<Warning, { kind: "massDelete" }> }
+  | {
+      readonly kind: "massDelete";
+      readonly warning: Extract<Warning, { kind: "massDelete" }>;
+      /** Opened by the window itself, so closing it puts the focus on the banner. */
+      readonly auto?: boolean;
+    }
+  | {
+      readonly kind: "removedHeads";
+      readonly warning: Extract<Warning, { kind: "removedHeads" }>;
+      readonly auto?: boolean;
+    }
+  /** A link the OS handed over to a device that is already set up. */
+  | { readonly kind: "linkNotNeeded" }
   | { readonly kind: "stopFolder"; readonly folder: Folder }
-  | { readonly kind: "deleteFolder"; readonly folder: Folder }
   | { readonly kind: "folderNumber"; readonly folder: Folder }
   | { readonly kind: "notSynced"; readonly folder: Folder }
   | { readonly kind: "addFolder" }
-  | { readonly kind: "serverScan" }
+  /** `link`: a pairing link the OS handed over, filled in. */
+  | { readonly kind: "serverScan"; readonly link?: string }
   | { readonly kind: "serverCompare" }
   | { readonly kind: "reanchor"; readonly folderId: string; readonly folderName: string }
   | { readonly kind: "suspect"; readonly warning: Extract<Warning, { kind: "suspect" }> }
   | { readonly kind: "notMe" }
-  | { readonly kind: "repair" };
+  | { readonly kind: "repair"; readonly link?: string };
 
 export type Open = (dialog: OpenDialog) => void;

@@ -10,13 +10,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hangar_drive_protocol::ids::{base64url, DeviceId};
+use hangar_drive_protocol::api::*;
+use hangar_drive_protocol::ids::*;
 use hangar_drive_sync::api::{ApiResult, BackendEvent, FolderStatus, PairResult, SetupState};
 use hangar_drive_sync::engine::{Engine, EngineCore, EnginePorts, EngineSettings};
+use hangar_drive_sync::memory::SharedKeychain;
 use hangar_drive_sync::memory::{
     ManualClock, MemFs, MemKeychain, MemServer, MemStore, SeededRandom, ServerState,
 };
-use hangar_drive_sync::ports::FileSystem;
+use hangar_drive_sync::ports::{FileSystem, NetError, ServerApi};
 
 type Disks = Rc<RefCell<BTreeMap<PathBuf, Arc<MemFs>>>>;
 
@@ -26,11 +28,31 @@ fn core(
     clock: &ManualClock,
     seed: u64,
 ) -> EngineCore {
+    core_with(
+        shared,
+        disks,
+        clock,
+        seed,
+        Box::new(MemKeychain::default()),
+        false,
+    )
+}
+
+/// [`core`] with a keychain the test keeps a handle to; `lie_head` makes the server answer
+/// every log append with a head it made up (security review I1).
+fn core_with(
+    shared: &Rc<RefCell<ServerState>>,
+    disks: &Disks,
+    clock: &ManualClock,
+    seed: u64,
+    keychain: Box<dyn hangar_drive_sync::ports::Keychain>,
+    lie_head: bool,
+) -> EngineCore {
     let server = Rc::clone(shared);
     let disks = Rc::clone(disks);
     let ports = EnginePorts {
         store: Box::new(MemStore::new()),
-        keychain: Box::new(MemKeychain::default()),
+        keychain,
         clock: Box::new(clock.clone()),
         entropy: Box::new(SeededRandom::new(seed)),
         fs: Box::new(move |path: &Path| {
@@ -42,9 +64,14 @@ fn core(
             let events = Box::new(fs.clone()) as Box<dyn hangar_drive_sync::watch::ChangeSource>;
             Ok((Box::new(fs) as Box<dyn FileSystem>, Some(events)))
         }),
-        server: Box::new(move |_config, identity| {
+        // Pinned like the real client: a server presenting another key fails every call.
+        server: Box::new(move |config, identity| {
             let device = identity.map_or(DeviceId::from_bytes([0; 16]), |i| i.device);
-            Ok(Box::new(MemServer::connect(&server, device)) as Box<_>)
+            let server = MemServer::connect_pinned(&server, device, config.pin);
+            if lie_head {
+                return Ok(Box::new(LyingHead(server)) as Box<_>);
+            }
+            Ok(Box::new(server) as Box<_>)
         }),
         // In-memory roots: the nesting rule on the path names, as the real check does on the
         // canonical forms.
@@ -60,6 +87,60 @@ fn core(
         }),
     };
     EngineCore::open(ports, EngineSettings::default()).unwrap()
+}
+
+/// A server that answers every log append with a head it made up.
+struct LyingHead(MemServer);
+
+macro_rules! pass {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) -> Result<$out, NetError> {
+            self.0.$name($($arg),*)
+        })*
+    };
+}
+
+impl ServerApi for LyingHead {
+    fn append_log(&mut self, request: &LogAppendRequest) -> Result<LogAppendResponse, NetError> {
+        let mut response = self.0.append_log(request)?;
+        response.head.hash = LogHash::from_bytes([0x66; 32]);
+        Ok(response)
+    }
+    pass! {
+        create_account(request: &CreateAccountRequest) -> CreateAccountResponse;
+        challenge(account: &AccountId, device: &DeviceId) -> ChallengeResponse;
+        proof(account: &AccountId, device: &DeviceId, challenge: &Challenge, signature: &Signature) -> SessionResponse;
+        log(after: u64) -> LogPage;
+        epoch_key(epoch: Epoch) -> WrappedKeyResponse;
+        record(key: &RecordKey) -> Option<RecordResponse>;
+        put_record(key: &RecordKey, put: &RecordPut) -> ();
+        feed(after: u64) -> FeedPage;
+        reserve_pairing(id: &PairingId) -> PairingReservation;
+        post_pairing(id: &PairingId, request: &PairingRequest) -> ();
+        get_pairing(id: &PairingId) -> Option<PairingRequest>;
+        close_pairing(id: &PairingId) -> ();
+        missing_objects(folder: &FolderId, ids: &[ObjectId]) -> Vec<ObjectId>;
+        put_object(folder: &FolderId, id: &ObjectId, blob: &[u8]) -> UploadResponse;
+        get_object(folder: &FolderId, id: &ObjectId) -> Vec<u8>;
+        commit(folder: &FolderId, request: &CommitRequest) -> CommitResponse;
+        commits(folder: &FolderId, after: u64) -> DeltaPage;
+        retire(folder: &FolderId) -> ();
+        bring_back(folder: &FolderId) -> ();
+    }
+    fn seen_pin(&self) -> Option<[u8; 32]> {
+        self.0.seen_pin()
+    }
+}
+
+/// A new account on `a` with its code confirmed; returns the code view.
+fn set_up(a: &mut EngineCore) -> hangar_drive_sync::api::RecoveryCodeView {
+    let link = format!("http://localhost:8080/join#{}", base64url(&[9; 16]));
+    let ApiResult::Ok(code) = a.begin_account(&link, "Laptop").unwrap() else {
+        panic!("begin");
+    };
+    let group = code.groups[code.check_group as usize - 1].clone();
+    assert!(a.confirm_recovery_group(&group).unwrap());
+    code
 }
 
 fn p(names: &[&str]) -> Vec<String> {
@@ -91,7 +172,30 @@ fn setup_pairing_and_sync_through_the_engine() {
 
     // Account: invite, recovery code, the typed check group.
     let link = format!("http://localhost:8080/join#{}", base64url(&[9; 16]));
-    assert!(matches!(a.check_invite(&link), ApiResult::Ok(ref h) if h == "localhost:8080"));
+    assert!(matches!(
+        a.check_invite(&link),
+        ApiResult::Ok(ref c) if c.host == "localhost:8080" && !c.pinned && !c.punycode
+    ));
+    // N3: a pin and a punycode host are reported, so the window can warn.
+    let pinned = format!(
+        "https://xn--drve-6qa.example/join#{}.{}.{}",
+        base64url(&[9; 16]),
+        "5e".repeat(16),
+        base64url(&[7; 32])
+    );
+    assert!(matches!(
+        a.check_invite(&pinned),
+        ApiResult::Ok(ref c) if c.pinned && c.punycode && c.host == "xn--drve-6qa.example"
+    ));
+    // Name errors are their own codes.
+    assert_eq!(
+        a.begin_account(&link, " Laptop").unwrap(),
+        ApiResult::Err(hangar_drive_sync::api::BeginError::EdgeWhitespace)
+    );
+    assert_eq!(
+        a.begin_account(&link, "   ").unwrap(),
+        ApiResult::Err(hangar_drive_sync::api::BeginError::Blank)
+    );
     assert!(matches!(a.check_invite("nonsense"), ApiResult::Err(_)));
     let ApiResult::Ok(code) = a.begin_account(&link, "Laptop").unwrap() else {
         panic!("begin");
@@ -117,6 +221,30 @@ fn setup_pairing_and_sync_through_the_engine() {
     // Pairing: A offers, B answers, A asks the person, B joins.
     let offer = a.create_pairing_offer().unwrap();
     assert_eq!(offer.code.len(), 8);
+    // N2: before B sends anything it shows host and account of the link.
+    let ApiResult::Ok(hangar_drive_sync::api::InspectedLink::Pair {
+        host,
+        account,
+        pinned,
+    }) = b.inspect_link(&offer.link)
+    else {
+        panic!("inspect");
+    };
+    assert_eq!(host, "localhost:8080");
+    assert_eq!(account, offer.account);
+    assert!(!pinned);
+    assert!(matches!(
+        b.inspect_link("hangar-drive://pair#AQID"),
+        ApiResult::Err(hangar_drive_sync::api::LinkProblem::Damaged)
+    ));
+    assert!(matches!(
+        b.inspect_link("nonsense"),
+        ApiResult::Err(hangar_drive_sync::api::LinkProblem::NotALink)
+    ));
+    assert!(matches!(
+        b.inspect_link(&link),
+        ApiResult::Ok(hangar_drive_sync::api::InspectedLink::Invite { .. })
+    ));
     let ApiResult::Ok(safety_b) = b.start_pairing(&offer.link, "Desktop").unwrap() else {
         panic!("start pairing");
     };
@@ -133,12 +261,19 @@ fn setup_pairing_and_sync_through_the_engine() {
     assert_eq!(request.safety, safety_b);
     a.answer_pair_request(&request.offer_id, true).unwrap();
     let events = b.tick();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BackendEvent::PairResult {
-            result: PairResult::Joined
-        }
-    )));
+    // N2: the joined device sees the account's devices to confirm them.
+    let joined = events
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::PairResult {
+                result: PairResult::Joined { devices },
+            } => Some(devices.clone()),
+            _ => None,
+        })
+        .expect("joined");
+    assert_eq!(joined.len(), 2);
+    assert!(joined.iter().any(|d| d.is_this && d.name == "Desktop"));
+    assert!(joined.iter().any(|d| !d.is_this && d.name == "Laptop"));
     assert_eq!(a.list_devices().unwrap().devices.len(), 2);
 
     // B sees the account folder and joins it.
@@ -301,4 +436,235 @@ fn recovery_with_the_sheet_replaces_every_lost_device() {
             .unwrap(),
         ApiResult::Ok(())
     );
+}
+
+/// N1: the sheet's genesis anchor binds the recovery to the account's own log.
+#[test]
+fn a_sheet_with_another_genesis_is_refused() {
+    use hangar_drive_protocol::ids::{AccountId, LogHash, ServerId};
+    use hangar_drive_sync::api::RecoverError;
+    use hangar_drive_sync::links::{parse_recovery_link, recovery_link};
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&shared, &disks, &clock, 21);
+    let link = format!("http://localhost:8080/join#{}", base64url(&[9; 16]));
+    let ApiResult::Ok(code) = a.begin_account(&link, "Laptop").unwrap() else {
+        panic!("begin");
+    };
+    let group = code.groups[code.check_group as usize - 1].clone();
+    assert!(a.confirm_recovery_group(&group).unwrap());
+    // The sheet names entry 1 of the log the server now holds.
+    let sheet = parse_recovery_link(&code.sheet.link).unwrap();
+    let log = shared.borrow().account_state().unwrap().hash_at(1).copied();
+    assert_eq!(Some(sheet.genesis), log);
+    assert_eq!(code.sheet.genesis_anchor, sheet.genesis.to_hex());
+    assert!(matches!(
+        a.inspect_link(&code.sheet.link),
+        ApiResult::Ok(hangar_drive_sync::api::InspectedLink::Recover { ref account, .. })
+            if *account == code.sheet.account_id
+    ));
+    let mut probe = core(&shared, &disks, &clock, 23);
+    assert_eq!(
+        probe
+            .recover_account(&code.sheet.link, "x", " Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::EdgeWhitespace)
+    );
+    assert_eq!(
+        sheet.account,
+        AccountId::from_hex(&code.sheet.account_id).unwrap()
+    );
+    assert_eq!(
+        sheet.server,
+        ServerId::from_hex(&code.sheet.server_id).unwrap()
+    );
+    // The same code with another anchor: the log does not start there.
+    let mut forged = sheet.clone();
+    forged.genesis = LogHash::from_bytes([0x42; 32]);
+    let mut c = core(&shared, &disks, &clock, 22);
+    let text = code.groups.join("-");
+    assert_eq!(
+        c.recover_account(&recovery_link(&forged), &text, "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::Unknown)
+    );
+    // With the real sheet it works.
+    assert_eq!(
+        c.recover_account(&code.sheet.link, &text, "Neu").unwrap(),
+        ApiResult::Ok(())
+    );
+}
+
+/// ux-concept 10.3: a renewed code replaces the old one only after the group check.
+#[test]
+fn a_renewed_code_replaces_the_old_one_after_the_group_check() {
+    use hangar_drive_sync::api::RecoverError;
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&shared, &disks, &clock, 31);
+    let link = format!("http://localhost:8080/join#{}", base64url(&[9; 16]));
+    let ApiResult::Ok(old) = a.begin_account(&link, "Laptop").unwrap() else {
+        panic!("begin");
+    };
+    let group = old.groups[old.check_group as usize - 1].clone();
+    assert!(a.confirm_recovery_group(&group).unwrap());
+    let created = a.list_devices().unwrap().recovery_created;
+
+    // Shown, then abandoned: the old code still works.
+    let abandoned = a.renew_recovery_code().unwrap();
+    assert_ne!(abandoned.groups, old.groups);
+    assert_eq!(
+        abandoned.sheet.link, old.sheet.link,
+        "the sheet's public part stays"
+    );
+    assert!(!a.confirm_recovery_group("0000").unwrap());
+
+    let renewed = a.renew_recovery_code().unwrap();
+    let group = renewed.groups[renewed.check_group as usize - 1].clone();
+    clock.advance(1_000);
+    assert!(a.confirm_recovery_group(&group).unwrap());
+    assert!(a.list_devices().unwrap().recovery_created > created);
+    let mut c = core(&shared, &disks, &clock, 32);
+    assert_eq!(
+        c.recover_account(&old.sheet.link, &old.groups.join(""), "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::Used)
+    );
+    assert_eq!(
+        c.recover_account(&abandoned.sheet.link, &abandoned.groups.join(""), "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::Unknown)
+    );
+    assert_eq!(
+        c.recover_account(&renewed.sheet.link, &renewed.groups.join(""), "Neu")
+            .unwrap(),
+        ApiResult::Ok(())
+    );
+}
+
+// Security review L1: a device that learns it was removed forgets its secrets and its account at
+// once and keeps the warning (with the remover's name when it could still read it), and the files
+// stay.
+#[test]
+fn a_removed_device_forgets_its_secrets() {
+    use hangar_drive_sync::api::Warning;
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let keys = SharedKeychain::default();
+    let mut a = core_with(&shared, &disks, &clock, 31, Box::new(keys.clone()), false);
+    let code = set_up(&mut a);
+    a.add_folder("mem:/a/Docs", "Docs").unwrap();
+    disk(&disks, "mem:/a/Docs").user_write(&p(&["plan.txt"]), b"mine");
+    a.tick();
+    assert!(keys.keys().contains(&"device-identity".to_owned()));
+    assert!(keys.keys().iter().any(|k| k.starts_with("epoch-")));
+    let lost = a.list_devices().unwrap().devices[0].id.clone();
+    // Another installation recovers the account and removes A.
+    let mut c = core(&shared, &disks, &clock, 32);
+    assert_eq!(
+        c.recover_account(&code.sheet.link, &code.groups.join("-"), "Rescue")
+            .unwrap(),
+        ApiResult::Ok(())
+    );
+    c.finish_recovery_cleanup(std::slice::from_ref(&lost))
+        .unwrap();
+    clock.advance(20_000);
+    a.tick();
+    assert_eq!(keys.keys(), Vec::<String>::new(), "no secret is left");
+    let snap = a.snapshot();
+    assert_eq!(snap.setup, SetupState::Needed);
+    assert!(snap.folders.is_empty());
+    assert!(
+        snap.warnings
+            .iter()
+            .any(|w| matches!(w, Warning::Removed { by, .. } if by.is_empty() || by == "Rescue")),
+        "{:?}",
+        snap.warnings
+    );
+    assert_eq!(
+        disk(&disks, "mem:/a/Docs")
+            .read_all(&p(&["plan.txt"]))
+            .unwrap(),
+        b"mine",
+        "the files stay"
+    );
+    // A reset clears the warning too; a restart finds no account and no warning left over.
+    a.reset_device().unwrap();
+    assert!(a.snapshot().warnings.is_empty());
+    assert_eq!(a.snapshot().setup, SetupState::Needed);
+}
+
+// Security review L1: "start over" forgets every secret and the account.
+#[test]
+fn a_reset_forgets_every_secret() {
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let keys = SharedKeychain::default();
+    let mut a = core_with(&shared, &disks, &clock, 33, Box::new(keys.clone()), false);
+    set_up(&mut a);
+    a.add_folder("mem:/a/Docs", "Docs").unwrap();
+    a.tick();
+    assert!(!keys.keys().is_empty());
+    a.reset_device().unwrap();
+    assert_eq!(keys.keys(), Vec::<String>::new());
+    let snap = a.snapshot();
+    assert_eq!(snap.setup, SetupState::Needed);
+    assert!(snap.folders.is_empty() && snap.warnings.is_empty());
+}
+
+// Security review L1: a join that fails after the identity was stored leaves nothing behind.
+#[test]
+fn an_aborted_join_leaves_no_secret() {
+    use hangar_drive_crypto::identity::DeviceIdentity;
+    use hangar_drive_sync::account::Account;
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&shared, &disks, &clock, 34);
+    let code = set_up(&mut a);
+    let account = AccountId::from_hex(&code.sheet.account_id).unwrap();
+    // A device the log does not list: the join reads the log and refuses.
+    let device = DeviceId::from_bytes([0x77; 16]);
+    let identity = DeviceIdentity::generate(&mut SeededRandom::new(35)).unwrap();
+    let mut server = MemServer::connect(&shared, device);
+    let mut keychain = MemKeychain::default();
+    let mut store = MemStore::new();
+    let joined = Account::join(
+        &mut server,
+        &mut keychain,
+        &mut store,
+        identity,
+        account,
+        device,
+        "Stranger",
+        &[],
+    );
+    assert!(joined.is_err());
+    assert_eq!(keychain.keys(), Vec::<String>::new());
+    assert!(Account::load(&store, &keychain).unwrap().is_none());
+}
+
+// Security review I1: the recovery computes the head after its append itself and refuses a
+// server that reports another one, before the new device joins at it.
+#[test]
+fn a_recovery_refuses_a_head_the_server_made_up() {
+    use hangar_drive_sync::api::RecoverError;
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&shared, &disks, &clock, 36);
+    let code = set_up(&mut a);
+    let keys = SharedKeychain::default();
+    let mut c = core_with(&shared, &disks, &clock, 37, Box::new(keys.clone()), true);
+    assert_eq!(
+        c.recover_account(&code.sheet.link, &code.groups.join("-"), "Neu")
+            .unwrap(),
+        ApiResult::Err(RecoverError::Unknown)
+    );
+    assert_eq!(c.snapshot().setup, SetupState::Needed);
+    assert_eq!(keys.keys(), Vec::<String>::new());
 }

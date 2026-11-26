@@ -27,6 +27,32 @@ async fn health_reports_version_and_protocol() {
     server.stop().await.unwrap();
 }
 
+/// `HANGAR_DRIVE_PUBLIC_URL` is required: every sign-in is bound to it (ADR 0001, section 6).
+#[tokio::test]
+async fn the_server_does_not_start_without_its_public_url() {
+    let dir = data_dir("no-public-url");
+    let config = hangar_drive_server::config::Config::from_lookup(|name| {
+        (name == "HANGAR_DRIVE_DATA_DIR").then(|| dir.clone().into_os_string())
+    })
+    .unwrap();
+    assert_eq!(config.public_url, None);
+    let deps = hangar_drive_server::Deps {
+        gc_job: false,
+        ..hangar_drive_server::Deps::default()
+    };
+    match hangar_drive_server::build(&config, deps).await {
+        Err(error @ hangar_drive_server::StartError::PublicUrlMissing) => {
+            let text = error.to_string();
+            assert!(
+                text.contains("HANGAR_DRIVE_PUBLIC_URL=https://drive.example.org/"),
+                "the message says how to set it: {text}"
+            );
+        }
+        Err(other) => panic!("another error: {other}"),
+        Ok(_) => panic!("the server started without its public URL"),
+    }
+}
+
 #[tokio::test]
 async fn unknown_paths_and_methods_answer_with_error_codes() {
     let mut server = TestServer::start("unknown").await;
@@ -104,4 +130,46 @@ async fn shutdown_ends_open_event_streams_within_the_grace_period() {
         "the stream held the shutdown"
     );
     assert!(TcpStream::connect(server.addr).await.is_err());
+}
+
+#[tokio::test]
+async fn the_join_page_is_static_with_its_own_strict_policy() {
+    let mut server = TestServer::start("join").await;
+    let client = Client::new(server.addr);
+    let csp = "default-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; \
+               form-action 'none'; frame-ancestors 'none'";
+    for (path, kind) in [
+        ("/join", "text/html"),
+        ("/join.js", "text/javascript"),
+        ("/join.css", "text/css"),
+    ] {
+        let reply = client.get(path).await;
+        assert_eq!(reply.status, 200, "{path}");
+        assert!(
+            reply
+                .header("content-type")
+                .is_some_and(|t| t.starts_with(kind)),
+            "{path}"
+        );
+        assert_eq!(
+            reply.header("content-security-policy").as_deref(),
+            Some(csp)
+        );
+        assert_eq!(reply.header("cache-control").as_deref(), Some("no-store"));
+        assert_eq!(
+            reply.header("referrer-policy").as_deref(),
+            Some("no-referrer")
+        );
+    }
+    let page = String::from_utf8(client.get("/join").await.body).unwrap();
+    assert!(page.contains("<script src=\"join.js\" defer></script>"));
+    assert!(!page.contains("<script>"), "no inline script");
+    assert!(page.contains("hangar-drive://join"));
+    // The API keeps its own policy.
+    let reply = client.get(HEALTH_PATH).await;
+    assert_eq!(
+        reply.header("content-security-policy").as_deref(),
+        Some("default-src 'none'; frame-ancestors 'none'")
+    );
+    server.stop().await.unwrap();
 }

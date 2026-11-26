@@ -14,8 +14,15 @@
 //!
 //! Failed proofs count against [`Scope::ProofFailures`], keyed by account and device and only
 //! for devices the account's log lists, so the table holds only real devices.
+//!
+//! **Removed devices** (finding E2E-3): a proof that verifies with the key the log last listed
+//! for a device the log removed is answered with [`ErrorCode::DeviceRemoved`] instead of
+//! [`ErrorCode::ProofInvalid`], so the removed device learns it and forgets the account; it
+//! could no longer read the log that says so. Only a holder of that key can make such a proof,
+//! so nobody else can ask whether a device was removed. The challenge is used up as for a
+//! session, and the answer does not count as a failed proof.
 
-use hangar_drive_crypto::session::verify_session;
+use hangar_drive_crypto::session::{verify_session, SessionError};
 use hangar_drive_crypto::{Entropy, OsEntropy};
 use hangar_drive_protocol::api::{
     ChallengeRequest, ChallengeResponse, ErrorCode, ProofRequest, SessionResponse, SessionScope,
@@ -146,14 +153,29 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         .get(&mut conn, account.pk, account.id, account.log_length)
         .await?;
     drop(conn);
+    // The proof must name this server's own address (relay protection, see `App::public_url`).
+    // A server without it serves nothing (`build` refuses), so a missing address refuses.
+    let Some(server_url) = app.public_url.as_deref() else {
+        return Err(ApiError::internal(&"sign-in without a public URL"));
+    };
+    if server_url != request.server_url {
+        app.limiter.hit(Scope::ProofFailures, &key, now / 1000);
+        return Err(ErrorCode::ProofInvalid.into());
+    }
     let record = match verify_session(
         &state,
         &app.server_id,
+        server_url,
         &request.device,
         &request.challenge,
         &request.signature,
     ) {
         Ok(record) => *record,
+        Err(SessionError::Removed) => {
+            // Used up like a sign-in's challenge, so a replay of this proof learns nothing new.
+            use_challenge(app, request, now, expires_challenge).await?;
+            return Err(ErrorCode::DeviceRemoved.into());
+        }
         Err(_) => {
             if state.device(&request.device).is_some() {
                 app.limiter.hit(Scope::ProofFailures, &key, now / 1000);
@@ -197,6 +219,32 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         token,
         expires_in_secs: SESSION_SECS,
     })
+}
+
+/// Marks the challenge of a proof that verified as used (a removed device's proof); a second
+/// use is a replay.
+async fn use_challenge(
+    app: &App,
+    request: &ProofRequest,
+    now: u64,
+    expires_challenge: u64,
+) -> ApiResult<()> {
+    let mut tx = begin_write(&app.db).await?;
+    sqlx::query("DELETE FROM used_challenges WHERE expires_ms <= ?")
+        .bind(i64_of(now))
+        .execute(&mut *tx)
+        .await?;
+    let fresh =
+        sqlx::query("INSERT OR IGNORE INTO used_challenges (challenge, expires_ms) VALUES (?, ?)")
+            .bind(request.challenge.as_bytes().as_slice())
+            .bind(i64_of(expires_challenge))
+            .execute(&mut *tx)
+            .await?;
+    if fresh.rows_affected() != 1 {
+        return Err(ErrorCode::ChallengeInvalid.into());
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// The session of a bearer token, or `unauthorized`. A device the verified log no longer lists

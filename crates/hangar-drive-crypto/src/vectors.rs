@@ -27,7 +27,7 @@ use crate::identity::{folder_safety_number, safety_number, server_key_number, De
 use crate::object::{padme, ObjectKeys};
 use crate::pairing::{parse_server_url, OfferContent, PairingSecret};
 use crate::record::RecordCipher;
-use crate::recovery::RecoveryCode;
+use crate::recovery::{RecoveryCode, RecoverySheet};
 
 fn counting(start: u8, len: usize) -> Vec<u8> {
     (0..len).map(|i| start.wrapping_add(i as u8)).collect()
@@ -420,14 +420,32 @@ fn compute() -> BTreeMap<String, String> {
     put("recovery.sign_public", hex(recovery.sign.as_bytes()));
     put("recovery.kem_public", hex(recovery.kem.as_bytes()));
     put("recovery.device_id", code.device_id().unwrap().to_hex());
+    // The recovery sheet (version 2): anchored at the create entry, with and without a pin.
+    let sheet = RecoverySheet {
+        server_url: parse_server_url("https://drive.example").unwrap(),
+        server,
+        account,
+        genesis: create_head.hash,
+        pin: Some(array(0xf0)),
+    };
+    put("recovery.sheet", hex(&sheet.encode()));
+    let plain = RecoverySheet { pin: None, ..sheet };
+    put("recovery.sheet_unpinned", hex(&plain.encode()));
 
     // Pairing.
     let pairing = PairingSecret::generate(&mut FixedEntropy::counting(0xe0, 16)).unwrap();
     put("pairing.code", pairing.reveal().to_string());
     put("pairing.id", pairing.pairing_id().unwrap().to_hex());
     let request = pairing
-        .request(&identity, &account, device, "Laptop")
+        .request(
+            &identity,
+            &account,
+            device,
+            "Laptop",
+            &mut FixedEntropy::counting(0xe8, 24),
+        )
         .unwrap();
+    put("pairing.sealed_name", hex(request.sealed_name.as_bytes()));
     put("pairing.tag", hex(request.tag.as_bytes()));
     let offer = OfferContent {
         server_url: parse_server_url("https://drive.example").unwrap(),
@@ -451,7 +469,13 @@ fn compute() -> BTreeMap<String, String> {
     put(
         "session.proof",
         hex(identity
-            .prove_session(&server, &account, &device, &challenge)
+            .prove_session(
+                &server,
+                "https://drive.example/",
+                &account,
+                &device,
+                &challenge,
+            )
             .as_bytes()),
     );
     put(
