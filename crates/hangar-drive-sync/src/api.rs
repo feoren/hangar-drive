@@ -204,6 +204,8 @@ pub struct Folder {
     pub freeze_days: Option<u32>,
     /// Entries never synced.
     pub not_synced_count: u64,
+    /// The bytes of its files on this disk; None before the first scan.
+    pub bytes: Option<u64>,
 }
 
 /// What happened to a file.

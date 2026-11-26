@@ -518,6 +518,14 @@ impl Tree {
     pub fn count_files(&self) -> usize {
         self.nodes.values().filter(|n| !n.is_dir()).count()
     }
+
+    /// The sum of the file sizes (directories have none).
+    pub fn file_bytes(&self) -> u64 {
+        self.nodes
+            .values()
+            .filter_map(|n| n.kind.file())
+            .fold(0u64, |sum, f| sum.saturating_add(f.size))
+    }
 }
 
 #[cfg(test)]

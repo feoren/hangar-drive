@@ -472,6 +472,9 @@ pub struct FolderSync {
     /// without this every publish ended in [`PublishFailure::LocalChanged`]. Not stored: after a
     /// restart the next failed upload finds the contents again.
     rehash: BTreeSet<ContentKey>,
+    /// Whether the local tree shows the disk: after a scan of this run, or loaded non-empty from
+    /// the index. A new folder's empty tree says nothing about its size yet. Not stored.
+    local_known: bool,
 }
 
 /// What the next scan reads from the disk.
@@ -815,6 +818,7 @@ impl FolderSync {
             too_large_at: None,
             last_action: None,
             rehash: BTreeSet::new(),
+            local_known: false,
         }
     }
 
@@ -836,11 +840,11 @@ impl FolderSync {
             meta.marks.iter().copied().collect(),
             meta.discarded.iter().copied().collect(),
         )?;
+        let local = Tree::from_nodes(stored.local);
         Ok(Some(Self {
             folder,
             remote: Tree::from_nodes(stored.remote),
             synced: Tree::from_nodes(stored.synced),
-            local: Tree::from_nodes(stored.local),
             file_ids: stored.file_ids.into_iter().collect(),
             file_ids_dirty: BTreeMap::new(),
             meta,
@@ -849,6 +853,8 @@ impl FolderSync {
             too_large_at: None,
             last_action: None,
             rehash: BTreeSet::new(),
+            local_known: !local.is_empty(),
+            local,
         }))
     }
 
@@ -935,6 +941,12 @@ impl FolderSync {
     /// The local tree.
     pub fn local(&self) -> &Tree {
         &self.local
+    }
+
+    /// The bytes of the folder's files on this disk as the local tree holds them, so the window
+    /// can show a size without walking the disk again; None until the tree shows the disk.
+    pub fn local_bytes(&self) -> Option<u64> {
+        self.local_known.then(|| self.local.file_bytes())
     }
 
     /// The verified chain.
@@ -1721,6 +1733,7 @@ impl FolderSync {
         for id in deleted {
             self.meta.deleted_seen.entry(id).or_insert(now);
         }
+        self.local_known = true;
         Ok(())
     }
 

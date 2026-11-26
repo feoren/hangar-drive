@@ -1118,6 +1118,7 @@ impl EngineCore {
                 status: Self::folder_status(f),
                 freeze_days: None,
                 not_synced_count: meta.not_synced.len() as u64,
+                bytes: f.sync.local_bytes(),
             });
             match f.sync.state() {
                 FolderState::Stopped(StopReason::MarkerMissing) => {

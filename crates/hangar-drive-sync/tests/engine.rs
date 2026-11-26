@@ -840,3 +840,30 @@ fn a_recovery_refuses_a_head_the_server_made_up() {
     assert_eq!(c.snapshot().setup, SetupState::Needed);
     assert_eq!(keys.keys(), Vec::<String>::new());
 }
+
+#[test]
+fn a_folder_shows_the_size_of_its_files_after_the_first_scan() {
+    let shared = MemServer::new_shared();
+    let disks: Disks = Rc::default();
+    let clock = ManualClock::at(1_795_651_200_000);
+    let mut a = core(&shared, &disks, &clock, 1);
+    set_up(&mut a);
+    a.add_folder("mem:/a/Docs", "Docs").unwrap();
+    // Before the first scan the size is unknown, not zero.
+    assert_eq!(a.snapshot().folders[0].bytes, None);
+
+    let fs = disk(&disks, "mem:/a/Docs");
+    fs.user_write(&p(&["plan.txt"]), b"12345");
+    fs.user_mkdir(&p(&["sub"]));
+    fs.user_write(&p(&["sub", "notes.txt"]), &[7; 300]);
+    a.tick();
+    a.tick();
+    // Files only: the directory and the folder's own marker do not count.
+    assert_eq!(a.snapshot().folders[0].bytes, Some(305));
+
+    fs.user_delete(&p(&["plan.txt"]));
+    clock.advance(20_000);
+    a.tick();
+    a.tick();
+    assert_eq!(a.snapshot().folders[0].bytes, Some(300));
+}
