@@ -6,15 +6,21 @@
 #   docker compose up -d --build
 #
 # The base images are pinned by digest (multi-platform index) so that a build is reproducible;
-# Dependabot proposes new digests. To update by hand:
-#   docker buildx imagetools inspect rust:1-alpine   (first "Digest:" line)
+# Dependabot proposes new digests. The Rust tag names the exact toolchain of
+# `rust-toolchain.toml`, so the image builds with the compiler the check suite ran with; raise
+# both together. To update by hand:
+#   docker buildx imagetools inspect rust:1.100.0-alpine   (first "Digest:" line)
 
-FROM rust:1-alpine@sha256:2cccd8b212b37dad15a555589c1b6787da4ab913fe24d8a9b2d99d3498869409 AS build
+FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY server ./server
+# sqlx keeps a checksum over the exact bytes of each migration: a file with CRLF (a Windows
+# checkout with core.autocrlf) would not match a database migrated by an LF build, and the server
+# would refuse to start on it.
+RUN if grep -l "$(printf '\015')" server/migrations/*.sql; then echo 'migrations with CRLF' >&2; exit 1; fi
 # The workspace lists the desktop app as a member, so Cargo has to read its manifest and find its
 # targets. It is not compiled: the build below selects the server package only.
 COPY src-tauri/Cargo.toml ./src-tauri/Cargo.toml

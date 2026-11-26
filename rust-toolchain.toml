@@ -1,0 +1,8 @@
+# The exact stable toolchain this repository builds and tests with (security review N3): a fixed
+# version, not the moving `stable` channel, so a local build, CI and a release build use the same
+# compiler and the same lints. Raise it deliberately, in its own commit, after the check suite
+# passed with the new version. The workspace MSRV (`rust-version` in `Cargo.toml`) stays the floor.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

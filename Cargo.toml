@@ -3,18 +3,27 @@
 # server share the protocol crate by path, so a change to it is built and tested against both.
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/hangar-drive-protocol", "crates/hangar-drive-crypto", "server"]
+members = [
+    "src-tauri",
+    "crates/hangar-drive-protocol",
+    "crates/hangar-drive-crypto",
+    "crates/hangar-drive-sync",
+    "server",
+]
 # The fuzz targets need nightly and cargo-fuzz; they are a package of their own.
 exclude = ["crates/hangar-drive-crypto/fuzz"]
 
 [workspace.package]
 edition = "2021"
-# The same minimum as Hangar's app; CI builds with current stable.
-rust-version = "1.89"
+# `notify` 9, the change watcher of the sync engine, needs Rust 1.91 (ADR 0001, section 8: the
+# workspace MSRV goes to 1.91 with the first change that adds it). Local builds and CI use the
+# toolchain pinned in `rust-toolchain.toml`.
+rust-version = "1.91"
 license = "MIT"
 
 [workspace.dependencies]
 hangar-drive-protocol = { path = "crates/hangar-drive-protocol" }
+hangar-drive-crypto = { path = "crates/hangar-drive-crypto" }
 # Wire types (JSON). MIT/Apache-2.0, the de facto standard, maintained by serde-rs; already in
 # the app's tree through Tauri.
 serde = { version = "1", features = ["derive"] }

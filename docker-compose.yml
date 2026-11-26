@@ -2,10 +2,11 @@
 #
 #   docker compose up -d --build
 #   curl http://localhost:8080/api/v1/health
+#   docker compose exec server hangar-drive-server invite
 #
-# The port is bound to localhost only: the server has no TLS and no sign-in yet, so it must not be
-# reachable from the network. Put a reverse proxy with TLS in front of it before exposing it.
-# HANGAR_DRIVE_HOST_PORT changes the port on the host (default 8080).
+# The port is bound to localhost only: devices must reach the server through a reverse proxy
+# with TLS (see docs/self-hosting.md and the commented Caddy service below). Settings come from
+# the environment; put them into a .env file next to this one (never commit it).
 
 services:
   server:
@@ -17,17 +18,82 @@ services:
     environment:
       HANGAR_DRIVE_PORT: "8080"
       HANGAR_DRIVE_DATA_DIR: /data
+      # Retention and limits (docs/self-hosting.md, "Configuration"). The defaults apply when a
+      # variable is empty.
+      HANGAR_DRIVE_RETENTION_DAYS: ${HANGAR_DRIVE_RETENTION_DAYS:-30}
+      HANGAR_DRIVE_RETENTION_MIN_COMMITS: ${HANGAR_DRIVE_RETENTION_MIN_COMMITS:-10}
+      HANGAR_DRIVE_QUOTA: ${HANGAR_DRIVE_QUOTA:-100GiB}
+      HANGAR_DRIVE_HEADROOM: ${HANGAR_DRIVE_HEADROOM:-}
+      HANGAR_DRIVE_MIN_COUNT_CAP: ${HANGAR_DRIVE_MIN_COUNT_CAP:-}
+      HANGAR_DRIVE_ACCOUNT_BUDGET: ${HANGAR_DRIVE_ACCOUNT_BUDGET:-}
+      HANGAR_DRIVE_DEVICE_BUDGET: ${HANGAR_DRIVE_DEVICE_BUDGET:-}
+      HANGAR_DRIVE_DISK_RESERVE: ${HANGAR_DRIVE_DISK_RESERVE:-1GiB}
+      HANGAR_DRIVE_RECORD_CAP: ${HANGAR_DRIVE_RECORD_CAP:-}
+      # Commits and record writes worked on at once; their bodies are held in memory (up to
+      # 80 MiB each), so this and mem_limit below go together.
+      HANGAR_DRIVE_HEAVY_REQUESTS: ${HANGAR_DRIVE_HEAVY_REQUESTS:-4}
+      # Reverse proxies whose X-Forwarded-For counts, by exact address. Empty by default: with
+      # no proxy, nobody may set the client address. The caddy service below has the fixed
+      # address 172.30.250.10; uncomment the next line together with it. An nginx on the host
+      # reaches the server from the network's gateway, 172.30.250.1 (docs/self-hosting.md).
+      # HANGAR_DRIVE_TRUSTED_PROXIES: 172.30.250.10
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - drive-data:/data
     ports:
       - "127.0.0.1:${HANGAR_DRIVE_HOST_PORT:-8080}:8080"
+    networks: [drive]
     read_only: true
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    # docker stop sends SIGTERM; the server finishes open requests and exits well within this.
+    # A ceiling for memory and processes, so a flood of large requests ends in refused
+    # requests or a restart of this container, never in a host that swaps or runs out of PIDs.
+    # 1 GiB covers HANGAR_DRIVE_HEAVY_REQUESTS (4) commits of the largest size and the rest.
+    mem_limit: 1g
+    pids_limit: 256
+    # docker stop sends SIGTERM; the server ends its event streams, finishes open requests
+    # within HANGAR_DRIVE_SHUTDOWN_GRACE_SECS (10 s) and exits well within this.
     stop_grace_period: 20s
+
+  # Reverse proxy with automatic HTTPS (Let's Encrypt). To use it: set DRIVE_DOMAIN in .env,
+  # point the domain's DNS to this host, free ports 80 and 443, and uncomment this service and
+  # the two volumes below. The Caddyfile is in docs/self-hosting.md.
+  #
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   depends_on: [server]
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   environment:
+  #     DRIVE_DOMAIN: ${DRIVE_DOMAIN:?set DRIVE_DOMAIN, e.g. drive.example.org}
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy-data:/data
+  #     - caddy-config:/config
+  #   networks:
+  #     drive:
+  #       # The one address the server trusts (HANGAR_DRIVE_TRUSTED_PROXIES above).
+  #       ipv4_address: 172.30.250.10
+  #   cap_drop: [ALL]
+  #   cap_add: [NET_BIND_SERVICE]
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   mem_limit: 512m
+  #   pids_limit: 256
+
+# A network of its own with a fixed range, so the proxy's address is known and can be trusted
+# exactly instead of a whole private range.
+networks:
+  drive:
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24
+          gateway: 172.30.250.1
 
 volumes:
   drive-data:
+  # caddy-data:
+  # caddy-config:
