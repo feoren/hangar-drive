@@ -62,7 +62,7 @@ The interface uses the left column only. Internal terms stay in code and docs.
 | Ordnernummer / folder number | folder safety number over the frontier | [ADR 4]; shown like the safety number (8.6, 8.7) |
 | Servernummer / server number | server key number over the server's SPKI | [ADR 6]; shown like the safety number (8.3), only as a row of numbers to compare |
 | Wiederherstellungscode / recovery code | recovery device secret | same term as the sister app |
-| Wiederherstellungsblatt / recovery sheet | printed sheet with code, server address, server ID, account ID | [ADR 4] |
+| Wiederherstellungsblatt / recovery sheet | printed sheet with code, server address, server ID, account ID, genesis anchor, optional pin and the link `hangar-drive://recover#...` | [ADR 4]; version 2 (4.4) |
 | Version, früherer Stand / version, earlier state | commit | [Design] |
 | Papierkorb / trash | files dropped by retained commits | [ADR 5] |
 | zwei Fassungen / two versions | conflict copy | [Design]; the word "Konflikt" appears only in the file name |
@@ -150,13 +150,39 @@ A step indicator "Schritt 1 von 3" sits above the title; the steps really are a 
   invite [ADR 6] and, for self-signed setups, the SPKI pin [ADR 6]. Nobody types a URL.
 - **Three ways in, all the same field.** [Design]
   1. Paste: the "Einfügen" button reads the clipboard only on that click (no silent clipboard
-     reading). Pasting with Ctrl+V into the field works too.
+     reading). Pasting with Ctrl+V into the field works too. The shell hands over only a link or
+     code of the app (security review L2); for anything else, as for an empty clipboard, the field
+     says calmly, without error colour, "In der Zwischenablage ist kein Link von Hangar Drive."
   2. Click in a browser or mail: the server serves a small static page at `/join` with a button
      that opens `hangar-drive://join#<invite>`; the app receives it and fills the field. [Backend]
   3. QR code: the operator can show the same link as a QR code. A desktop rarely has a camera, so
      scanning is offered only when one exists ("Mit Kamera scannen"). [Design]
 - **The invite stays in the fragment** after `#`, so it does not land in proxy or access logs.
   [Design, in the spirit of ADR 6]
+- **Link formats.** [ADR 6, sync engine `links.rs`] The invite is
+  `https://<server>[/<base>]/join#<token>[.<server ID>[.<pin>]]` or, from the `/join` page,
+  `hangar-drive://join#<invite>@<server URL>`. Pairing is `hangar-drive://pair#<offer>`, the
+  sheet `hangar-drive://recover#<sheet>`. Every link field of the app recognizes all of them by
+  their shape (`src/domain/links.ts`); white space inside a link is removed while the person
+  types or pastes (the caret stays after the same character), so it never reaches the backend,
+  whose parsers refuse it: a link never contains any, and a copied or printed link often breaks
+  over lines or is typed in groups of four. A link
+  of another kind is named in words ("Das ist ein Kopplungslink von einem deiner Geräte.") with a
+  button that opens its own door, the link filled in; it is never sent as the wrong kind. Links the
+  OS hands to the app arrive as the event `openLink` and open the matching door the same way; on a
+  device that is already set up they show "Dieses Gerät ist schon eingerichtet" (`link.notNeeded.*`),
+  except a pairing link while the server identifies itself differently (8.3) or after this device
+  was removed (8.8), which fills the field of that flow. Nothing is sent before the person presses
+  the button of the flow. [Design]
+- **A pinned invite (N3).** When the invite carries a pin, the server has no certificate from a
+  public authority and the device will trust the key the link names. Below "Verbunden mit {host}"
+  a calm notice in the banner's warn tone says so and advises to accept the link only straight from
+  the operator (`setup.connect.pinnedTitle`, `setup.connect.pinned`). It asks for no extra click:
+  the operator of a self-hosted server is usually the person or someone they know, and the advice
+  is what protects. [Design]
+- **Hosts in punycode (N2).** Every host the window shows comes from the backend in the ASCII
+  form the client connects to, so an internationalized name appears as `xn--...` and letters
+  that look alike cannot hide another server. [Design, Backend]
 - **Validation happens while typing**, not on "Weiter". A recognised link shows the server's host
   name with a check mark. The app contacts the server at once to check the invite, so an expired
   or used link is reported in step 1, not after the recovery code. [Design]
@@ -202,11 +228,11 @@ then, after "Ich habe ihn gesichert":
 - **Format.** [ADR 4] 128 random bits, Crockford base32 with checksum, the sister app's structure:
   32 characters in 8 groups of 4. On screen the groups are separated by spaces and the code is set
   in the monospace token, large (20 px), selectable. [Design]
-- **Print** produces the recovery sheet [ADR 4, threat model 2.3]: the code, in the clear the
-  server address, server ID and account ID, the date, the device that created it, and three plain
-  sentences: what the code does, that the code plus the server's data is full access, and that
-  without the code and without any device the data is gone. [Design] A QR code of code plus
-  server address is printed too, for a later mobile app or a webcam. [Design]
+- **Print** produces the recovery sheet, version 2 [ADR 4, threat model 2.3]: the code, in the
+  clear the server address, server ID, account ID, genesis anchor, the pin when there is one, the
+  link `hangar-drive://recover#...`, the date, the device that created it, and four plain
+  sentences (4.4, "The sheet, version 2"). [Design] The QR code on the sheet holds the link only,
+  never the code, which is always typed. [ADR 4]
 - **Save as file** writes a short text file with the same content. The save dialog proposes the
   Documents folder; choosing a place inside a synced folder is refused with a reason
   ("recovery.savedInSync"), because the code must not travel to the server next to the data it
@@ -281,8 +307,17 @@ step, because the account already has one. [Design]
 |                                                              |
 |  [ Mit Kamera scannen ]  (only with a camera)                |
 |  Kein Kopieren möglich? Code abtippen (link)                 |
+|                                                              |
+|  Name dieses Geräts  [ Arbeitslaptop                      ]  |
+|  So erkennst du es später in der Geräteliste.                |
 +--------------------------------------------------------------+
 ```
+
+- **Name of this device.** [Design, security review N5] The same field as in 4.2, filled with the
+  computer's name. It goes with the pairing (`startPairing(input, deviceName)`, trimmed), so the
+  other device asks "„{device}“ möchte dazukommen." with the name the person chose. A blank name is
+  refused at the field before anything is sent; the backend's own refusal is shown there too.
+  A link the OS hands over skips this form and uses the computer's name.
 
 - **Link or QR.** [ADR 4] The pairing offer (server address, optional pin, server ID, account ID,
   device ID, account log head, 128 bit secret, expiry) is one link, also shown as a QR code. On a
@@ -294,6 +329,14 @@ step, because the account already has one. [Design]
   characters, shown in groups). Without the log head from the offer, the new device cannot anchor
   the account log, so this path always requires the safety number comparison on both sides.
   [ADR 4] No short code: [ADR 4] forbids short codes until there is a PAKE.
+- **Server question before sending (N2).** [Design, security review N2] A pasted, scanned or
+  opened pairing link is first read offline (`inspectLink`). The window then shows "Mit diesem
+  Server verbinden?" with the server's host in punycode and the account ID in groups of four,
+  says where the other device shows both (`pair.check.body`; the offer screen of section 5 now
+  names "Server {host}, Konto {account}"), and adds the calm pin notice when the offer pins the
+  server. "Zurück" has the focus; "Verbinden" holds back clicks for 1 s like every confirm button
+  of a comparison. Only "Verbinden" sends the link. The typed path needs no question: the person
+  typed the server.
 - **Waiting, link or QR.** [ADR 4, Design] The offer already carries the secret and the account
   log head, so the person only has to approve on the other device. The new device shows
   "Bestätige jetzt auf deinem anderen Gerät." (`pair.new.waitingLink`) and a collapsed
@@ -302,6 +345,14 @@ step, because the account already has one. [Design]
 - **Waiting, typed code.** [ADR 4] The new device shows "Bestätige jetzt auf deinem anderen
   Gerät. Dort steht dieselbe Zahlenreihe:" (`pair.new.waiting`) with its safety number open, because
   on this path the comparison is required (section 5).
+
+**After joining: "Das sind deine Geräte?" (N2).** [Design, security review N2] Before any folder
+is chosen, the new device lists the account's devices (`listDevices`), this one marked "Dieses
+Gerät", with "Kennst du die Geräte nicht, brich ab: Dann wird es wieder getrennt, bevor Dateien
+übertragen werden." "Ja, das sind meine" goes on to step 2; "Nein, abbrechen" disconnects this
+device (`disconnectThisDevice`) and returns to step 1 with "Abgebrochen. Dieses Gerät ist wieder
+getrennt, es wurden keine Dateien übertragen." A link that leads to a stranger's account shows
+strangers here, before anything of this device reaches it.
 
 **Step 2: choose folders.**
 
@@ -326,19 +377,37 @@ step, because the account already has one. [Design]
 
 Chosen with "Kein Gerät mehr da?". [ADR 4, threat model 2.3]
 
-1. **Enter the sheet.** Fields: server address and recovery code (8 groups of 4, one field that
-   accepts the whole code pasted, spaces and dashes ignored). A QR scan of the sheet fills both.
-   The account ID is not typed: proposal, the server finds the account from the recovery device's
-   public key, which the client derives from the code. [Backend]
-2. **Device name**, prefilled.
-3. **Clean up**, one screen: "Diese Geräte gehören noch zu deinem Konto. Entferne die, die du
+1. **Enter the sheet.** [ADR 4 "Sheet", open point A] The person pastes the sheet's link
+   `hangar-drive://recover#...` (from the saved file or a password manager) or scans its QR code,
+   and types the recovery code (8 groups of 4, one field that accepts the whole code pasted, spaces
+   and dashes ignored). The link carries the server address, the server ID, the account ID, the
+   genesis anchor and, for a self-signed server, the pin; the code is never part of it and is always
+   typed. **The account ID is not looked up by the server and not typed separately: it comes with
+   the link.** (The first version of this concept proposed a lookup by the recovery device's key;
+   the ADR decided against it, because the sheet is the only place the account is named and the
+   anchor binds the recovery to that account's log.) Once the link is read offline
+   (`inspectLink`), the field says "Gefunden: {host}" and "Konto {account}" in groups of four, so
+   the person can compare with the paper, and the device name appears, prefilled. Without a camera
+   and with only the paper, the link is typed; white space is ignored, and the printed sheet sets
+   the link in groups for that. [Backend: layout of the printed link] "Weiter" calls
+   `recoverAccount(sheet, code, name)`.
+2. **Clean up**, one screen: "Diese Geräte gehören noch zu deinem Konto. Entferne die, die du
    nicht mehr hast." All old devices are listed and checked. [ADR 4: remove the lost devices and
    the used recovery device]
-4. **New recovery code**, the same screen as setup step 2: the used code stops working. [ADR 4]
-5. **Choose folders**, as in 4.3 step 2.
+3. **New recovery code**, the same screen as setup step 2: the used code stops working. [ADR 4]
+4. **Choose folders**, as in 4.3 step 2.
 
-That is five screens, more than three, but it is the rare emergency path, and every screen is one
-decision. [Design]
+Four screens: the name moved onto the first one, where it appears only after the link is read,
+as in 4.2 step 1. Every screen is still one decision. [Design]
+
+**The sheet, version 2.** [ADR 4, Design] Print and "Als Datei speichern" lay out the same
+document, worded by the window in the UI language (`sheet.*`, `RecoverySheetDocument`): the
+code, the server address, server ID, account ID, the account's check value (genesis anchor), the
+server's check value (pin, only when there is one), the link to paste, the date and the device
+that made it, then four plain sentences (what the code does, that it is full access together with
+the server, that without it and without a device the data is gone, and how a recovery goes). The
+printed sheet carries a QR code of the link, never of the code. On screen, the code step keeps the
+code in front and folds the rest under "Was noch auf dem Blatt steht".
 
 ## 5. Adding a device, seen from the existing device
 
@@ -354,7 +423,7 @@ Devices > "Gerät hinzufügen":
 |                                                              |
 |      +-----------+                                           |
 |      |  QR CODE  |     [ Link kopieren ]                     |
-|      +-----------+                                           |
+|      +-----------+     (an image of the backend's SVG)       |
 |                                                              |
 |   Gültig bis 14:42, nur für ein Gerät.                       |
 |   Kein Kopieren möglich? Code zum Abtippen zeigen (link)     |
@@ -379,18 +448,27 @@ Devices > "Gerät hinzufügen":
 |                       [ Ablehnen ]   [ Hinzufügen ]          |
 ```
 
-  **Typed code:** the comparison is part of the question and cannot be collapsed. [ADR 4]
+  **Typed code:** the numbers are shown and cannot be collapsed. [ADR 4]
 
 ```text
-| „Arbeitslaptop“ möchte dazukommen                            |
-| Auf dem neuen Gerät steht jetzt eine Zahlenreihe. Stimmt sie |
-| mit dieser hier überein?                                     |
+| „Arbeitslaptop“ möchte dazukommen.                           |
+| Danach fragt dein System noch einmal nach und zeigt diese    |
+| Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt. |
 |                                                              |
 |      48213  90577  12846                                     |
 |      66031  27419  85502                                     |
 |                                                              |
-|   [ Nein, abbrechen ]   [ Ja, gleiche Zahlen, hinzufügen ]   |
+|                       [ Ablehnen ]   [ Hinzufügen … ]        |
 ```
+
+- **The question itself is native.** [security review L2, 2026-11-26] "Hinzufügen …" leads to
+  the operating system's own dialog, which the shell shows with the device's name, the sentence
+  `pair.confirm.body` and the safety number, and the buttons "Ja, gleiche Zahlen, hinzufügen" and
+  "Nein, abbrechen". A page that was taken over cannot click it. The window does not ask the same
+  question first: two identical questions in a row teach people to click through both. The
+  window's step only shows who wants to join (`pair.request.body` on both paths) and offers
+  "Ablehnen", which declines at once without the native dialog. "Nein" in the native dialog
+  declines too and shows the mismatch text below; it is not an error.
 
 - **Why the comparison is optional on the link path.** [ADR 4] The link or QR code carries the
   128 bit secret and the account log head, so only the device that received it can answer. The
@@ -398,11 +476,11 @@ Devices > "Gerät hinzufügen":
   "same" without looking, which is exactly the habit the typed path cannot afford. The collapsed
   "Zahlen vergleichen" (`pair.numbers.compare`) shows the same rows as the typed path, with the
   sentence `pair.confirm.body`.
-- **The confirm button waits a moment on both paths.** [ADR 6, threat model R8] "Hinzufügen" and
-  "Ja, gleiche Zahlen, hinzufügen" take no click for 1 s after the dialog appears or changes
+- **The confirm button waits a moment on both paths.** [ADR 6, threat model R8] "Hinzufügen …"
+  takes no click for 1 s after the dialog appears or changes
   (the sister app's arm delay for number checks), so a click meant for what was there before
   cannot add a device. The button looks disabled during that second and its accessible name stays
-  the same. "Ablehnen" and "Nein, abbrechen" work at once.
+  the same. "Ablehnen" works at once.
 - **Plain language for the safety number.** [Design] The word "Sicherheitsnummer" is the label;
   the sentence is about what to do: compare two rows of numbers. Six groups of five digits, the
   same layout on both screens, so the eye can compare group by group. The screen reader reads the
@@ -518,10 +596,14 @@ The tray shows one state for the whole app, the most urgent across all folders. 
 - **"Nicht mehr synchronisieren"** keeps the local files and everything on the server and says
   so in the confirmation. [Design]
 - **Deleting a folder everywhere** [ADR 5: a retired folder can be brought back within the
-  window] is the last row menu item, below a separator: "Auf allen Geräten löschen". The
-  confirmation says that the folder disappears from all devices and can be brought back for
-  {days} days. Deleted folders appear in "Ordner hinzufügen" under "Gelöschte Ordner" with
-  "Zurückholen" until the window has passed. [Design]
+  window] is the last row menu item, below a separator: "Auf allen Geräten löschen". The question
+  is the operating system's own dialog, which the shell shows with the folder's name
+  (`folder.delete.title`, "Überall löschen" or "Abbrechen"; security review L2); the window asks
+  no question of its own before it, so the person answers once. "Abbrechen" there changes nothing
+  and shows nothing. After a yes, a line below the folders says
+  "„{folder}“ ist gelöscht." followed by `folder.delete.body` (the folder disappears from all
+  devices and can be brought back for {days} days). Deleted folders appear in "Ordner hinzufügen"
+  under "Gelöschte Ordner" with "Zurückholen" until the window has passed. [Design]
 - **Activity list.** [Design] The last 50 events of this device, newest first: file name, folder,
   what happened (geändert, neu, gelöscht, umbenannt, von {device}, wiederhergestellt, zwei
   Fassungen), relative time. Many events of one run are grouped ("Fotos: 120 neue Dateien").
@@ -738,7 +820,7 @@ banner (`server.identity`) offers exactly two ways back, as two buttons:
 ```text
 | Servernummer vergleichen                                     |
 | Bitte den Betreiber, auf dem Server diesen Befehl            |
-| auszuführen: hangar-drive-server key-number                  |
+| auszuführen: hangar-drive-server server-key-number           |
 | Stimmen alle Zahlen mit diesen hier überein?                 |
 |                                                              |
 |      30417  88265  10394                                     |
@@ -752,6 +834,10 @@ banner (`server.identity`) offers exactly two ways back, as two buttons:
   "server number" (`server.number.label`); it is always a row of numbers to compare, never a technical term.
 - **The confirm button waits 1 s** after the dialog appears or the numbers change, as in
   section 5. [ADR 6]
+- **Asked once more by the system.** [Security review L2] "Ja, gleiche Zahlen, verbinden" asks
+  again in the operating system's dialog with the same numbers, as accepting a pairing does, so a
+  click the person never made trusts no key. "Nein" there trusts nothing and shows the mismatch
+  line below (`confirmServerNumber` answers `declined`).
 - **Mismatch** ("Nein"): "Dann verbinde nicht. Sag dem Betreiber, dass die Zahlen nicht passen.
   Deine Dateien hier bleiben, wie sie sind." (`server.fix.mismatch`). The banner stays.
 - **The command** in the text is a placeholder `{command}` filled by the app, so the CLI can be
@@ -920,12 +1006,38 @@ The dialog has one decision per screen. [ADR 4 "Re-anchor" step 1, Design]
   Ordnernummer." with "Ordnernummer vergleichen", which shows the folder safety number in the same
   six groups of five as the pairing screen. [Design]
 
+### 8.9 Changes from a removed device
+
+- **Trigger.** [ADR 4 "A resumable job", security review H1] A device's delta check finds saved
+  states of a device that the account log has removed, without the barrier the removing device
+  writes after a removal. The engine does not take them in; the folder stops
+  (`StopReason::RemovedHeads`), the warning `removedHeads` appears and the event `removedHeads`
+  asks the window to put the question in front. This is a strong sign of a malicious server or a
+  leaked key, so the question comes as a dialog, opened once by itself like 8.1, and the tray goes
+  to "Braucht dich".
+- **Text.** One sentence, no technical terms: "In „Fotos“ sind Änderungen von „Alter Laptop“
+  angekommen, obwohl das Gerät nicht mehr zu deinem Konto gehört." When the name is unknown or
+  several devices are involved: "... von {count} Geräten ..., die nicht mehr zu deinem Konto
+  gehören." Below, muted: "Am sichersten machst du sie rückgängig. Bis du dich entscheidest,
+  wartet der Ordner." (`heads.*`)
+- **Two ways, one default.** "Ansehen und rückgängig machen" (primary, focused) takes the changes
+  in (`acceptRemovedHeads`) and opens the earlier versions at the last state before the first of
+  them, labelled "Vor den Änderungen von „Alter Laptop“": this is "Undo a device" of 9.4, and the
+  reset works as there. "Übernehmen" takes them in and says "Übernommen. „Fotos“ wird wieder
+  synchronisiert." with "Doch rückgängig machen" as the way back. Both take the changes in, so
+  both hold back clicks for 1 s after the dialog appears. [Design]
+- **Deciding later.** Escape closes the dialog without deciding: the folder stays stopped
+  ("Angehalten: Änderungen eines entfernten Geräts"), the banner stays with "Entscheiden", and the
+  focus goes to the banner. A new `removedHeads` event brings the question back. [Design]
+
 ### 8.8 This device was removed, or the app is too old
 
 | Case | Text | Actions |
 | --- | --- | --- |
 | removed by another device | "Dieses Gerät wurde von „{device}“ entfernt. Deine Dateien bleiben hier, werden aber nicht mehr synchronisiert." | "Wieder koppeln" (opens 4.3), "Das war ich nicht" (explains the recovery sheet path) |
-| the server needs a newer app | "Hangar Drive braucht ein Update, um weiter zu synchronisieren." | "Jetzt aktualisieren" |
+| removed, the remover unknown (the server answers `deviceRemoved` at sign-in) | "Dieses Gerät wurde aus deinem Konto entfernt. Deine Dateien bleiben hier, werden aber nicht mehr synchronisiert." | as above |
+| the server needs a newer app | "Hangar Drive braucht ein Update, um weiter zu synchronisieren." | "Jetzt aktualisieren"; the result shows as a line ("Version {version} ist installiert. …" or "Es gibt noch keine neuere Version. …") |
+| the same, in a build that cannot update itself (no updater key, `About.updates` false or `installUpdate` refused with "updates are off") | "Hangar Drive braucht ein Update, um weiter zu synchronisieren. Installiere die neue Version, dann geht es von selbst weiter." | none: the button is hidden, no error is shown |
 | the server refuses this device | "Dein Server lässt dieses Gerät nicht mehr herein." | "Wieder koppeln", "Fehlerbericht kopieren" |
 
 [ADR 6 for revocation, Design for the texts]
@@ -1148,6 +1260,10 @@ As few as possible; every entry needs a reason that holds against "just pick a g
 That is all. Below them, not settings but information:
 
 - **Konto:** server address, used storage, retention ("Versionen bleiben 30 Tage erhalten").
+- **Hilfe:** "Dieses Gerät zurücksetzen" (security review L1): the account is forgotten on this
+  device, the files stay. The question is asked once, in place, with "Abbrechen" focused and
+  "Zurücksetzen" in the danger style; afterwards the window shows the welcome (4.1), from where
+  the person sets up a new account or pairs again. [Design]
 - **Über Hangar Drive:** version, "Fehlerbericht speichern" (a text file with versions, states and
   error codes, never file names or keys, shown before saving), the honest notes "Deine Dateien
   liegen auf diesem Computer unverschlüsselt. Schalte die Laufwerksverschlüsselung deines
@@ -1229,9 +1345,9 @@ German is the source and uses "du"; English is the fallback. The other ten langu
 the i18n module [project rules]. Placeholders in braces are identical in all languages. The
 existing keys `empty.title` and `empty.body` are replaced by `main.empty.*`; `app.name` stays.
 
-The tables match `src/i18n.ts` for German and English (aligned on 2026-11-26). Keys marked
-"backend" below are printed or written by the Rust side and are not part of the window's
-i18n module yet.
+The tables match `src/i18n.ts` for German and English (aligned on 2026-11-26, again after the
+sync engine flows). The recovery sheet's texts (`sheet.*`) are part of the window's module now:
+the window words the sheet and the backend only lays it out (4.4).
 
 ### Plural forms
 
@@ -1278,12 +1394,24 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `setup.connect.scan` | Mit Kamera scannen | Scan with camera |
 | `setup.connect.checking` | Einladung wird geprüft … | Checking the invite … |
 | `setup.connect.ok` | Verbunden mit {host} | Connected to {host} |
+| `setup.connect.pinnedTitle` | Server mit eigenem Zertifikat | A server with its own certificate |
+| `setup.connect.pinned` | Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. Nimm den Link nur an, wenn er direkt vom Betreiber deines Servers kommt. | This server has no public certificate. {app} trusts it because the link says so. Only accept the link if it comes straight from the person who runs your server. |
+| `link.isInvite` | Das ist ein Einladungslink. Damit richtest du ein neues Konto ein. | This is an invite link. It sets up a new account. |
+| `link.isPair` | Das ist ein Kopplungslink von einem deiner Geräte. | This is a pairing link from one of your devices. |
+| `link.isRecover` | Das ist der Link von deinem Wiederherstellungsblatt. | This is the link from your recovery sheet. |
+| `link.toInvite` | Neues Konto einrichten | Set up a new account |
+| `link.toPair` | Stattdessen koppeln | Pair instead |
+| `link.toRecover` | Mit dem Blatt einrichten | Set up with the sheet |
+| `link.needPair` | Hier gehört ein Kopplungslink hin. | This needs a pairing link. |
+| `link.notNeeded.title` | Dieses Gerät ist schon eingerichtet | This device is already set up |
+| `link.notNeeded.body` | Hier brauchst du den Link nicht. Öffne ihn auf dem Gerät, das du neu einrichten willst. | You do not need this link here. Open it on the device you want to set up. |
 | `setup.deviceName.label` | Name dieses Geräts | Name of this device |
 | `setup.deviceName.help` | So erkennst du es später in der Geräteliste. | This is how you will recognize it in your device list. |
 | `recovery.title` | Dein Wiederherstellungscode | Your recovery code |
 | `recovery.body` | Wenn du alle Geräte verlierst, holt dieser Code deine Dateien zurück. Es gibt keinen anderen Weg, auch nicht über den Betreiber. | If you lose all your devices, this code gets your files back. There is no other way, not even through the operator. |
 | `recovery.print` | Drucken | Print |
 | `recovery.save` | Als Datei speichern | Save as file |
+| `recovery.saveElsewhere` | Anderen Ort wählen | Choose another place |
 | `recovery.copy` | Kopieren | Copy |
 | `recovery.copied` | Kopiert. Er wird nach 1 Minute aus der Zwischenablage entfernt. | Copied. It will be removed from the clipboard after 1 minute. |
 | `recovery.saved` | Gespeichert: {path} | Saved: {path} |
@@ -1294,15 +1422,22 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `recovery.check.label` | Gruppe {group} | Group {group} |
 | `recovery.check.confirm` | Bestätigen | Confirm |
 | `recovery.check.wrong` | Das passt nicht. Schau noch mal auf dein Blatt oder in deine Datei. | That does not match. Check your sheet or your file again. |
+| `sheet.more` | Was noch auf dem Blatt steht | What else is on the sheet |
+| `sheet.title` | {app}: Wiederherstellungsblatt | {app}: recovery sheet |
+| `sheet.serverId` | Server-Kennung | Server ID |
+| `sheet.accountId` | Konto-Kennung | Account ID |
+| `sheet.anchor` | Prüfwert des Kontos | Account check value |
+| `sheet.pin` | Prüfwert des Servers | Server check value |
+| `sheet.link` | Link zum Einfügen | Link to paste |
+| `sheet.date` | Erstellt am | Created on |
+| `sheet.device` | Gerät | Device |
+| `sheet.note.what` | Mit diesem Code holst du deine Dateien zurück, wenn du alle Geräte verloren hast. | This code brings your files back if you lose all your devices. |
+| `sheet.note.access` | Wer den Code hat, kann zusammen mit deinem Server alle deine Dateien lesen. Bewahre das Blatt auf wie einen Haustürschlüssel. | Whoever has the code can read all your files together with your server. Keep this sheet like a house key. |
+| `sheet.note.gone` | Ohne diesen Code und ohne eines deiner Geräte lassen sich deine Dateien nicht mehr öffnen, auch nicht über den Betreiber. | Without this code and without any of your devices, your files can no longer be opened, not even through the operator. |
+| `sheet.note.how` | So geht es: Installiere {app}, wähle „{door}“, füge den Link ein oder scanne den QR-Code und tippe den Code ab. | How it works: install {app}, choose “{door}”, paste the link or scan the QR code, then type the code. |
+| `sheet.fileName` | {app} Wiederherstellungsblatt.txt | {app} recovery sheet.txt |
 | `recovery.check.showAgain` | Code noch mal ansehen | Show the code again |
 | `recovery.groupLabel` | Gruppe {index}: {chars} | Group {index}: {chars} |
-| `recovery.sheet.heading` (backend) | {app}: Wiederherstellungsblatt | {app}: recovery sheet |
-| `recovery.sheet.what` (backend) | Mit diesem Code bekommst du deine Dateien zurück, wenn du kein Gerät mehr hast. | This code gets your files back when you have no device left. |
-| `recovery.sheet.risk` (backend) | Wer diesen Code hat, kann deine Dateien lesen. Bewahre das Blatt sicher auf. | Whoever has this code can read your files. Keep this sheet safe. |
-| `recovery.sheet.loss` (backend) | Ohne diesen Code und ohne eines deiner Geräte sind deine Dateien nicht mehr zu öffnen. | Without this code and without one of your devices, your files cannot be opened again. |
-| `recovery.sheet.server` (backend) | Server: {host} | Server: {host} |
-| `recovery.sheet.ids` (backend) | Server-ID: {server} · Konto-ID: {account} | Server ID: {server} · Account ID: {account} |
-| `recovery.sheet.created` (backend) | Erstellt am {date} auf „{device}“ | Created on {date} on “{device}” |
 | `folder.setup.title` | Wo sollen deine Dateien liegen? | Where should your files live? |
 | `folder.setup.body` | Alles, was du in diesen Ordner legst, ist auch auf deinen anderen Geräten. Weitere Ordner kannst du später hinzufügen. | Everything you put in this folder is on your other devices too. You can add more folders later. |
 | `folder.setup.defaultName` (backend) | Hangar Drive | Hangar Drive |
@@ -1323,7 +1458,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `app.name` | Hangar Drive | Hangar Drive |
 | `name.blank` | Der Name ist leer. Gib einen Namen mit sichtbaren Zeichen ein. | The name is empty. Enter a name with visible characters. |
 | `name.edgeWhitespace` | Der Name darf nicht mit einem Leerzeichen beginnen oder enden. | The name cannot start or end with a space. |
-| `setup.pasteEmpty` | In der Zwischenablage ist gerade kein Text. | There is no text on the clipboard right now. |
+| `setup.pasteNoLink` | In der Zwischenablage ist kein Link von {app}. | There is no {app} link on the clipboard. |
 | `recovery.codeLabel` | Wiederherstellungscode, 8 Gruppen | Recovery code, 8 groups |
 | `setup.ready.continue` | Zum Fenster | Go to the window |
 
@@ -1355,14 +1490,26 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `pair.add.expired` | Dieser Code ist abgelaufen. | This code has expired. |
 | `pair.add.renew` | Neuen Code erzeugen | Create a new code |
 | `pair.confirm.title` | „{device}“ möchte dazukommen. | “{device}” wants to join. |
-| `pair.confirm.add` | Hinzufügen | Add |
+| `pair.confirm.add` | Hinzufügen … | Add … |
 | `pair.confirm.decline` | Ablehnen | Decline |
 | `pair.confirm.body` | Auf dem neuen Gerät steht jetzt eine Zahlenreihe. Stimmt sie mit dieser hier überein? | The new device now shows a row of numbers. Does it match this one? |
 | `pair.confirm.yes` | Ja, gleiche Zahlen, hinzufügen | Yes, same numbers, add it |
 | `pair.confirm.no` | Nein, abbrechen | No, cancel |
+| `pair.request.body` | Danach fragt dein System noch einmal nach und zeigt diese Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt. | Your system then asks once more and shows this row of numbers. Only say yes if the new device shows the same one. |
 | `pair.mismatch` | Dann füge das Gerät nicht hinzu. Starte auf dem neuen Gerät noch mal von vorn. Passiert das wieder, sprich mit dem Betreiber deines Servers. | Then do not add the device. Start over on the new device. If it happens again, talk to the person who runs your server. |
 | `pair.added` | „{device}“ ist jetzt dabei. | “{device}” has been added. |
 | `pair.joined` | Gekoppelt. Gleich geht es weiter. | Paired. Just a moment. |
+| `pair.check.title` | Mit diesem Server verbinden? | Connect to this server? |
+| `pair.check.body` | Vergleiche Server und Konto mit deinem anderen Gerät. Dort stehen sie unter Geräte, dann Gerät hinzufügen. | Compare server and account with your other device. It shows them under Devices, then Add device. |
+| `pair.check.server` | Server | Server |
+| `pair.check.account` | Konto | Account |
+| `pair.check.connect` | Verbinden | Connect |
+| `pair.check.pinned` | Dieser Server hat kein öffentliches Zertifikat. {app} vertraut ihm, weil der Link es so festlegt. | This server has no public certificate. {app} trusts it because the link says so. |
+| `pair.add.target` | Server {host}, Konto {account} | Server {host}, account {account} |
+| `pair.devices.title` | Das sind deine Geräte? | Are these your devices? |
+| `pair.devices.body` | Dieses Gerät ist jetzt mit dem Konto verbunden. Kennst du die Geräte nicht, brich ab: Dann wird es wieder getrennt, bevor Dateien übertragen werden. | This device is now connected to the account. If you do not know these devices, cancel: it is then disconnected before any files move. |
+| `pair.devices.yes` | Ja, das sind meine | Yes, these are mine |
+| `pair.devices.aborted` | Abgebrochen. Dieses Gerät ist wieder getrennt, es wurden keine Dateien übertragen. | Cancelled. This device is disconnected again, and no files were moved. |
 | `safety.label` | Sicherheitsnummer | Safety number |
 | `safety.group` | Gruppe {index}: {digits} | Group {index}: {digits} |
 | `pair.new.linkInstead` | Doch lieber den Link einfügen | Paste the link after all |
@@ -1376,12 +1523,14 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | Key | de | en |
 | --- | --- | --- |
 | `recover.title` | Mit dem Wiederherstellungsblatt einrichten | Set up with your recovery sheet |
-| `recover.body` | Gib die Serveradresse und den Code von deinem Blatt ein. | Enter the server address and the code from your sheet. |
+| `recover.body` | Füge den Link von deinem Blatt ein oder scanne den QR-Code darauf. Den Code tippst du ab. | Paste the link from your sheet or scan the QR code on it. Then type the code. |
 | `recover.codeLabel` | Wiederherstellungscode | Recovery code |
 | `recover.cleanup.title` | Alte Geräte entfernen | Remove old devices |
 | `recover.cleanup.body` | Diese Geräte gehören noch zu deinem Konto. Entferne die, die du nicht mehr hast. | These devices still belong to your account. Remove the ones you no longer have. |
 | `recover.newCode` | Der alte Code ist jetzt verbraucht. Hier ist dein neuer. | The old code is used up now. Here is your new one. |
-| `recover.name.title` | Wie soll dieses Gerät heißen? | What should this device be called? |
+| `recover.linkLabel` | Link vom Blatt | Link from the sheet |
+| `recover.linkOk` | Gefunden: {host} | Found: {host} |
+| `recover.linkAccount` | Konto {account} | Account {account} |
 | `recover.cleanup.remove` | „{device}“ entfernen | Remove “{device}” |
 
 ### 13.4 Tray
@@ -1455,6 +1604,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `folder.delete.confirm` | Überall löschen | Delete everywhere |
 | `folder.deleted.section` | Gelöschte Ordner | Deleted folders |
 | `folder.deleted.restore` | Zurückholen | Bring back |
+| `folder.deleted.done` | „{folder}“ ist gelöscht. | “{folder}” has been deleted. |
 | `activity.changed` | geändert | changed |
 | `activity.added` | neu | new |
 | `activity.deleted` | gelöscht | deleted |
@@ -1479,6 +1629,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `main.rowMenu` | Aktionen für „{name}“ | Actions for “{name}” |
 | `folder.reason.missing` | Ordner nicht gefunden | folder not found |
 | `folder.reason.olderState` | älterer Stand auf dem Server | older state on the server |
+| `folder.reason.removedHeads` | Änderungen eines entfernten Geräts | changes from a removed device |
 | `folder.number.title` | Ordnernummer von „{folder}“ | Folder number of “{folder}” |
 | `folder.number.body` | Vergleiche diese Zahlen mit der Ordnernummer auf deinem anderen Gerät. Sind sie gleich, sehen beide Geräte denselben Stand. | Compare these numbers with the folder number on your other device. If they are the same, both devices see the same state. |
 | `folder.deleted.daysLeft.one` | noch {days} Tag | {days} day left |
@@ -1499,6 +1650,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `conflict.banner.other` | {count} Dateien gibt es in zwei Fassungen | {count} files exist in two versions |
 | `conflict.view` | Ansehen | View |
 | `conflict.version` | Fassung von {device}, {time} | Version from {device}, {time} |
+| `conflict.versionSize` | {version}, {size} | {version}, {size} |
 | `conflict.openBoth` | Beide öffnen | Open both |
 | `conflict.keepThis` | Diese behalten | Keep this one |
 | `conflict.keepBoth` | Beide behalten | Keep both |
@@ -1611,10 +1763,23 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `removed.notMeBody` | Dann hat jemand Zugriff auf eines deiner Geräte. Richte {app} mit deinem Wiederherstellungsblatt neu ein und entferne dabei die Geräte, die du nicht kennst. | Then someone has access to one of your devices. Set up {app} again with your recovery sheet and remove the devices you do not recognize. |
 | `update.body` | {app} braucht ein Update, um weiter zu synchronisieren. | {app} needs an update to keep syncing. |
 | `update.now` | Jetzt aktualisieren | Update now |
+| `update.bodyManual` | {app} braucht ein Update, um weiter zu synchronisieren. Installiere die neue Version, dann geht es von selbst weiter. | {app} needs an update to keep syncing. Install the new version and it carries on by itself. |
+| `update.upToDate` | Es gibt noch keine neuere Version. Versuch es später noch einmal. | There is no newer version yet. Try again later. |
+| `update.installed` | Version {version} ist installiert. Starte {app} neu, falls es nicht von selbst neu startet. | Version {version} is installed. Restart {app} if it does not restart by itself. |
 | `refused.body` | Dein Server lässt dieses Gerät nicht mehr herein. | Your server no longer lets this device in. |
 | `deletes.decide` | Entscheiden | Decide |
 | `deletes.done.one` | {count} Datei ist jetzt auch auf deinen anderen Geräten gelöscht. | {count} file is now deleted on your other devices too. |
 | `deletes.done.other` | {count} Dateien sind jetzt auch auf deinen anderen Geräten gelöscht. | {count} files are now deleted on your other devices too. |
+| `heads.title` | Änderungen von einem entfernten Gerät | Changes from a removed device |
+| `heads.body` | In „{folder}“ sind Änderungen von „{device}“ angekommen, obwohl das Gerät nicht mehr zu deinem Konto gehört. | Changes from “{device}” arrived in “{folder}”, although that device no longer belongs to your account. |
+| `heads.bodyMany.one` | In „{folder}“ sind Änderungen von {count} Gerät angekommen, das nicht mehr zu deinem Konto gehört. | Changes from {count} device that no longer belongs to your account arrived in “{folder}”. |
+| `heads.bodyMany.other` | In „{folder}“ sind Änderungen von {count} Geräten angekommen, die nicht mehr zu deinem Konto gehören. | Changes from {count} devices that no longer belong to your account arrived in “{folder}”. |
+| `heads.advice` | Am sichersten machst du sie rückgängig. Bis du dich entscheidest, wartet der Ordner. | Undoing them is the safest choice. Until you decide, the folder waits. |
+| `heads.undo` | Ansehen und rückgängig machen | Review and undo |
+| `heads.accept` | Übernehmen | Accept |
+| `heads.accepted` | Übernommen. „{folder}“ wird wieder synchronisiert. | Accepted. “{folder}” syncs again. |
+| `heads.undoLater` | Doch rückgängig machen | Undo after all |
+| `removedHeads.title` (notification, backend) | Änderungen des entfernten Geräts „{device}“ in „{folder}“ | Changes from the removed device “{device}” in “{folder}” |
 | `server.fix.apply` | Verbinden | Connect |
 | `older.stillOlder` | Der Server zeigt noch den älteren Stand. | The server still shows the older state. |
 
@@ -1671,6 +1836,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `restore.otherVersion` | Andere Version wählen | Choose another version |
 | `restore.beforeDevice` | Stand vor Änderungen von … | State before changes from … |
 | `restore.beforeDeviceEntry` | Vor den Änderungen von „{device}“ | Before the changes from “{device}” |
+| `restore.beforeDevice.finding` | Wird gesucht … | Searching … |
 | `trash.title` | Papierkorb von „{folder}“ | Trash of “{folder}” |
 | `trash.search` | Suchen | Search |
 | `trash.deleted` | gelöscht {when}, {device} | deleted {when}, {device} |
@@ -1760,6 +1926,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `settings.localNote` | Deine Dateien liegen auf diesem Computer unverschlüsselt. Schalte die Laufwerksverschlüsselung deines Systems ein. | Your files are stored unencrypted on this computer. Turn on your system’s drive encryption. |
 | `settings.serverNote` | Auf dem Server sind deine Dateien verschlüsselt. Der Betreiber sieht weder Namen noch Inhalte. | On the server your files are encrypted. The operator sees neither names nor contents. |
 | `settings.reportPreview` | Das steht im Fehlerbericht | What the error report contains |
+| `reset.action` | Dieses Gerät zurücksetzen | Reset this device |
+| `reset.help` | Für einen Neuanfang: {app} vergisst dein Konto auf diesem Gerät. Deine Dateien bleiben hier. | To start over: {app} forgets your account on this device. Your files stay here. |
+| `reset.question` | Dieses Gerät wirklich zurücksetzen? | Really reset this device? |
+| `reset.body` | {app} hört hier auf zu synchronisieren und vergisst das Konto. Danach kannst du ein neues Konto einrichten oder dieses Gerät wieder hinzufügen. | {app} stops syncing here and forgets the account. Afterwards you can set up a new account or add this device again. |
+| `reset.confirm` | Zurücksetzen | Reset |
 | `help.title` | Hilfe | Help |
 | `help.body` | {app} hält deine Ordner auf allen deinen Geräten gleich. Wenn etwas deine Entscheidung braucht, steht es oben im Fenster. | {app} keeps your folders the same on all your devices. When something needs your decision, it shows at the top of the window. |
 | `help.keys` | Tastenkürzel | Keyboard shortcuts |
@@ -1785,6 +1956,8 @@ Each says what happened and what to do; the technical cause goes into the error 
 | `error.invite.unreachable` | Der Server aus dem Link antwortet nicht. Prüfe deine Internetverbindung oder frag den Betreiber. | The server in the link does not answer. Check your internet connection or ask the operator. |
 | `error.insecure` | Dieser Server ist nicht verschlüsselt erreichbar. {app} verbindet sich nur über https. | This server cannot be reached securely. {app} only connects over https. |
 | `error.pair.notALink` | Das ist kein Kopplungslink. Kopiere ihn auf dem anderen Gerät unter Geräte und dann Gerät hinzufügen. | That is not a pairing link. Copy it on the other device under Devices, then Add device. |
+| `error.link.damaged` | Der Link ist unvollständig. Kopiere ihn noch einmal ganz. | The link is incomplete. Copy all of it again. |
+| `error.recover.notALink` | Das ist nicht der Link von deinem Blatt. Er beginnt mit hangar-drive://recover#. | That is not the link from your sheet. It starts with hangar-drive://recover#. |
 | `error.pair.expired` | Dieser Code ist abgelaufen oder wurde schon benutzt. Erzeuge auf dem anderen Gerät einen neuen. | This code has expired or was already used. Create a new one on the other device. |
 | `error.pair.typo` | Im Code ist ein Tippfehler. Vergleiche ihn Zeichen für Zeichen. | There is a typo in the code. Compare it character by character. |
 | `error.pair.declined` | Das andere Gerät hat abgelehnt. Starte noch mal, wenn das ein Versehen war. | The other device declined. Start again if that was a mistake. |
@@ -1795,6 +1968,7 @@ Each says what happened and what to do; the technical cause goes into the error 
 | `error.recovery.used` | Dieser Code wurde ersetzt. Nimm das neuere Blatt. | This code was replaced. Use the newer sheet. |
 | `error.recovery.otherApp` | Das ist ein Code für Hangar. Hier gehört der Code für {app} hin. | That is a code for Hangar. This needs the code for {app}. |
 | `error.recovery.savedInSync` | Speichere den Code nicht in einem synchronisierten Ordner, sonst liegt er neben den Dateien, die er öffnet. Wähle einen anderen Ort. | Do not save the code in a synced folder, or it sits next to the files it opens. Choose another place. |
+| `error.recovery.savedInCloud` | Dieser Ordner wird mit einer Cloud synchronisiert. Speichere das Blatt lieber an einem Ort, der nur auf diesem Gerät liegt, zum Beispiel in „Downloads“ oder auf einem USB-Stick. | This folder syncs with a cloud. Better save the sheet somewhere that stays on this device only, for example in “Downloads” or on a USB stick. |
 | `error.folder.network` | Netzlaufwerke gehen nicht. Wähle einen Ordner auf diesem Computer. | Network drives do not work. Choose a folder on this computer. |
 | `error.folder.root` | Ein ganzes Laufwerk geht nicht. Wähle einen Ordner darauf. | A whole drive does not work. Choose a folder on it. |
 | `error.folder.system` | Dieser Ordner gehört zum System. Wähle einen eigenen Ordner. | This folder belongs to the system. Choose a folder of your own. |
@@ -1836,8 +2010,10 @@ and 3 now follow the rules of [[0001-foundation]] sections 4 and 6.
   the recovery device (4.2.1).
 - `hangar-drive://join` and `hangar-drive://pair` link handlers; a static `/join` page on the
   server that never sends the fragment to the server.
-- Account lookup by the recovery device's public key, so the sheet needs no account ID input
-  (4.4).
+- ~~Account lookup by the recovery device's public key~~: decided otherwise, the account ID
+  travels in the sheet's link (4.4). The app shell needs `inspectLink`, `acceptRemovedHeads`,
+  the sheet document for printing and saving, and the `openLink` and `removedHeads` events,
+  holding a start link until the window listens (`src/backend/types.ts`).
 - A distinct version byte for Drive recovery codes, proposal prefix `D` (4.2 step 2).
 - Per-account used storage, quota and retention days readable by the client (6.3, 9.1).
 - What the timeline needs per commit (9.1): the writing device (from the signed commit body), the

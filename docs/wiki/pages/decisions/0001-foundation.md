@@ -114,6 +114,12 @@ are reasoned here and are part of the external review (see Consequences).
       refuses a commit whose reference delta names an object the server does not hold.
     - A folder delta pull returns every commit after a folder cursor, using a monotonic
       sequence per folder.
+      - **Unknown folder** (conclusion, finding E2E-2): a folder the account holds nothing of
+        yet (no object, no commit; also one purged for good) has the empty chain, sequence 0
+        and no commits, never `NotFound`. A new folder pulls before its first upload, and the
+        in-memory server the engine is tested against answers the same. Folder IDs are random
+        and looked up per account, so the answer tells nothing about another account's folders
+        (no IDOR). Test `objects_and_folders_of_another_account_are_out_of_reach`.
     - An account change feed returns every account level change after an account cursor,
       using a monotonic sequence per account ("Change feed" below).
     - **Pairing slots** (conclusion, server security review M2): `PUT /pairing/{id}` reserves
@@ -122,6 +128,10 @@ are reasoned here and are part of the external review (see Consequences).
       empty slot, once; `GET /pairing/{id}` reads it, only from the reserving account. Without
       the reservation anyone could create slots under invented IDs until the server's slot
       limit refused every real pairing (section 4, "Pairing").
+      `DELETE /pairing/{id}` (`ApiCall::ClosePairing`, conclusion, finding E2E-6) deletes the
+      slot with its request, only of the reserving account and idempotent; the inviting device
+      calls it once the person accepted or declined. A slot nobody closes is deleted when it
+      expires, by the next reservation and by the housekeeping of the collection job.
     - The commit call checks its reference deltas as sets in one transaction (server security
       review M4), and at most a few commits and record writes, whose bodies are held in
       memory, are worked on at once (`HANGAR_DRIVE_HEAVY_REQUESTS`, default 4). One account
@@ -526,6 +536,14 @@ primitives the sister app already uses:
     the slot of the offer's pairing ID with its session before it shows the offer
     (`ApiCall::ReservePairing`); the new device's request is accepted only into that slot
     (section 3, "Pairing slots"). The offer format does not change.
+  - **Sealed name** (conclusion, finding E2E-6): the request carries the new device's name
+    sealed, never in the clear, since device names are sealed records everywhere else:
+    `P_name = HKDF-SHA256(P, field("hangar-drive/v1/pairing-name"), 32)`, `sealed_name = nonce
+    (24) || XChaCha20-Poly1305(P_name, nonce, name, aad = field(label) || field(account) ||
+    field(new device))`, and the request tag covers `sealed_name` instead of the name. Only who
+    holds P opens it; the server checks only its size. Vectors `pairing.sealed_name` and
+    `pairing.tag`, recomputed by `test_vectors.py`. The inviting device closes the slot after
+    the answer (section 3, "Pairing slots").
   - **Added device** (conclusion, finding L6): the append call with the add device entry
     carries exactly one wrapped key, the current epoch's secret for the new device, and no
     rotation happens; the server checks that this wrap names the added device. A new device
@@ -539,8 +557,10 @@ primitives the sister app already uses:
     (`RecoveryCode::identity`, `RecoveryCode::device_id`, label
     `hangar-drive/v1/recovery-device-id`, vector `recovery.device_id`), so nothing else is
     needed. The sheet's public part is also the link `hangar-drive://recover#<payload>`
-    (base64url of version 1, account ID, server ID and server URL); the link never carries the
-    code, which is always typed. The server ID is learnt before the code is shown, through the
+    (base64url of the sheet bytes, version 2 since the second engine review: account ID, server
+    ID, the genesis anchor, the optional SPKI pin and the server URL; see the amendment "App
+    shell and the second engine review"); the link never carries the code, which is always
+    typed. The server ID is learnt before the code is shown, through the
     session challenge, which the server answers for any account and which writes nothing.
   - **Flow** (conclusion): the new installation signs in as the recovery device at the
     sheet's server (server ID checked at the sign-in), checks that the verified log lists that
@@ -880,6 +900,17 @@ primitives the sister app already uses:
     ransomware encrypting files in place, pass them; against those the server's retention and
     anomaly pinning apply.
   - Deletes are propagated after a short delay.
+- **Residual risk: withheld log entries** (conclusion, app shell security review): the server
+  cannot forge or reorder device log entries, but it can withhold the ones after a point it
+  chooses, for one device or for all. A device then keeps working on the log it verified: a
+  device removed later still looks current to it, an epoch rotated later is not used, and a
+  recovery or pairing joins at an older head. Nothing in version 1 proves to a device that it
+  has seen the newest entry; the frontier rule and the safety numbers only show the
+  inconsistency once two devices compare or the server lets the entries through (the freeze of
+  section 4, "Versions"). The recovery computes the head after its own append itself and
+  refuses a server that reports another one (security review I1), which closes the made-up
+  anchor, not the withheld tail. Accepted for version 1; a signed log head with a timestamp
+  that every device must see refreshed within a bound is the follow-up.
 
 ### 6. Transport and access
 
@@ -928,8 +959,22 @@ primitives the sister app already uses:
     role for transport only.
 - **Accounts:** an account needs a single-use, expiring invite that the operator creates on the
   server.
-- **Device sign-in:** an Ed25519 challenge proof bound to the server ID, the account and the
-  protocol version. Sessions use short-lived bearer tokens that the server stores only as hashes.
+- **Device sign-in:** an Ed25519 challenge proof bound to the server ID, the server URL, the
+  account and the protocol version. Sessions use short-lived bearer tokens that the server stores
+  only as hashes.
+  - **Server URL** (conclusion, app shell security review, open point "session binding"): the
+    server ID is public, so a recovery sheet or link with the real server ID and a foreign URL
+    would let that host relay a device's sign-in to the real server and hold the session. The
+    statement therefore carries the base URL the device connects to
+    (`hangar_drive_crypto::session::base_url`, the parser's serialization ending in `/`), the
+    proof request names it, and the server refuses a proof for any other address than
+    `HANGAR_DRIVE_PUBLIC_URL`. That setting is required (conclusion after the end-to-end test):
+    `serve` does not start without it and says how to set it, so the binding cannot be off by
+    an omission; the admin commands run without it, and a proof is then refused. Test
+    `the_server_does_not_start_without_its_public_url`. The SPKI is not bound: TLS ends at the
+    reverse proxy, so the server does not
+    know the key its clients see. Vector `session.proof`, test
+    `a_proof_for_another_address_is_refused_by_a_server_with_a_public_url`.
   - **Stateless challenge** (conclusion, server security review M1): the 32 challenge bytes
     are `expiry (u64, ms) || nonce (8) || the first 16 bytes of HMAC-SHA-256(server secret,
     label || server || account || device || expiry || nonce)`. The server secret is 32 random
@@ -939,6 +984,14 @@ primitives the sister app already uses:
     bytes as before; the wire format is unchanged.
 - **Sessions:** a token lives about one hour, is renewed by a new proof and is revoked at once
   when the device log removes the device. Tokens never appear in URLs or logs.
+  - **Removed device** (conclusion, finding E2E-3): a removed device can no longer read the
+    log that says so. A proof that verifies with the key the log last listed for a device the
+    log removed is therefore answered with `DeviceRemoved` (403), the challenge used up, and
+    not counted as a failed proof; any other bad proof stays `ProofInvalid`, so only a holder of
+    that key learns of the removal. The engine then forgets the account as for a removal it read
+    in the log (security review L1, `account::forget`) and shows "this device was removed"
+    without a name; `ProofInvalid` never does that. A recovery device answered so means "this
+    code was used before" (E2E-5). `SessionError::Removed` in `hangar_drive_crypto::session`.
   - **Scope:** the server sets a session's scope at sign-in from the verified log. A regular
     device may make every call; a recovery device only the calls of the recovery session
     (section 4, "Recovery session").
@@ -1101,6 +1154,39 @@ and atime. Everything in this subsection is a conclusion of this ADR.
   `rustls-platform-verifier` in `hangar-drive-sync`. CDLA-Permissive-2.0 is a permissive data
   license (keep the license text, no copyleft). Accepted as an exception; the alternative would be
   dropping the platform verifier for TLS.
+- **App shell** (conclusion, 2026-11-26): the desktop app (`src-tauri/Cargo.toml`, each with its
+  reason there) adds the official Tauri plugins `dialog`, `notification`, `autostart`,
+  `clipboard-manager`, `single-instance` (feature `deep-link`) and `deep-link` (MIT/Apache-2.0),
+  `keyring` 4 with `keyring-core` for the OS keychain, as the sister app does, `qrcode` 0.15
+  (MIT/Apache-2.0, without the `image` feature) for the pairing QR code, and `resvg` 0.50
+  (Apache-2.0 OR MIT, without default features) as a build dependency that rasterizes the tray
+  icons from `src/tray/icons/*.svg`. Four crates they pull need an exception, checked by
+  `cargo deny`:
+  - `clipboard-win` 5 and `error-code` 3 (BSL-1.0): the Windows clipboard of `arboard`, pulled by
+    the clipboard plugin; BSL-1.0 is accepted on the same grounds as `xxhash-rust`, and the
+    sister app ships the same crates.
+  - `tiny-keccak` 2 (CC0-1.0): pulled by the deep link plugin through `rust-ini`,
+    `ordered-multimap`, `dlv-list` and `const-random`; CC0 is accepted on the same grounds as
+    `notify`.
+  - `arrayref` 0.3 (BSD-2-Clause): pulled by `resvg` through `tiny-skia-path`, at build time only,
+    so it is not part of the shipped app. BSD-2-Clause is BSD-3-Clause without the endorsement
+    clause, so it is at least as permissive. Alternative: tray icons rasterized once and committed
+    as PNGs, which drift from the SVGs the window generates and tests.
+- **Signed updates** (conclusion, app shell security review): `tauri-plugin-updater` 2.14
+  (Apache-2.0 OR MIT, without default features, with `rustls-tls` and `zip`) installs an update
+  only when its minisign signature verifies against the public key in `tauri.conf.json`; it is
+  registered only once that key and an endpoint are there, and the command `install_update`
+  refuses until then. It adds `minisign-verify` (MIT); `reqwest`, `rustls` and `ring` are in the
+  tree through the sync crate already. Key handling: [[0002-version-scheme]], "Signed updates".
+- **Exceptions pinned to versions** (conclusion, security review I2): every license exception in
+  `deny.toml` names the exact locked version (`notify@9.0.0`, ...), so a new version fails the
+  check until its license was looked at again. `cargo deny --locked check advisories` runs in the
+  job `licenses` too; the advisories it lists with a reason are the zbus 5 D-Bus crates merged
+  into zbus 6 (RUSTSEC-2026-0370, -0371, -0372, Linux, through `keyring` and the notification
+  and single instance plugins) and `proc-macro-error` (RUSTSEC-2024-0370) of Tauri's GTK 3
+  stack. cargo-audit also warns about RUSTSEC-2024-0429 (glib 0.18 `VariantStrIter`, unsound,
+  never called here) and RUSTSEC-2026-0543 (chrono, locked but in no build), which cargo-deny
+  does not match against the graph.
 
 ## Consequences
 
@@ -1258,3 +1344,169 @@ and atime. Everything in this subsection is a conclusion of this ADR.
   against the fixed vectors in `crates/hangar-drive-crypto/testdata/vectors.json`; otherwise
   Drive keeps its own crate for the differing parts, because stored logs, records and commits
   must stay readable.
+
+## Amendment 2026-11-26: app shell and the second engine review
+
+Conclusions of wiring the desktop app to the sync engine and of the open points N1 to N5 of the
+second sync engine review. Formats of version 1 that were never shipped change in place.
+
+- **Recovery sheet, version 2 (N1, covers N6):** `0x02 || account ID (16) || server ID (16) ||
+  genesis (32) || pin flag (0x00 or 0x01) || SPKI pin (32, with flag 0x01) || server URL`, in
+  `hangar_drive_crypto::recovery::RecoverySheet`, with the vectors `recovery.sheet` and
+  `recovery.sheet_unpinned` in `testdata/vectors.json`, recomputed by `test_vectors.py`.
+  - **Genesis anchor:** the hash of the account's first device log entry. The first entry is made
+    when the code is shown, before the invite is redeemed (`account::Genesis`), so the sheet can
+    name it; nothing reaches the server before the typed check group, as before (ux-concept
+    4.2.1).
+  - **Recovery checks it twice:** the recovery session's verified log must start with the anchor
+    (otherwise "unknown code"), and the new device joins with the anchor and the head of its own
+    add device entry, so neither session can be handed another account's log or a made-up one.
+  - **Pin:** a sheet printed for a self-signed server carries the pin this device trusts, so the
+    recovery's first connection is pinned like a pairing's; a sheet for a public CA carries none.
+  - Version 1 sheets (without anchor) are refused.
+- **Log length (N4):** reading a device log refuses a server's page that claims more than
+  `MAX_LOG_ENTRIES`, before any entry is read, and stops after at most that many pages
+  (`recovery::fetch_log`, `Account::sync_log`).
+- **Invite check (N3):** `checkInvite` answers the host in its ASCII (punycode) form, whether a
+  label is punycode and whether the link pins a key, so the window can warn before anything is
+  sent. A recovery checks the new device's name first and answers `blank` or `edgeWhitespace`.
+- **Pairing confirmation (N2):** before a new device sends anything, `inspectLink` reads an
+  invite, a pairing offer or a recovery sheet offline and names its host and account, so the
+  person confirms them first; a pairing offer carries the account ID on both screens, and after
+  joining `pairResult` carries the account's devices for the person to confirm as their own.
+- **Re-seal without folders** (found while testing a renewed recovery code): a removal in an
+  account without folders left the device names sealed under the old epoch, so a device added
+  later could not read them. The re-seal is now due whenever an account record was sealed before
+  the last removal, not only a folder key ring (`Account::reseal_due`).
+- **Renewed recovery code (ux-concept 10.3):** `renewRecoveryCode` shows a new code; the typed
+  check group adds its recovery device and then removes the old one with its rotation, so closing
+  the dialog midway leaves the old code valid and a failure in between leaves both valid, never
+  none.
+- **Reserved directories (N5), mtime tolerance on Linux, invite link and `/join` page:** see the
+  log entry of the same day; the server prints the whole invite link from
+  `HANGAR_DRIVE_PUBLIC_URL`, with the pin only on request, and serves a static `/join` page under
+  its own strict CSP whose first-party script builds the deep link in the browser, so the invite
+  never reaches the server.
+- **App shell:** the index and the shell's `settings.json` live in the platform's local config
+  folder (`dirs::config_local_dir()/Hangar Drive`), which the root check refuses as a sync root;
+  secrets only in the OS keychain (service `hangar-drive`, Windows persistence `Local`); one
+  instance per user session in every build, because two instances on one index and one folder
+  would fight over every file; autostart on by default, applied once in release builds.
+
+## Amendment 2026-11-26: security review of the app shell
+
+Fixes of the app shell's security review (M1 to M3, L1 to L7, I1 to I4), each with a test.
+
+- **Clipboard (M1):** codes and pairing links are copied with `write_secret` of the clipboard
+  plugin, which on Windows adds `ExcludeClipboardContentFromMonitorProcessing` (no history, no
+  cloud clipboard) and elsewhere the clipboard managers' concealed hints, and cleared after a
+  minute unless something else was copied (`src-tauri/src/clipboard.rs`). `readClipboardText`
+  returns only a Hangar Drive link or a code, otherwise `""` (L2).
+- **Recovery file (M2):** the save dialog starts in Downloads, and a place below OneDrive
+  (`OneDrive`, `OneDriveConsumer`, `OneDriveCommercial`, registry), Dropbox, Google Drive,
+  iCloud Drive, `~/Library/CloudStorage` or `~/Library/Mobile Documents`, or on a volume labelled
+  "Google Drive", gives `SaveResult` `inCloudFolder`.
+- **Print window (M3):** the sheet is served once from memory over the app's own scheme
+  `hangar-print` under a random path, dropped and wiped when served, in an incognito WebView that
+  may navigate nowhere else (L3); no `data:` URL any more.
+- **Secrets on removal, reset and uninstall (L1):** a device that learns it was removed forgets
+  the account at once (`device-identity`, `epoch-1` to the newest epoch plus a margin, the stored
+  account and the folders' sync state; the files stay) and keeps the "removed" warning until it
+  is set up again; `resetDevice` does the same without the warning; a join that fails after the
+  identity was stored, or joins another account, leaves nothing behind. The NSIS uninstaller
+  starts the app with `--uninstall-cleanup` (not on an update), which forgets the secrets and
+  removes the index folder.
+- **Defense in depth (L2):** accepting a pairing request and deleting a folder everywhere ask
+  again in a native dialog that names the device and its safety number, or the folder. Folder
+  places reach the backend only as tokens of `pickFolder`, `defaultFolderPlace` and
+  `listAccountFolders`.
+- **Navigation (L3), folder checks (L4), file manager (L5), bidi isolation (L7):** the main
+  window is built in code with a navigation guard (own origin, the dev server only in a
+  development build); a new root is checked before it is created
+  (`roots::check_planned_root`); on Windows the file manager is driven through
+  `SHOpenFolderAndSelectItems` and `ShellExecuteW` on a canonical path inside the folder; the
+  backend's texts isolate names with RTL letters or bidi controls (FSI ... PDI) as the window's
+  `isolateName` does.
+- **Recovery head (I1):** see section 5, "Residual risk: withheld log entries".
+- **Error report (I3):** paths in an engine error lose the user name (`~`, `<user>`).
+- **Development builds (I4):** keychain service `hangar-drive-dev` and the index in
+  `<local config>/Hangar Drive/dev/`.
+- **Session binding:** section 6, "Server URL".
+
+## Amendment 2026-11-26: end-to-end test against the real server
+
+The end-to-end test `crates/hangar-drive-sync/tests/e2e_server.rs` (the real server with real
+engines, file systems and HTTP clients) found six errors; each has its own test, and the core
+flow runs without workarounds.
+
+- **E2E-1, account creation:** the group check redeemed the invite without a session and then
+  called endpoints that need one. It now has two steps: `Account::create_from` redeems the
+  invite and stores identity and account at once, marked as not set up; `Account::finish_setup`
+  signs in as the new device, reads what an earlier attempt got through and adds the first epoch
+  and the device names. The engine carries an unfinished setup on at the next confirmation or
+  tick, also after a restart, and the server answers a repeated creation (used invite, same
+  account, the same entry 1 byte for byte) with the same success, so a lost answer does not
+  strand the account.
+- **E2E-2, first commit of a new folder:** section 3, "Unknown folder". The engine no longer
+  swallows a failing folder round: after three failed rounds in a row the folder shows a banner
+  (`refused`, or `quotaFull`, `serverDisk`, `updateRequired` by the error).
+- **E2E-3 and E2E-5, removed devices:** section 6, "Removed device".
+- **E2E-4, recovered device name:** the recovered device writes its name into the sealed device
+  names, as pairing does; should that fail, `finish_recovery_cleanup` writes it after its
+  re-seal.
+- **E2E-6, device name on the server:** section 4, "Sealed name", and section 3, "Pairing
+  slots".
+- **Public URL required:** section 6, "Server URL".
+
+## Amendment 2026-11-26: the window's last commands
+
+The window called nine commands the app shell did not have yet (`disconnectThisDevice`, `undo`,
+`restoreDeletedFolder`, `cancelRestore`, `redownloadFolder`, `getServerNumber`,
+`confirmServerNumber`, `fixServerWithOffer`, `restoreRemoteDeleted`). They now run in the engine
+(`crates/hangar-drive-sync/src/engine.rs`, `folder.rs`), with the shell as a thin layer; a test of
+the shell (`every_command_the_window_calls_exists_with_its_arguments`) reads the window's bridge
+and fails for a command the shell lacks or an argument name it does not read. Conclusions:
+
+- **Disconnecting this device** (conclusion): after "these are not my devices" right after a
+  join (security review N2) and from the device list, the device forgets the account at once, as
+  a reset does (L1): its identity and every epoch secret leave the keychain, the account and the
+  folders' sync state leave the index, and its session token, which lives only in memory, goes
+  with the connection. It cannot take itself out of the account's log, since no device removes
+  itself (section 4, the log rules), and the server has no call that ends a session; a token runs
+  out on the server within the hour (`SESSION_SECS`). So the device stays in the log of that
+  account until a device of that account removes it. That is harmless: the entry only names
+  public keys, and the private keys that could use them are gone, so nobody can sign in as that
+  device, open an epoch secret wrapped to it or sign anything in its name. A device the person
+  pairs again later is a new device with new keys. Before any folder is chosen nothing of this
+  device reached the other account. Tests `disconnecting_after_the_join_forgets_the_strangers_account`
+  (engine) and `disconnecting_this_device_forgets_the_account` (shell).
+- **Undo** (conclusion; section 5, "A restore is a commit"): "Keep this", a restored file, a
+  folder reset and restored trash items answer with an undo token. The token names what the
+  action changed in the remote tree, each item with its node before (`UndoState`), kept in memory
+  for the last 20 actions. Undoing publishes the device's own pending changes first (a "keep
+  this" lives on the disk until its round) and then a new commit that puts exactly those items
+  back, so the history keeps both states and changes of other devices since stay. An item the
+  server never held is left alone. Where no token can be drawn the window shows no "Undo".
+- **Folders deleted everywhere** (section 3, "Folder list"): the sealed folder list carries no
+  retired entries, so every device remembers the folders it saw in the list and keeps one that
+  left it under "Gelöschte Ordner" for the retention window. Bringing one back undoes the retire
+  call (`DELETE /api/v1/folders/{folder}/retire`, `ServerApi::bring_back`) and then names the
+  folder in the list again; both steps may be repeated.
+- **Restores that wait for the upload budget** (UX 9.1): a restore the server holds back with
+  `budget_exceeded` is a stored job, tried again every 15 minutes and computed on the then
+  current state; `cancelRestore` drops it, and a job that expired or no longer fits leaves the
+  list.
+- **Download again** (UX 8.2): only for a folder stopped because its marker is missing. The shell
+  checks and creates the old place, and the folder forgets what it held on disk while it keeps
+  its verified chain, marks and history, so its protection against an older state stays.
+- **Pin rotation** (section 6): `getServerNumber` shows the server key number of the key the
+  server presented in the aborted handshake (the HTTP client keeps its SPKI hash after a
+  mismatch, `ServerApi::seen_pin`); `confirmServerNumber` takes exactly that key, after one more
+  question in a native dialog that shows the number (security review L2, now three actions). An
+  offer (`fixServerWithOffer`) gives only URL and pin, through
+  `PairingOffer::server_address`; for an offer whose log head is newer than the verified log,
+  the log is fetched through the offered address, verified from the anchor and the offer checked
+  again, and the old address stays on any failure.
+- **Files another device deleted** (UX 8.1): one activity entry per round and folder, with
+  "Wiederherstellen", which restores every file of it that is still gone from the head before the
+  round, in one commit; a file that came back meanwhile stays as it is.

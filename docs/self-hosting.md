@@ -17,13 +17,19 @@ backups, updates and the server key number.
 
 ## Install in five steps
 
-1. Get the source and build the image:
+1. Get the source, set the address devices will reach your server under, and build the image:
 
    ```sh
    git clone <repository URL> hangar-drive
    cd hangar-drive
+   echo "HANGAR_DRIVE_PUBLIC_URL=https://drive.example.org/" > .env
    docker compose up -d --build
    ```
+
+   `HANGAR_DRIVE_PUBLIC_URL` is required: without it Compose refuses to start the service
+   and the server itself does not start either, with a message that says how to set it.
+   Every sign-in is bound to this address ([Invite links](#invite-links)). For a first test on
+   this machine alone, `http://localhost:8080/` works.
 
 2. Check that it runs:
 
@@ -36,18 +42,51 @@ backups, updates and the server key number.
 
 3. Put a reverse proxy with TLS in front of it ([Caddy](#caddy) or [nginx](#nginx)).
 
-4. Create the first invite:
+4. Create the first invite (with the address of step 1 in `HANGAR_DRIVE_PUBLIC_URL`; after
+   changing it, restart with `docker compose up -d`):
 
    ```sh
    docker compose exec server hangar-drive-server invite
+   # https://drive.example.org/join#<invite>.<server ID>
    ```
 
-   The invite is printed once, is valid for 7 days (`--days N`, up to 90) and creates exactly
-   one account. The server stores only its hash.
+   The command prints the whole invite link once. It is valid for 7 days (`--days N`, up to
+   90) and creates exactly one account; the server stores only the invite's hash. Everything
+   after `#` is the invite: browsers and proxies never send that part to a server, so it ends
+   up in no access log. Send the whole link. With a self-signed certificate, add `--pin` (see
+   [Invite links](#invite-links)).
 
-5. In the Hangar Drive app, choose "Set up a new account", enter your server's URL (for example
-   `https://drive.example.org`) and the invite. Further devices of the same account join by
-   pairing from a device you already have; they need no invite.
+5. Open the link on the new device. The page `/join` of your server explains that the link
+   belongs to the Hangar Drive app and offers a button that opens it there; pasting the link
+   into the app ("Start with an invite link") works as well. Further devices of the same
+   account join by pairing from a device you already have; they need no invite.
+
+### Invite links
+
+The link has the form `<public URL>join#<invite>.<server ID>[.<pin>]`:
+
+- `<invite>`: the single-use invite, 22 characters (base64url).
+- `<server ID>`: the server's ID, 32 hex digits. The app checks it when it first connects, so
+  a link cannot be redirected to another server.
+- `<pin>`: only with `invite --pin`: the SHA-256 of the certificate's public key (SPKI), 43
+  characters (base64url), taken from `HANGAR_DRIVE_TLS_CERT`, `--cert FILE` or `--spki HEX`.
+  Use it only for a self-signed certificate. A certificate from a public authority (Let's
+  Encrypt) needs no pin, and pinning one would lock devices out when a renewal brings a new
+  key.
+
+`HANGAR_DRIVE_PUBLIC_URL` must be an `https` address (`http` only for `localhost`), without a
+user name, query or fragment; a path is allowed (`https://example.org/drive/` gives
+`https://example.org/drive/join#...`). The server itself serves the page at `/join` (with
+`/join.js` and `/join.css`); behind a path prefix, the reverse proxy maps it. The page loads no
+third-party resource, runs only its own script under a strict Content Security Policy, and
+builds the app link `hangar-drive://join#...` from the fragment in the browser.
+
+The public URL also guards every sign-in: a device signs its session proof for the address it
+connects to, and the server refuses a proof for any other address. A host that copies your
+server's ID into a link or recovery sheet with its own address therefore cannot pass a device's
+sign-in on to your server. That is why the server does not start without
+`HANGAR_DRIVE_PUBLIC_URL`. Keep it the address your devices use: changing it signs every device
+out until it is set back.
 
 ## Reverse proxy
 
@@ -181,6 +220,7 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HANGAR_DRIVE_PORT` | `8080` | Port to listen on |
+| `HANGAR_DRIVE_PUBLIC_URL` | none, required | The address devices reach the server under, for the links `invite` prints and the sign-in check ([Invite links](#invite-links)); the server does not start without it |
 | `HANGAR_DRIVE_DATA_DIR` | `/data` in the image | Database and objects |
 | `HANGAR_DRIVE_RETENTION_DAYS` | `30` | How long a version stays restorable after it was replaced (W) |
 | `HANGAR_DRIVE_RETENTION_MIN_COMMITS` | `10` | Newest versions per folder kept regardless of age, within the minimum count cap |
@@ -239,7 +279,7 @@ docker compose exec server hangar-drive-server <command>
 
 | Command | What it does |
 | --- | --- |
-| `invite [--days N]` | Creates a single-use invite |
+| `invite [--days N] [--pin [--cert FILE \| --spki SHA256-HEX]]` | Creates a single-use invite and prints its link ([Invite links](#invite-links)) |
 | `status` | Accounts, devices, folders, live and stored bytes, pins, warnings, free disk space |
 | `server-key-number [--cert FILE \| --spki SHA256-HEX]` | Prints the server key number (below) |
 | `pin list` | Lists anomaly pins |

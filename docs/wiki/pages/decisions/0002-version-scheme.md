@@ -84,6 +84,56 @@ the same choice the sister desktop app made in its own ADR 0002.
   changelog entry. Until the script exists, these steps are manual.
 - The Windows installer's file version carries the build number only if the internal form uses `+`.
 
+## Signed updates (amendment 2026-11-26, app shell security review)
+
+The app updates itself only through `tauri-plugin-updater`, which installs an update only when its
+minisign signature verifies against the public key in `src-tauri/tauri.conf.json`. Until the owner
+puts that key and an endpoint there, the plugin is not registered and the command `install_update`
+answers "updates are off" (`src-tauri/src/updater.rs`); no key is in the repository.
+
+**Making the key (owner, once, on the release machine):**
+
+1. `pnpm tauri signer generate -w "%USERPROFILE%\.tauri\hangar-drive.key"`, with a strong
+   password. The private key stays in `%USERPROFILE%\.tauri\hangar-drive.key`: never in the
+   repository, never in a synced or cloud folder (OneDrive, Dropbox, the Hangar Drive folders),
+   backed up offline (for example on a USB stick in a safe). A lost key means no update can reach
+   the installed apps any more; a leaked key means anyone can ship one.
+2. Put the public key (`hangar-drive.key.pub`, one line) into `tauri.conf.json`:
+
+   ```json
+   "plugins": {
+     "updater": {
+       "pubkey": "<content of hangar-drive.key.pub>",
+       "endpoints": ["https://<download host>/hangar-drive/latest.json"],
+       "windows": { "installMode": "passive" }
+     }
+   }
+   ```
+
+   and `"createUpdaterArtifacts": true` under `bundle`. The endpoint comes from the release
+   setup, never an internal host in the public repository.
+3. At release time the build reads the key from the environment only:
+   `TAURI_SIGNING_PRIVATE_KEY` (the path or the content) and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, set in the release shell, never in a file of the
+   repository or in `.env`.
+
+> [!note] Checked 2026-11-26 against the installed CLI (tauri-cli 2.12.6)
+> `pnpm tauri signer generate --help` lists `-w, --write-keys`; the CLI's changelog documents
+> `TAURI_SIGNING_PRIVATE_KEY` (a path or the key itself for `build`) and
+> `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Check again after a major CLI update.
+
+**Authenticode (installer signature, owner):** the updater's signature protects updates, not the
+first download. The NSIS installer and the app's `.exe` should carry an Authenticode signature too,
+so SmartScreen and the person can tell them from a copy:
+
+- a code signing certificate (OV or EV) kept on a hardware token or in a cloud HSM, never as a
+  `.pfx` in the repository or in a synced folder;
+- `bundle.windows.signCommand` in `tauri.conf.json` calling `signtool sign /fd sha256 /tr
+  <RFC 3161 timestamp URL> /td sha256 ...` (or the HSM vendor's tool), so the bundler signs the
+  `.exe` and the installer; the timestamp keeps the signature valid after the certificate expires.
+
+Neither key nor certificate exists yet; both are the owner's step before the first public release.
+
 ## Evidence
 - [[version-number-wikipedia]], [[tauri-version-handling-code-reading]].
 - Code: `src/version.ts`, `src/buildInfo.ts`, `vite.config.ts`, `src/changelog.json`; tests
