@@ -80,7 +80,8 @@ jobs:
           cargo test --workspace --locked --no-fail-fast
 
   # The crypto crate's fixed vectors (testdata/vectors.json), recomputed independently with the
-  # Python standard library. One platform is enough: the script only does arithmetic.
+  # Python standard library, and the Python tools. One platform is enough: the scripts only do
+  # arithmetic and read metadata.
   crypto-vectors:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -97,6 +98,17 @@ jobs:
 
       - name: Recompute the test vectors
         run: python3 -I crates/hangar-drive-crypto/test_vectors.py
+
+      # THIRD_PARTY_NOTICES.md must follow Cargo.lock; the script reads `cargo metadata`, so the
+      # job needs Cargo, but no build.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Python tools and third-party notices
+        run: |
+          python3 -m unittest discover tools
+          python3 -I tools/third_party_notices.py --check
 
   # The server image as users build it: from the repository root with server/Dockerfile. It must
   # start as a container and answer its health endpoint, then stop cleanly on SIGTERM.

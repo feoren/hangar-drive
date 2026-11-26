@@ -30,14 +30,18 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 pnpm format:check && pnpm lint && pnpm test && pnpm build
 py -3 crates/hangar-drive-crypto/test_vectors.py
+py -3 -m unittest discover tools
+py -3 tools/third_party_notices.py --check
 ```
 
 The Cargo commands run from the repository root and cover every Rust package of the workspace.
 `pnpm build` comes before the first Cargo build, because the app embeds the built frontend.
-The last line recomputes the crypto crate's fixed test vectors (`testdata/vectors.json`) with the
+`test_vectors.py` recomputes the crypto crate's fixed test vectors (`testdata/vectors.json`) with the
 Python standard library, independently of the Rust code. It needs Python 3.14, whose `unicodedata`
 has the Unicode version of the name policy; on Linux and macOS run it as `python3`.
 After a deliberate format change, regenerate the file with `--write` and review the diff.
+The two lines after it test the Python tools and check that `THIRD_PARTY_NOTICES.md` still follows
+`Cargo.lock`; after a dependency change, regenerate it with `py -3 tools/third_party_notices.py`.
 A change to the server should also pass an image build:
 `docker build -f server/Dockerfile -t hangar-drive-server .`
 
