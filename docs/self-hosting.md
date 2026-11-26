@@ -110,6 +110,11 @@ connects from, never a whole private range, because every other container or pro
 range could then choose its own rate limit key. Leave access logs of the proxy off or without
 request headers: the `Authorization` header carries session tokens.
 
+If the proxy is missing from that list, every client behind it shares the proxy's address and
+so its rate limits: one client can use them up for all. The server logs an `operator warning`
+once per address when a private, loopback or link-local address sends `X-Forwarded-For`
+without being listed; add that exact address if it is your proxy.
+
 ### Caddy
 
 Caddy obtains and renews a Let's Encrypt certificate on its own. The commented `caddy` service in
@@ -210,7 +215,19 @@ so with this setting only the proxy may reach the published port: keep it bound 
 The server can terminate TLS 1.3 itself. Mount the certificate chain and key (PEM) into the
 container and set `HANGAR_DRIVE_TLS_CERT` and `HANGAR_DRIVE_TLS_KEY`. Then bind the port to the
 network instead of `127.0.0.1`. A reverse proxy remains the recommended setup: it renews
-certificates on its own.
+certificates on its own. A server that terminates TLS itself sends
+`Strict-Transport-Security: max-age=31536000` on every reply; behind a proxy it sends none, so
+set it in the proxy as shown above.
+
+### Forward proxies on the devices
+
+The app uses the forward proxy of the device's environment (`HTTPS_PROXY`, `ALL_PROXY`) for
+`https` server addresses. Such a proxy only tunnels the TLS connection: it learns the server's
+host name, but the app checks the certificate, or the pinned key of a self-signed server, end
+to end with the server, so the proxy can neither read nor change a request. Networks that allow
+`https` only through a proxy therefore keep working. Plain `http`, which the app allows only for
+`localhost`, `127.0.0.1` and `::1`, never goes through a proxy: the session token would travel
+through it in the clear.
 
 ## Configuration
 
@@ -331,6 +348,20 @@ against a lost disk or a lost server. Keep three copies of the data on two diffe
 one of them off site, for example the live volume, a nightly copy on another disk and a weekly
 copy at another place. The data is encrypted, so the copies need no extra encryption to stay
 confidential, but keep them away from the people who should not delete them.
+
+A copy holds the whole data folder, not only the objects:
+
+- `drive.sqlite3` (with `drive.sqlite3-wal` and `drive.sqlite3-shm` while the server runs): the
+  metadata, that is accounts, device logs, commits, reference lists, pins, sealed records and
+  the change feed. Without it the objects cannot be told apart or restored. It holds no file
+  content and no names in the clear, but it does show which device wrote what and when, so
+  treat it like the objects. Deleted rows are overwritten in the file (`secure_delete`), so an
+  old copy holds only what was in the database when it was taken.
+- `server.secret`: the 32 byte key of the sign-in challenges. Without it the server makes a new
+  one, which only invalidates challenges in flight. It is still a secret: whoever holds it can
+  forge challenges of this server (not proofs, which need a device's key), so keep the copies
+  as protected as the volume and never in a public place.
+- `objects/`: the encrypted objects.
 
 A consistent copy needs the database and the objects from the same moment. The simplest way is
 a short stop:

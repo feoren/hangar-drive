@@ -1496,6 +1496,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `pair.confirm.yes` | Ja, gleiche Zahlen, hinzufügen | Yes, same numbers, add it |
 | `pair.confirm.no` | Nein, abbrechen | No, cancel |
 | `pair.request.body` | Danach fragt dein System noch einmal nach und zeigt diese Zahlenreihe. Sag nur Ja, wenn das neue Gerät dieselbe zeigt. | Your system then asks once more and shows this row of numbers. Only say yes if the new device shows the same one. |
+| `pair.request.lookAlike` | Es gibt schon ein Gerät, das so heißt: „{device}“. Prüfe die Zahlen besonders genau. | There is already a device with this name: “{device}”. Check the numbers especially carefully. |
 | `pair.mismatch` | Dann füge das Gerät nicht hinzu. Starte auf dem neuen Gerät noch mal von vorn. Passiert das wieder, sprich mit dem Betreiber deines Servers. | Then do not add the device. Start over on the new device. If it happens again, talk to the person who runs your server. |
 | `pair.added` | „{device}“ ist jetzt dabei. | “{device}” has been added. |
 | `pair.joined` | Gekoppelt. Gleich geht es weiter. | Paired. Just a moment. |
@@ -1532,6 +1533,9 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `recover.linkOk` | Gefunden: {host} | Found: {host} |
 | `recover.linkAccount` | Konto {account} | Account {account} |
 | `recover.cleanup.remove` | „{device}“ entfernen | Remove “{device}” |
+| `recover.cleanup.ask.one` (backend) | {count} Gerät aus deinem Konto entfernen? | Remove {count} device from your account? |
+| `recover.cleanup.ask.other` (backend) | {count} Geräte aus deinem Konto entfernen? | Remove {count} devices from your account? |
+| `recover.cleanup.askBody` (backend) | Danach können diese Geräte nichts mehr synchronisieren und keine neuen Dateien mehr lesen. | These devices can then no longer sync or read new files. |
 
 ### 13.4 Tray
 
@@ -1630,6 +1634,7 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `folder.reason.missing` | Ordner nicht gefunden | folder not found |
 | `folder.reason.olderState` | älterer Stand auf dem Server | older state on the server |
 | `folder.reason.removedHeads` | Änderungen eines entfernten Geräts | changes from a removed device |
+| `folder.reason.tooLarge` | zu groß für einen Ordner | too large for a folder |
 | `folder.number.title` | Ordnernummer von „{folder}“ | Folder number of “{folder}” |
 | `folder.number.body` | Vergleiche diese Zahlen mit der Ordnernummer auf deinem anderen Gerät. Sind sie gleich, sehen beide Geräte denselben Stand. | Compare these numbers with the folder number on your other device. If they are the same, both devices see the same state. |
 | `folder.deleted.daysLeft.one` | noch {days} Tag | {days} day left |
@@ -1827,9 +1832,12 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `restore.beforeDevice.from` | ab | from |
 | `restore.beforeDevice.advice` | Entferne dieses Gerät zuerst, sonst ändert es die Dateien gleich wieder. | Remove this device first, or it will change the files again right away. |
 | `restore.folder` | Ganzen Ordner auf diesen Stand zurücksetzen | Reset the whole folder to this state |
-| `restore.folder.title` | Auf diesen Stand zurücksetzen? | Reset to this state? |
-| `restore.folder.body` | „{folder}“ wird auf den Stand von {when} zurückgesetzt. Der jetzige Stand bleibt als Version erhalten, du kannst also auch das rückgängig machen. | “{folder}” will be reset to the state of {when}. The current state stays as a version, so you can undo this too. |
 | `restore.folder.confirm` | Zurücksetzen | Reset |
+| `restore.folder.ask` (backend) | „{folder}“ auf allen Geräten auf diesen Stand zurücksetzen? | Reset “{folder}” to this state on all devices? |
+| `restore.folder.askGone.one` (backend) | Dabei verschwindet {count} Datei, die es damals noch nicht gab. | {count} file that did not exist then will disappear. |
+| `restore.folder.askGone.other` (backend) | Dabei verschwinden {count} Dateien, die es damals noch nicht gab. | {count} files that did not exist then will disappear. |
+| `restore.folder.askNoneGone` (backend) | Dabei verschwindet keine Datei. | No file will disappear. |
+| `restore.folder.askBody` (backend) | Geänderte Dateien bekommen ihren damaligen Inhalt. Der jetzige Stand bleibt als Version erhalten, du kannst das also rückgängig machen. | Changed files get their content from then. The current state stays as a version, so you can undo this. |
 | `restore.folder.done` | „{folder}“ ist auf dem Stand von {when}. | “{folder}” is back to the state of {when}. |
 | `restore.retention.one` | Versionen bleiben {days} Tag erhalten. Das legt dein Server fest. | Versions are kept for {days} day. Your server sets this. |
 | `restore.retention.other` | Versionen bleiben {days} Tage erhalten. Das legt dein Server fest. | Versions are kept for {days} days. Your server sets this. |
@@ -1889,6 +1897,9 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `devices.remove.title` | „{device}“ entfernen? | Remove “{device}”? |
 | `devices.remove.body` | Danach kann dieses Gerät nichts mehr synchronisieren und keine neuen Dateien mehr lesen. Was schon darauf liegt, bleibt dort: {app} kann auf einem anderen Gerät nichts aus der Ferne löschen. | After that, this device can no longer sync or read new files. What is already on it stays there: {app} cannot delete anything remotely. |
 | `devices.remove.lost` | Verloren oder gestohlen? Dann entferne es jetzt. | Lost or stolen? Then remove it now. |
+| `devices.name.lookAlike` | Es gibt schon ein Gerät, das so heißt. | There is already a device with this name. |
+| `devices.lookAlike.question` (backend) | „{name}“ sieht aus wie „{device}“, ein anderes Gerät in deinem Konto. Trotzdem so nennen? | “{name}” looks like “{device}”, another device in your account. Use this name anyway? |
+| `devices.lookAlike.yes` (backend) | Trotzdem so nennen | Use it anyway |
 | `devices.removed` | „{device}“ wurde entfernt. | “{device}” was removed. |
 | `devices.removedBy` | „{device}“ wurde von „{by}“ entfernt. | “{device}” was removed by “{by}”. |
 | `devices.addedBy` | „{device}“ wurde hinzugefügt. | “{device}” was added. |
@@ -2119,3 +2130,65 @@ Reworked against the current [[0001-foundation]] (sections 3 to 6):
 - **6.5, new:** a chosen folder that is not empty is merged after a question that shows the
   number of local files.
 - Example paths use `%USERPROFILE%`.
+
+## Changes after the overall security review (2026-11-26)
+
+These supersede the passages they name; where an earlier section still describes a question of
+the window's own, this section wins.
+
+- **Native questions (M4, H1, H2).** Removing a device (10.2), disconnecting this device (10.2,
+  the warning for the last device in the same question instead of a second one), "Dieses Gerät
+  zurücksetzen" (11), taking a renewed recovery code once its group matched (10.3), continuing a
+  folder with the server's older state (8.6), taking in the changes of a removed device (8.9),
+  "Ja, löschen" for many deletions (8.1), turning "Beim Anmelden starten" off (11), "Jetzt
+  aktualisieren" once an update was found (8.8) and confirming a removal only the server reports
+  (8.8) are asked by the operating system's dialog, with what the backend knows (device, folder,
+  number of files, version). The window asks nothing of its own before these where its step
+  would only repeat the question: the device row menu, the reset button and the suspect step
+  call the backend directly, and the re-anchor goes from "Ja, gleiche Zahlen" straight to the
+  native question (the confirm screen is gone; the screen without a comparison stays, because
+  it says what skipping the comparison costs). Dialogs that carry the decision itself (8.1, 8.9,
+  the comparison of 8.6) stay. "Nein" in a native question is not an error: nothing changes and
+  nothing is shown.
+- **6.5, a folder that is not empty (H1).** The window's merge dialog is gone. The shell asks
+  natively with the number of files, the account folder, the place and the server the files go
+  to, with "Zusammenführen" and "Anderen Ordner wählen"; the latter opens the folder picker for
+  that folder. Proposed places are always new folders below `%USERPROFILE%\Hangar Drive\`,
+  never an existing folder and never a folder directly in the home folder; a leading dot of a
+  folder name becomes `_` (N8).
+- **8.8, a removal only the server reports (H2).** The banner says "Dein Server meldet, dass
+  dieses Gerät aus deinem Konto entfernt wurde. Bis du das bestätigst, synchronisiert Hangar
+  Drive hier nicht." with "Bestätigen" (native question "Wurde dieses Gerät aus deinem Konto
+  entfernt?", "Ja, Konto hier vergessen") and "Fehlerbericht kopieren".
+- **A version too large for a folder (M3).** The banner "Ein zu großer Stand von „{folder}“"
+  explains that the server's version is too large or nested too deeply and was not taken in,
+  with "Frühere Versionen"; the folder row says "Angehalten: zu großer Stand auf dem Server".
+- **An older account state on the server (M2)** is a quiet notice line: "Dein Server hatte einen
+  älteren Stand deines Kontos. Hangar Drive hat alles neu eingelesen, es fehlt nichts."
+- **Names (N9).** Bidi control characters in a file, folder or device name are shown as U+FFFD
+  before the name is isolated, in the window and in the native dialogs.
+
+## Changes after the follow-up check of the overall security review (2026-11-26)
+
+These supersede the passages they name ([[0001-foundation]], amendment "Follow-up check of the
+overall security review").
+
+- **9.2, resetting a folder (N-1).** "Ganzen Ordner auf diesen Stand zurücksetzen" calls the
+  backend directly; the window's own question is gone. The operating system asks every time,
+  with the folder's name and how many files disappear on every device ("Dabei verschwinden 3
+  Dateien, die es damals noch nicht gab." or "Dabei verschwindet keine Datei."), "Zurücksetzen"
+  and "Abbrechen". After "Abbrechen" the window shows nothing.
+- **4.4, removing old devices after a recovery (N-2).** "Weiter" on "Alte Geräte entfernen" asks
+  natively as soon as at least one old device is ticked, with their names, "Entfernen" and
+  "Abbrechen". After "Abbrechen" the step stays as it was.
+- **5, a new device whose name looks like one of yours.** The pairing step says "Es gibt schon
+  ein Gerät, das so heißt: „{device}“. Prüfe die Zahlen besonders genau." above the numbers, and
+  the native question repeats it. Renaming a device to a name that looks like another one's
+  asks natively ("Trotzdem so nennen"); after "Abbrechen" the field says "Es gibt schon ein
+  Gerät, das so heißt."
+- **6, a folder too large for a folder (N-4).** The folder row says "Angehalten: zu groß für
+  einen Ordner"; the folder goes on by itself once it is within the limits again.
+- **8.8, a removal the server shows with the log (H2).** A removal this device verified in the
+  device log the server sent is forgotten at once and shows the "removed" banner with the name
+  of the removing device; the banner "Dein Server meldet ..." with "Bestätigen" remains only for
+  a report without such a removal. It cannot be hidden.

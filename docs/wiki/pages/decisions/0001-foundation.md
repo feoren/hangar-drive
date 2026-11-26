@@ -538,10 +538,13 @@ primitives the sister app already uses:
     (section 3, "Pairing slots"). The offer format does not change.
   - **Sealed name** (conclusion, finding E2E-6): the request carries the new device's name
     sealed, never in the clear, since device names are sealed records everywhere else:
-    `P_name = HKDF-SHA256(P, field("hangar-drive/v1/pairing-name"), 32)`, `sealed_name = nonce
-    (24) || XChaCha20-Poly1305(P_name, nonce, name, aad = field(label) || field(account) ||
-    field(new device))`, and the request tag covers `sealed_name` instead of the name. Only who
-    holds P opens it; the server checks only its size. Vectors `pairing.sealed_name` and
+    `P_name = HKDF-SHA256(P, field("hangar-drive/v1/pairing-name-key"), 32)`, `sealed_name =
+    nonce (24) || XChaCha20-Poly1305(P_name, nonce, padded, aad = field("hangar-drive/v1/pairing-name")
+    || field(account) || field(new device))` with `padded = length (u64) || name || zeros` to its
+    Padmé length, and the request tag covers `sealed_name` instead of the name. Only who holds P
+    opens it; the server checks only its size (the Padmé lengths of one and of 128 bytes of
+    name). Key label and associated data differ, and the name is padded, since the overall
+    security review (N13 and info, "Crypto and protocol" below). Vectors `pairing.sealed_name` and
     `pairing.tag`, recomputed by `test_vectors.py`. The inviting device closes the slot after
     the answer (section 3, "Pairing slots").
   - **Added device** (conclusion, finding L6): the append call with the add device entry
@@ -697,6 +700,8 @@ primitives the sister app already uses:
     Bringing back a retired folder whose last head a standing pin holds is a restore of a
     pinned tree: its bytes go through the pin restore allowance before the budgets (conclusion,
     re-review of the server fixes), so undoing a harmful retirement does not wait for a budget.
+    That holds once per pinned head (overall review N1): a later bring-back of the same head
+    pays the budgets.
   - **Pin cap, a lasting invariant** (conclusion): the bytes that only admitted pins retain
     (class 3 in "Retention classes" below) never exceed the pin cap P of the account: its quota
     plus the headroom, `Q + H`, because one pinned tree was live and can therefore reach that
@@ -988,9 +993,15 @@ primitives the sister app already uses:
     log that says so. A proof that verifies with the key the log last listed for a device the
     log removed is therefore answered with `DeviceRemoved` (403), the challenge used up, and
     not counted as a failed proof; any other bad proof stays `ProofInvalid`, so only a holder of
-    that key learns of the removal. The engine then forgets the account as for a removal it read
-    in the log (security review L1, `account::forget`) and shows "this device was removed"
-    without a name; `ProofInvalid` never does that. A recovery device answered so means "this
+    that key learns of the removal. The proof names the length of the log the device verified
+    (`ProofRequest::log_length`, a hint outside the signed statement), and the answer carries
+    the log entries after it up to and including the removal, at most `MAX_LOG_PAGE`
+    (`ErrorBody::removal_log`). The engine counts `DeviceRemoved` only as the answer to its own
+    proof call; it forgets the account at once (security review L1, `account::forget`) and shows
+    "removed by ..." when those entries continue its own verified log with a valid removal of
+    itself (`AccountState::removal_in`), and otherwise stops syncing, shows the server's report
+    and forgets only once the person confirms ("Follow-up check of the overall security
+    review" below); `ProofInvalid` never does that. A recovery device answered so means "this
     code was used before" (E2E-5). `SessionError::Removed` in `hangar_drive_crypto::session`.
   - **Scope:** the server sets a session's scope at sign-in from the verified log. A regular
     device may make every call; a recovery device only the calls of the recovery session
@@ -1001,10 +1012,13 @@ primitives the sister app already uses:
     body is read. Each public endpoint is limited per address (IPv4, IPv6 /64) and, with four
     times the limit, per network (IPv4 /16, IPv6 /48). Sign-in is limited per account only by
     failed proofs, keyed by account and device and only for devices the log lists, so nobody
-    can fill the table with invented accounts or lock an account out with challenges. A full
+    can fill the table with invented accounts or lock an account out with challenges. A proof
+    counts only after its check failed, and a valid proof always goes through, also over the
+    counter (overall review M1). A full
     table evicts the entries whose window ended, oldest first. A public body must arrive
     within 10 seconds; connections per address are capped in the accept loop, except for
-    trusted proxies, which limit per client themselves.
+    trusted proxies, which limit per client themselves. Calls with a bearer token are limited
+    per address and network before the token is looked up (overall review, info).
 - **Client IPs:** taken from `X-Forwarded-For` only when the operator has marked the proxy as
   trusted. No proxy is trusted by default, and the self-hosting guide names the exact proxy
   address to trust, never a whole private range (server security review L1).
@@ -1039,9 +1053,44 @@ primitives the sister app already uses:
     another one. A padded name is refused rather than trimmed, because the name is signed and
     sealed as given; callers trim user input before they submit it. Fillers inside a name stay
     allowed, since Korean text may use them.
+  - **Visible character and padded edges** (conclusion, overall security review N12): a visible
+    character is a letter, number, punctuation or symbol (General Category L, N, P, S) that is
+    no filler; the blank Braille pattern U+2800 joins the fillers. The combining grapheme joiner
+    U+034F and the variation selectors are combining marks and never visible, and a name may not
+    start or end with them or a filler, except a variation selector right after a visible
+    character, which belongs to it (an emoji such as U+2764 U+FE0F). The rule is decided by what
+    a character is not (white space, Cc, Cf, Zl, Zp, M, Co, a filler, a default ignorable code
+    point), so any other unassigned code point counts as visible until the tables know it.
+    Default ignorable code points
+    (`Default_Ignorable_Code_Point`, reserved ones such as U+2065 included, `DEFAULT_IGNORABLE_RANGES`)
+    render as nothing in any renderer, so they are never visible and pad an edge like a filler
+    (follow-up check of the fixes: before, a name of U+2065 alone passed as not blank). Vector
+    `name.display_names`.
+- **8.3 short name aliases** (conclusion, overall security review N14): a name of the shape of
+  a short name (a base of at most eight characters ending in `~` and digits, an optional
+  extension of at most three) is marked "cannot sync on this device" on Windows
+  (`WindowsNameProblem::ShortNameAlias`). Windows opens a path by its short name too, so such a
+  name can address another entry: `HANGAR~1` at the root is usually `.hangar-drive`, and a write
+  under it would land in the reserved directory past the ignore list. Which short names exist
+  depends on the volume and the order of creation, so every name of that shape is refused, not
+  only the reserved one; elsewhere such names sync as usual.
+- **Code points HFS+ ignores** (conclusion, overall security review N15): the case keys drop
+  U+200C to U+200F, U+202A to U+202E, U+206A to U+206F and U+FEFF before they are computed, the
+  code points HFS+ ignores when it compares names (Apple TN1150, not measured on a volume), so
+  two names that differ only in them collide by case and become a conflict copy instead of two
+  names on one file. The comparison key keeps them.
 - Long paths: the app manifest declares `longPathAware`, and file system calls use `\\?\`
   paths, because the manifest alone works only when the `LongPathsEnabled` registry value is set.
 - 8.3 short names from watcher events are resolved to long names before matching.
+- **Reading a file** (overall security review N6): the open uses `FILE_FLAG_OPEN_REPARSE_POINT`
+  on Windows and `O_NOFOLLOW` on Unix and refuses a handle that is a reparse point, so a link put
+  in place of the file is never read through. **Residual risk:** the directories above the file
+  are checked by path before the open (their file IDs against the index, L1), not through
+  handles; a program that may write in the sync root can swap one of them for a junction or a
+  link between that check and the open, and the engine then reads, and uploads, a file from
+  outside the root. Roots that other users or untrusted programs may write to are not protected
+  against that race; closing it needs a walk by handles (`NtCreateFile` relative to a directory
+  handle, `openat` on Unix), an open point.
 - Locked files (sharing violations from Office, antivirus, the indexer) are retried with backoff
   and never block the whole run.
 - Downloads go to a temporary file and are renamed atomically.
@@ -1195,6 +1244,8 @@ and atime. Everything in this subsection is a conclusion of this ADR.
 - **Exact sizes:** the server cannot see them, because of Padmé padding. Small files cost one
   object each, and dedup is weaker than with CDC for files edited in the middle.
 - **Visible metadata:** the server still sees object counts, object types and padded sizes,
+  the padded sizes of records and sealed pairing names (overall security review N13; before,
+  exact sizes, which told the number of folders, devices and generations),
   upload and commit times, which device wrote, the device log, the reference graph between commits and objects,
   merges, side commits and re-anchor commits, live and retained bytes, and upload volume per
   device. The README and
@@ -1502,7 +1553,9 @@ and fails for a command the shell lacks or an argument name it does not read. Co
 - **Pin rotation** (section 6): `getServerNumber` shows the server key number of the key the
   server presented in the aborted handshake (the HTTP client keeps its SPKI hash after a
   mismatch, `ServerApi::seen_pin`); `confirmServerNumber` takes exactly that key, after one more
-  question in a native dialog that shows the number (security review L2, now three actions). An
+  question in a native dialog that shows the number (security review L2, now three actions),
+  and only while it is still the key of the number shown (`confirm_server_number(&pin)`, overall
+  security review N7). An
   offer (`fixServerWithOffer`) gives only URL and pin, through
   `PairingOffer::server_address`; for an offer whose log head is newer than the verified log,
   the log is fetched through the offered address, verified from the anchor and the offer checked
@@ -1510,3 +1563,303 @@ and fails for a command the shell lacks or an argument name it does not read. Co
 - **Files another device deleted** (UX 8.1): one activity entry per round and folder, with
   "Wiederherstellen", which restores every file of it that is still gone from the head before the
   round, in one commit; a file that came back meanwhile stays as it is.
+
+## Amendment 2026-11-26: overall security review
+
+Fixes of the overall security review of engine, crypto, protocol and server (H1, H2, M1 to M3,
+N1 to N7, N12 to N15 and the info points), each with a test that replays the attack and fails
+without the fix.
+
+### Engine
+
+Tests in `crates/hangar-drive-sync/tests/` unless named otherwise.
+
+- **Pairing only without an account (H1):** `EngineCore::start_pairing` refuses while the device
+  belongs to an account or a pairing is open, and `Account::join` refuses
+  (`SyncError::AlreadySetUp`) before it writes anything when the keychain holds an identity or
+  the index an account. The join stores its identity and epoch secrets under the same keychain
+  names, so a compromised window could pair a set-up device into a stranger's account: its
+  identity was replaced, the clean-up of a failed join deleted its epoch secrets, and the folders
+  the person then added went to the stranger. A failed join now deletes exactly what it wrote
+  (its identity, the epoch secrets it fetched, the account it saved), and a refused join ends
+  the pairing instead of retrying. Test `pairing_guard.rs`, taken over from the review's proof of
+  concept, and `a_join_over_a_stored_identity_touches_nothing`.
+- **"Removed" from the server (H2):** `device_removed` counts only as the answer to the
+  device's own proof (`NetError::DeviceRemoved`); on any other route it is a protocol error,
+  since a token says nothing about which key made it. How the engine then decides was changed
+  by the follow-up check (amendment "Follow-up check of the overall security review", H2): it
+  forgets at once on a removal it verified in the log the server sends with the answer, and
+  never by itself otherwise. Without such a removal it stops syncing, shows
+  `Warning::RemovalReported`, signs in again once an hour with a fresh challenge and proof, and
+  forgets the account (L1) only when the person confirms (`confirm_device_removed`, the
+  shell's `confirmDeviceRemoved`); a proof the server accepts again ends the report. A clock
+  set back since the last report makes the probe due at once (follow-up check of the fixes:
+  before, the device stayed stopped until the clock caught up, also when the server accepted
+  it again; `a_clock_set_back_does_not_stop_the_probes`).
+  - **The trade-off against L1:** replaced by the follow-up check (H2 there): the automatic
+    forgetting after three answers over a day is gone.
+  - Tests `removal_report.rs` (`device_removed_on_the_feed_does_not_forget`, the confirmation,
+    `a_bare_removal_answer_never_forgets_by_itself`, a server that accepts the device again),
+    `removal_proof.rs`, `http.rs`
+    (`device_removed_counts_only_as_the_answer_to_the_proof`) and the end-to-end flow.
+- **Offers with a new server identity (M2):** `fix_server_with_offer` checks an offer whose log
+  head is ahead of the verified log through a temporary connection to the offered address: the
+  log goes into a fresh `AccountState`, which must contain the device's own verified head, and
+  the offer's signature is checked against it. Nothing is stored and the account is not
+  refreshed until the address is taken; before, the refresh through a forged offer's server
+  stored its feed cursor (up to `u64::MAX`, a freeze) and records before the check. A feed
+  sequence below the device's cursor is an older state: the cursor goes to 0, the whole account
+  is read again and verified as always, and the window shows `ServerNotice::OlderAccountState`.
+  Tests `older_feed.rs` (`a_forged_offer_touches_nothing_before_its_signature_is_checked`,
+  `a_feed_sequence_pushed_to_the_maximum_does_not_freeze_the_device`).
+- **Trees beyond the limits of a folder (M3):** decoding a server's tree stops at 512 levels and
+  2^20 items before more objects are fetched (`codec::MAX_TREE_DEPTH`, `MAX_TREE_ITEMS`; 512
+  levels is the deepest path macOS's `PATH_MAX` of 1024 bytes can hold, and 2^20 items keep the
+  three trees of a folder below about a gigabyte), and `Tree::check` and the encoder's order
+  walk the tree once, O(n), where the walk from every item to the root was O(n x depth). A head
+  beyond the limits is taken into the verified chain and the history, but its tree never: the
+  folder stops (`StopReason::TreeLimit`, `Warning::TreeLimit`), and "Undo a device" publishes on
+  that head with the reference delta computed by `codec::reachable`, which lists a tree's
+  objects without building it (bounded by `MAX_REACHABLE_OBJECTS`), then makes the folder
+  active again. Measured (debug build, Windows): a chain of 40,000 directories is refused after
+  513 directory nodes in about 40 ms, and `Tree::check` of it takes about 60 to 100 ms. Tests
+  `tree_limits.rs`.
+- **The confirmed server number (N7):** `confirm_server_number(expected_pin)` takes the key only
+  if it is still the candidate of the number shown; `ServerNumberView::pin` (not serialized for
+  the window) carries it to the shell. A number shown again for another key in between keeps
+  the old pin. Test `the_server_number_confirmed_becomes_the_pin` (`commands.rs`).
+- **No proxy for loopback (N5):** plain HTTP, allowed only to the loopback address, never goes
+  through a proxy of the environment (`no_proxy`); for https the environment's proxy only
+  tunnels the end-to-end checked TLS connection (`docs/self-hosting.md`, "Forward proxies on the
+  devices"). Test `http_proxy.rs`.
+- **Reading a file (N6):** section 7, "Reading a file", with its residual risk. Test
+  `a_link_in_place_of_a_file_is_not_read` (`localfs.rs`); it needs the right to create symbolic
+  links, which Windows grants only in developer mode, and skips without it.
+- **Info:** the quarantine is cleaned with every hourly scan (`FileSystem::housekeeping`), not
+  only when a root is opened (`the_quarantine_is_cleaned_while_the_root_stays_open`);
+  `inspectLink` names a punycode host for a pairing offer and a recovery sheet as for an invite
+  (`InspectedLink::*::punycode`, `inspect_link_names_a_punycode_host_of_an_offer_and_a_sheet`);
+  the pin mismatch flag explains only a failure of the TLS handshake, so a timeout after a
+  mismatch is "unreachable" (`a_later_timeout_is_not_reported_as_a_pin_mismatch`); release
+  builds keep integer overflow checks (`[profile.release] overflow-checks = true` in the root
+  manifest, with its reason).
+
+### Crypto and protocol
+
+- **Signature before the log (M2):** `PairingOffer::server_address` checks the signature first
+  when the inviter is a current, regular device of the verified log, so a forged offer in a
+  known device's name with a head far ahead is `Signature`, not `AheadOfLog`; only an inviter
+  the log does not list yet makes the device fetch the log
+  (`a_device_of_the_account_takes_url_and_pin_only_from_a_signed_offer`).
+- **Display names (N12), short name aliases (N14), code points HFS+ ignores (N15):** section 7.
+  Tests in `crates/hangar-drive-protocol/src/name.rs`, vector `name.display_names` (24 names).
+- **Padmé for records and sealed names (N13):** formats of version 1 that hold no data yet
+  change in place; the vectors and `test_vectors.py` hold the new bytes
+  (`records_are_padded_with_padme`, `sealed_names_are_padded_with_padme`).
+
+  | Format | Change |
+  | --- | --- |
+  | Sealed account record | the ciphertext seals `length (u64) \|\| plaintext \|\| zeros` to `padme(8 + len)`, checked strictly on opening (`OpenError::Padding`); the largest record is `MAX_RECORD_LEN`, the bound the server checks |
+  | Sealed pairing name | the ciphertext seals `length (u64) \|\| name \|\| zeros` to `padme(8 + len)`; the server accepts 10 to 144 padded bytes (`SEALED_NAME_MIN_PADDED`, `SEALED_NAME_MAX_PADDED`) |
+  | Pairing name key | HKDF info `field("hangar-drive/v1/pairing-name-key")`; the associated data keeps `pairing-name`, so no byte string serves as both |
+
+- **Framing (info):** a field of 4 GiB or more panics as a documented invariant instead of
+  saturating its length prefix, which gave two different field lists the same bytes
+  (`framing::length_prefix`, also for the framed hash and MAC); every field is bounded far
+  below that by the protocol limits before it is framed
+  (`a_field_of_four_gib_is_refused_not_saturated`).
+- **Keys only from the verified log (info):** `AccountKey::derive` and `RecordCipher::new` are
+  crate-internal; outside the crate a record key comes only from `AccountKey::for_epoch` and
+  `RecordCipher::for_epoch`, which check the secret against the epoch's commitment.
+- **`MAX_GENERATIONS` (info):** a folder key ring holds at most 4096 generations
+  (`folder_keys::MAX_GENERATIONS`); every device removal adds one to every ring, so the bound
+  is far above any account's life, and a ring that claims more is refused before it is read,
+  which bounds the work and memory of opening one.
+- **Corrections of the design report** (info; the raw report stays as it was): Padmé pads every
+  object, full chunks included, because the 8-byte length prefix makes a full chunk `4 MiB + 8`
+  bytes, which pads to `4 MiB + 128 KiB` (about 3 %), not only a file's last chunk; and the
+  pairing secret P is 128 bits (16 bytes, `recovery::ENTROPY_LEN`), as section 4 says, not 32
+  bytes.
+- **Fuzz targets (info):** `decode_sheet` (`RecoverySheet::decode`), `open_name` (sealed pairing
+  names, `PairingSecret::open_name` is public for it) and `decode_api_json` (the JSON of the
+  server API) in `crates/hangar-drive-crypto/fuzz`; they build with `cargo check`, a fuzz run
+  needs nightly.
+
+### Server
+
+Tests in `server/tests/overall_review.rs` unless named otherwise.
+
+- **Failed proofs (M1):** a proof is checked first; only a failed check counts against the
+  device's failure counter, and only for a device the log lists, in the address branch (a proof
+  signed for another URL) as in the signature branch. Over the limit a failing proof is answered
+  `rate_limited`, but a valid proof always goes through. Anyone who knows the account and device
+  IDs can send bad proofs in a device's name, so a counter that also refused the valid proof let
+  a third party lock the device out; the counter guards nothing a valid Ed25519 proof needs.
+  Tests `m1_a_third_party_does_not_lock_a_device_out` and the reversed
+  `sign_in_invite_pairing_and_upload_are_rate_limited` (`flows.rs`).
+- **Bring-back and the allowance (N1):** the pin restore allowance covers bringing back a
+  retired folder once per pinned head. Migration `0003_overall_review.sql` adds
+  `pins.brought_back_ms`; a bring-back takes the allowance only while no pin on that folder and
+  head carries it, and sets it on all of them, so a pin of a later retirement of the same head
+  does not reopen it. Otherwise a device could retire and bring back a pinned folder over and
+  over for free, until the allowance it drained was missing for the restore it exists for. Test
+  `n1_the_allowance_brings_a_pinned_folder_back_only_once`.
+- **Folder removal after the collection (N2):** a folder the collection deletes gets a row in
+  `folder_tombstones` in the same transaction, and the row goes only after the folder's
+  directory was removed. While it exists, `find_or_create` refuses to make the folder ID again
+  (`rate_limited`, retried by the device). Before, an upload between the collection's commit and
+  the removal created the folder again, put its file into the old directory and lost it with
+  the directory, while its row stayed: a committed object without a file. A tombstone left by a
+  crash is finished by the next step of the account. Chosen over renaming the directory before
+  the commit, which leaves objects without files when the transaction then fails or the process
+  dies in between. Tests `n2_an_upload_while_a_deleted_folder_is_removed_is_not_lost` (the
+  store stopped inside `delete_folder` through `Deps::store_layer`) and
+  `n2_a_tombstone_left_by_a_crash_is_finished_by_the_next_step`.
+- **Unlisted proxy (N3):** a request whose peer is a private, shared (RFC 6598), loopback or
+  link-local address, sends `X-Forwarded-For` and is not a trusted proxy logs one `operator
+  warning` per address (at most 64 addresses), since every client behind such a proxy shares its
+  rate limits. The header stays ignored; a public peer with the header is an ordinary client and
+  is not reported. A warning at start is not possible: the server learns its proxy only from
+  the first request. Unit test
+  `a_local_peer_with_a_forwarded_header_that_is_not_trusted_is_found_once` (`client_ip.rs`).
+- **Memory of the largest commit (N4):** measured with a counting allocator
+  (`server/tests/commit_memory.rs`, `#[ignore]`, release build): a commit with
+  `MAX_REFERENCE_DELTA_IDS` (1,048,576) added IDs, a 67 MiB body, held 312 MiB of heap at its
+  peak. Two causes: the IDs bound as one `Vec<String>` plus one JSON text (about 160 MiB), and the
+  body buffer grown by doubling (a 128 MiB buffer and the copy from the 64 MiB one). The IDs
+  now go to SQLite in pages of 4096, written straight into one reused text, and the body buffer
+  is reserved at the announced `Content-Length` (within the limit). Peak after: 115 MiB, the body
+  plus the parsed IDs. At the 80 MiB body limit, with a side delta, that is about 140 to 175 MiB
+  per call, so `HANGAR_DRIVE_HEAVY_REQUESTS` stays at 4: about 0.7 GiB at most for four such
+  calls, below the 1 GiB `mem_limit` of `docker-compose.yml`. SQLite allocates outside the Rust
+  allocator; its share stays small, since each statement gets one page of IDs and its temporary
+  tables spill to disk. The call with a million IDs takes about 45 s under the write lock, which
+  is an open point for its own measurement.
+- **Info:** `PRAGMA secure_delete=ON` on every connection, so deleted rows (token hashes,
+  records, reference lists) do not linger in free pages of the database file or its copies
+  (unit test `deleted_rows_are_overwritten`, `db.rs`); a server that terminates TLS itself sends
+  `Strict-Transport-Security: max-age=31536000` without `includeSubDomains` or `preload`, which
+  would bind hosts it does not serve, and a server behind a proxy sends none, since only the
+  proxy knows whether every client reaches it over https (`tls_cli.rs`,
+  `a_server_behind_a_proxy_sets_no_hsts`); calls with a bearer token are limited per address
+  (3000 per minute) and network (12000) before the token is looked up, and the address limits
+  of a route come before its token, the account limits after it, so a flood of made-up tokens
+  costs no database read beyond the limit (`ratelimit::check_address`, `check_account`); the
+  backup section of `docs/self-hosting.md` names the database file and `server.secret`.
+
+## Amendment 2026-11-26: follow-up check of the overall security review
+
+The last points of the follow-up check of the overall security review (N-1 to N-4), the
+decision on H2 (a verifiable removal) and the skeleton check of device names. Each has a test
+that fails without the fix.
+
+- **Resetting a folder (N-1):** `reset_folder` changes the folder on every device, so the shell
+  asks in the system's dialog every time, not only above a threshold, with the folder's name and
+  the number of files that disappear: files of the folder's current state that the entry does
+  not hold, counted by the engine before the question (`EngineCore::reset_folder_preview`,
+  `ResetPreview`). Files that only change keep their history and are not counted. The window's
+  own question is gone; "no" answers `null` and the window shows nothing (`resetFolder` answers
+  `RestoreOutcome | null`). Tests `a_reset_preview_counts_the_files_that_disappear`
+  (`crates/hangar-drive-sync/tests/commands.rs`), `a_folder_reset_runs_only_after_a_yes` and
+  `destructive_commands_ask_natively_first` (`src-tauri/src/commands.rs`).
+- **Removing devices after a recovery (N-2):** `finish_recovery_cleanup` asks in the system's
+  dialog as soon as regular devices are to be removed and lists their names (isolated against
+  bidirectional text); only devices the engine offered (`recovery_devices`) are passed on, so
+  the engine never removes a device the question did not name. The used recovery device is
+  removed without a question, as before. "No" answers `null` and the window stays at the step.
+  Tests `the_recovery_cleanup_passes_on_only_offered_devices`,
+  `destructive_commands_ask_natively_first`, and in the window "stays at the old devices after
+  a no in the system's question".
+- **Hiding warnings (N-3):** `dismiss_warning` (`dismissSuspect`) takes only the ID of a warning
+  the engine shows at that moment; a made-up ID would otherwise hide a warning before it
+  appears. Only "suspect device" (`Suspect`) is on the allowlist (`dismissible`), since it is
+  the only kind with "That was me" in the window; every other kind is refused, and an old
+  hidden entry of another kind no longer hides it. `RemovalReported` in particular can never
+  be hidden, only confirmed. The list of hidden IDs keeps the newest `MAX_DISMISSED` (64); warning IDs
+  are per folder and kind, so a device collects only a few, and the oldest fall out first. The
+  question before turning autostart off stays. Tests `only_a_shown_warning_can_be_hidden`
+  (`commands.rs`), `the_removal_report_cannot_be_dismissed` (`removal_report.rs`) and the unit
+  tests in `crates/hangar-drive-sync/src/engine.rs`.
+- **Limits of a folder on the disk (N-4):** `MAX_TREE_ITEMS` and `MAX_TREE_DEPTH` (section
+  "Trees beyond the limits of a folder" of the overall review) also hold for the local scan
+  and for the tree to publish (`FolderSettings::max_tree_items`, `max_tree_depth`, smaller in
+  tests). The scan checks them while it walks, so a folder far beyond them is not read to its
+  end, and the merged tree is checked before it is encoded, since disk and server can each be
+  within the limits while their merge is not (`Tree::within`, O(n)). A folder beyond them stops
+  with its own reason (`StopReason::LocalTooLarge`, `StopReasonApi::TooLarge`, "too large for a
+  folder" in twelve languages) and publishes nothing: no other device would take such a tree
+  in. It tries again with a full scan once the watcher reports a change in it (at most once a
+  minute) or with the hourly scan. Tests `local_limits.rs` (too many items, too deep, a merged
+  tree beyond the limit).
+- **Verifiable removal (H2), decision of the main agent:** the server sends with `device_removed`,
+  and only as the answer to the device's own proof, the signed end of the device log from the
+  head the device names. The proof names it in the new optional field `log_length` of
+  `ProofRequest` (not part of the signed statement; the session vector is unchanged), and the
+  error body carries the entries in the new optional field `removal_log` (`ErrorBody`, a
+  `LogPage`): the entries after that length up to and including the entry that removed the
+  device, at most `MAX_LOG_PAGE`. The device checks them with the existing device log verifier
+  from its own verified head (`AccountState::removal_in`: the first entry must be the one after
+  the head and chain to its hash, every entry goes through `apply` on a copy). A valid removal of
+  itself makes it forget at once and show who removed it; a bare code, a forged or missing
+  entry, or a chain that does not start at its own head never makes it forget: the warning stays
+  until the person confirms. The automatic forgetting after three answers over a day is gone.
+  The HTTP client reads error bodies up to 1 MiB for this (`MAX_ERROR_BODY`).
+  - **The trade-off against L1:** L1 forgets the secrets of a removed device so that a thief or
+    the next owner finds nothing to open. The day without a confirmation kept L1 for a device
+    nobody looks at, but it let any server, or anyone with a valid certificate for its name,
+    wipe the keys of any device by saying "removed" for a day, which on the last device of an
+    account without its recovery code lost the account. The log closes that gap from both
+    sides: a real removal is signed by a device of the account, so a device that was really
+    removed now forgets at once, sooner than after a day, which serves L1 better; and a server
+    cannot forge a removal, since every entry must verify from the device's own head, so a
+    false claim never wipes anything. What is left without the person is the case where the
+    server will not or cannot show the removal: it withholds the log, the gap is longer than a
+    page (more than 512 log entries since the device last synced), or the device's own head is
+    no longer part of the server's log. Then the device stays stopped and shows the warning, and
+    its keys stay until the person confirms. That is accepted: a server that withholds the log
+    is not trusted with a wipe either, the keys of a removed device open only what the server
+    still serves (it refuses the device's sign-in), and the device keeps reading its folders'
+    plaintext from disk anyway.
+  - **Privacy of the log end:** only a holder of the removed device's key gets the answer, the
+    entries are the device log every device of the account reads anyway, and they stop at the
+    removal, so the removed device learns nothing the account did after it.
+  - Tests: `a_removal_counts_only_from_the_own_head` (`crates/hangar-drive-crypto/src/devicelog.rs`:
+    the real removal, another device, no removal, a gap, a wrong first index, a broken signature,
+    a removal signed by a key the log does not list); `removal_proof.rs` (a real removal entry
+    forgets at once; a missing log, a log without the removal and a forged removal never forget;
+    a chain said to start before or after the own head never forgets);
+    `a_removed_device_loses_its_session_proof_and_commits_at_once` (`server/tests/flows.rs`: no
+    log without a head, the log from the head up to the removal and not beyond it, verified by
+    `removal_in`); `device_removed_counts_only_as_the_answer_to_the_proof` (`http.rs`: the proof
+    carries `log_length`, the log reaches the engine); the end-to-end flows
+    `a_removed_device_learns_that_it_was_removed` and `the_core_flow_works_against_the_real_server`
+    now see the removal verified and forgotten without a confirmation, also for a device whose
+    log end runs over a recovery device's entry.
+- **Device names that look alike (skeleton check):** when a device is named or renamed and when
+  a pairing request arrives, the engine compares the name with the names of the account's
+  current regular devices (`EngineCore::similar_device_name`,
+  `hangar_drive_protocol::name::looks_alike`): NFKC, default ignorable code points dropped, runs
+  of white space as one space, full case folding, and a small homoglyph table
+  (`name::HOMOGLYPHS`) for Latin, Cyrillic and Greek letters and the digits 0 and 1, taken from
+  the single code point mappings of `confusables.txt` of Unicode Technical Standard #39
+  (Unicode 16.0) [UNVERIFIED: the entries were chosen from the standard's table and common
+  glyphs, not checked line by line against the file]. The table is applied once before and once
+  after folding, since a capital look-alike (Cyrillic `В` for `B`) folds to a small letter that
+  looks like nothing Latin; two names look alike when either skeleton is equal. False positives
+  cost a hint and a question, a miss lets a stranger's device pass for one of the person's own,
+  so the check errs on the side of "alike". A pairing request carries the name it looks like
+  (`PairRequestView::similar_to`): the window says "There is already a device with this name"
+  and the native question before the device is added names that device. A rename to a look-alike
+  name is refused (`DeviceNameError::LooksLike`) unless the shell asked natively and the person
+  said yes (`rename_device(.., allow_look_alike)`); "no" shows the reason at the field. The
+  recovery name of a new installation is not checked: the old devices it resembles are usually
+  the ones the cleanup removes. Tests `look_alike_device_names_are_found` and
+  `the_homoglyph_table_maps_only_to_basic_latin_and_once` (`name.rs`),
+  `a_pairing_request_names_a_device_that_looks_the_same` and
+  `a_rename_to_a_look_alike_needs_the_confirmation` (`commands.rs`), the questions in
+  `src-tauri/src/confirm.rs`, and the window tests in `src/devices/devices.test.tsx`.
+
+| Wire change | Where | Compatibility |
+| --- | --- | --- |
+| `ProofRequest.log_length: Option<u64>` | request of `POST /session/proof` | optional and left out when empty; a server of an older build refuses it as an unknown field (no build is released yet) |
+| `ErrorBody.removal_log: Option<LogPage>` | `device_removed` answer of the proof | optional; replies ignore unknown fields |
