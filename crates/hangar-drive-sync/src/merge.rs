@@ -21,13 +21,25 @@
 //! directory by directory, and nothing is deleted on either side.
 //!
 //! The merge is pure and deterministic given the fresh item IDs it draws.
+//!
+//! **Collisions in linear time** (security review HIGH 2). The rule is defined round by round:
+//! look at the directories in order (the root, then by item ID), sort the first directory's
+//! entries that has a collision by [`Merger::priority`], keep each entry that collides with no
+//! entry kept before it, fix the first one that does, and start again. Run literally, that is
+//! cubic in the size of a directory. [`Merger::fix_collisions`] takes the same fixes in the
+//! same order in one walk: an entry's case keys are computed once per walk of its directory and
+//! looked up in hash maps, and a walk goes on where the last fix left it, since a fix never
+//! changes the entries ahead of it or the order among them: a renamed loser collides with no
+//! entry any more and a removed one is gone. Only a merge of two directories adds entries to
+//! another directory; that directory is walked again from its start, before the current one
+//! goes on if it comes first in the order, exactly as the round by round search would.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use hangar_drive_protocol::ids::ItemId;
 use hangar_drive_protocol::name::CaseKeys;
 
-use crate::names::{conflict_copy_name, LabelWords};
+use crate::names::{case_keys, conflict_label, DirNames, LabelWords};
 use crate::tree::{Node, NodeKind, Tree, ROOT};
 
 /// Draws fresh, random item IDs for conflict copies.
@@ -92,14 +104,17 @@ pub struct MergeOutcome {
     pub dropped_local_moves: usize,
 }
 
-struct Merger<'a, 'l> {
+struct Merger<'a> {
     base: &'a Tree,
     remote: &'a Tree,
     local: Tree,
     m: Tree,
-    labels: &'a MergeLabels<'l>,
+    /// The label of the conflict copies ([`conflict_label`]).
+    copy_label: String,
     from_local: BTreeSet<ItemId>,
     rekeys: BTreeMap<ItemId, ItemId>,
+    /// `rekeys` backwards: per merged ID the local IDs that point to it.
+    rekey_sources: HashMap<ItemId, BTreeSet<ItemId>>,
     copies: Vec<ConflictCopy>,
     content_copies: BTreeSet<ItemId>,
     dropped_local_moves: usize,
@@ -118,9 +133,10 @@ pub fn merge3(
         remote,
         local: local.clone(),
         m: remote.clone(),
-        labels,
+        copy_label: conflict_label(labels.words, labels.device, labels.date),
         from_local: BTreeSet::new(),
         rekeys: BTreeMap::new(),
+        rekey_sources: HashMap::new(),
         copies: Vec::new(),
         content_copies: BTreeSet::new(),
         dropped_local_moves: 0,
@@ -157,26 +173,69 @@ pub fn join(
     merge3(&Tree::new(), remote, local, labels, ids)
 }
 
-fn names_collide(a: &str, b: &str) -> bool {
-    let (ka, kb) = (
-        hangar_drive_protocol::name::comparison_key(a),
-        hangar_drive_protocol::name::comparison_key(b),
-    );
-    ka == kb || CaseKeys::of(&ka).collides(&CaseKeys::of(&kb))
+/// The walk of one directory in [`Merger::fix_collisions`].
+struct DirWalk {
+    /// The entries in priority order, as at the start of the walk; empty when nothing collides.
+    order: Vec<ItemId>,
+    /// The next entry to look at.
+    next: usize,
+    /// The case keys of the entries.
+    keys: HashMap<ItemId, CaseKeys>,
+    /// The names of the entries, for collisions and copy names.
+    names: DirNames,
+    /// Per key kind (lower, fold, upper): the kept entries by key, with their place in `order`.
+    /// Kept entries never collide with each other, so a key names at most one of them.
+    kept: [HashMap<String, (usize, ItemId)>; 3],
 }
 
-impl Merger<'_, '_> {
-    /// Records that the local item now called `from` is called `to`.
-    fn record_rekey(&mut self, from: ItemId, to: ItemId) {
-        let mut found = false;
-        for value in self.rekeys.values_mut() {
-            if *value == from {
-                *value = to;
-                found = true;
-            }
+impl DirWalk {
+    /// The first kept entry in priority order that collides with an entry of these keys.
+    fn winner(&self, keys: &CaseKeys) -> Option<ItemId> {
+        [&keys.lower, &keys.fold, &keys.upper]
+            .into_iter()
+            .zip(&self.kept)
+            .filter_map(|(key, kept)| kept.get(key.as_str()))
+            .min()
+            .map(|(_, id)| *id)
+    }
+
+    fn keep(&mut self, place: usize, id: ItemId, keys: &CaseKeys) {
+        for (key, kept) in [&keys.lower, &keys.fold, &keys.upper]
+            .into_iter()
+            .zip(&mut self.kept)
+        {
+            kept.insert(key.clone(), (place, id));
         }
-        if !found {
-            self.rekeys.insert(from, to);
+    }
+}
+
+/// How a walk of a directory ended.
+enum WalkEnd {
+    /// No collision is left in the directory.
+    Done,
+    /// It stopped for a directory that comes first in the order, or for the fix budget.
+    Paused,
+}
+
+impl Merger<'_> {
+    /// Records that the local item now called `from` is called `to`: every local item that
+    /// pointed to `from` points to `to` now; if none did, `from` itself does. The backward map
+    /// finds them without a pass over all rekeys (a join rekeys every local item).
+    fn record_rekey(&mut self, from: ItemId, to: ItemId) {
+        let sources = self.rekey_sources.remove(&from).unwrap_or_default();
+        if sources.is_empty() {
+            if let Some(old) = self.rekeys.insert(from, to) {
+                if let Some(set) = self.rekey_sources.get_mut(&old) {
+                    set.remove(&from);
+                }
+            }
+            self.rekey_sources.entry(to).or_default().insert(from);
+            return;
+        }
+        let target = self.rekey_sources.entry(to).or_default();
+        for source in sources {
+            self.rekeys.insert(source, to);
+            target.insert(source);
         }
     }
 
@@ -335,17 +394,23 @@ impl Merger<'_, '_> {
         copy
     }
 
-    /// Orphans, cycles and collisions, until nothing changes.
+    /// Orphans, cycles and collisions, round by round until nothing changes; a round fixes the
+    /// orphans and cycles it finds and then one collision.
     fn settle(&mut self) {
         // Each round resolves at least one problem; the bound only guards against a bug.
         let limit = 4 * (self.m.len() + 4);
-        for _ in 0..limit {
+        for round in 1..=limit {
             let mut changed = self.fix_orphans();
             changed |= self.fix_cycles();
-            changed |= self.fix_collisions();
-            if !changed {
-                return;
+            if changed {
+                self.fix_collisions(1);
+                continue;
             }
+            // Fixing a collision makes no orphan and no cycle: it renames an entry, removes a
+            // file, or moves a directory's entries into a directory next to it. So every later
+            // round would only fix the next collision; take them all now, one per round left.
+            self.fix_collisions(limit - round + 1);
+            return;
         }
     }
 
@@ -388,8 +453,29 @@ impl Merger<'_, '_> {
         }
     }
 
+    /// Whether every item reaches the root through its parents: one walk down from the root,
+    /// instead of a path per item, which [`Merger::fix_cycles`] needs only when one does not.
+    fn all_reach_root(&self) -> bool {
+        // A node with the root's ID has a path by definition and is never walked into, so a
+        // parent link to itself cannot loop.
+        let mut reached = usize::from(self.m.contains(&ROOT));
+        let mut stack = vec![ROOT];
+        while let Some(at) = stack.pop() {
+            for kid in self.m.children(&at) {
+                if *kid != ROOT {
+                    reached += 1;
+                    stack.push(*kid);
+                }
+            }
+        }
+        reached == self.m.len()
+    }
+
     /// Moves that form a cycle: the local moves in it fall back to the remote place.
     fn fix_cycles(&mut self) -> bool {
+        if self.all_reach_root() {
+            return false;
+        }
         let mut changed = false;
         let ids: Vec<ItemId> = self.m.ids().copied().collect();
         for id in ids {
@@ -456,86 +542,159 @@ impl Merger<'_, '_> {
         (rank, *id)
     }
 
-    fn fix_collisions(&mut self) -> bool {
-        let mut dirs: Vec<ItemId> = vec![ROOT];
-        dirs.extend(self.m.iter().filter(|(_, n)| n.is_dir()).map(|(id, _)| *id));
-        for dir in dirs {
+    /// Fixes collisions, at most `budget` of them, in the order of the round by round search
+    /// (module docs): the first directory in the order that has a collision, there the first
+    /// entry in priority order that collides with an entry kept before it. Returns how many
+    /// were fixed.
+    fn fix_collisions(&mut self, budget: usize) -> usize {
+        // The directories that may hold a collision, in the order of the search: the root's
+        // all-zero ID sorts first.
+        let mut open: BTreeSet<ItemId> = std::iter::once(ROOT)
+            .chain(self.m.iter().filter(|(_, n)| n.is_dir()).map(|(id, _)| *id))
+            .collect();
+        let mut paused: HashMap<ItemId, DirWalk> = HashMap::new();
+        let mut fixed = 0;
+        while fixed < budget {
+            let Some(dir) = open.first().copied() else {
+                break;
+            };
             if dir != ROOT && !self.m.contains(&dir) {
+                open.remove(&dir);
+                paused.remove(&dir);
                 continue;
             }
-            let mut kids: Vec<ItemId> = self.m.children(&dir).copied().collect();
-            if kids.len() < 2 {
-                continue;
-            }
-            kids.sort_by_key(|k| self.priority(&dir, k));
-            let mut accepted: Vec<ItemId> = Vec::new();
-            for kid in kids {
-                let Some(node) = self.m.get(&kid).cloned() else {
-                    continue;
-                };
-                let winner = accepted.iter().copied().find(|a| {
-                    self.m
-                        .get(a)
-                        .is_some_and(|w| names_collide(&w.name, &node.name))
-                });
-                let Some(winner) = winner else {
-                    accepted.push(kid);
-                    continue;
-                };
-                let Some(win) = self.m.get(&winner).cloned() else {
-                    continue;
-                };
-                let is_new = !self.base.contains(&kid)
-                    && !self.remote.contains(&kid)
-                    && !self.content_copies.contains(&kid);
-                let local_can_rekey = !self.local.contains(&winner) && self.local.contains(&kid);
-                match (&win.kind, &node.kind) {
-                    (NodeKind::File(wv), NodeKind::File(nv))
-                        if is_new && local_can_rekey && wv.same_content(nv) =>
-                    {
-                        self.m.remove(&kid);
-                        self.local.rekey(&kid, winner);
-                        self.record_rekey(kid, winner);
-                        return true;
-                    }
-                    (NodeKind::Directory, NodeKind::Directory) if is_new && local_can_rekey => {
-                        let grandkids: Vec<ItemId> = self.m.children(&kid).copied().collect();
-                        for g in grandkids {
-                            if let Some(mut gn) = self.m.get(&g).cloned() {
-                                gn.parent = winner;
-                                self.m.insert(g, gn);
-                            }
-                        }
-                        self.m.remove(&kid);
-                        self.local.rekey(&kid, winner);
-                        self.record_rekey(kid, winner);
-                        return true;
-                    }
-                    _ => {
-                        self.rename_loser(dir, kid, &node, winner, &win);
-                        return true;
-                    }
+            let mut walk = match paused.remove(&dir) {
+                Some(walk) => walk,
+                None => self.start_walk(dir),
+            };
+            match self.walk(dir, &mut walk, &mut open, &mut paused, &mut fixed, budget) {
+                WalkEnd::Done => {
+                    open.remove(&dir);
+                }
+                WalkEnd::Paused => {
+                    paused.insert(dir, walk);
                 }
             }
         }
-        false
+        fixed
     }
 
-    fn rename_loser(&mut self, dir: ItemId, kid: ItemId, node: &Node, winner: ItemId, win: &Node) {
-        let siblings: Vec<String> = self
-            .m
-            .children(&dir)
-            .filter(|s| **s != kid)
-            .filter_map(|s| self.m.get(s).map(|n| n.name.clone()))
-            .collect();
-        let taken = |candidate: &str| siblings.iter().any(|s| names_collide(s, candidate));
-        let name = conflict_copy_name(
-            &node.name,
-            self.labels.words,
-            self.labels.device,
-            self.labels.date,
-            &taken,
-        );
+    /// The walk of `dir` from its start: the entries' keys, and their priority order if any
+    /// two of them collide.
+    fn start_walk(&self, dir: ItemId) -> DirWalk {
+        let mut names = DirNames::default();
+        let mut keys = HashMap::new();
+        for kid in self.m.children(&dir) {
+            if let Some(node) = self.m.get(kid) {
+                let k = case_keys(&node.name);
+                names.add(&k);
+                keys.insert(*kid, k);
+            }
+        }
+        let mut order = Vec::new();
+        if keys.len() >= 2 && names.any_collision() {
+            order = self.m.children(&dir).copied().collect();
+            order.sort_by_cached_key(|k| self.priority(&dir, k));
+        }
+        DirWalk {
+            order,
+            next: 0,
+            keys,
+            names,
+            kept: Default::default(),
+        }
+    }
+
+    /// Walks `dir` on from where it stopped, fixing each collision, until it ends or a merge
+    /// of two directories adds entries to a directory that comes first in the order.
+    fn walk(
+        &mut self,
+        dir: ItemId,
+        walk: &mut DirWalk,
+        open: &mut BTreeSet<ItemId>,
+        paused: &mut HashMap<ItemId, DirWalk>,
+        fixed: &mut usize,
+        budget: usize,
+    ) -> WalkEnd {
+        while walk.next < walk.order.len() {
+            if *fixed >= budget {
+                return WalkEnd::Paused;
+            }
+            let place = walk.next;
+            let kid = walk.order[place];
+            walk.next += 1;
+            let (Some(node), Some(keys)) = (self.m.get(&kid).cloned(), walk.keys.get(&kid)) else {
+                continue;
+            };
+            let Some(winner) = walk.winner(keys) else {
+                let keys = keys.clone();
+                walk.keep(place, kid, &keys);
+                continue;
+            };
+            let Some(win) = self.m.get(&winner).cloned() else {
+                continue;
+            };
+            *fixed += 1;
+            let is_new = !self.base.contains(&kid)
+                && !self.remote.contains(&kid)
+                && !self.content_copies.contains(&kid);
+            let local_can_rekey = !self.local.contains(&winner) && self.local.contains(&kid);
+            match (&win.kind, &node.kind) {
+                (NodeKind::File(wv), NodeKind::File(nv))
+                    if is_new && local_can_rekey && wv.same_content(nv) =>
+                {
+                    self.m.remove(&kid);
+                    self.local.rekey(&kid, winner);
+                    self.record_rekey(kid, winner);
+                    if let Some(keys) = walk.keys.remove(&kid) {
+                        walk.names.remove(&keys);
+                    }
+                }
+                (NodeKind::Directory, NodeKind::Directory) if is_new && local_can_rekey => {
+                    let grandkids: Vec<ItemId> = self.m.children(&kid).copied().collect();
+                    for g in grandkids {
+                        if let Some(mut gn) = self.m.get(&g).cloned() {
+                            gn.parent = winner;
+                            self.m.insert(g, gn);
+                        }
+                    }
+                    self.m.remove(&kid);
+                    self.local.rekey(&kid, winner);
+                    self.record_rekey(kid, winner);
+                    if let Some(keys) = walk.keys.remove(&kid) {
+                        walk.names.remove(&keys);
+                    }
+                    open.remove(&kid);
+                    paused.remove(&kid);
+                    // The winner has new entries: walk it again from its start.
+                    paused.remove(&winner);
+                    open.insert(winner);
+                    if winner < dir {
+                        return WalkEnd::Paused;
+                    }
+                }
+                _ => self.rename_loser(walk, kid, &node, winner, &win),
+            }
+        }
+        WalkEnd::Done
+    }
+
+    fn rename_loser(
+        &mut self,
+        walk: &mut DirWalk,
+        kid: ItemId,
+        node: &Node,
+        winner: ItemId,
+        win: &Node,
+    ) {
+        // The copy name must not collide with any other entry of the directory.
+        if let Some(keys) = walk.keys.remove(&kid) {
+            walk.names.remove(&keys);
+        }
+        let name = walk.names.copy_name(&node.name, &self.copy_label);
+        let keys = case_keys(&name);
+        walk.names.add(&keys);
+        walk.keys.insert(kid, keys);
         let mut renamed = node.clone();
         renamed.name = name;
         renamed.conflict_of = Some(win.conflict_of.unwrap_or(winner));
@@ -575,6 +734,7 @@ impl Merger<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::tests::{keys_computed, Rng};
     use crate::tree::tests::{content, file, id};
     use crate::tree::FileVersion;
 
@@ -857,5 +1017,545 @@ mod tests {
         assert!(!out.tree.contains(&id(3)));
         let fresh = out.rekeys[0].to;
         assert!(out.tree.get(&fresh).unwrap().is_dir());
+    }
+
+    /// The collision fixing as it was before security review HIGH 2, round by round with a pair
+    /// comparison of names, kept as the reference the linear version must equal.
+    mod reference {
+        use super::super::*;
+        use crate::names::first_free;
+
+        fn names_collide(a: &str, b: &str) -> bool {
+            let (ka, kb) = (
+                hangar_drive_protocol::name::comparison_key(a),
+                hangar_drive_protocol::name::comparison_key(b),
+            );
+            ka == kb || CaseKeys::of(&ka).collides(&CaseKeys::of(&kb))
+        }
+
+        /// The old `record_rekey`, a pass over all rekeys.
+        pub(super) fn record_rekey(
+            rekeys: &mut BTreeMap<ItemId, ItemId>,
+            from: ItemId,
+            to: ItemId,
+        ) {
+            let mut found = false;
+            for value in rekeys.values_mut() {
+                if *value == from {
+                    *value = to;
+                    found = true;
+                }
+            }
+            if !found {
+                rekeys.insert(from, to);
+            }
+        }
+
+        /// [`merge3`] with the old settle.
+        pub(super) fn merge3(
+            base: &Tree,
+            remote: &Tree,
+            local: &Tree,
+            labels: &MergeLabels<'_>,
+            ids: &mut dyn ItemIds,
+        ) -> MergeOutcome {
+            let mut merger = Merger {
+                base,
+                remote,
+                local: local.clone(),
+                m: remote.clone(),
+                copy_label: conflict_label(labels.words, labels.device, labels.date),
+                from_local: BTreeSet::new(),
+                rekeys: BTreeMap::new(),
+                rekey_sources: HashMap::new(),
+                copies: Vec::new(),
+                content_copies: BTreeSet::new(),
+                dropped_local_moves: 0,
+            };
+            merger.split_kind_changes(ids);
+            merger.apply_local(ids);
+            merger.settle_reference();
+            merger.drop_dangling_links();
+            let mut tree = merger.m;
+            tree.clear_dirty();
+            let mut local = merger.local;
+            local.clear_dirty();
+            MergeOutcome {
+                tree,
+                local,
+                rekeys: merger
+                    .rekeys
+                    .into_iter()
+                    .filter(|(from, to)| from != to)
+                    .map(|(from, to)| Rekey { from, to })
+                    .collect(),
+                copies: merger.copies,
+                dropped_local_moves: merger.dropped_local_moves,
+            }
+        }
+
+        impl Merger<'_> {
+            fn settle_reference(&mut self) {
+                let limit = 4 * (self.m.len() + 4);
+                for _ in 0..limit {
+                    let mut changed = self.fix_orphans();
+                    changed |= self.fix_cycles_reference();
+                    changed |= self.fix_collisions_reference();
+                    if !changed {
+                        return;
+                    }
+                }
+            }
+
+            fn fix_cycles_reference(&mut self) -> bool {
+                let mut changed = false;
+                let ids: Vec<ItemId> = self.m.ids().copied().collect();
+                for id in ids {
+                    if self.m.path(&id).is_some() {
+                        continue;
+                    }
+                    let mut cycle = Vec::new();
+                    let mut seen = BTreeSet::new();
+                    let mut at = id;
+                    while at != ROOT && seen.insert(at) {
+                        cycle.push(at);
+                        match self.m.get(&at) {
+                            Some(n) => at = n.parent,
+                            None => break,
+                        }
+                    }
+                    let mut reverted = false;
+                    for node_id in cycle.iter().rev() {
+                        if !self.from_local.contains(node_id) {
+                            continue;
+                        }
+                        let Some(mut node) = self.m.get(node_id).cloned() else {
+                            continue;
+                        };
+                        let fallback = self.remote.get(node_id).or_else(|| self.base.get(node_id));
+                        match fallback {
+                            Some(place) => {
+                                node.parent = place.parent;
+                                node.name = place.name.clone();
+                            }
+                            None => node.parent = ROOT,
+                        }
+                        self.m.insert(*node_id, node);
+                        self.from_local.remove(node_id);
+                        self.dropped_local_moves += 1;
+                        reverted = true;
+                        break;
+                    }
+                    if !reverted {
+                        self.move_to_root(id);
+                    }
+                    changed = true;
+                }
+                changed
+            }
+
+            fn fix_collisions_reference(&mut self) -> bool {
+                let mut dirs: Vec<ItemId> = vec![ROOT];
+                dirs.extend(self.m.iter().filter(|(_, n)| n.is_dir()).map(|(id, _)| *id));
+                for dir in dirs {
+                    if dir != ROOT && !self.m.contains(&dir) {
+                        continue;
+                    }
+                    let mut kids: Vec<ItemId> = self.m.children(&dir).copied().collect();
+                    if kids.len() < 2 {
+                        continue;
+                    }
+                    kids.sort_by_key(|k| self.priority(&dir, k));
+                    let mut accepted: Vec<ItemId> = Vec::new();
+                    for kid in kids {
+                        let Some(node) = self.m.get(&kid).cloned() else {
+                            continue;
+                        };
+                        let winner = accepted.iter().copied().find(|a| {
+                            self.m
+                                .get(a)
+                                .is_some_and(|w| names_collide(&w.name, &node.name))
+                        });
+                        let Some(winner) = winner else {
+                            accepted.push(kid);
+                            continue;
+                        };
+                        let Some(win) = self.m.get(&winner).cloned() else {
+                            continue;
+                        };
+                        let is_new = !self.base.contains(&kid)
+                            && !self.remote.contains(&kid)
+                            && !self.content_copies.contains(&kid);
+                        let local_can_rekey =
+                            !self.local.contains(&winner) && self.local.contains(&kid);
+                        match (&win.kind, &node.kind) {
+                            (NodeKind::File(wv), NodeKind::File(nv))
+                                if is_new && local_can_rekey && wv.same_content(nv) =>
+                            {
+                                self.m.remove(&kid);
+                                self.local.rekey(&kid, winner);
+                                record_rekey(&mut self.rekeys, kid, winner);
+                                return true;
+                            }
+                            (NodeKind::Directory, NodeKind::Directory)
+                                if is_new && local_can_rekey =>
+                            {
+                                let grandkids: Vec<ItemId> =
+                                    self.m.children(&kid).copied().collect();
+                                for g in grandkids {
+                                    if let Some(mut gn) = self.m.get(&g).cloned() {
+                                        gn.parent = winner;
+                                        self.m.insert(g, gn);
+                                    }
+                                }
+                                self.m.remove(&kid);
+                                self.local.rekey(&kid, winner);
+                                record_rekey(&mut self.rekeys, kid, winner);
+                                return true;
+                            }
+                            _ => {
+                                self.rename_loser_reference(dir, kid, &node, winner, &win);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+
+            fn rename_loser_reference(
+                &mut self,
+                dir: ItemId,
+                kid: ItemId,
+                node: &Node,
+                winner: ItemId,
+                win: &Node,
+            ) {
+                let siblings: Vec<String> = self
+                    .m
+                    .children(&dir)
+                    .filter(|s| **s != kid)
+                    .filter_map(|s| self.m.get(s).map(|n| n.name.clone()))
+                    .collect();
+                let taken = |candidate: &str| siblings.iter().any(|s| names_collide(s, candidate));
+                let name = first_free(&node.name, &self.copy_label, &taken);
+                let mut renamed = node.clone();
+                renamed.name = name;
+                renamed.conflict_of = Some(win.conflict_of.unwrap_or(winner));
+                if renamed.conflict_of == Some(kid) {
+                    renamed.conflict_of = None;
+                }
+                self.m.insert(kid, renamed);
+                if !self.content_copies.contains(&kid) {
+                    self.copies.push(ConflictCopy {
+                        original: winner,
+                        copy: kid,
+                        reason: CopyReason::Collision,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Fresh IDs in a range of their own, for any number of copies.
+    struct Fresh(u64);
+
+    impl ItemIds for Fresh {
+        fn new_item_id(&mut self) -> ItemId {
+            self.0 += 1;
+            let mut bytes = [0xee; 16];
+            bytes[8..].copy_from_slice(&self.0.to_be_bytes());
+            ItemId::from_bytes(bytes)
+        }
+    }
+
+    fn labels_for(words: &LabelWords) -> MergeLabels<'_> {
+        MergeLabels {
+            words,
+            device: "Laptop",
+            date: "2026-11-26",
+        }
+    }
+
+    /// A random tree over a small pool of IDs and colliding names: directories and files, parents
+    /// from the pool (so some are missing or files, which makes orphans and cycles), contents from
+    /// a small set (so equal new files are taken once).
+    fn random_tree(rng: &mut Rng, pool: &[ItemId], names: &[String], size: usize) -> Tree {
+        let mut t = Tree::new();
+        for _ in 0..size {
+            let item = *rng.pick(pool);
+            let parent = if rng.below(3) == 0 {
+                ROOT
+            } else {
+                *rng.pick(pool)
+            };
+            let name = rng.pick(names).clone();
+            let node = if rng.below(3) == 0 {
+                Node::dir(parent, name)
+            } else {
+                Node::file(parent, name, file(1 + rng.below(3) as u8))
+            };
+            t.insert(item, node);
+        }
+        t
+    }
+
+    /// Changes some nodes of `t`: names, parents, contents, deletes and adds.
+    fn mutate(rng: &mut Rng, t: &Tree, pool: &[ItemId], names: &[String]) -> Tree {
+        let mut out = t.clone();
+        for _ in 0..1 + rng.below(6) {
+            let item = *rng.pick(pool);
+            match (rng.below(5), out.get(&item).cloned()) {
+                (0, Some(_)) => {
+                    out.remove(&item);
+                }
+                (1, Some(mut node)) => {
+                    node.name = rng.pick(names).clone();
+                    out.insert(item, node);
+                }
+                (2, Some(mut node)) => {
+                    node.parent = if rng.below(2) == 0 {
+                        ROOT
+                    } else {
+                        *rng.pick(pool)
+                    };
+                    out.insert(item, node);
+                }
+                (3, Some(mut node)) if !node.is_dir() => {
+                    node.kind = NodeKind::File(file(1 + rng.below(3) as u8));
+                    out.insert(item, node);
+                }
+                _ => {
+                    let parent = if rng.below(2) == 0 {
+                        ROOT
+                    } else {
+                        *rng.pick(pool)
+                    };
+                    let name = rng.pick(names).clone();
+                    let node = if rng.below(3) == 0 {
+                        Node::dir(parent, name)
+                    } else {
+                        Node::file(parent, name, file(1 + rng.below(3) as u8))
+                    };
+                    out.insert(item, node);
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_same(new: &MergeOutcome, old: &MergeOutcome, case: usize) {
+        assert_eq!(new.tree, old.tree, "case {case}: merged tree");
+        assert_eq!(new.local, old.local, "case {case}: local tree");
+        assert_eq!(new.rekeys, old.rekeys, "case {case}: rekeys");
+        assert_eq!(new.copies, old.copies, "case {case}: copies");
+        assert_eq!(
+            new.dropped_local_moves, old.dropped_local_moves,
+            "case {case}: dropped moves"
+        );
+    }
+
+    /// Security review HIGH 2: the linear collision fixing gives exactly the result of the round
+    /// by round search, on random trees full of case, NFC, long s and sigma collisions, numbered
+    /// copy names, merges of new directories into remote ones, orphans and cycles.
+    #[test]
+    fn linear_collision_fixing_equals_the_reference() {
+        let words = LabelWords::default();
+        let labels = labels_for(&words);
+        let mut rng = Rng(0x5eed);
+        let mut names: Vec<String> = [
+            "a", "A", "b", "B", "x.txt", "X.TXT", "X.txt", "e\u{301}", "\u{e9}", "\u{c9}", "s",
+            "\u{17f}", "S", "\u{3a3}", "\u{3c3}", "\u{3c2}", "\u{212a}", "k", "K",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        names.push("x (conflict Laptop 2026-11-26).txt".into());
+        names.push("X (conflict Laptop 2026-11-26 2).TXT".into());
+        names.push("a (conflict Laptop 2026-11-26)".into());
+        for case in 0..4000 {
+            // Pools of different sizes and ID orders, so winners come before and after their
+            // directory in the order.
+            let pool: Vec<ItemId> = (0..4 + rng.below(14))
+                .map(|_| id(1 + rng.below(200) as u8))
+                .collect();
+            let size = rng.below(10);
+            let base = random_tree(&mut rng, &pool, &names, size);
+            let (remote, local) = match rng.below(3) {
+                // A join: the empty base, new items on both sides.
+                0 => {
+                    let (r, l) = (2 + rng.below(12), 2 + rng.below(12));
+                    (
+                        random_tree(&mut rng, &pool, &names, r),
+                        random_tree(&mut rng, &pool, &names, l),
+                    )
+                }
+                _ => (
+                    mutate(&mut rng, &base, &pool, &names),
+                    mutate(&mut rng, &base, &pool, &names),
+                ),
+            };
+            let base = if rng.below(3) == 0 { Tree::new() } else { base };
+            let new = merge3(&base, &remote, &local, &labels, &mut Fresh(0));
+            let old = reference::merge3(&base, &remote, &local, &labels, &mut Fresh(0));
+            assert_same(&new, &old, case);
+        }
+    }
+
+    /// Larger directories: many local new directories that collide with remote ones by case, each
+    /// with colliding entries, some nested, in both ID orders.
+    #[test]
+    fn nested_directory_merges_equal_the_reference() {
+        let words = LabelWords::default();
+        let labels = labels_for(&words);
+        let mut rng = Rng(77);
+        let variants = ["d", "D", "\u{17f}", "s", "S"];
+        for case in 0..150 {
+            let mut remote = Tree::new();
+            let mut local = Tree::new();
+            let mut next = 1u8;
+            let mut fresh = |rng: &mut Rng| {
+                next = next.wrapping_add(1 + rng.below(3) as u8);
+                id(next)
+            };
+            let mut remote_dirs = vec![ROOT];
+            let mut local_dirs = vec![ROOT];
+            for _ in 0..30 {
+                let name = format!("{}{}", rng.pick(&variants), rng.below(2));
+                let (tree, dirs) = if rng.below(2) == 0 {
+                    (&mut remote, &mut remote_dirs)
+                } else {
+                    (&mut local, &mut local_dirs)
+                };
+                let parent = *rng.pick(dirs);
+                let item = fresh(&mut rng);
+                if tree.contains(&item) {
+                    continue;
+                }
+                if rng.below(2) == 0 {
+                    tree.insert(item, Node::dir(parent, name));
+                    dirs.push(item);
+                } else {
+                    tree.insert(item, Node::file(parent, name, file(1 + rng.below(2) as u8)));
+                }
+            }
+            let new = join(&remote, &local, &labels, &mut Fresh(0));
+            let old = reference::merge3(&Tree::new(), &remote, &local, &labels, &mut Fresh(0));
+            assert_same(&new, &old, case);
+        }
+    }
+
+    /// The backward map of `record_rekey` gives the rekeys of the old pass over all of them.
+    #[test]
+    fn record_rekey_equals_the_reference() {
+        let empty = Tree::new();
+        let mut rng = Rng(5);
+        for case in 0..2000 {
+            let mut merger = Merger {
+                base: &empty,
+                remote: &empty,
+                local: Tree::new(),
+                m: Tree::new(),
+                copy_label: String::new(),
+                from_local: BTreeSet::new(),
+                rekeys: BTreeMap::new(),
+                rekey_sources: HashMap::new(),
+                copies: Vec::new(),
+                content_copies: BTreeSet::new(),
+                dropped_local_moves: 0,
+            };
+            let mut old = BTreeMap::new();
+            for _ in 0..12 {
+                let (from, to) = (id(rng.below(8) as u8), id(rng.below(8) as u8));
+                merger.record_rekey(from, to);
+                reference::record_rekey(&mut old, from, to);
+                assert_eq!(merger.rekeys, old, "case {case}");
+            }
+        }
+    }
+
+    /// Work bounds that hold in a debug build without a clock (security review HIGH 2): the keys
+    /// of a name are computed a few times per entry, not once per pair or per round.
+    #[test]
+    fn collisions_take_linear_work() {
+        let words = LabelWords::default();
+        let labels = labels_for(&words);
+        let wide = |n: u32, hi: u8| {
+            let mut bytes = [0u8; 16];
+            bytes[0] = hi;
+            bytes[12..].copy_from_slice(&n.to_be_bytes());
+            ItemId::from_bytes(bytes)
+        };
+        let version = |n: u32| FileVersion {
+            size: u64::from(n),
+            mtime_ms: 0,
+            executable: false,
+            content: crate::tree::ContentKey([(n % 251) as u8; 32]),
+        };
+
+        // An unchanged folder of 50,000 files.
+        let files = 50_000u32;
+        let t = Tree::from_nodes((0..files).map(|i| {
+            (
+                wide(i, 1),
+                Node::file(ROOT, format!("f{i:06}.jpg"), version(i)),
+            )
+        }));
+        let before = keys_computed();
+        let out = merge3(&t, &t, &t, &labels, &mut Fresh(0));
+        assert_eq!(out.tree, t);
+        let work = keys_computed() - before;
+        assert!(
+            work <= 2 * u64::from(files),
+            "unchanged: {work} key computations"
+        );
+
+        // A join of 5,000 identical files: each is taken once under the remote ID.
+        let n = 5_000u32;
+        let remote = Tree::from_nodes((0..n).map(|i| {
+            (
+                wide(i, 1),
+                Node::file(ROOT, format!("f{i:05}.jpg"), version(i)),
+            )
+        }));
+        let local = Tree::from_nodes((0..n).map(|i| {
+            (
+                wide(i, 2),
+                Node::file(ROOT, format!("F{i:05}.JPG"), version(i)),
+            )
+        }));
+        let before = keys_computed();
+        let out = join(&remote, &local, &labels, &mut Fresh(0));
+        assert_eq!(out.tree, remote);
+        assert_eq!(out.rekeys.len(), n as usize);
+        let work = keys_computed() - before;
+        assert!(work <= 4 * u64::from(n), "join: {work} key computations");
+
+        // 2,048 case variants of one name on the server: one keeps it, the others become copies.
+        let variants = 2_048u32;
+        let remote = Tree::from_nodes((0..variants).map(|i| {
+            let name: String = "abcdefghijk.txt"
+                .chars()
+                .enumerate()
+                .map(|(at, c)| {
+                    if (i >> at) & 1 == 1 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            (wide(i, 3), Node::file(ROOT, name, version(i)))
+        }));
+        let before = keys_computed();
+        let out = merge3(&remote, &remote, &remote, &labels, &mut Fresh(0));
+        assert_eq!(out.tree.check(), Ok(()));
+        assert_eq!(out.copies.len(), variants as usize - 1);
+        let work = keys_computed() - before;
+        // A few per copy and digit of its number.
+        assert!(
+            work <= 20 * u64::from(variants),
+            "variants: {work} key computations"
+        );
     }
 }

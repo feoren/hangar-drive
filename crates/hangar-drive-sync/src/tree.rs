@@ -16,8 +16,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hangar_drive_protocol::ids::{ItemId, ObjectId};
-use hangar_drive_protocol::name::{comparison_key, CaseKeys};
+use hangar_drive_protocol::name::comparison_key;
 use sha2::{Digest, Sha256};
+
+use crate::names::case_keys;
 
 /// The parent of every top level item. No node has this ID; a tree from the server that holds it
 /// is refused ([`Tree::check`]).
@@ -287,16 +289,19 @@ impl Tree {
     }
 
     /// The children of `parent` that collide with `name` by comparison key or case (ADR 0001,
-    /// section 7), `except` left out.
+    /// section 7), `except` left out. Equal comparison keys make equal case keys, since the case
+    /// keys start from the comparison key, so the case keys alone decide.
+    ///
+    /// This looks at every child; a caller that asks many times about one directory keeps an
+    /// index by case key instead, as the executor does (security review HIGH 2).
     pub fn colliding_children(&self, parent: &ItemId, name: &str, except: &ItemId) -> Vec<ItemId> {
-        let key = comparison_key(name);
-        let keys = CaseKeys::of(&key);
+        let keys = case_keys(name);
         self.children(parent)
             .filter(|id| *id != except)
             .filter(|id| {
                 self.nodes
                     .get(id)
-                    .is_some_and(|n| n.key() == key || CaseKeys::of(&n.key()).collides(&keys))
+                    .is_some_and(|n| case_keys(&n.name).collides(&keys))
             })
             .copied()
             .collect()
