@@ -7,7 +7,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BackendError } from "../backend/errors";
 import { MOCK_INPUTS } from "../backend/mock/mockBackend";
-import { button, cleanup, click, field, flush, renderApp, text, type } from "../test/harness";
+import {
+  button,
+  cleanup,
+  click,
+  field,
+  flush,
+  openMenu,
+  renderApp,
+  text,
+  type,
+} from "../test/harness";
 import { ARM_DELAY_MS } from "../ui/parts";
 
 const FILLER = String.fromCharCode(0x3164);
@@ -88,7 +98,7 @@ describe("device name in the recovery", () => {
 describe("renaming a device", () => {
   it("trims, refuses blank names and shows the backend's answer", async () => {
     const { mock } = await renderApp();
-    await click("Geräte");
+    await openMenu("Geräte");
     await click("Aktionen für „Büro-PC“");
     await click("Umbenennen");
     await type(field("Name"), FILLER);
@@ -106,7 +116,7 @@ describe("renaming a device", () => {
 
   it("keeps an unexpected failure apart from the name rule", async () => {
     const { mock } = await renderApp();
-    await click("Geräte");
+    await openMenu("Geräte");
     await click("Aktionen für „Büro-PC“");
     await click("Umbenennen");
     vi.spyOn(mock, "renameDevice").mockRejectedValue(

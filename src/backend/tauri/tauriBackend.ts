@@ -19,6 +19,7 @@ import type {
   DeviceId,
   FolderChoice,
   FolderId,
+  FolderView,
   Millis,
   PairAnswer,
   PairInput,
@@ -436,6 +437,10 @@ export class TauriBackend implements Backend {
   }
   async setLanguage(language: Language | "system") {
     await this.run("setLanguage", { language });
+  }
+
+  async setFolderView(view: FolderView) {
+    await this.run("setFolderView", { view });
   }
   getAbout() {
     return this.call("getAbout", {}, d.about);

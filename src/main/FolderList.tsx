@@ -1,12 +1,15 @@
-// The folder rows (UX 6.3): name, full path truncated in the middle, status in words, row menu.
+// The folder rows (UX 6.3): name, full path truncated in the middle, status in words with the
+// size on this disk below it, row menu. As a grid, the same rows are cards (the path is the
+// tooltip), and "Add folder" is a dashed card; the choice is kept in the shell's settings.
 // One tab stop for the list; arrow keys move, Enter opens the folder, Shift+F10 the menu.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import type { Folder, StopReason } from "../backend/types";
-import { useT, type MessageKey, type Translate } from "../i18n";
+import type { Folder, FolderView, StopReason } from "../backend/types";
+import { formatSize } from "../format";
+import { useLanguage, useT, type MessageKey, type Translate } from "../i18n";
 import { useBackend } from "../ui/backendContext";
-import { FolderIcon, PlusIcon } from "../ui/icons";
+import { FolderIcon, GridIcon, ListIcon, PlusIcon } from "../ui/icons";
 import { RowMenu, type MenuItem } from "../ui/Menu";
 import { Feedback, PathText } from "../ui/parts";
 import { isMenuKey, useRoving } from "../ui/roving";
@@ -40,24 +43,98 @@ export function folderStatusText(folder: Folder, t: Translate): string {
   }
 }
 
-function statusTone(folder: Folder): string {
+/**
+ * The row's color class: green ("is-ok") only for a folder that is done while the server is
+ * reachable, since offline nothing can be confirmed; red ("is-stopped") for every state that
+ * needs the person; neutral otherwise.
+ */
+export function folderTone(folder: Folder, online: boolean): string {
   switch (folder.status.kind) {
+    case "upToDate":
+      return online ? "is-ok" : "is-quiet";
     case "uploading":
     case "downloading":
       return "is-active";
     case "stopped":
       return "is-stopped";
-    default:
+    case "paused":
       return "is-quiet";
   }
 }
 
+/** The folder view of the settings, "list" until they are read; a change is saved at once. */
+export function useFolderView(): [FolderView, (view: FolderView) => void] {
+  const backend = useBackend();
+  const [view, setView] = useState<FolderView>("list");
+  // A click before the settings arrive wins over the stored view they bring.
+  const chosen = useRef(false);
+  useEffect(() => {
+    let current = true;
+    backend.getSettings().then(
+      (settings) => {
+        if (current && !chosen.current) setView(settings.folderView);
+      },
+      () => undefined,
+    );
+    return () => {
+      current = false;
+    };
+  }, [backend]);
+  const change = (next: FolderView) => {
+    chosen.current = true;
+    setView(next);
+    backend.setFolderView(next).catch((error: unknown) => {
+      console.error("Hangar Drive: saving the folder view failed", error);
+    });
+  };
+  return [view, change];
+}
+
+/** Two icon buttons next to the "Folders" heading; the pressed one is the current view. */
+export function FolderViewSwitch({
+  view,
+  onChange,
+}: {
+  readonly view: FolderView;
+  readonly onChange: (view: FolderView) => void;
+}) {
+  const t = useT();
+  const options = [
+    { id: "list", label: t("main.view.list"), icon: <ListIcon size={18} /> },
+    { id: "grid", label: t("main.view.grid"), icon: <GridIcon size={18} /> },
+  ] as const;
+  return (
+    <div className="segmented" role="group" aria-label={t("main.view")}>
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          className="segment"
+          aria-pressed={view === option.id}
+          aria-label={option.label}
+          title={option.label}
+          onClick={() => {
+            onChange(option.id);
+          }}
+        >
+          {option.icon}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function FolderList({
   folders,
+  view = "list",
+  online,
   open,
   onDeleted,
 }: {
   readonly folders: readonly Folder[];
+  readonly view?: FolderView;
+  /** The server answers; without it no folder is shown as done. */
+  readonly online: boolean;
   readonly open: Open;
   /** A folder was deleted everywhere (the person said yes in the native question). */
   readonly onDeleted: (name: string) => void;
@@ -65,11 +142,16 @@ export function FolderList({
   const t = useT();
   const roving = useRoving(folders.length + 1);
   return (
-    <div className="list folder-list" role="list" onKeyDown={roving.onKeyDown}>
+    <div
+      className={view === "grid" ? "folder-list is-grid" : "list folder-list"}
+      role="list"
+      onKeyDown={roving.onKeyDown}
+    >
       {folders.map((folder, index) => (
         <FolderRow
           key={folder.id}
           folder={folder}
+          online={online}
           open={open}
           onDeleted={onDeleted}
           tabIndex={roving.tabIndex(index)}
@@ -103,23 +185,28 @@ export function FolderList({
 
 function FolderRow({
   folder,
+  online,
   open,
   onDeleted,
   tabIndex,
   onFocus,
 }: {
   readonly folder: Folder;
+  readonly online: boolean;
   readonly open: Open;
   readonly onDeleted: (name: string) => void;
   readonly tabIndex: 0 | -1;
   readonly onFocus: () => void;
 }) {
   const t = useT();
+  const language = useLanguage();
   const backend = useBackend();
   const action = useAction();
   const [menuOpen, setMenuOpen] = useState(false);
   const main = useRef<HTMLButtonElement>(null);
   const status = folderStatusText(folder, t);
+  // Unknown before the first scan: nothing rather than a "0 B" that would read as empty.
+  const size = folder.bytes === null ? null : formatSize(language, folder.bytes);
   const paused = folder.status.kind === "paused";
 
   const openInExplorer = () => {
@@ -182,7 +269,7 @@ function FolderRow({
   ];
 
   return (
-    <div role="listitem" className={`row folder-row ${statusTone(folder)}`}>
+    <div role="listitem" className={`row folder-row ${folderTone(folder, online)}`}>
       <div className="row-line">
         <button
           ref={main}
@@ -190,7 +277,7 @@ function FolderRow({
           className="row-main"
           data-roving
           tabIndex={tabIndex}
-          aria-label={`${folder.name}, ${folder.path}, ${status}`}
+          aria-label={[folder.name, folder.path, status, size].filter(Boolean).join(", ")}
           title={folder.path}
           onFocus={onFocus}
           onDoubleClick={openInExplorer}
@@ -212,7 +299,10 @@ function FolderRow({
             <span className="row-name">{folder.name}</span>
             <PathText path={folder.path} className="row-sub" />
           </span>
-          <span className="row-status">{status}</span>
+          <span className="row-end">
+            <span className="row-status">{status}</span>
+            {size !== null && <span className="row-size">{size}</span>}
+          </span>
         </button>
         <RowMenu
           items={items}

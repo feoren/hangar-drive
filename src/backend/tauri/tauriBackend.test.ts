@@ -57,7 +57,16 @@ describe("tauri backend", () => {
     await expect(good.backend.getSettings()).resolves.toEqual({
       autostart: true,
       language: "system",
+      folderView: "list",
     });
+    const grid = backendWith({
+      get_settings: { autostart: true, language: "system", folderView: "grid" },
+    });
+    await expect(grid.backend.getSettings()).resolves.toMatchObject({ folderView: "grid" });
+    const wrong = backendWith({
+      get_settings: { autostart: true, language: "system", folderView: "tiles" },
+    });
+    await expect(wrong.backend.getSettings()).rejects.toMatchObject({ code: "badResponse" });
   });
 
   it("decodes a full snapshot from the mock unchanged", async () => {
@@ -71,6 +80,25 @@ describe("tauri backend", () => {
       const bridge = backendWith({ get_snapshot: JSON.parse(JSON.stringify(state)) });
       await expect(bridge.backend.getSnapshot()).resolves.toEqual(state);
     }
+  });
+
+  it("decodes a folder's size, null before the first scan, and refuses a wrong one", async () => {
+    const snapshot = await new MockBackend({ scenario: "upToDate" }).getSnapshot();
+    const unscanned = {
+      ...snapshot,
+      folders: snapshot.folders.map((folder, index) =>
+        index === 1 ? { ...folder, bytes: null } : folder,
+      ),
+    };
+    const decoded = await backendWith({ get_snapshot: unscanned }).backend.getSnapshot();
+    expect(decoded.folders.map((folder) => folder.bytes)).toEqual([2_412_000_000, null]);
+    const wrong = {
+      ...snapshot,
+      folders: snapshot.folders.map((folder) => ({ ...folder, bytes: "2,4 GB" })),
+    };
+    await expect(backendWith({ get_snapshot: wrong }).backend.getSnapshot()).rejects.toMatchObject({
+      code: "badResponse",
+    });
   });
 
   it("decodes results with their error codes", async () => {

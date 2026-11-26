@@ -17,6 +17,7 @@ import {
   dialogTitle,
   field,
   flush,
+  openMenu,
   renderApp,
   renderWith,
   text,
@@ -154,7 +155,7 @@ describe("add folder", () => {
 describe("devices", () => {
   it("removes a device not seen for long right from its hint", async () => {
     const { mock } = await renderApp();
-    await click("Geräte");
+    await openMenu("Geräte");
     await click("Entfernen: Alter Laptop");
     expect(mock.calls.some((call) => call.startsWith("removeDevice"))).toBe(true);
     expect(text()).toContain("„Alter Laptop“ wurde entfernt.");

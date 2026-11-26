@@ -1,12 +1,13 @@
-// Recent activity (UX 6.3): the last events of this device, newest first. Enter or a double click
-// shows the file in Explorer; the row menu has "Earlier versions".
+// Recent activity (UX 6.3): the last events of this device, newest first, in a view of the main
+// menu. Enter or a double click shows the file in Explorer; the row menu has "Earlier versions".
 
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import type { ActivityEntry } from "../backend/types";
 import { formatRelative } from "../format";
 import { useLanguage, useT, type Translate } from "../i18n";
-import { useBackend, useNow } from "../ui/backendContext";
+import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
+import { Dialog } from "../ui/Dialog";
 import { FileIcon, FolderIcon } from "../ui/icons";
 import { RowMenu } from "../ui/Menu";
 import { Feedback } from "../ui/parts";
@@ -172,5 +173,35 @@ function ActivityRow({
       {restored !== null && <Feedback>{t("deletes.restored", { count: restored })}</Feedback>}
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
     </div>
+  );
+}
+
+/** Recent activity as its own view from the main menu, in the style of the devices view. */
+export function ActivityDialog({
+  open,
+  onClose,
+}: {
+  readonly open: Open;
+  readonly onClose: () => void;
+}) {
+  const t = useT();
+  const snapshot = useSnapshot();
+  const titleId = useId();
+  return (
+    <Dialog labelledBy={titleId} size="medium" onClose={onClose}>
+      <div className="view-head">
+        <h2 id={titleId} className="dialog-title">
+          {t("main.activity")}
+        </h2>
+      </div>
+      <div className="view-body">
+        <ActivityList entries={snapshot.activity} open={open} />
+      </div>
+      <div className="dialog-actions">
+        <button type="button" className="button secondary" onClick={onClose}>
+          {t("common.close")}
+        </button>
+      </div>
+    </Dialog>
   );
 }

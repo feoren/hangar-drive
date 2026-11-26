@@ -44,6 +44,33 @@ export function PlusIcon(props: IconProps) {
   );
 }
 
+export function MenuIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13" />
+    </Svg>
+  );
+}
+
+export function ListIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M7.5 5.5h9M7.5 10h9M7.5 14.5h9M3.75 5.5h.5M3.75 10h.5M3.75 14.5h.5" />
+    </Svg>
+  );
+}
+
+export function GridIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="3.5" y="3.5" width="5.25" height="5.25" rx="1.2" />
+      <rect x="11.25" y="3.5" width="5.25" height="5.25" rx="1.2" />
+      <rect x="3.5" y="11.25" width="5.25" height="5.25" rx="1.2" />
+      <rect x="11.25" y="11.25" width="5.25" height="5.25" rx="1.2" />
+    </Svg>
+  );
+}
+
 export function MoreIcon(props: IconProps) {
   return (
     <Svg {...props}>

@@ -2,7 +2,16 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { all, cleanup, click, dialogTitle, field, renderApp, text } from "../test/harness";
+import {
+  all,
+  cleanup,
+  click,
+  dialogTitle,
+  field,
+  openMenu,
+  renderApp,
+  text,
+} from "../test/harness";
 
 afterEach(() => {
   cleanup();
@@ -11,7 +20,7 @@ afterEach(() => {
 describe("settings (UX 11)", () => {
   it("has only autostart and language, then account and about", async () => {
     await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     expect(dialogTitle()).toBe("Einstellungen");
     expect(all('[role="dialog"] input[type="checkbox"], [role="dialog"] select')).toHaveLength(2);
     expect(text()).toContain("Server: drive.example.org");
@@ -23,7 +32,7 @@ describe("settings (UX 11)", () => {
 
   it("switches autostart", async () => {
     const { mock } = await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     const toggle = field("Beim Anmelden starten");
     expect(toggle.checked).toBe(true);
     expect(toggle.getAttribute("role")).toBe("switch");
@@ -34,7 +43,7 @@ describe("settings (UX 11)", () => {
 
   it("lists every language by its own name, the system first", async () => {
     await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     const options = all("select option").map((option) => option.textContent);
     expect(options[0]).toBe("Wie das System");
     expect(options).toContain("Ελληνικά");
@@ -44,7 +53,7 @@ describe("settings (UX 11)", () => {
 
   it("shows the error report before saving it", async () => {
     const { mock } = await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     await click("Fehlerbericht speichern");
     expect(text()).toContain("Das steht im Fehlerbericht");
     expect(document.querySelector(".report-preview")?.textContent).toContain("Hangar Drive 0.1.0");
@@ -55,7 +64,7 @@ describe("settings (UX 11)", () => {
 
   it("lists the keyboard shortcuts in the help", async () => {
     await renderApp();
-    await click("Hilfe");
+    await openMenu("Hilfe");
     expect(all("kbd").map((element) => element.textContent)).toEqual([
       "F1",
       "Strg+,",
@@ -74,7 +83,7 @@ describe("settings (UX 11)", () => {
   ])("shows $version with build $build as Version 0.1.0-12", async (about) => {
     const { mock } = await renderApp();
     vi.spyOn(mock, "getAbout").mockResolvedValue({ ...about, updates: true });
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     const line = all('[role="dialog"] .info-line')
       .map((element) => element.textContent)
       .find((content) => content.startsWith("Version "));
@@ -87,7 +96,7 @@ describe("reset this device", () => {
   // there keeps everything as it was and shows no error.
   it("asks natively only, then goes back to the welcome", async () => {
     const { mock } = await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     expect(text()).toContain("Hilfe");
     mock.controls.nativeConfirm = "no";
     await click("Dieses Gerät zurücksetzen");
@@ -103,7 +112,7 @@ describe("reset this device", () => {
   // Security review M4: turning autostart off asks natively; "no" leaves it on.
   it("turns autostart off only after the native question", async () => {
     const { mock } = await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     const autostart = () => document.querySelector<HTMLInputElement>('input[role="switch"]');
     expect(autostart()?.checked).toBe(true);
     mock.controls.nativeConfirm = "no";

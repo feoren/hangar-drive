@@ -5,6 +5,7 @@ import type { Folder, Warning } from "../backend/types";
 
 export type OpenDialog =
   | { readonly kind: "devices" }
+  | { readonly kind: "activity" }
   | { readonly kind: "settings" }
   | { readonly kind: "help" }
   | {

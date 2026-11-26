@@ -1,8 +1,17 @@
 // The row menu ("…"): a button that opens a menu below it. Arrow keys move, Enter runs, Escape
 // closes and returns focus to the button. The row itself can open it with Shift+F10 or the
-// context menu key (UX 12), through `open` and `onOpenChange`.
+// context menu key (UX 12), through `open` and `onOpenChange`. The window's main menu ("≡") is the
+// same menu with another icon, opening to the right of a button at the start of the header.
 
-import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 
 import { MoreIcon } from "./icons";
@@ -24,29 +33,47 @@ interface Props {
   readonly onOpenChange: (open: boolean) => void;
   /** Focus target after closing without a choice; the button itself by default. */
   readonly returnFocus?: RefObject<HTMLElement | null>;
+  /** The button's icon; "…" by default. */
+  readonly icon?: ReactNode;
+  /** "start": the menu's left edge at the button's (a button at the window's left edge). */
+  readonly align?: "start" | "end";
+  /** A tab stop of its own; a row's menu button is not, the row opens it (roving focus). */
+  readonly tabbable?: boolean;
 }
 
-export function RowMenu({ items, label, open, onOpenChange, returnFocus }: Props) {
+export function RowMenu({
+  items,
+  label,
+  open,
+  onOpenChange,
+  returnFocus,
+  icon,
+  align = "end",
+  tabbable = false,
+}: Props) {
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const menuId = useId();
-  const [position, setPosition] = useState<{ top: number; right: number; up: boolean } | null>(
-    null,
-  );
+  const [position, setPosition] = useState<{
+    top: number;
+    left?: number;
+    right?: number;
+    up: boolean;
+  } | null>(null);
 
   useLayoutEffect(() => {
     if (!open || !button.current) return;
     const rect = button.current.getBoundingClientRect();
     const below = window.innerHeight - rect.bottom;
     const up = below < 40 + items.length * 34 && rect.top > below;
-    const next = {
-      top: up ? rect.top - 4 : rect.bottom + 4,
-      right: Math.max(8, window.innerWidth - rect.right),
-      up,
-    };
+    const top = up ? rect.top - 4 : rect.bottom + 4;
+    const next =
+      align === "start"
+        ? { top, left: Math.max(8, rect.left), up }
+        : { top, right: Math.max(8, window.innerWidth - rect.right), up };
     // Measured from the layout of this frame; a state update here is the documented pattern.
     setPosition(next);
-  }, [open, items.length]);
+  }, [open, items.length, align]);
 
   // The estimate above can miss (long labels, larger text); the measured menu is moved fully into
   // the window, and scrolls when the window is lower than the menu (UX 12: nothing cut off).
@@ -136,7 +163,7 @@ export function RowMenu({ items, label, open, onOpenChange, returnFocus }: Props
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        tabIndex={-1}
+        tabIndex={tabbable ? 0 : -1}
         onClick={(event) => {
           event.stopPropagation();
           onOpenChange(!open);
@@ -145,7 +172,7 @@ export function RowMenu({ items, label, open, onOpenChange, returnFocus }: Props
           event.stopPropagation();
         }}
       >
-        <MoreIcon />
+        {icon ?? <MoreIcon />}
       </button>
       {open &&
         position &&
@@ -158,6 +185,7 @@ export function RowMenu({ items, label, open, onOpenChange, returnFocus }: Props
             aria-label={label}
             style={{
               top: position.top,
+              left: position.left,
               right: position.right,
             }}
             onKeyDown={onKeyDown}

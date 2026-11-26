@@ -79,6 +79,27 @@ describe("token contrast", () => {
     });
   }
 
+  it("uses the logo's green as accent and for done, the error red at the same lightness", () => {
+    const logo = readFileSync(join(import.meta.dirname, "../src-tauri/app-icon.svg"), "utf8");
+    expect(logo).toContain(`fill="${dark.get("accent") ?? ""}"`);
+    for (const [, theme] of THEMES) {
+      expect(theme.get("ok")).toBe(theme.get("accent"));
+      expect(theme.get("primary")).toBe(theme.get("accent"));
+      // Same weight, other hue: the two marks differ by less than a quarter in luminance.
+      const ok = luminance(theme.get("ok") ?? "");
+      const error = luminance(theme.get("error") ?? "");
+      expect(Math.abs(ok - error) / Math.max(ok, error)).toBeLessThan(0.25);
+    }
+  });
+
+  it("tints the tray's attention icon with the window's --error (build.rs)", () => {
+    const build = readFileSync(join(import.meta.dirname, "../src-tauri/build.rs"), "utf8");
+    expect(build).toContain(
+      `("light", "${light.get("text") ?? ""}", "${light.get("error") ?? ""}")`,
+    );
+    expect(build).toContain(`("dark", "#ffffff", "${dark.get("error") ?? ""}")`);
+  });
+
   it("fixes the light --warn on --panel of the sister app (4.46 : 1)", () => {
     expect(contrast("#9a6700", "#f3f5f8")).toBeLessThan(4.5);
     expect(contrast(light.get("warn") ?? "", light.get("panel") ?? "")).toBeGreaterThanOrEqual(4.5);

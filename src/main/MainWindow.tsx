@@ -1,6 +1,7 @@
-// The main window (UX 6.3): status first, then the one banner, the folders, recent activity and
-// the quiet lines at the bottom. The header buttons come last in the tab order (UX 12), so the
-// header follows the content in the document and is placed on top by the layout.
+// The main window (UX 6.3): the one banner, the folders and the quiet lines at the bottom, below a
+// header with the main menu (recent activity, devices, settings, help), the logo and the status.
+// The header comes last in the tab order (UX 12), so it follows the content in the document and
+// is placed on top by the layout; the status sentence still opens the content as its heading.
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
@@ -24,9 +25,10 @@ import { shortcutFor } from "../shortcuts";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback } from "../ui/parts";
-import { DevicesIcon, GearIcon, HelpIcon, PlusIcon } from "../ui/icons";
-import { BrandMark } from "../ui/StatusMark";
-import { ActivityList } from "./ActivityList";
+import { MenuIcon, PlusIcon } from "../ui/icons";
+import { RowMenu, type MenuItem } from "../ui/Menu";
+import { AppLogo } from "../ui/StatusMark";
+import { ActivityDialog } from "./ActivityList";
 import { BannerArea } from "./BannerArea";
 import {
   AddFolderDialog,
@@ -34,9 +36,9 @@ import {
   NotSyncedDialog,
   StopFolderDialog,
 } from "./FolderDialogs";
-import { FolderList } from "./FolderList";
+import { FolderList, FolderViewSwitch, useFolderView } from "./FolderList";
 import type { OpenDialog } from "./openDialog";
-import { StatusHeader } from "./StatusHeader";
+import { StatusHeader, StatusHeading } from "./StatusHeader";
 
 /** The storage line appears only above this share of the quota (UX 6.3). */
 export const STORAGE_LINE_SHARE = 0.8;
@@ -118,6 +120,46 @@ export function MainWindow({
     };
   }, [dialog]);
 
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [folderView, setFolderView] = useFolderView();
+  const menuItems: MenuItem[] = [
+    {
+      id: "addFolder",
+      label: t("main.addFolder"),
+      onSelect: () => {
+        open({ kind: "addFolder" });
+      },
+    },
+    {
+      id: "activity",
+      label: t("main.activity"),
+      onSelect: () => {
+        open({ kind: "activity" });
+      },
+    },
+    {
+      id: "devices",
+      label: t("main.devices"),
+      onSelect: () => {
+        open({ kind: "devices" });
+      },
+    },
+    {
+      id: "settings",
+      label: t("main.settings"),
+      onSelect: () => {
+        open({ kind: "settings" });
+      },
+    },
+    {
+      id: "help",
+      label: t("help.title"),
+      onSelect: () => {
+        open({ kind: "help" });
+      },
+    },
+  ];
+
   const storage = snapshot.storage;
   const showStorage =
     storage !== null && storage.quota > 0 && storage.used / storage.quota >= STORAGE_LINE_SHARE;
@@ -126,12 +168,17 @@ export function MainWindow({
     <div className="window">
       <main className="main">
         <div className="column">
-          <StatusHeader danger={danger} />
+          <StatusHeading />
           <BannerArea open={open} focus={focus} heads={heads} region={banner} />
           <section className="section" aria-labelledby="folders-title">
-            <h2 id="folders-title" className="section-title">
-              {t("main.folders")}
-            </h2>
+            <div className="section-head">
+              <h2 id="folders-title" className="section-title">
+                {t("main.folders")}
+              </h2>
+              {snapshot.folders.length > 0 && (
+                <FolderViewSwitch view={folderView} onChange={setFolderView} />
+              )}
+            </div>
             {snapshot.folders.length === 0 ? (
               <div className="empty">
                 <p className="empty-title">{t("main.empty.title")}</p>
@@ -148,7 +195,13 @@ export function MainWindow({
                 </button>
               </div>
             ) : (
-              <FolderList folders={snapshot.folders} open={open} onDeleted={setDeleted} />
+              <FolderList
+                folders={snapshot.folders}
+                view={folderView}
+                online={snapshot.sync.connection.kind === "online"}
+                open={open}
+                onDeleted={setDeleted}
+              />
             )}
             {deleted !== null && (
               <Feedback>
@@ -157,12 +210,6 @@ export function MainWindow({
                 })}`}
               </Feedback>
             )}
-          </section>
-          <section className="section" aria-labelledby="activity-title">
-            <h2 id="activity-title" className="section-title">
-              {t("main.activity")}
-            </h2>
-            <ActivityList entries={snapshot.activity} open={open} />
           </section>
           {(showStorage || snapshot.notices.length > 0) && (
             <footer className="quiet-lines">
@@ -184,42 +231,21 @@ export function MainWindow({
       </main>
       <header className="topbar">
         <div className="brand">
-          <BrandMark size={20} className="brand-mark" />
+          <RowMenu
+            items={menuItems}
+            label={t("main.menu")}
+            open={menuOpen}
+            onOpenChange={setMenuOpen}
+            icon={<MenuIcon size={18} />}
+            align="start"
+            tabbable
+          />
+          <AppLogo size={22} className="brand-mark" />
           <span className="brand-name">{t("app.name")}</span>
         </div>
-        <nav className="topbar-actions" aria-label={t("app.name")}>
-          <button
-            type="button"
-            className="quiet-button"
-            onClick={() => {
-              open({ kind: "devices" });
-            }}
-          >
-            <DevicesIcon size={18} />
-            <span>{t("main.devices")}</span>
-          </button>
-          <button
-            type="button"
-            className="quiet-button"
-            onClick={() => {
-              open({ kind: "settings" });
-            }}
-          >
-            <GearIcon size={18} />
-            <span>{t("main.settings")}</span>
-          </button>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label={t("help.title")}
-            title={t("help.title")}
-            onClick={() => {
-              open({ kind: "help" });
-            }}
-          >
-            <HelpIcon size={18} />
-          </button>
-        </nav>
+        <div className="topbar-actions">
+          <StatusHeader danger={danger} />
+        </div>
       </header>
       {dialog && <DialogHost dialog={dialog} open={open} onClose={close} />}
     </div>
@@ -238,6 +264,8 @@ function DialogHost({
   switch (dialog.kind) {
     case "devices":
       return <DevicesDialog onClose={onClose} />;
+    case "activity":
+      return <ActivityDialog open={open} onClose={onClose} />;
     case "settings":
       return <SettingsDialog onClose={onClose} />;
     case "help":

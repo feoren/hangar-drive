@@ -1,7 +1,9 @@
-/* Design tokens of the Hangar family (taken from Hangar's src/styles.css until this app has its
-   own), plus the type scale, radii and motion of this window. Dark is the default; the light values
-   follow below. main.tsx sets data-theme from the system. Sizes are in rem against the 13 px root,
-   so the layout holds at the Windows text size setting of 200 % (UX 12). */
+/* Design tokens of the Hangar family (taken from Hangar's src/styles.css), with this app's own
+   accent: the green of its logo (src-tauri/app-icon.svg). "Done" (--ok) is that green and an error
+   (--error) is a red of the same OKLCH lightness at full chroma, so both marks weigh the same and
+   differ only in hue (UX 12). Dark is the default; the light values follow below. main.tsx sets
+   data-theme from the system. Sizes are in rem against the 13 px root, so the layout holds at the
+   Windows text size setting of 200 % (UX 12). */
 :root {
   --bg: #0e1116;
   --panel: #151a21;
@@ -10,16 +12,21 @@
   --border: #262e39;
   --text: #d6dde6;
   --muted: #8592a3;
-  --accent: #5aa9ff;
-  --ok: #57ab5a;
+  --accent: #4fd1a5;
+  --ok: #4fd1a5;
   --warn: #c69026;
   --on-warn: #1a1d21;
-  --error: #f47067;
+  --error: #ff9491;
   --brand-mark: #f2e3c6;
+  /* The logo's own colors (src-tauri/app-icon.svg), the same in both themes. */
+  --logo-tile: #141a24;
+  --logo-fold: #4fd1a5;
+  --logo-squares: #f2e3c6;
   --on-badge: #ffffff;
-  --primary: #2f6fb3;
-  --primary-hover: #3a7fc8;
-  --on-primary: #ffffff;
+  /* Light green under dark text, as on the logo's tile. */
+  --primary: #4fd1a5;
+  --primary-hover: #67deb5;
+  --on-primary: #0e1116;
   --error-bg: #5c2626;
   --error-fg: #ffffff;
   --shadow: rgb(0 0 0 / 45%);
@@ -79,15 +86,17 @@
   --border: #d0d7de;
   --text: #1f2328;
   --muted: #59636e;
-  --accent: #0969da;
-  --ok: #1a7f37;
+  /* The logo's hue at OKLCH lightness 0.50, for 4.5 : 1 on every light surface. */
+  --accent: #097559;
+  --ok: #097559;
   /* Darker than Hangar's #9a6700, which has only 4.46 : 1 on --panel (UX 12). */
   --warn: #8a5a00;
   --on-warn: #ffffff;
-  --error: #cf222e;
+  --error: #bb022a;
   --brand-mark: #b8892e;
-  --primary: #0969da;
-  --primary-hover: #0860ca;
+  --primary: #097559;
+  --primary-hover: #04684f;
+  --on-primary: #ffffff;
   --error-bg: #ffebe9;
   --error-fg: #82071e;
   --shadow: rgb(31 35 40 / 16%);
@@ -579,7 +588,7 @@ code.command {
   justify-content: space-between;
   gap: var(--space-2);
   height: 48px;
-  padding: 0 14px 0 20px;
+  padding: 0 14px 0 10px;
   border-bottom: var(--hairline) solid var(--border);
 }
 
@@ -591,7 +600,8 @@ code.command {
 }
 
 .brand-mark {
-  color: var(--accent);
+  flex: none;
+  margin-left: 2px;
 }
 
 .brand-name {
@@ -603,6 +613,7 @@ code.command {
   display: flex;
   align-items: center;
   gap: 2px;
+  min-width: 0;
 }
 
 .main {
@@ -618,17 +629,46 @@ code.command {
   padding: var(--space-3) var(--space-4) 40px;
 }
 
-/* Status: the tray's sentence, large, one quiet line below. */
+/* Status: the tray's state as one compact item in the header, before the buttons; its details
+   open in a small panel below it. */
 .status {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
-  gap: 14px;
-  padding: 6px 0 var(--space-3);
+  position: relative;
+  min-width: 0;
+  margin-right: 6px;
+}
+
+.status-button {
+  max-width: 22em;
+  color: var(--text);
 }
 
 .status-mark {
-  margin-top: -3px;
+  flex: none;
+}
+
+.status-short {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 300;
+  width: max-content;
+  max-width: min(22rem, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--panel-raised);
+  box-shadow: 0 8px 24px var(--shadow);
+  animation: enter var(--enter) var(--ease-out);
+}
+
+.status-panel:focus-visible {
+  outline-offset: 2px;
 }
 
 .tone-ok {
@@ -636,7 +676,7 @@ code.command {
 }
 
 .tone-active {
-  color: var(--accent);
+  color: var(--text);
 }
 
 .tone-attention {
@@ -652,11 +692,7 @@ code.command {
 }
 
 .status-title {
-  font-family: var(--display);
-  font-size: var(--text-2xl);
   font-weight: 600;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
   overflow-wrap: anywhere;
 }
 
@@ -751,6 +787,49 @@ code.command {
   color: var(--muted);
 }
 
+/* A section heading with a control at its end (the folder view switch). */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1);
+  margin-bottom: 6px;
+}
+
+.section-head .section-title {
+  margin-bottom: 0;
+}
+
+/* Two icon buttons as one control; the pressed one is filled. */
+.segmented {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  gap: 2px;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-m);
+}
+
+.segment {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 26px;
+  border-radius: var(--radius-s);
+  color: var(--muted);
+}
+
+.segment[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--hover);
+}
+
+@media (hover: hover) {
+  .segment:hover {
+    color: var(--text);
+  }
+}
+
 .section-label {
   margin: var(--space-2) 0 6px;
   font-size: var(--text-m);
@@ -836,12 +915,132 @@ code.command {
   white-space: nowrap;
 }
 
+/* The folders as cards: the same rows, stacked inside; the path is the tooltip, the name may wrap
+   so it is never cut off, and the grid reflows from one column at the minimum width. */
+.folder-list.is-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 12.5rem), 1fr));
+  gap: 10px;
+}
+
+.is-grid .row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--panel);
+}
+
+.is-grid .row-line {
+  flex: 1;
+  align-items: stretch;
+}
+
+.is-grid .row-main {
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  justify-items: start;
+  gap: 10px;
+  min-height: 128px;
+  padding: 14px 14px 12px;
+  border-radius: var(--radius-l);
+}
+
+.is-grid .row-text {
+  width: 100%;
+  padding-right: 28px;
+}
+
+.is-grid .row-name {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.is-grid .row-sub {
+  display: none;
+}
+
+.is-grid .row-end {
+  align-items: flex-start;
+}
+
+.is-grid .row-status {
+  text-align: left;
+  white-space: normal;
+}
+
+.is-grid .row-menu-button {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+
+.is-grid .row-note,
+.is-grid .row .feedback {
+  margin: 0 14px 12px;
+}
+
+.is-grid .add-row {
+  border-style: dashed;
+  border-color: var(--field-line);
+  background: none;
+}
+
+.is-grid .add-row .row-main {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  align-content: center;
+  text-align: center;
+}
+
+.is-grid .add-row .row-icon {
+  border: none;
+}
+
+/* Status above, the folder's size below it: right-aligned, so the numbers of all rows line up. */
+.row-end {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  min-width: 0;
+}
+
+.row-size {
+  font-size: var(--text-s);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Green only for a folder that is done, red for one that needs the person; everything else stays
+   neutral, so the two marks keep their meaning. The words say the same, color is never alone. */
+.folder-row .row-icon {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 11%, transparent);
+}
+
+.folder-row.is-ok .row-icon {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+
+.folder-row.is-stopped .row-icon {
+  color: var(--error);
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.is-ok .row-status {
+  color: var(--ok);
+}
+
 .is-active .row-status {
-  color: var(--accent);
+  color: var(--text);
 }
 
 .is-stopped .row-status {
-  color: var(--warn);
+  color: var(--error);
 }
 
 .row-note {
@@ -2199,10 +2398,6 @@ code.command {
     grid-column: 4;
   }
 
-  .status-title {
-    font-size: var(--text-xl);
-  }
-
   /* Wraps instead of cutting off: the status is the one word that must stay whole (UX 12). */
   .row-status {
     max-width: 14em;
@@ -2211,10 +2406,6 @@ code.command {
 }
 
 @media (max-width: 600px) {
-  .quiet-button span {
-    display: none;
-  }
-
   .activity-what {
     display: none;
   }
@@ -2272,9 +2463,18 @@ code.command {
     padding: 10px 20px;
     row-gap: 4px;
   }
+}
 
-  .status {
-    padding-bottom: var(--space-2);
+/* Narrower than the minimum window (a zoomed or docked view): the status keeps only its mark; the
+   words stay its name and tooltip. */
+@media (max-width: 480px) {
+  .status-short {
+    display: none;
+  }
+
+  /* A long status ("Angehalten: Ordner nicht gefunden") wraps further, so the name keeps room. */
+  .row-status {
+    max-width: 8em;
   }
 }
 
@@ -2300,6 +2500,14 @@ code.command {
 
   .button.arming {
     color: GrayText;
+  }
+
+  .folder-row .row-icon {
+    border: 1px solid CanvasText;
+  }
+
+  .status-panel {
+    border: 1px solid CanvasText;
   }
 }
 

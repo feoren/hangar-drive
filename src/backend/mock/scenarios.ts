@@ -132,7 +132,7 @@ export function baseState(now: Millis): MockState {
     recoveryCreated: now - 30 * fx.DAY,
     conflicts: fx.conflicts(now),
     nameIssues: fx.nameIssues(),
-    settings: { autostart: true, language: "system" },
+    settings: { autostart: true, language: "system", folderView: "list" },
     startLink: null,
     removedHeads: null,
     updates: true,

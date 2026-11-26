@@ -14,6 +14,7 @@ import {
   flush,
   key,
   maybeButton,
+  openMenu,
   renderApp,
   text,
   type,
@@ -33,7 +34,7 @@ async function wait(ms: number): Promise<void> {
 
 async function openDevices(scenario: Parameters<typeof renderApp>[0] = "upToDate") {
   const harness = await renderApp(scenario, { timeScale: 0.001 });
-  await click("Geräte");
+  await openMenu("Geräte");
   return harness;
 }
 

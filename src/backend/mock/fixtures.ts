@@ -59,6 +59,7 @@ export function folders(): Folder[] {
       status: { kind: "upToDate" },
       freezeDays: null,
       notSyncedCount: 0,
+      bytes: 2_412_000_000,
     },
     {
       id: "f-photos",
@@ -67,6 +68,7 @@ export function folders(): Folder[] {
       status: { kind: "upToDate" },
       freezeDays: null,
       notSyncedCount: 0,
+      bytes: 86_300_000_000,
     },
   ];
 }

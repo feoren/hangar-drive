@@ -28,6 +28,7 @@ import type {
   DeviceList,
   FolderChoice,
   FolderId,
+  FolderView,
   FolderPlace,
   FolderRefusal,
   InspectedLink,
@@ -573,6 +574,7 @@ export class MockBackend implements Backend {
           status: { kind: "upToDate" },
           freezeDays: null,
           notSyncedCount: 0,
+          bytes: 48_200_000,
         },
       ],
       activity: [],
@@ -664,6 +666,7 @@ export class MockBackend implements Backend {
         status: { kind: "downloading", count: 240 },
         freezeDays: null,
         notSyncedCount: 0,
+        bytes: null,
       })),
       activity: [],
       conflicts: [],
@@ -803,6 +806,7 @@ export class MockBackend implements Backend {
         status: { kind: "uploading", count: 12 },
         freezeDays: null,
         notSyncedCount: 0,
+        bytes: null,
       },
     ];
     this.emitSnapshot();
@@ -826,6 +830,7 @@ export class MockBackend implements Backend {
         status: { kind: "downloading", count: 86 },
         freezeDays: null,
         notSyncedCount: 0,
+        bytes: null,
       },
     ];
     this.emitSnapshot();
@@ -1423,6 +1428,11 @@ export class MockBackend implements Backend {
   async setLanguage(language: Language | "system"): Promise<void> {
     await this.call(`setLanguage:${language}`);
     this.state.settings = { ...this.state.settings, language };
+  }
+
+  async setFolderView(view: FolderView): Promise<void> {
+    await this.call(`setFolderView:${view}`);
+    this.state.settings = { ...this.state.settings, folderView: view };
   }
 
   async getAbout(): Promise<About> {

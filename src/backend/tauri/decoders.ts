@@ -157,6 +157,7 @@ export const snapshot = object({
       status: folderStatus,
       freezeDays: nullable(num),
       notSyncedCount: num,
+      bytes: nullable(num),
     }),
   ),
   activity: array(activityEntry),
@@ -373,7 +374,12 @@ const language: Decoder<Language | "system"> = (value, path) => {
   throw new DecodeError(path, "language");
 };
 
-export const settings = object({ autostart: bool, language }) satisfies Decoder<Settings>;
+/** `folderView` came later: a shell without it reads as the list. */
+export const settings = object({
+  autostart: bool,
+  language,
+  folderView: orDefault(literal("list", "grid"), "list"),
+}) satisfies Decoder<Settings>;
 
 /**
  * `updates` is the proposed field of `get_about`. A shell without it reads as "on": the button

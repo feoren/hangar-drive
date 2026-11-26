@@ -13,7 +13,9 @@ import {
   flush,
   key,
   maybeButton,
+  openMenu,
   renderApp,
+  renderWith,
   text,
 } from "../test/harness";
 
@@ -23,6 +25,13 @@ afterEach(() => {
 
 function status(): string {
   return document.querySelector(".status")?.textContent ?? "";
+}
+
+/** Opens the details of the compact status in the header. */
+async function openStatus(): Promise<void> {
+  const item = document.querySelector<HTMLElement>(".status-button");
+  if (!item) throw new Error("no status in the header");
+  await click(item);
 }
 
 function banner(): HTMLElement | null {
@@ -48,26 +57,93 @@ describe("status", () => {
     await renderApp(scenario);
     await closeDialog();
     expect(document.querySelector("h1")?.textContent).toContain(title);
+    await openStatus();
+    expect(status()).toContain(title);
     expect(status()).toContain(line);
+  });
+
+  it("shows the state compactly in the header, the details as tooltip and description", async () => {
+    await renderApp("upToDate");
+    const item = document.querySelector<HTMLElement>(".topbar .status-button");
+    expect(item?.textContent).toBe("Alles aktuell");
+    expect(item?.getAttribute("aria-label")).toBe("Alles aktuell");
+    expect(item?.getAttribute("title")).toMatch(/^Alles aktuell\nZuletzt synchronisiert um /);
+    const description = document.getElementById(item?.getAttribute("aria-describedby") ?? "");
+    expect(description?.textContent).toMatch(/^Zuletzt synchronisiert um /);
+    expect(item?.querySelector("[data-icon]")?.getAttribute("data-icon")).toBe("upToDate");
+    expect(item?.querySelector(".status-mark")?.classList.contains("tone-ok")).toBe(true);
+    // Not in the content any more: the folders come first there.
+    expect(document.querySelector("main .status-button")).toBeNull();
+  });
+
+  it("says offline in one word in the header, the sentence in its name", async () => {
+    await renderApp("offline");
+    const item = document.querySelector<HTMLElement>(".status-button");
+    expect(item?.textContent).toBe("Offline");
+    expect(item?.getAttribute("aria-label")).toBe(
+      "Offline. Änderungen werden später synchronisiert.",
+    );
+  });
+
+  it("closes the details with Escape and gives the focus back", async () => {
+    await renderApp("paused");
+    await openStatus();
+    const panel = document.querySelector<HTMLElement>(".status-panel");
+    expect(document.activeElement).toBe(panel);
+    await key(panel ?? document.body, "Escape");
+    expect(document.querySelector(".status-panel")).toBeNull();
+    expect(document.activeElement).toBe(document.querySelector(".status-button"));
+  });
+
+  it("opens the main menu before the logo, closes it with Escape and opens a dialog from it", async () => {
+    await renderApp();
+    const menu = button("Menü");
+    expect(menu.closest(".brand")?.querySelector(".brand-mark")).toBeTruthy();
+    expect(menu.tabIndex).toBe(0);
+    expect(menu.getAttribute("aria-expanded")).toBe("false");
+    await click(menu);
+    expect(menu.getAttribute("aria-expanded")).toBe("true");
+    expect(all('[role="menu"] [role="menuitem"]').map((item) => item.textContent)).toEqual([
+      "Ordner hinzufügen",
+      "Letzte Aktivitäten",
+      "Geräte",
+      "Einstellungen",
+      "Hilfe",
+    ]);
+    expect(document.activeElement?.textContent).toBe("Ordner hinzufügen");
+    await key(document.activeElement ?? document.body, "Escape");
+    expect(all('[role="menu"]')).toHaveLength(0);
+    expect(document.activeElement).toBe(menu);
+    await click(menu);
+    await click("Einstellungen");
+    expect(dialogTitle()).toBe("Einstellungen");
+    // The bar holds only the menu, the logo with the name and the status.
+    expect(all(".topbar button").map((element) => element.className)).toEqual([
+      "icon-button row-menu-button",
+      "quiet-button status-button",
+    ]);
   });
 
   it("announces only changes of the state, not every file count", async () => {
     await renderApp("upToDate");
-    const live = document.querySelector('.status [role="status"]');
+    const live = document.querySelector('main [role="status"]');
     expect(live?.textContent).toBe("Alles aktuell");
   });
 
   it("resumes, retries and lets waiting files go from the status", async () => {
     const paused = await renderApp("paused");
+    await openStatus();
     await click("Fortsetzen");
     expect(paused.mock.calls).toContain("resume");
     expect(document.querySelector("h1")?.textContent).toBe("Alles aktuell");
 
     const silent = await renderApp("serverSilent");
+    await openStatus();
     await click("Jetzt versuchen");
     expect(silent.mock.calls).toContain("retryConnection");
 
     const metered = await renderApp("metered");
+    await openStatus();
     await click("Jetzt synchronisieren");
     expect(metered.mock.calls).toContain("syncNow");
   });
@@ -75,6 +151,7 @@ describe("status", () => {
   it("shows a failed action next to the button", async () => {
     const { mock } = await renderApp("paused");
     mock.controls.failNext = "unexpected";
+    await openStatus();
     await click("Fortsetzen");
     expect(status()).toContain("Etwas ist schiefgegangen. Deine Dateien sind nicht betroffen.");
   });
@@ -309,6 +386,62 @@ describe("folders", () => {
     expect(button("Fotos, D:\\Fotos, 117 Dateien werden hochgeladen")).toBeTruthy();
   });
 
+  it("shows the size of each folder on this disk, also in the accessible name", async () => {
+    await renderApp();
+    // Intl puts a no-break space between number and unit.
+    const sizes = all(".folder-row .row-size").map((size) => size.textContent.replace(/\s/g, " "));
+    expect(sizes).toEqual(["2,4 GB", "86,3 GB"]);
+    expect(button(/^Fotos, D:\\Fotos, Aktuell, 86,3\sGB$/)).toBeTruthy();
+  });
+
+  it.each<[ScenarioId, string, string[]]>([
+    ["upToDate", "done", ["is-ok", "is-ok"]],
+    ["syncing", "syncing", ["is-active", "is-active"]],
+    ["offline", "offline", ["is-quiet", "is-quiet"]],
+    ["paused", "paused", ["is-quiet", "is-quiet"]],
+    ["missingFolder", "needs you", ["is-ok", "is-stopped"]],
+  ])("marks the folders of %s as %s", async (scenario, _what, tones) => {
+    await renderApp(scenario);
+    await closeDialog();
+    const rows = all(".folder-row").map((row) =>
+      ["is-ok", "is-active", "is-stopped", "is-quiet"].find((tone) => row.classList.contains(tone)),
+    );
+    expect(rows).toEqual(tones);
+  });
+
+  it("switches between list and grid and keeps the choice in the settings", async () => {
+    const { mock } = await renderApp();
+    const list = button("Liste");
+    const grid = button("Kacheln");
+    expect(list.closest('[role="group"]')?.getAttribute("aria-label")).toBe("Ansicht");
+    expect(list.getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".folder-list.is-grid")).toBeNull();
+    await click(grid);
+    expect(mock.calls).toContain("setFolderView:grid");
+    expect(grid.getAttribute("aria-pressed")).toBe("true");
+    expect(list.getAttribute("aria-pressed")).toBe("false");
+    // The cards keep everything: name, status, size, the menu and the dashed "add" card.
+    const cards = all(".folder-list.is-grid .folder-row");
+    expect(cards).toHaveLength(2);
+    expect(cards[1]?.querySelector(".row-size")?.textContent.replace(/\s/g, " ")).toBe("86,3 GB");
+    expect(button("Fotos, D:\\Fotos, Aktuell").getAttribute("title")).toBe("D:\\Fotos");
+    expect(button("Aktionen für „Fotos“")).toBeTruthy();
+    expect(document.querySelector(".is-grid .add-row")).not.toBeNull();
+    // Read again on the next start.
+    await renderWith(mock);
+    expect(document.querySelector(".folder-list.is-grid")).not.toBeNull();
+  });
+
+  it("shows no size for a folder that was not scanned yet", async () => {
+    const { mock } = await renderApp();
+    mock.controls.pick = "ok";
+    await click("Ordner hinzufügen");
+    await click("Anderen Ordner wählen …");
+    const added = button("Projekte 2027").closest(".folder-row");
+    expect(added?.querySelector(".row-size")).toBeNull();
+    expect(button("Projekte 2027").getAttribute("aria-label")).not.toMatch(/\d B$/);
+  });
+
   it("opens a folder with Enter and offers the row menu", async () => {
     const { mock } = await renderApp();
     const row = button("Hangar Drive, C:\\Users\\Alex\\Hangar Drive, Aktuell");
@@ -415,7 +548,7 @@ describe("folders", () => {
   it("invites to add the first folder", async () => {
     await renderApp("empty");
     expect(text()).toContain("Noch kein Ordner");
-    expect(text()).toContain("Hier erscheint, was sich in deinen Ordnern ändert.");
+    expect(document.querySelector(".segmented")).toBeNull();
     await click(button(/^Ordner hinzufügen$/));
     expect(dialogTitle()).toBe("Ordner hinzufügen");
   });
@@ -474,8 +607,19 @@ describe("add folder", () => {
 });
 
 describe("activity", () => {
+  it("lives in the main menu, not in the window, and says when nothing happened yet", async () => {
+    await renderApp("empty");
+    expect(text()).not.toContain("Letzte Aktivitäten");
+    await openMenu("Letzte Aktivitäten");
+    expect(dialogTitle()).toBe("Letzte Aktivitäten");
+    expect(dialog()?.textContent).toContain("Hier erscheint, was sich in deinen Ordnern ändert.");
+    await click("Schließen");
+    expect(dialog()).toBeNull();
+  });
+
   it("lists what happened with folder, action and time", async () => {
     await renderApp();
+    await openMenu("Letzte Aktivitäten");
     expect(button("Bericht.docx, Hangar Drive, geändert, vor 2 Min.")).toBeTruthy();
     expect(button("Urlaub 014.jpg, Fotos, von Büro-PC, vor 1 Std.")).toBeTruthy();
     expect(button("Fotos: 120 neue Dateien")).toBeTruthy();
@@ -483,6 +627,7 @@ describe("activity", () => {
 
   it("shows a file in Explorer and opens its versions", async () => {
     const { mock } = await renderApp();
+    await openMenu("Letzte Aktivitäten");
     await click(button("Bericht.docx, Hangar Drive"));
     expect(mock.calls).toContain("openFolder:f-main:Projekte/Bericht.docx");
     await click("Aktionen für „Bericht.docx“");
@@ -497,6 +642,7 @@ describe("activity", () => {
 
   it("brings back files another device deleted", async () => {
     const { mock } = await renderApp();
+    await openMenu("Letzte Aktivitäten");
     const restore = all(".activity-row .row-note button")[0];
     await click(restore ?? document.body);
     expect(mock.calls).toContain("restoreRemoteDeleted");
@@ -541,17 +687,15 @@ describe("keyboard", () => {
 
   it("returns focus to the opener when a dialog closes", async () => {
     await renderApp();
-    const settings = button("Einstellungen");
-    settings.focus();
-    await click(settings);
+    await openMenu("Einstellungen");
     expect(dialog()).not.toBeNull();
     await key(dialog() ?? document.body, "Escape");
-    expect(document.activeElement).toBe(settings);
+    expect(document.activeElement).toBe(button("Menü"));
   });
 
   it("keeps Tab inside a dialog", async () => {
     await renderApp();
-    await click("Hilfe");
+    await openMenu("Hilfe");
     const close = button("Schließen");
     close.focus();
     await key(close, "Tab");
@@ -561,8 +705,14 @@ describe("keyboard", () => {
   it("puts the header buttons last in the tab order", async () => {
     await renderApp();
     const order = all("button, [tabindex='0']").filter((element) => element.tabIndex >= 0);
-    const settings = order.findIndex((element) => element.textContent === "Einstellungen");
-    const lastRow = order.findIndex((element) => element.textContent.includes("Plan 2027.xlsx"));
-    expect(settings).toBeGreaterThan(lastRow);
+    const menu = order.findIndex((element) => element.getAttribute("aria-label") === "Menü");
+    const content = order.filter((element) => element.closest("main") !== null);
+    const lastContent = order.indexOf(content[content.length - 1] ?? document.body);
+    // The folder list and the view switch are in the content, the header follows all of it.
+    expect(content.some((element) => element.closest(".folder-list") !== null)).toBe(true);
+    expect(content.some((element) => element.closest(".segmented") !== null)).toBe(true);
+    expect(lastContent).toBeGreaterThanOrEqual(0);
+    expect(menu).toBeGreaterThan(lastContent);
+    expect(order[menu + 1]?.classList.contains("status-button")).toBe(true);
   });
 });

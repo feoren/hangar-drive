@@ -123,6 +123,16 @@ export async function click(target: string | RegExp | HTMLElement): Promise<void
   await flush();
 }
 
+/** Opens an entry of the window's main menu ("≡" in the header): devices, settings, help. */
+export async function openMenu(entry: string): Promise<void> {
+  await click(button(/^(Menü|Menu)$/));
+  const item = all('[role="menu"] [role="menuitem"]').find(
+    (element) => element.textContent === entry,
+  );
+  if (!item) throw new Error(`no menu entry "${entry}"`);
+  await click(item);
+}
+
 export async function key(
   target: Element,
   keyName: string,

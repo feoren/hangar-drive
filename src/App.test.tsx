@@ -12,6 +12,7 @@ import {
   dialogTitle,
   flush,
   key,
+  openMenu,
   renderApp,
   renderWith,
   text,
@@ -40,7 +41,7 @@ describe("App", () => {
 
   it("changes the language at once when the person picks another one", async () => {
     const { mock } = await renderApp();
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     const select = all("select")[0];
     if (!(select instanceof HTMLSelectElement)) throw new Error("no select");
     select.value = "fr";
@@ -55,6 +56,7 @@ describe("App", () => {
     const { mock } = await renderApp("paused");
     expect(mock.tray?.icon).toBe("paused");
     expect(mock.tray?.tooltip).toMatch(/^Hangar Drive: Angehalten bis /);
+    await click(/^Angehalten bis /);
     await click("Fortsetzen");
     expect(mock.tray?.icon).toBe("upToDate");
   });
@@ -100,7 +102,7 @@ describe("App", () => {
       () => Promise.resolve(() => undefined),
     );
     await renderWith(tauri);
-    await click("Settings");
+    await openMenu("Settings");
     expect(text()).toContain("This version of Hangar Drive cannot do that yet.");
     expect(button("Close")).toBeTruthy();
     warn.mockRestore();

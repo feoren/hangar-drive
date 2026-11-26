@@ -105,9 +105,12 @@ export function StatusMark({
   );
 }
 
-/** The app's mark: the plain filled cloud, so it never claims a state. */
-export function BrandMark({
-  size = 20,
+/**
+ * The app's logo, the folded D of src-tauri/app-icon.svg (same paths), in its own colors in both
+ * themes: it is the product's sign, not a state. Decorative: the app's name stands next to it.
+ */
+export function AppLogo({
+  size = 22,
   className,
 }: {
   readonly size?: number;
@@ -118,11 +121,17 @@ export function BrandMark({
       className={className}
       width={size}
       height={size}
-      viewBox={VIEW_BOX}
+      viewBox="0 0 256 256"
       aria-hidden="true"
       focusable="false"
     >
-      <path d={CLOUD} fill="currentColor" />
+      <rect width="256" height="256" rx="56" fill="var(--logo-tile)" />
+      <path
+        d="M40 72L80 58H160L216 114V158L174 200H40ZM80 98V160H158L176 142V130L144 98Z"
+        fill="var(--logo-fold)"
+        fillRule="evenodd"
+      />
+      <path d="M104 112H128V128H104ZM136 136H160V152H136Z" fill="var(--logo-squares)" />
     </svg>
   );
 }

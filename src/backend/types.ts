@@ -88,6 +88,8 @@ export interface Folder {
   readonly freezeDays: number | null;
   /** Entries that are never synced (links, system files), shown as a quiet line. */
   readonly notSyncedCount: number;
+  /** The bytes of its files on this disk; null before the first scan, then nothing is shown. */
+  readonly bytes: Bytes | null;
 }
 
 export type FileAction =
@@ -636,9 +638,13 @@ export interface AcceptedHeads {
 // ---------------------------------------------------------------------------------------------
 // Settings
 
+/** How the main window lists the folders (UX 6.3). */
+export type FolderView = "list" | "grid";
+
 export interface Settings {
   readonly autostart: boolean;
   readonly language: Language | "system";
+  readonly folderView: FolderView;
 }
 
 export interface About {
@@ -928,6 +934,7 @@ export interface Backend {
   /** Turning it off asks natively first. */
   setAutostart(on: boolean): Promise<Confirmation>;
   setLanguage(language: Language | "system"): Promise<void>;
+  setFolderView(view: FolderView): Promise<void>;
   getAbout(): Promise<About>;
 
   // Tray (6.1, 6.2): the window computes icon, tooltip and menu, the backend draws them.
