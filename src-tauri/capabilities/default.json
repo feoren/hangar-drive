@@ -92,6 +92,7 @@
     "allow-get-settings",
     "allow-set-autostart",
     "allow-set-language",
+    "allow-set-folder-view",
     "allow-get-about",
     "allow-update-tray",
     "allow-show-window",

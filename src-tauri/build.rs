@@ -100,6 +100,7 @@ const COMMANDS: &[&str] = &[
     "get_settings",
     "set_autostart",
     "set_language",
+    "set_folder_view",
     "get_about",
     "update_tray",
     "show_window",
@@ -120,8 +121,8 @@ const TRAY_SIZES: &[u32] = &[16, 20, 24, 32];
 /// dark theme (src/styles.css), so tray and window speak one language.
 const THEMES: &[(&str, &str, &str)] = &[
     // (theme, glyph, attention)
-    ("light", "#1f2328", "#cf222e"),
-    ("dark", "#ffffff", "#f47067"),
+    ("light", "#1f2328", "#bb022a"),
+    ("dark", "#ffffff", "#ff9491"),
 ];
 
 /// Text keys the backend shows itself; a key ending in `.` takes every key with that prefix.

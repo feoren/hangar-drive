@@ -21,6 +21,8 @@ pub struct Stored {
     pub autostart_applied: bool,
     /// The one-time "keeps running in the notification area" was shown (ux-concept 3).
     pub close_hint_shown: bool,
+    /// How the main window lists the folders: `list` or `grid` (ux-concept 6.3).
+    pub folder_view: String,
 }
 
 impl Default for Stored {
@@ -29,6 +31,7 @@ impl Default for Stored {
             language: "system".into(),
             autostart_applied: false,
             close_hint_shown: false,
+            folder_view: "list".into(),
         }
     }
 }
@@ -47,6 +50,9 @@ impl Stored {
         if !is_language_choice(&stored.language) {
             stored.language = "system".into();
         }
+        if !is_folder_view(&stored.folder_view) {
+            stored.folder_view = "list".into();
+        }
         stored
     }
 
@@ -61,6 +67,11 @@ impl Stored {
         std::fs::write(&temp, bytes)?;
         std::fs::rename(&temp, path)
     }
+}
+
+/// `list` or `grid`.
+pub fn is_folder_view(value: &str) -> bool {
+    matches!(value, "list" | "grid")
 }
 
 /// `system` or one of the twelve languages.
@@ -109,13 +120,19 @@ mod tests {
             language: "fr".into(),
             autostart_applied: true,
             close_hint_shown: true,
+            folder_view: "grid".into(),
         };
         stored.save(&path).unwrap();
         assert_eq!(Stored::load(&path), stored);
-        std::fs::write(&path, b"{\"language\": \"xx\", \"closeHintShown\": true}").unwrap();
+        std::fs::write(
+            &path,
+            b"{\"language\": \"xx\", \"closeHintShown\": true, \"folderView\": \"tiles\"}",
+        )
+        .unwrap();
         let read = Stored::load(&path);
         assert_eq!(read.language, "system");
         assert!(read.close_hint_shown);
+        assert_eq!(read.folder_view, "list");
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(Stored::load(&path), Stored::default());
         let _ = std::fs::remove_dir_all(&dir);
@@ -140,5 +157,7 @@ mod tests {
         assert!(is_language_choice("system"));
         assert!(is_language_choice("zh"));
         assert!(!is_language_choice("EN"));
+        assert!(is_folder_view("list") && is_folder_view("grid"));
+        assert!(!is_folder_view("Grid"));
     }
 }

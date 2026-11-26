@@ -134,9 +134,11 @@ pub struct PairingOffer {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     autostart: bool,
     language: String,
+    folder_view: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2105,6 +2107,7 @@ pub async fn get_settings(app: AppHandle, shell: State<'_, Shell>) -> Answer<Set
     Ok(SettingsView {
         autostart: app.autolaunch().is_enabled().unwrap_or(false),
         language: lock(&shell.settings).language.clone(),
+        folder_view: lock(&shell.settings).folder_view.clone(),
     })
 }
 
@@ -2141,6 +2144,16 @@ pub async fn set_language(shell: State<'_, Shell>, language: String) -> Answer<(
         return Err(CommandError::invalid("unknown language"));
     }
     lock(&shell.settings).language = language;
+    shell.save_settings()
+}
+
+/// How the main window lists the folders, kept across restarts.
+#[tauri::command]
+pub async fn set_folder_view(shell: State<'_, Shell>, view: String) -> Answer<()> {
+    if !crate::settings::is_folder_view(&view) {
+        return Err(CommandError::invalid("unknown folder view"));
+    }
+    lock(&shell.settings).folder_view = view;
     shell.save_settings()
 }
 
@@ -2275,6 +2288,7 @@ macro_rules! command_handler {
             $crate::commands::get_settings,
             $crate::commands::set_autostart,
             $crate::commands::set_language,
+            $crate::commands::set_folder_view,
             $crate::commands::get_about,
             $crate::commands::update_tray,
             $crate::commands::show_window,
@@ -2370,6 +2384,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "get_settings",
     "set_autostart",
     "set_language",
+    "set_folder_view",
     "get_about",
     "update_tray",
     "show_window",
@@ -2472,6 +2487,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(about("0.1.0", off)).unwrap(),
             json!({ "version": "0.1.0", "build": null, "updates": false })
+        );
+        // A folder row with its size, null before the first scan.
+        let folder = |bytes| hangar_drive_sync::api::Folder {
+            id: "f".into(),
+            name: "Docs".into(),
+            path: "C:\\Docs".into(),
+            status: hangar_drive_sync::api::FolderStatus::UpToDate,
+            freeze_days: None,
+            not_synced_count: 0,
+            bytes,
+        };
+        assert_eq!(
+            serde_json::to_value(folder(Some(2_400))).unwrap(),
+            json!({
+                "id": "f",
+                "name": "Docs",
+                "path": "C:\\Docs",
+                "status": { "kind": "upToDate" },
+                "freezeDays": null,
+                "notSyncedCount": 0,
+                "bytes": 2400
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(folder(None)).unwrap()["bytes"],
+            json!(null)
         );
         // The suspect warning and the server notices, as src/backend/tauri/decoders.ts reads
         // them (ADR 0001, section 5).

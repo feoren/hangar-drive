@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-folder-view"
+description = "Enables the set_folder_view command without any pre-configured scope."
+commands.allow = ["set_folder_view"]
+
+[[permission]]
+identifier = "deny-set-folder-view"
+description = "Denies the set_folder_view command without any pre-configured scope."
+commands.deny = ["set_folder_view"]
