@@ -3,8 +3,8 @@
 
 import { useRef, useState } from "react";
 
-import type { Folder } from "../backend/types";
-import { useT, type Translate } from "../i18n";
+import type { Folder, StopReason } from "../backend/types";
+import { useT, type MessageKey, type Translate } from "../i18n";
 import { useBackend } from "../ui/backendContext";
 import { FolderIcon, PlusIcon } from "../ui/icons";
 import { RowMenu, type MenuItem } from "../ui/Menu";
@@ -12,6 +12,15 @@ import { Feedback, PathText } from "../ui/parts";
 import { isMenuKey, useRoving } from "../ui/roving";
 import { errorText, useAction } from "../ui/useAsync";
 import type { Open } from "./openDialog";
+
+/** Why a folder stopped, in words. */
+const STOP_REASON_TEXT: Readonly<Record<StopReason, MessageKey>> = {
+  missing: "folder.reason.missing",
+  olderState: "folder.reason.olderState",
+  removedHeads: "folder.reason.removedHeads",
+  treeLimit: "folder.reason.treeLimit",
+  tooLarge: "folder.reason.tooLarge",
+};
 
 export function folderStatusText(folder: Folder, t: Translate): string {
   const status = folder.status;
@@ -26,13 +35,7 @@ export function folderStatusText(folder: Folder, t: Translate): string {
       return t("folder.status.paused");
     case "stopped":
       return t("folder.status.stopped", {
-        reason: t(
-          status.reason === "missing"
-            ? "folder.reason.missing"
-            : status.reason === "olderState"
-              ? "folder.reason.olderState"
-              : "folder.reason.removedHeads",
-        ),
+        reason: t(STOP_REASON_TEXT[status.reason]),
       });
   }
 }

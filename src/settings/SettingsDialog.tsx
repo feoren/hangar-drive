@@ -2,7 +2,7 @@
 // information: the account and "About", with the error report and the two honest notes, and
 // "Help" with "Reset this device" for starting over.
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useId, useState } from "react";
 
 import { HANGAR_DRIVE_BUILD } from "../buildInfo";
 import { formatSize } from "../format";
@@ -165,6 +165,8 @@ export function noticeText(
       return t("notice.budgetDevice", { device: notice.device });
     case "minCount":
       return t("notice.minCount", { days: notice.days });
+    case "olderAccountState":
+      return t("notice.olderAccountState", { app: t("app.name") });
   }
 }
 
@@ -231,70 +233,30 @@ function ErrorReport() {
 }
 
 /**
- * "Reset this device": forgets the account here, the files stay. Asked once, in place, because
- * it cannot be undone from this device; afterwards the snapshot says the setup is needed and the
- * window shows the welcome.
+ * "Reset this device": forgets the account here, the files stay. The shell asks natively before
+ * it acts (security review M4), so the window asks nothing itself; afterwards the snapshot says
+ * the setup is needed and the window shows the welcome. "No" there changes nothing.
  */
 function ResetDevice() {
   const t = useT();
   const backend = useBackend();
   const action = useAction();
-  const [asking, setAsking] = useState(false);
-  const bodyId = useId();
   const app = t("app.name");
-  const cancel = useRef<HTMLButtonElement>(null);
-  const start = useRef<HTMLButtonElement>(null);
-  const [asked, setAsked] = useState(false);
-  // The focus follows the question in and back out, so it never falls to the page.
-  useEffect(() => {
-    if (asking) cancel.current?.focus();
-    else if (asked) start.current?.focus();
-  }, [asking, asked]);
   return (
     <div className="report">
       <p className="setting-help">{t("reset.help", { app })}</p>
-      {asking ? (
-        <div role="group" aria-labelledby={bodyId}>
-          <p id={bodyId} className="field-label">
-            {t("reset.question")}
-          </p>
-          <p className="setting-help">{t("reset.body", { app })}</p>
-          <div className="group-actions">
-            <button
-              ref={cancel}
-              type="button"
-              className="button secondary"
-              onClick={() => {
-                setAsking(false);
-              }}
-            >
-              {t("common.cancel")}
-            </button>
-            <button
-              type="button"
-              className="button danger"
-              disabled={action.pending}
-              onClick={() => {
-                void action.run(() => backend.resetDevice());
-              }}
-            >
-              {t("reset.confirm")}
-            </button>
-          </div>
-        </div>
-      ) : (
-        <button
-          ref={start}
-          type="button"
-          className="button secondary"
-          onClick={() => {
-            setAsked(true);
-            setAsking(true);
-          }}
-        >
-          {t("reset.action")}
-        </button>
-      )}
+      <button
+        type="button"
+        className="button secondary"
+        disabled={action.pending}
+        onClick={() => {
+          void action.run(async () => {
+            await backend.resetDevice();
+          });
+        }}
+      >
+        {t("reset.action")}
+      </button>
       {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
     </div>
   );

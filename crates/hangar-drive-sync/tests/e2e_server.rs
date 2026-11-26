@@ -543,6 +543,9 @@ impl ServerApi for Recorded {
     fn seen_pin(&self) -> Option<[u8; 32]> {
         self.inner.seen_pin()
     }
+    fn set_known_log_length(&mut self, length: u64) {
+        self.inner.set_known_log_length(length);
+    }
 }
 
 /// The real server factory (`engine::real_server_factory`) behind [`Recorded`].
@@ -996,7 +999,9 @@ fn pair(inviter: &mut Peer, joiner: &mut Peer, name: &str, clock: &TestClock) {
 /// log again: the window keeps showing "online" without a warning, and every pass signs in
 /// again until the server answers `RateLimited`. The in-memory server lets a removed device read
 /// the log, so `tests/engine.rs` passed. Now the server answers the removed device's own proof
-/// with `DeviceRemoved`, and the engine forgets the account (security review L1).
+/// with `DeviceRemoved` and the device log from the head the device named up to its removal
+/// (security review H2). The device verifies that log from its own head, finds A's valid
+/// removal of itself and forgets the account at once (security review L1), with A's name.
 #[test]
 fn a_removed_device_learns_that_it_was_removed() {
     let scratch = Scratch::new("removed");
@@ -1011,12 +1016,15 @@ fn a_removed_device_learns_that_it_was_removed() {
     wait_for(
         &mut [&mut a, &mut b],
         &clock,
-        "B showing it was removed",
+        "B showing the verified removal",
         |p| {
             p[1].has_warning(|w| matches!(w, Warning::Removed { .. }))
                 .then_some(())
         },
     );
+    // The removal came with the log and verified, so nobody had to confirm anything (H2).
+    assert!(b.has_warning(|w| matches!(w, Warning::Removed { by, .. } if by == "Laptop A")));
+    assert!(!b.has_warning(|w| matches!(w, Warning::RemovalReported { .. })));
     assert_eq!(b.core.snapshot().setup, SetupState::Needed);
     assert!(
         b.keychain.0.borrow().is_empty(),
@@ -1226,13 +1234,14 @@ fn the_core_flow_works_against_the_real_server() {
         host: offer_host,
         account: offer_account,
         pinned,
+        punycode,
     }) = b.core.inspect_link(&offer.link)
     else {
         panic!("the offer does not read");
     };
     assert_eq!(offer_host, host);
     assert_eq!(offer_account, offer.account);
-    assert!(!pinned);
+    assert!(!pinned && !punycode);
     let ApiResult::Ok(safety_b) = b
         .core
         .start_pairing(&offer.link, "Desktop B")
@@ -1600,13 +1609,13 @@ fn the_core_flow_works_against_the_real_server() {
         .put_object(&folder_id, &probe, &[0u8; 64])
         .expect_err("upload after the removal");
     assert!(is_auth_refusal(&refused), "{refused:?}");
-    // B's engine keeps running: it shows that it was removed and forgets the account (E2E-3),
-    // and a new file never reaches A.
+    // B's engine keeps running: it verifies the removal the server sends with its answer and
+    // forgets the account (E2E-3, H2), and a new file never reaches A.
     b.write("written-after-removal.txt", b"must not arrive");
     wait_for(
         &mut [&mut a, &mut b],
         &clock,
-        "B showing it was removed",
+        "B showing the verified removal",
         |p| {
             p[1].has_warning(|w| matches!(w, Warning::Removed { .. }))
                 .then_some(())
@@ -1709,17 +1718,20 @@ fn the_core_flow_works_against_the_real_server() {
         assert_eq!(answer, ApiResult::Err(RecoverError::Used));
         assert_eq!(again.core.snapshot().setup, SetupState::Needed);
     }
-    // A, removed by C, uploads nothing any more either, and shows that it was removed (E2E-3).
+    // A, removed by C, uploads nothing any more either: the log the server sends with its
+    // answer runs from A's head over the recovery device's entry to C's removal of A, which A
+    // verifies, so it forgets the account by itself (E2E-3, overall security review H2).
     a.write("written-by-removed-a.txt", b"must not arrive");
     wait_for(
         &mut [&mut a, &mut c],
         &clock,
-        "A showing it was removed",
+        "A showing the verified removal",
         |p| {
             p[0].has_warning(|w| matches!(w, Warning::Removed { .. }))
                 .then_some(())
         },
     );
+    assert_eq!(a.core.snapshot().setup, SetupState::Needed);
     run_rounds(&mut [&mut a, &mut c], &clock, 5);
     assert!(!c.files().contains_key("written-by-removed-a.txt"));
     steps.done("9 recovery");

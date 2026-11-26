@@ -29,11 +29,13 @@ describe("mock scenarios", () => {
         "quota",
         "quotaFull",
         "refused",
+        "removalReported",
         "removed",
         "removedHeads",
         "serverDisk",
         "serverIdentity",
         "suspect",
+        "treeLimit",
         "updateRequired",
       ].sort(),
     );
@@ -178,7 +180,11 @@ describe("mock magic inputs", () => {
 
   it("take in changes of a removed device and name the state before them", async () => {
     const heads = new MockBackend({ scenario: "removedHeads" });
-    expect(await heads.acceptRemovedHeads("f-photos")).toEqual({ count: 1, beforeEntryId: "t3" });
+    expect(await heads.acceptRemovedHeads("f-photos")).toEqual({
+      kind: "accepted",
+      count: 1,
+      beforeEntryId: "t3",
+    });
     const snapshot = await heads.getSnapshot();
     expect(snapshot.warnings).toEqual([]);
     expect(snapshot.folders.find((folder) => folder.id === "f-photos")?.status).toEqual({
@@ -220,8 +226,8 @@ describe("mock controls", () => {
     expect(result.value.groups[0]?.startsWith("D")).toBe(true);
     expect(result.value.checkGroup).toBeGreaterThan(1);
     const group = result.value.groups[result.value.checkGroup - 1] ?? "";
-    expect(await mock.confirmRecoveryGroup("WRONG")).toBe(false);
-    expect(await mock.confirmRecoveryGroup(group.toLowerCase())).toBe(true);
+    expect(await mock.confirmRecoveryGroup("WRONG")).toBe("wrong");
+    expect(await mock.confirmRecoveryGroup(group.toLowerCase())).toBe("confirmed");
   });
 
   it("finish the setup into a state with one folder", async () => {

@@ -31,6 +31,8 @@ pub struct App {
     /// a proof is then refused, never checked against the URL the device signed.
     pub public_url: Option<String>,
     pub trusted_proxies: Vec<IpNet>,
+    /// Unlisted local proxies already warned about (overall review N3).
+    pub forwarder_warnings: crate::http::client_ip::ForwarderWarnings,
     pub limiter: RateLimiter,
     pub events: Arc<EventHub>,
     pub states: StateCache,

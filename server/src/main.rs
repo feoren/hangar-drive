@@ -166,7 +166,8 @@ async fn invite(config: &Config, args: &[String]) -> Result<()> {
     // Checked before the invite exists, so a missing address never leaves an unusable invite.
     let public_url = config.public_url.as_deref().ok_or_else(|| {
         anyhow!(
-            "set {} to the address devices reach this server under, for example              https://drive.example.org/",
+            "set {} to the address devices reach this server under, for example \
+             https://drive.example.org/",
             hangar_drive_server::config::PUBLIC_URL_VAR
         )
     })?;
@@ -183,7 +184,8 @@ async fn invite(config: &Config, args: &[String]) -> Result<()> {
     let (app, _shutdown) = open(config).await?;
     let (token, expires_ms) = accounts::create_invite(&app.db, app.now_ms(), days).await?;
     eprintln!(
-        "Single-use invite, valid for {days} days (until {} UTC). It is shown only now; send          the whole link, the part after # is the invite.",
+        "Single-use invite, valid for {days} days (until {} UTC). It is shown only now; send \
+         the whole link, the part after # is the invite.",
         format_ms(expires_ms)
     );
     println!(

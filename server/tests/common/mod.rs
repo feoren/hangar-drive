@@ -69,6 +69,8 @@ pub struct Options {
     pub concurrency: Concurrency,
     /// `HANGAR_DRIVE_PUBLIC_URL`, which `serve` needs; the test devices sign for [`TEST_URL`].
     pub public_url: &'static str,
+    /// Wraps the object store (`Deps::store_layer`).
+    pub store_layer: Option<hangar_drive_server::StoreLayer>,
 }
 
 impl Default for Options {
@@ -83,6 +85,7 @@ impl Default for Options {
             tls: false,
             concurrency: Concurrency::default(),
             public_url: TEST_URL,
+            store_layer: None,
         }
     }
 }
@@ -134,6 +137,7 @@ impl TestServer {
             disk: Some(disk.clone()),
             limiter: options.limiter,
             gc_job: false,
+            store_layer: options.store_layer,
         };
         let mut server: Server = hangar_drive_server::build(&config, deps).await.unwrap();
         if let Some(timeout) = options.header_timeout {
@@ -471,6 +475,7 @@ impl Account {
                     challenge: challenge.challenge,
                     server_url: TEST_URL.into(),
                     signature,
+                    log_length: None,
                 },
             )
             .await;

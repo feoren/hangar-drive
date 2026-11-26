@@ -83,19 +83,35 @@ describe("settings (UX 11)", () => {
 });
 
 describe("reset this device", () => {
-  it("asks once in place, then goes back to the welcome", async () => {
+  // Security review M4: the shell asks natively, so the window asks nothing before it; "no"
+  // there keeps everything as it was and shows no error.
+  it("asks natively only, then goes back to the welcome", async () => {
     const { mock } = await renderApp();
     await click("Einstellungen");
     expect(text()).toContain("Hilfe");
+    mock.controls.nativeConfirm = "no";
     await click("Dieses Gerät zurücksetzen");
-    expect(text()).toContain("Dieses Gerät wirklich zurücksetzen?");
-    expect(document.activeElement?.textContent).toBe("Abbrechen");
-    await click("Abbrechen");
-    expect(mock.calls).not.toContain("resetDevice");
-    expect(document.activeElement?.textContent).toBe("Dieses Gerät zurücksetzen");
-    await click("Dieses Gerät zurücksetzen");
-    await click("Zurücksetzen");
     expect(mock.calls).toContain("resetDevice");
+    expect(text()).not.toContain("Dieses Gerät wirklich zurücksetzen?");
+    expect(text()).toContain("Einstellungen");
+    expect(document.querySelector(".error-text, .feedback.error")).toBeNull();
+    mock.controls.nativeConfirm = "yes";
+    await click("Dieses Gerät zurücksetzen");
     expect(document.querySelector("h1")?.textContent).toBe("Willkommen bei Hangar Drive");
+  });
+
+  // Security review M4: turning autostart off asks natively; "no" leaves it on.
+  it("turns autostart off only after the native question", async () => {
+    const { mock } = await renderApp();
+    await click("Einstellungen");
+    const autostart = () => document.querySelector<HTMLInputElement>('input[role="switch"]');
+    expect(autostart()?.checked).toBe(true);
+    mock.controls.nativeConfirm = "no";
+    await click(autostart() ?? document.body);
+    expect(mock.calls).toContain("setAutostart");
+    expect(autostart()?.checked).toBe(true);
+    mock.controls.nativeConfirm = "yes";
+    await click(autostart() ?? document.body);
+    expect(autostart()?.checked).toBe(false);
   });
 });

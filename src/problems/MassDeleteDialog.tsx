@@ -83,8 +83,9 @@ export function MassDeleteDialog({
           disabled={action.pending}
           onClick={() => {
             void action.run(async () => {
-              const count = await backend.resolveMassDelete(warning.id, "delete");
-              setDone(t("deletes.done", { count }));
+              // "No" in the native question leaves the dialog as it is.
+              const outcome = await backend.resolveMassDelete(warning.id, "delete");
+              if (outcome.kind === "resolved") setDone(t("deletes.done", { count: outcome.count }));
             });
           }}
         >
@@ -97,8 +98,10 @@ export function MassDeleteDialog({
           disabled={action.pending}
           onClick={() => {
             void action.run(async () => {
-              const count = await backend.resolveMassDelete(warning.id, "restore");
-              setDone(t("deletes.restored", { count }));
+              const outcome = await backend.resolveMassDelete(warning.id, "restore");
+              if (outcome.kind === "resolved") {
+                setDone(t("deletes.restored", { count: outcome.count }));
+              }
             });
           }}
         >

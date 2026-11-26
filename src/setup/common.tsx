@@ -2,7 +2,13 @@
 
 import { useId, useState } from "react";
 
-import type { AccountFolder, FolderChoice, FolderPlace, NameError } from "../backend/types";
+import type {
+  AccountFolder,
+  DeviceNameError,
+  FolderChoice,
+  FolderPlace,
+  NameError,
+} from "../backend/types";
 import { formatSize } from "../format";
 import { nameProblem } from "../domain/names";
 import { useLanguage, useT, type Translate } from "../i18n";
@@ -11,7 +17,6 @@ import { useBackend } from "../ui/backendContext";
 import { FolderIcon } from "../ui/icons";
 import { Feedback, Loading, PathText } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
-import { MergeDialog } from "./MergeDialog";
 
 /** "Schritt 1 von 3" with a quiet bar of segments: the steps really are a sequence (UX 4.2). */
 export function StepIndicator({ step, total }: { readonly step: number; readonly total: number }) {
@@ -30,8 +35,15 @@ export function StepIndicator({ step, total }: { readonly step: number; readonly
 
 /** The device name field, prefilled with the computer name (UX 4.2 step 1). */
 /** The words for a refused name (rule N5), shown at the field. */
-export function nameErrorText(error: NameError, t: Translate): string {
-  return error === "blank" ? t("name.blank") : t("name.edgeWhitespace");
+export function nameErrorText(error: DeviceNameError, t: Translate): string {
+  switch (error) {
+    case "blank":
+      return t("name.blank");
+    case "edgeWhitespace":
+      return t("name.edgeWhitespace");
+    case "looksLike":
+      return t("devices.name.lookAlike");
+  }
 }
 
 export function DeviceNameField({
@@ -86,7 +98,10 @@ function proposed(folder: AccountFolder): FolderPlace {
 
 /**
  * "Which folders should be on this device?" (UX 4.3 step 2, 4.4 step 5): all checked, each at a
- * proposed place. A place that already holds files asks the merge question first (6.5).
+ * proposed place. A place that already holds files is asked about natively by the shell, with
+ * the place, the number of files and the server (6.5, security review H1); "Choose another
+ * folder" there opens the picker for that folder here, and the folders joined meanwhile leave
+ * the list.
  */
 export function FolderChoiceStep({
   titleId,
@@ -103,10 +118,6 @@ export function FolderChoiceStep({
   const [loaded] = useLoad(() => backend.listAccountFolders(), [backend]);
   const [choices, setChoices] = useState<readonly Choice[] | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [asking, setAsking] = useState<{
-    queue: readonly Choice[];
-    done: readonly FolderChoice[];
-  } | null>(null);
   const action = useAction();
 
   const list =
@@ -120,25 +131,36 @@ export function FolderChoiceStep({
     setChoices(list.map((choice) => (choice.folder.id === id ? { ...choice, ...change } : choice)));
   };
 
-  /** Walks the checked folders; one that is not empty stops at the merge question. */
-  const proceed = (queue: readonly Choice[], done: readonly FolderChoice[]) => {
+  /** Joins the checked folders; one declined natively gets the picker, the joined ones go. */
+  const proceed = (chosen: readonly Choice[]) => {
+    if (!list) return;
     void action.run(async () => {
-      const rest = [...queue];
-      const accepted = [...done];
-      while (rest.length > 0) {
-        const next = rest[0];
-        if (!next) break;
-        const count = await backend.countLocalFiles(next.place.token);
-        if (count > 0) {
-          setAsking({ queue: rest, done: accepted });
-          return;
-        }
-        accepted.push({ folderId: next.folder.id, token: next.place.token });
-        rest.shift();
+      const declined = await backend.joinFolders(
+        chosen.map((choice): FolderChoice => ({
+          folderId: choice.folder.id,
+          token: choice.place.token,
+        })),
+      );
+      if (declined.length === 0) {
+        onDone();
+        return;
       }
-      setAsking(null);
-      await backend.joinFolders(accepted);
-      onDone();
+      const joined = new Set(
+        chosen.filter((choice) => !declined.includes(choice.folder.id)).map((c) => c.folder.id),
+      );
+      let rest = list.filter((choice) => !joined.has(choice.folder.id));
+      const first = declined[0];
+      if (first !== undefined) {
+        const result = await backend.pickFolder({ kind: "account", folderId: first });
+        if (result.kind === "picked") {
+          rest = rest.map((choice) =>
+            choice.folder.id === first ? { ...choice, place: result } : choice,
+          );
+        }
+        if (result.kind === "refused")
+          setMessage(folderRefusalText(result.reason, result.folder, t));
+      }
+      setChoices(rest);
     });
   };
 
@@ -148,7 +170,6 @@ export function FolderChoiceStep({
   const free = loaded.data.free;
   const chosen = list.filter((choice) => choice.checked);
   const total = chosen.reduce((sum, choice) => sum + choice.folder.size, 0);
-  const current = asking?.queue[0];
 
   return (
     <div className="step-form">
@@ -213,29 +234,13 @@ export function FolderChoiceStep({
           aria-disabled={chosen.length === 0 || action.pending}
           onClick={() => {
             if (chosen.length === 0) return;
-            proceed(chosen, []);
+            setMessage(null);
+            proceed(chosen);
           }}
         >
           {t("setup.done")}
         </button>
       </div>
-      {asking && current && (
-        <MergeDialog
-          folderId={current.folder.id}
-          folderName={current.folder.name}
-          place={current.place}
-          onMerge={(place) => {
-            update(current.folder.id, { place });
-            const accepted = [...asking.done, { folderId: current.folder.id, token: place.token }];
-            setAsking(null);
-            proceed(asking.queue.slice(1), accepted);
-            return Promise.resolve();
-          }}
-          onClose={() => {
-            setAsking(null);
-          }}
-        />
-      )}
     </div>
   );
 }

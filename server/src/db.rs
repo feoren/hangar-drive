@@ -30,6 +30,11 @@ pub async fn connect(path: &Path) -> Result<Db, DbError> {
         // like a rollback to it.
         .synchronous(SqliteSynchronous::Full)
         .foreign_keys(true)
+        // Deleted rows (expired sessions' token hashes, dropped records, deleted folders'
+        // reference lists) are overwritten with zeros instead of lingering in free pages,
+        // where a copy of the database file would still hold them (overall review, info). The
+        // WAL keeps a deleted page only until the next checkpoint.
+        .pragma("secure_delete", "ON")
         .busy_timeout(Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
@@ -55,4 +60,23 @@ pub fn i64_of(value: u64) -> i64 {
 /// An `INTEGER` read back; negative values (never written) read as 0.
 pub fn u64_of(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn deleted_rows_are_overwritten() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/.tmp/server-unit/db-secure-delete");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = super::connect(&dir.join("meta.db")).await.unwrap();
+        let on: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(on, 1, "every connection of the pool deletes securely");
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

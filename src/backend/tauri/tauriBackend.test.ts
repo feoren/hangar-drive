@@ -64,6 +64,13 @@ describe("tauri backend", () => {
     const snapshot = await new MockBackend({ scenario: "many" }).getSnapshot();
     const { backend } = backendWith({ get_snapshot: JSON.parse(JSON.stringify(snapshot)) });
     await expect(backend.getSnapshot()).resolves.toEqual(snapshot);
+    // The engine's states of the overall security review (H2, M2, M3) decode too, so a snapshot
+    // with one of them does not break the window.
+    for (const scenario of ["removalReported", "treeLimit"] as const) {
+      const state = await new MockBackend({ scenario }).getSnapshot();
+      const bridge = backendWith({ get_snapshot: JSON.parse(JSON.stringify(state)) });
+      await expect(bridge.backend.getSnapshot()).resolves.toEqual(state);
+    }
   });
 
   it("decodes results with their error codes", async () => {
@@ -156,7 +163,7 @@ describe("the sync engine's shapes", () => {
         ok: true,
         value: { kind: "pair", host: "h", account: "3f9a", pinned: false },
       },
-      accept_removed_heads: { count: 2, beforeEntryId: null },
+      accept_removed_heads: { kind: "accepted", count: 2, beforeEntryId: null },
     });
     await expect(backend.checkInvite("l")).resolves.toEqual({
       ok: true,
@@ -164,6 +171,7 @@ describe("the sync engine's shapes", () => {
     });
     await expect(backend.inspectLink("l")).resolves.toMatchObject({ value: { kind: "pair" } });
     await expect(backend.acceptRemovedHeads("f")).resolves.toEqual({
+      kind: "accepted",
       count: 2,
       beforeEntryId: null,
     });
@@ -244,8 +252,8 @@ describe("tauri backend after the security review (L2, M2)", () => {
       count_local_files: 3,
       finish_setup: null,
       add_folder: null,
-      add_account_folder: null,
-      join_folders: null,
+      add_account_folder: "declined",
+      join_folders: ["f"],
       list_account_folders: {
         folders: [
           { id: "f", name: "Docs", size: 1, proposedPath: place.path, proposedToken: "p1" },
@@ -264,8 +272,8 @@ describe("tauri backend after the security review (L2, M2)", () => {
     await backend.countLocalFiles("t0k");
     await backend.finishSetup("t0k");
     await backend.addFolder("t0k");
-    await backend.addAccountFolder("f", "t0k");
-    await backend.joinFolders([{ folderId: "f", token: "p1" }]);
+    await expect(backend.addAccountFolder("f", "t0k")).resolves.toBe("declined");
+    await expect(backend.joinFolders([{ folderId: "f", token: "p1" }])).resolves.toEqual(["f"]);
     expect(calls.slice(3).map((call) => [call.command, call.args])).toEqual([
       ["count_local_files", { token: "t0k" }],
       ["finish_setup", { token: "t0k" }],
@@ -334,8 +342,36 @@ describe("tauri backend after the security review (L2, M2)", () => {
   });
 
   it("resets this device", async () => {
-    const { backend, calls } = backendWith({ reset_device: null });
-    await backend.resetDevice();
+    const { backend, calls } = backendWith({ reset_device: "confirmed" });
+    await expect(backend.resetDevice()).resolves.toBe("confirmed");
     expect(calls).toEqual([{ command: "reset_device", args: {} }]);
+  });
+
+  // Security review M4: the answers of the native questions, "declined" included, decode; an
+  // answer of the old shape does not pass silently.
+  it("decodes the answers of the native questions", async () => {
+    const { backend } = backendWith({
+      remove_device: "declined",
+      disconnect_this_device: "confirmed",
+      reanchor: "declined",
+      set_autostart: "declined",
+      confirm_recovery_group: "declined",
+      resolve_mass_delete: { kind: "declined" },
+      accept_removed_heads: { kind: "declined" },
+      install_update: { kind: "declined" },
+    });
+    await expect(backend.removeDevice("d")).resolves.toBe("declined");
+    await expect(backend.disconnectThisDevice()).resolves.toBe("confirmed");
+    await expect(backend.reanchor("f", true)).resolves.toBe("declined");
+    await expect(backend.setAutostart(false)).resolves.toBe("declined");
+    await expect(backend.confirmRecoveryGroup("ABCD")).resolves.toBe("declined");
+    await expect(backend.resolveMassDelete("w", "delete")).resolves.toEqual({ kind: "declined" });
+    await expect(backend.acceptRemovedHeads("f")).resolves.toEqual({ kind: "declined" });
+    await expect(backend.installUpdate()).resolves.toEqual({ kind: "declined" });
+    const old = backendWith({ confirm_recovery_group: true, remove_device: null });
+    await expect(old.backend.confirmRecoveryGroup("ABCD")).rejects.toMatchObject({
+      code: "badResponse",
+    });
+    await expect(old.backend.removeDevice("d")).rejects.toMatchObject({ code: "badResponse" });
   });
 });

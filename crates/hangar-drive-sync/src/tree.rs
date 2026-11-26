@@ -408,23 +408,69 @@ impl Tree {
                 return Err(TreeError::Parent);
             }
         }
-        for id in self.nodes.keys() {
-            if self.path(id).is_none() {
-                return Err(TreeError::Cycle);
-            }
-        }
-        for (parent, kids) in &self.children {
-            let _ = parent;
+        // One walk down from the root through the child links, O(n) (security review M3; the
+        // walk from every item up to the root was O(n x depth), about 10^9 steps for a chain of
+        // 40,000 directories). Every parent is a directory of the tree, so an item the walk
+        // does not reach is on a cycle of parent links.
+        let mut reached = 0usize;
+        let mut stack = vec![ROOT];
+        while let Some(dir) = stack.pop() {
             let mut keys = BTreeSet::new();
-            for kid in kids {
-                if let Some(node) = self.nodes.get(kid) {
-                    if !keys.insert(node.key()) {
-                        return Err(TreeError::DuplicateName);
-                    }
+            for kid in self.children(&dir) {
+                let Some(node) = self.nodes.get(kid) else {
+                    continue;
+                };
+                if !keys.insert(node.key()) {
+                    return Err(TreeError::DuplicateName);
+                }
+                reached += 1;
+                if node.is_dir() {
+                    stack.push(*kid);
                 }
             }
         }
+        if reached != self.nodes.len() {
+            return Err(TreeError::Cycle);
+        }
         Ok(())
+    }
+
+    /// Whether the tree holds at most `max_items` items and no item deeper than `max_depth`
+    /// (1 for a top level item), the limits a device decodes (`codec::MAX_TREE_ITEMS`,
+    /// `codec::MAX_TREE_DEPTH`). One walk down from the root, O(n); an item the walk does not
+    /// reach (a broken tree) is not counted, [`Tree::check`] refuses such a tree.
+    pub fn within(&self, max_items: usize, max_depth: usize) -> bool {
+        if self.nodes.len() > max_items {
+            return false;
+        }
+        let mut stack = vec![(ROOT, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for kid in self.children(&dir) {
+                if depth + 1 > max_depth {
+                    return false;
+                }
+                if self.nodes.get(kid).is_some_and(Node::is_dir) {
+                    stack.push((*kid, depth + 1));
+                }
+            }
+        }
+        true
+    }
+
+    /// The directories reachable from the root, every parent before its children (breadth
+    /// first), in O(n); [`ROOT`] itself is not listed.
+    pub fn dirs_top_down(&self) -> Vec<ItemId> {
+        let mut out = Vec::new();
+        let mut queue = std::collections::VecDeque::from([ROOT]);
+        while let Some(dir) = queue.pop_front() {
+            for kid in self.children(&dir) {
+                if self.nodes.get(kid).is_some_and(Node::is_dir) {
+                    out.push(*kid);
+                    queue.push_back(*kid);
+                }
+            }
+        }
+        out
     }
 
     /// The rows changed since the last call; clears the record.

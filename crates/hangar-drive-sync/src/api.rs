@@ -63,6 +63,11 @@ pub struct ServerNumberView {
     pub number: NumberRows,
     /// The command the operator runs on the server.
     pub command: String,
+    /// The pin (SHA-256 of the SPKI) of the key whose number this is. The shell hands it back to
+    /// `confirm_server_number`, so only the key whose number the person compared is taken
+    /// (security review N7); the window never sees it.
+    #[serde(skip)]
+    pub pin: [u8; 32],
 }
 
 /// Why an offer could not bring the server's new identity (`fixServerWithOffer`).
@@ -150,6 +155,12 @@ pub enum StopReasonApi {
     OlderState,
     /// Heads of a removed device wait for the person's decision (security review H1).
     RemovedHeads,
+    /// The server's tree of the folder is beyond the limits of a folder (security review M3);
+    /// a restore ("Undo a device") replaces it.
+    TreeLimit,
+    /// The folder on this disk is too large for a folder (follow-up check N-4): more items or
+    /// deeper than a device takes in. Nothing is published until it is within the limits.
+    TooLarge,
 }
 
 /// A folder's status.
@@ -357,6 +368,17 @@ pub enum Warning {
         /// Its name.
         folder_name: String,
     },
+    /// The folder's newest version on the server is too deep or too large to be a folder
+    /// (security review M3): it was not taken in, and the folder waits for "Undo a device".
+    #[serde(rename_all = "camelCase")]
+    TreeLimit {
+        /// Warning ID.
+        id: String,
+        /// The folder.
+        folder_id: String,
+        /// Its name.
+        folder_name: String,
+    },
     /// A removed device's changes arrived without the barrier of the device that removed it;
     /// the folder waits until the person takes them in (then "Undo a device" is offered) or
     /// leaves the folder stopped (security review H1).
@@ -379,6 +401,17 @@ pub enum Warning {
         id: String,
         /// By which device.
         by: String,
+    },
+    /// The server answered this device's own sign-in with "removed" without device log entries
+    /// that show a valid removal from this device's own verified head (security review H2).
+    /// Sync stops; the account is forgotten only once the person confirms
+    /// (`confirmDeviceRemoved`). A verified removal forgets at once and shows [`Self::Removed`]
+    /// instead. This warning cannot be dismissed, only confirmed.
+    RemovalReported {
+        /// Warning ID.
+        id: String,
+        /// When the server said it first (Unix ms).
+        since: i64,
     },
     /// The server needs a newer app.
     UpdateRequired {
@@ -440,6 +473,10 @@ pub enum ServerNotice {
         /// Days.
         days: u32,
     },
+    /// The server's change feed was behind this device's cursor (an older backup of the server,
+    /// or a sequence a server had pushed too far): the device read the whole account again
+    /// (security review M2).
+    OlderAccountState,
 }
 
 /// The account.
@@ -896,6 +933,10 @@ pub struct PairRequestView {
     pub path: PairPath,
     /// Its safety number.
     pub safety: NumberRows,
+    /// The name of a device of the account that looks the same as the new one's
+    /// (`hangar_drive_protocol::name::looks_alike`): the window says so, and the native question
+    /// names it, so a stranger's device cannot pass for one of the person's own.
+    pub similar_to: Option<String>,
 }
 
 /// Why pairing failed.
@@ -1012,6 +1053,8 @@ pub enum InspectedLink {
         host: String,
         /// The link carries an SPKI pin.
         pinned: bool,
+        /// A label of the host is punycode, which can hide a look-alike name (N3).
+        punycode: bool,
     },
     /// A pairing offer of another device.
     Pair {
@@ -1021,6 +1064,8 @@ pub enum InspectedLink {
         account: String,
         /// The offer carries an SPKI pin.
         pinned: bool,
+        /// A label of the host is punycode (security review, info: as for an invite).
+        punycode: bool,
     },
     /// A recovery sheet.
     Recover {
@@ -1030,6 +1075,8 @@ pub enum InspectedLink {
         account: String,
         /// The sheet carries an SPKI pin.
         pinned: bool,
+        /// A label of the host is punycode (security review, info: as for an invite).
+        punycode: bool,
     },
 }
 
@@ -1128,6 +1175,40 @@ pub enum NameError {
     Blank,
     /// White space at an edge.
     EdgeWhitespace,
+}
+
+/// Why a device name was refused when a device is named or renamed: the name rule (N5), or a
+/// name that looks the same as another device's of the account and was not confirmed in the
+/// native question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceNameError {
+    /// Blank.
+    Blank,
+    /// White space at an edge.
+    EdgeWhitespace,
+    /// Looks the same as the name of another device of the account.
+    LooksLike,
+}
+
+impl From<NameError> for DeviceNameError {
+    fn from(error: NameError) -> Self {
+        match error {
+            NameError::Blank => Self::Blank,
+            NameError::EdgeWhitespace => Self::EdgeWhitespace,
+        }
+    }
+}
+
+/// What resetting a folder to a timeline entry changes, computed before the native question
+/// (follow-up check N-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetPreview {
+    /// The folder's name.
+    pub folder_name: String,
+    /// Files of the folder's current state that the entry does not hold: they disappear on
+    /// every device (they stay in the history).
+    pub vanishing: u64,
 }
 
 /// How long to pause.

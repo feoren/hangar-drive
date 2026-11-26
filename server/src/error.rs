@@ -5,7 +5,7 @@
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hangar_drive_protocol::api::{ErrorBody, ErrorCode};
+use hangar_drive_protocol::api::{ErrorBody, ErrorCode, LogPage};
 use hangar_drive_protocol::ids::{CommitId, ObjectId};
 
 /// Missing object IDs one error reply lists at most.
@@ -17,6 +17,8 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub current_head: Option<CommitId>,
     pub missing: Vec<ObjectId>,
+    /// With `device_removed`: the device log up to the removal (security review H2).
+    pub removal_log: Option<LogPage>,
     /// HTTP status other than the code's own (only 405 for a known path with another method).
     pub status: Option<StatusCode>,
 }
@@ -27,7 +29,16 @@ impl ApiError {
             code,
             current_head: None,
             missing: Vec::new(),
+            removal_log: None,
             status: None,
+        }
+    }
+
+    /// `device_removed` with the device log from the device's head up to its removal.
+    pub fn device_removed(removal_log: Option<LogPage>) -> Self {
+        Self {
+            removal_log,
+            ..Self::new(ErrorCode::DeviceRemoved)
         }
     }
 
@@ -81,6 +92,7 @@ impl IntoResponse for ApiError {
             code: self.code,
             current_head: self.current_head,
             missing: self.missing,
+            removal_log: self.removal_log,
         };
         let mut response = (status, Json(body)).into_response();
         if self.code == ErrorCode::RateLimited {

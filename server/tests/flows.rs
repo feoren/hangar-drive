@@ -193,6 +193,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 challenge: c.challenge,
                 server_url: TEST_URL.into(),
                 signature: wrong,
+                log_length: None,
             },
         )
         .await;
@@ -209,6 +210,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
         challenge: c.challenge,
         server_url: TEST_URL.into(),
         signature: right,
+        log_length: None,
     };
     assert_eq!(client.post(PROOF_PATH, &proof).await.status, 200);
     let reply = client.post(PROOF_PATH, &proof).await;
@@ -235,6 +237,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 challenge: c.challenge,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;
@@ -254,6 +257,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 challenge: forged,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;
@@ -276,6 +280,7 @@ async fn accounts_need_a_single_use_invite_and_devices_sign_in_with_a_proof() {
                 challenge: c.challenge,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;
@@ -520,6 +525,8 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         .await;
     assert_eq!(reply.code(), ErrorCode::LogEntryRefused);
 
+    // The log as b verified it before its removal.
+    let b_view = account.state.clone();
     let reply = account.remove(&ca, &a, &[b.id]).await;
     assert_eq!(
         reply.status,
@@ -551,6 +558,7 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
                 challenge: ch.challenge,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;
@@ -560,6 +568,8 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         (reply.status, reply.code()),
         (403, ErrorCode::DeviceRemoved)
     );
+    let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body.removal_log, None, "no head named, no log");
     let replay = c
         .post(
             PROOF_PATH,
@@ -569,6 +579,7 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
                 challenge: ch.challenge,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;
@@ -595,6 +606,7 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
                 challenge: ch.challenge,
                 server_url: TEST_URL.into(),
                 signature: forged,
+                log_length: None,
             },
         )
         .await;
@@ -602,6 +614,54 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         (reply.status, reply.code()),
         (401, ErrorCode::ProofInvalid),
         "another key never learns of the removal"
+    );
+    // Security review H2: with the head it verified, the removed device gets the log from there
+    // up to its removal, which it can check itself; nothing after the removal.
+    let ch: ChallengeResponse = c
+        .post(
+            CHALLENGE_PATH,
+            &ChallengeRequest {
+                account: account.id,
+                device: b.id,
+            },
+        )
+        .await
+        .json();
+    let signature =
+        b.identity
+            .prove_session(&ch.server, TEST_URL, &account.id, &b.id, &ch.challenge);
+    let reply = c
+        .post(
+            PROOF_PATH,
+            &ProofRequest {
+                account: account.id,
+                device: b.id,
+                challenge: ch.challenge,
+                server_url: TEST_URL.into(),
+                signature,
+                log_length: Some(b_view.len()),
+            },
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (403, ErrorCode::DeviceRemoved)
+    );
+    let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+    let log = body.removal_log.expect("the log up to the removal");
+    assert_eq!(log.first_index, b_view.len() + 1);
+    assert_eq!(log.entries.len(), 1, "it stops at the removal");
+    assert!(
+        account.state.len() > b_view.len() + 1,
+        "the rotation came after it"
+    );
+    assert_eq!(
+        b_view.removal_in(
+            log.first_index,
+            log.entries.iter().map(|e| e.as_bytes()),
+            &b.id
+        ),
+        Some(a.id)
     );
     // Not even another device can publish the removed device's commit (signer removed, and not
     // its own commit).
@@ -737,7 +797,7 @@ async fn pairing_slots_are_reserved_by_the_inviter_and_written_once() {
         sign: new.identity.public_keys().sign,
         kem: new.identity.public_keys().kem,
         proof: Signature::from_bytes([4; 64]),
-        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 14]),
         tag: Blob(vec![5; 32]),
     };
     let anonymous = Client::new(server.addr);
@@ -862,7 +922,7 @@ async fn a_pairing_slot_is_closed_by_its_account_and_expired_slots_are_swept() {
         sign: new.identity.public_keys().sign,
         kem: new.identity.public_keys().kem,
         proof: Signature::from_bytes([4; 64]),
-        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 14]),
         tag: Blob(vec![5; 32]),
     };
     let anonymous = Client::new(server.addr);
@@ -1437,8 +1497,8 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         )
         .await;
     assert_eq!(reply.code(), ErrorCode::RateLimited);
-    // Failed proofs count per account and listed device (finding M1); after one, even a valid
-    // proof of that device waits for the window.
+    // Failed proofs count per account and listed device (finding M1), but only failing proofs
+    // wait for the window: the device's own valid proof goes through (overall review M1).
     let c: ChallengeResponse = client.post(CHALLENGE_PATH, &challenge).await.json();
     let proof = |signature| ProofRequest {
         account: account.id,
@@ -1446,6 +1506,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         challenge: c.challenge,
         server_url: TEST_URL.into(),
         signature,
+        log_length: None,
     };
     let wrong =
         Device::new()
@@ -1459,8 +1520,9 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         .identity
         .prove_session(&c.server, TEST_URL, &account.id, &a.id, &c.challenge);
     assert_eq!(
-        client.post(PROOF_PATH, &proof(right)).await.code(),
-        ErrorCode::RateLimited
+        client.post(PROOF_PATH, &proof(right)).await.status,
+        200,
+        "a valid proof goes through over the failure counter"
     );
     // Devices the log does not list leave no trace in that table.
     server.clock.advance_ms(61_000);
@@ -1492,6 +1554,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
                     challenge: c.challenge,
                     server_url: TEST_URL.into(),
                     signature,
+                    log_length: None,
                 },
             )
             .await;
@@ -1509,7 +1572,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
     assert_eq!(
         client.post(PROOF_PATH, &proof(right)).await.code(),
         ErrorCode::ChallengeInvalid,
-        "the window ended; the challenge expired meanwhile"
+        "the challenge was used up by the sign-in above"
     );
     // Pairing: one anonymous post per window and address.
     let request = PairingRequest {
@@ -1517,7 +1580,7 @@ async fn sign_in_invite_pairing_and_upload_are_rate_limited() {
         sign: a.identity.public_keys().sign,
         kem: a.identity.public_keys().kem,
         proof: Signature::from_bytes([4; 64]),
-        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 5]),
+        sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 14]),
         tag: Blob(vec![5; 32]),
     };
     let (first, second) = (
@@ -1653,6 +1716,7 @@ async fn a_proof_for_another_address_is_refused_by_a_server_with_a_public_url() 
                     challenge: c.challenge,
                     server_url: relay.into(),
                     signature,
+                    log_length: None,
                 },
             )
             .await;
@@ -1682,6 +1746,7 @@ async fn a_proof_for_another_address_is_refused_by_a_server_with_a_public_url() 
                 challenge: c.challenge,
                 server_url: TEST_URL.into(),
                 signature,
+                log_length: None,
             },
         )
         .await;

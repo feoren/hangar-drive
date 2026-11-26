@@ -237,6 +237,12 @@
           "markdownDescription": "Enables the check_pairing command without any pre-configured scope."
         },
         {
+          "description": "Enables the confirm_device_removed command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-device-removed",
+          "markdownDescription": "Enables the confirm_device_removed command without any pre-configured scope."
+        },
+        {
           "description": "Enables the confirm_recovery_group command without any pre-configured scope.",
           "type": "string",
           "const": "allow-confirm-recovery-group",
@@ -769,6 +775,12 @@
           "type": "string",
           "const": "deny-check-pairing",
           "markdownDescription": "Denies the check_pairing command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_device_removed command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-device-removed",
+          "markdownDescription": "Denies the confirm_device_removed command without any pre-configured scope."
         },
         {
           "description": "Denies the confirm_recovery_group command without any pre-configured scope.",

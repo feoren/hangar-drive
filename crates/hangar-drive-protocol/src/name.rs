@@ -28,9 +28,10 @@
 //!   characters, no format characters (General Category Cf, which holds every bidirectional
 //!   control), no line or paragraph separators (Zl, Zp), so a name cannot reorder or hide the
 //!   text around it in a prompt such as `Add device <name>?`. A name also needs a visible
-//!   character and must not start or end with white space: a blank name, a name made only of
-//!   Hangul fillers ([`FILLER_CHARACTERS`]) or a name with a padded edge would look empty, or
-//!   like the name of another device, in that prompt.
+//!   character ([`is_visible`]: a letter, number, punctuation or symbol that is not one of the
+//!   [`FILLER_CHARACTERS`]) and must not start or end with white space or an
+//!   [`is_edge_filler`] character: a blank name, a name made only of fillers or a name with a
+//!   padded edge would look empty, or like the name of another device, in that prompt.
 //! - **Windows:** [`windows_problem`] says why Windows cannot hold a name. The tree itself
 //!   allows `\` and `:` (Linux and macOS can hold them), so the sync engine must call
 //!   [`windows_problem`] on every name **before** it builds a local path from it on Windows:
@@ -93,15 +94,38 @@ pub fn comparison_key(name: &str) -> String {
     name.nfc().collect()
 }
 
-/// The case key of a name: the comparison key in lowercase, in NFC again (module docs).
+/// Code points HFS+ ignores when it compares names (security review N15): ZWNJ, ZWJ, LRM and
+/// RLM (U+200C to U+200F), the embedding and override controls U+202A to U+202E, the
+/// deprecated format controls U+206A to U+206F and the byte order mark U+FEFF. Two names that
+/// differ only in them are one file on HFS+ (Apple, Technical Note TN1150, "Unicode Subtleties"
+/// and its case folding table [UNVERIFIED: taken from TN1150, not measured on a volume]), so
+/// the case keys drop them and such names collide by case: a false collision only makes a
+/// conflict copy. The comparison key keeps them, since the exact bytes stay the name.
+pub fn is_hfs_ignorable(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x200c..=0x200f | 0x202a..=0x202e | 0x206a..=0x206f | 0xfeff
+    )
+}
+
+/// The comparison key without the [`is_hfs_ignorable`] code points, the start of every case key.
+fn case_base(name: &str) -> String {
+    comparison_key(name)
+        .chars()
+        .filter(|c| !is_hfs_ignorable(*c))
+        .collect()
+}
+
+/// The case key of a name: the comparison key without the code points HFS+ ignores, in
+/// lowercase, in NFC again (module docs).
 pub fn case_key(name: &str) -> String {
-    comparison_key(name).to_lowercase().nfc().collect()
+    case_base(name).to_lowercase().nfc().collect()
 }
 
 /// The fold key of a name: the comparison key under full Unicode case folding, in NFC again
 /// (module docs).
 pub fn fold_key(name: &str) -> String {
-    UniCase::unicode(comparison_key(name))
+    UniCase::unicode(case_base(name))
         .to_folded_case()
         .nfc()
         .collect()
@@ -111,7 +135,7 @@ pub fn fold_key(name: &str) -> String {
 /// character itself where the uppercase has more than one character, in NFC again (module
 /// docs).
 pub fn upper_key(name: &str) -> String {
-    comparison_key(name)
+    case_base(name)
         .chars()
         .map(|c| {
             let mut upper = c.to_uppercase();
@@ -219,11 +243,91 @@ pub fn is_format_character(c: char) -> bool {
         .any(|&(low, high)| (low..=high).contains(&c))
 }
 
-/// Characters that render as nothing in most fonts but are letters (General Category Lo), so
-/// neither [`char::is_whitespace`] nor [`is_format_character`] catches them: the Hangul fillers
-/// U+115F, U+1160 and U+3164 and the halfwidth U+FFA0. A display name made only of these and
-/// white space is blank. Inside a name they stay allowed, since Korean text may use them.
-pub const FILLER_CHARACTERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
+/// Characters that render as nothing in most fonts but are letters or symbols (General
+/// Category Lo, So), so neither [`char::is_whitespace`] nor [`is_format_character`] catches
+/// them: the Hangul fillers U+115F, U+1160 and U+3164, the halfwidth U+FFA0 and the blank
+/// Braille pattern U+2800 (security review N12). They never count as visible, and a display
+/// name may not start or end with one. Inside a name they stay allowed, since Korean text may
+/// use the fillers.
+pub const FILLER_CHARACTERS: [char; 5] =
+    ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}', '\u{2800}'];
+
+/// Whether `c` makes a display name visible (security review N12): a letter, number,
+/// punctuation or symbol (General Category L, N, P, S), not one of the [`FILLER_CHARACTERS`].
+/// Decided by what it is not: white space, a control or format character, a combining mark
+/// (General Category M, which holds the combining grapheme joiner U+034F and every variation
+/// selector), a private use character (Co) or a default ignorable code point
+/// ([`DEFAULT_IGNORABLE_RANGES`], reserved ones included). Any other unassigned code point (Cn)
+/// counts as visible until the Unicode tables of `unicode-normalization` and
+/// [`FORMAT_CHARACTER_RANGES`] know it, as for the format characters; a renderer shows it as a
+/// replacement glyph, so it can only look odd, not blank out a known name.
+pub fn is_visible(c: char) -> bool {
+    !c.is_whitespace()
+        && !c.is_control()
+        && !is_format_character(c)
+        && !unicode_normalization::char::is_combining_mark(c)
+        && !FILLER_CHARACTERS.contains(&c)
+        && !is_private_use(c)
+        && !is_default_ignorable(c)
+}
+
+fn is_private_use(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x10_0000..=0x10_fffd
+    )
+}
+
+/// Whether `c` pads the edge of a display name (security review N12): white space, the
+/// [`FILLER_CHARACTERS`], the combining grapheme joiner U+034F and the variation selectors
+/// U+FE00 to U+FE0F and U+E0100 to U+E01EF. A variation selector right after a visible
+/// character belongs to it (U+2764 U+FE0F is one emoji) and is no edge.
+pub fn is_edge_filler(c: char) -> bool {
+    c.is_whitespace()
+        || FILLER_CHARACTERS.contains(&c)
+        || c == '\u{34f}'
+        || is_variation_selector(c)
+        || is_default_ignorable(c)
+}
+
+/// The code points Unicode marks `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt,
+/// Unicode 15.1), unassigned ones included: a renderer shows them as nothing, whether or not
+/// its tables know them yet. Most are format characters, fillers, the combining grapheme
+/// joiner or variation selectors and refused or handled above already; the others are the
+/// Khmer inherent vowels U+17B4 and U+17B5, the Mongolian free variation selectors U+180B to
+/// U+180D and U+180F, and the reserved U+2065, U+FFF0 to U+FFF8 and the rest of U+E0000 to
+/// U+E0FFF. A name made only of them would look blank, and one at the edge pads it.
+pub const DEFAULT_IGNORABLE_RANGES: [(u32, u32); 17] = [
+    (0x00ad, 0x00ad),
+    (0x034f, 0x034f),
+    (0x061c, 0x061c),
+    (0x115f, 0x1160),
+    (0x17b4, 0x17b5),
+    (0x180b, 0x180f),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x206f),
+    (0x3164, 0x3164),
+    (0xfe00, 0xfe0f),
+    (0xfeff, 0xfeff),
+    (0xffa0, 0xffa0),
+    (0xfff0, 0xfff8),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0000, 0xe0fff),
+];
+
+/// Whether `c` is in [`DEFAULT_IGNORABLE_RANGES`].
+pub fn is_default_ignorable(c: char) -> bool {
+    let c = u32::from(c);
+    DEFAULT_IGNORABLE_RANGES
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&c))
+}
+
+fn is_variation_selector(c: char) -> bool {
+    matches!(u32::from(c), 0xfe00..=0xfe0f | 0xe0100..=0xe01ef)
+}
 
 /// Why a device, folder or pairing name was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -240,10 +344,10 @@ pub enum DisplayNameError {
     /// A format character, line or paragraph separator or bidirectional control.
     #[error("the name contains an invisible formatting character")]
     Format,
-    /// Only white space and [`FILLER_CHARACTERS`]: nothing visible.
+    /// No [`is_visible`] character.
     #[error("the name has no visible character")]
     Blank,
-    /// White space at the start or the end.
+    /// White space or another [`is_edge_filler`] character at the start or the end.
     #[error("the name starts or ends with white space")]
     EdgeWhitespace,
 }
@@ -262,18 +366,154 @@ pub fn check_display_name(name: &str, max_len: usize) -> Result<(), DisplayNameE
     if name.chars().any(is_format_character) {
         return Err(DisplayNameError::Format);
     }
-    if name
-        .chars()
-        .all(|c| c.is_whitespace() || FILLER_CHARACTERS.contains(&c))
-    {
+    if !name.chars().any(is_visible) {
         return Err(DisplayNameError::Blank);
     }
     // Refused, not trimmed: the name is signed and sealed as given, so every device shows the
-    // bytes the owner entered. Callers trim user input before they submit it.
-    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
+    // bytes the owner entered. Callers trim user input before they submit it. Trailing
+    // variation selectors right after a visible character belong to it (an emoji).
+    let first = name.chars().next();
+    let base = name.trim_end_matches(is_variation_selector);
+    let last = match base.chars().next_back() {
+        Some(c) if base.len() < name.len() && is_visible(c) => Some(c),
+        _ => name.chars().next_back(),
+    };
+    if first.is_some_and(is_edge_filler) || last.is_some_and(is_edge_filler) {
         return Err(DisplayNameError::EdgeWhitespace);
     }
     Ok(())
+}
+
+/// Letters of Latin, Cyrillic and Greek that look like a basic Latin letter, and two digits,
+/// each with that letter: a small part of the single code point mappings of `confusables.txt` of
+/// Unicode Technical Standard #39, "Unicode Security Mechanisms" (Unicode 16.0), restricted to
+/// the three scripts device names of this app are most likely written in, plus the digits 0 and
+/// 1, which the standard maps to `O` and `l`. The full table has more than 6,000 entries and
+/// changes with every Unicode version; the device name check only has to catch the obvious
+/// look-alikes in a short list of names one person gave their own devices. [UNVERIFIED: entries
+/// chosen from the standard's table and the glyphs of common fonts, not checked line by line
+/// against the file.]
+///
+/// Capital and small letters are listed separately, since a capital look-alike (Cyrillic `В`
+/// for `B`) folds to a small letter that looks like nothing Latin (`в`): [`display_skeletons`]
+/// applies the table once before and once after case folding.
+pub const HOMOGLYPHS: [(char, char); 66] = [
+    // Cyrillic capitals.
+    ('\u{0410}', 'A'),
+    ('\u{0412}', 'B'),
+    ('\u{0415}', 'E'),
+    ('\u{041A}', 'K'),
+    ('\u{041C}', 'M'),
+    ('\u{041D}', 'H'),
+    ('\u{041E}', 'O'),
+    ('\u{0420}', 'P'),
+    ('\u{0421}', 'C'),
+    ('\u{0422}', 'T'),
+    ('\u{0423}', 'Y'),
+    ('\u{0425}', 'X'),
+    ('\u{0405}', 'S'),
+    ('\u{0406}', 'I'),
+    ('\u{0408}', 'J'),
+    ('\u{051A}', 'Q'),
+    ('\u{051C}', 'W'),
+    // Cyrillic small letters.
+    ('\u{0430}', 'a'),
+    ('\u{0435}', 'e'),
+    ('\u{043E}', 'o'),
+    ('\u{0440}', 'p'),
+    ('\u{0441}', 'c'),
+    ('\u{0443}', 'y'),
+    ('\u{0445}', 'x'),
+    ('\u{0455}', 's'),
+    ('\u{0456}', 'i'),
+    ('\u{0458}', 'j'),
+    ('\u{04BB}', 'h'),
+    ('\u{0501}', 'd'),
+    ('\u{051B}', 'q'),
+    ('\u{051D}', 'w'),
+    ('\u{04CF}', 'l'),
+    // Greek capitals.
+    ('\u{0391}', 'A'),
+    ('\u{0392}', 'B'),
+    ('\u{0395}', 'E'),
+    ('\u{0396}', 'Z'),
+    ('\u{0397}', 'H'),
+    ('\u{0399}', 'I'),
+    ('\u{039A}', 'K'),
+    ('\u{039C}', 'M'),
+    ('\u{039D}', 'N'),
+    ('\u{039F}', 'O'),
+    ('\u{03A1}', 'P'),
+    ('\u{03A4}', 'T'),
+    ('\u{03A5}', 'Y'),
+    ('\u{03A7}', 'X'),
+    // Greek small letters.
+    ('\u{03B1}', 'a'),
+    ('\u{03B3}', 'y'),
+    ('\u{03B9}', 'i'),
+    ('\u{03BD}', 'v'),
+    ('\u{03BF}', 'o'),
+    ('\u{03C1}', 'p'),
+    // Latin letters outside basic Latin.
+    ('\u{0131}', 'i'),
+    ('\u{0237}', 'j'),
+    ('\u{0251}', 'a'),
+    ('\u{0261}', 'g'),
+    ('\u{01C0}', 'l'),
+    ('\u{0269}', 'i'),
+    ('\u{028F}', 'y'),
+    ('\u{0274}', 'n'),
+    ('\u{0280}', 'r'),
+    ('\u{1D04}', 'c'),
+    ('\u{1D0F}', 'o'),
+    ('\u{1D1C}', 'u'),
+    // Digits the standard maps to letters.
+    ('0', 'o'),
+    ('1', 'l'),
+];
+
+fn homoglyph(c: char) -> char {
+    HOMOGLYPHS
+        .iter()
+        .find(|(from, _)| *from == c)
+        .map_or(c, |(_, to)| *to)
+}
+
+fn fold(text: &str) -> String {
+    UniCase::unicode(text).to_folded_case()
+}
+
+/// The two skeletons of a display name, which [`looks_alike`] compares: NFKC (fullwidth forms,
+/// ligatures, superscripts and other compatibility forms become their plain letters), without
+/// the [`is_default_ignorable`] code points, every run of white space as one space, then the
+/// [`HOMOGLYPHS`] table applied before and after full case folding, each skeleton folded and in
+/// NFC at the end.
+pub fn display_skeletons(name: &str) -> [String; 2] {
+    let mut plain = String::with_capacity(name.len());
+    let mut space = false;
+    for c in name.nfkc().filter(|c| !is_default_ignorable(*c)) {
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space && !plain.is_empty() {
+            plain.push(' ');
+        }
+        space = false;
+        plain.push(c);
+    }
+    let before: String = plain.chars().map(homoglyph).collect();
+    let after: String = fold(&plain).chars().map(homoglyph).collect();
+    [fold(&before).nfc().collect(), fold(&after).nfc().collect()]
+}
+
+/// Whether two device names look the same to a person (the skeleton check of device names):
+/// equal skeletons in either order of [`display_skeletons`]. A false positive costs a hint and
+/// one more question, a miss lets a stranger's device pass for one of the person's own, so the
+/// check calls more names alike than a strict confusable test would.
+pub fn looks_alike(a: &str, b: &str) -> bool {
+    let (a, b) = (display_skeletons(a), display_skeletons(b));
+    a[0] == b[0] || a[1] == b[1]
 }
 
 /// The most UTF-16 code units of one name on Windows (NTFS and the Win32 API).
@@ -298,6 +538,43 @@ pub enum WindowsNameProblem {
     /// More than [`MAX_WINDOWS_NAME_UNITS`] UTF-16 code units.
     #[error("the name is too long for Windows")]
     TooLong,
+    /// The shape of an 8.3 short name alias (`HANGAR~1`, `REPORT~2.DOC`), see
+    /// [`is_short_name_alias`].
+    #[error("the name looks like a Windows short name")]
+    ShortNameAlias,
+}
+
+/// Whether `name` has the shape of an 8.3 short name alias that NTFS and FAT make for long
+/// names (security review N14): a base of at most eight characters that ends in `~` and one or
+/// more digits, then optionally a dot and at most three characters, every character one a
+/// short name may hold, compared without regard to ASCII case.
+///
+/// Windows opens a path by its short name as well as by its long name, so a name of that shape
+/// can address another entry of the same directory: `HANGAR~1` at the sync root is usually the
+/// reserved directory `.hangar-drive`, and a file the engine writes under that name would land
+/// in the root marker's directory or the quarantine, past the ignore list. Which short names a
+/// directory holds depends on the volume and on the order the entries were made, so the engine
+/// cannot tell an alias from a real name; every name of that shape is refused on Windows
+/// ("cannot sync on this device"), not only the reserved one. Real files with such names are
+/// rare, and they stay in the tree and sync on every other platform.
+pub fn is_short_name_alias(name: &str) -> bool {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "!#$%&'()-@^_`{}~".contains(c);
+    let (base, extension) = match name.split_once('.') {
+        Some((base, extension)) => (base, Some(extension)),
+        None => (name, None),
+    };
+    if base.is_empty() || base.len() > 8 || !base.chars().all(allowed) {
+        return false;
+    }
+    if let Some(extension) = extension {
+        if extension.len() > 3 || !extension.chars().all(|c| allowed(c) && c != '~') {
+            return false;
+        }
+    }
+    let Some((stem, digits)) = base.rsplit_once('~') else {
+        return false;
+    };
+    !stem.is_empty() && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Device names Windows reserves in every directory. `COM` and `LPT` take the digits 0 to 9
@@ -349,6 +626,9 @@ pub fn windows_problem(name: &str) -> Option<WindowsNameProblem> {
     let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     if is_reserved_stem(stem) {
         return Some(WindowsNameProblem::Reserved);
+    }
+    if is_short_name_alias(name) {
+        return Some(WindowsNameProblem::ShortNameAlias);
     }
     None
 }
@@ -409,6 +689,52 @@ pub fn is_ignored(name: &str, at_root: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The skeleton check of device names: names that only look the same are found, others not.
+    #[test]
+    fn look_alike_device_names_are_found() {
+        for (a, b) in [
+            ("Laptop", "laptop"),
+            ("Laptop", "LAPTOP"),
+            // Cyrillic small a and o in Latin "Laptop".
+            ("Laptop", "L\u{0430}pt\u{043E}p"),
+            // Cyrillic capitals for B, O and B.
+            ("BOB", "\u{0412}\u{041E}\u{0412}"),
+            ("bob", "\u{0412}\u{041E}\u{0412}"),
+            // Greek capitals.
+            ("PC", "\u{03A1}C"),
+            // Fullwidth letters through NFKC.
+            ("Desk", "\u{FF24}\u{FF45}\u{FF53}\u{FF4B}"),
+            // A soft hyphen and a zero width space are dropped.
+            ("Desktop", "Desk\u{00AD}to\u{200B}p"),
+            // Digits that look like letters, and doubled white space.
+            ("Hallo PC", "Hall0  PC"),
+            ("lan", "1an"),
+            // Dotless i.
+            ("Mini", "M\u{0131}n\u{0131}"),
+        ] {
+            assert!(looks_alike(a, b), "{a:?} and {b:?}");
+            assert!(looks_alike(b, a), "{b:?} and {a:?}");
+        }
+        for (a, b) in [
+            ("Laptop", "Desktop"),
+            ("Laptop", "Laptop 2"),
+            ("Feos PC", "Feos Mac"),
+            // A Cyrillic word that looks like no Latin word stays apart.
+            ("\u{0414}\u{043E}\u{043C}", "Dom"),
+        ] {
+            assert!(!looks_alike(a, b), "{a:?} and {b:?}");
+        }
+    }
+
+    #[test]
+    fn the_homoglyph_table_maps_only_to_basic_latin_and_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (from, to) in HOMOGLYPHS {
+            assert!(to.is_ascii_alphabetic(), "{from:?}");
+            assert!(seen.insert(from), "{from:?} twice");
+        }
+    }
 
     const COMPOSED: &str = "caf\u{e9}";
     const DECOMPOSED: &str = "cafe\u{301}";
@@ -572,14 +898,56 @@ mod tests {
                 "{name:?}"
             );
         }
-        // White space and fillers inside a name, or a filler next to a visible character, stay
-        // allowed.
+        // Security review N12: blank symbols, joiners and selectors are no visible character,
+        // and a filler at the edge pads the name like white space.
+        for name in [
+            "\u{2800}",
+            "\u{34f}",
+            "\u{fe0f}",
+            "\u{e0100}",
+            "\u{e000}",
+            "\u{301}",
+            // Default ignorable code points, reserved ones included, render as nothing.
+            "\u{2065}",
+            "\u{fff0}",
+            "\u{e0fff}",
+            "\u{180b}\u{17b4}",
+        ] {
+            assert_eq!(
+                check_display_name(name, 128),
+                Err(DisplayNameError::Blank),
+                "{name:?}"
+            );
+        }
+        for name in [
+            "\u{d55c}\u{3164}",
+            "\u{3164}a",
+            "a\u{2800}",
+            "\u{34f}Laptop",
+            "Laptop\u{34f}",
+            "\u{fe0f}Laptop",
+            "Laptop \u{fe0f}",
+            "\u{180b}Laptop",
+            "Laptop\u{17b4}",
+            "Laptop\u{e0080}",
+            "\u{2065}Laptop",
+        ] {
+            assert_eq!(
+                check_display_name(name, 128),
+                Err(DisplayNameError::EdgeWhitespace),
+                "{name:?}"
+            );
+        }
+        // White space and fillers inside a name stay allowed, and a variation selector that
+        // follows its emoji is part of it.
         for name in [
             "My Laptop",
             "a\u{3000}b",
-            "\u{d55c}\u{3164}",
-            "\u{3164}a",
+            "\u{d55c}\u{3164}\u{d55c}",
             "x",
+            "Anna \u{2764}\u{fe0f}",
+            "Caf\u{e9}",
+            "Cafe\u{301}",
         ] {
             assert_eq!(check_display_name(name, 128), Ok(()), "{name:?}");
         }
@@ -591,6 +959,60 @@ mod tests {
         assert_eq!(
             check_display_name("Laptop\n", 128),
             Err(DisplayNameError::Control)
+        );
+    }
+
+    // Security review N14: a name of the shape of a short name alias can address another
+    // entry on Windows, `HANGAR~1` the reserved directory at the root.
+    #[test]
+    fn short_name_aliases_cannot_sync_on_windows() {
+        for name in [
+            "HANGAR~1",
+            "hangar~2",
+            "REPOR~12.DOC",
+            "A~1",
+            "ab~1.t",
+            "X~123456",
+        ] {
+            assert_eq!(
+                windows_problem(name),
+                Some(WindowsNameProblem::ShortNameAlias),
+                "{name:?}"
+            );
+        }
+        for name in [
+            ".hangar-drive",
+            "~1",
+            "REPORT~.DOC",
+            "LONGNAME~1",
+            "REPORT~1.DOCX",
+            "a~1.b.c",
+            "a~b",
+            "Notes ~1.txt",
+            "report~1x.txt",
+        ] {
+            assert_eq!(windows_problem(name), None, "{name:?}");
+        }
+    }
+
+    // Security review N15: names that differ only in code points HFS+ ignores are one file on
+    // HFS+, so they collide by case (the comparison keys stay different).
+    #[test]
+    fn code_points_hfs_ignores_do_not_hide_a_collision() {
+        for (a, b) in [
+            ("report.txt", "re\u{200d}port.txt"),
+            ("report.txt", "\u{feff}report.txt"),
+            ("report.txt", "report\u{200c}.txt"),
+            ("Report.txt", "re\u{202e}port.txt"),
+            ("abc", "a\u{206a}bc"),
+        ] {
+            assert_eq!(collision(a, b), Some(Collision::Case), "{a:?} {b:?}");
+        }
+        assert_ne!(comparison_key("a\u{200d}b"), comparison_key("ab"));
+        assert_eq!(
+            collision("ab", "a\u{200b}b"),
+            None,
+            "U+200B is not ignored by HFS+"
         );
     }
 

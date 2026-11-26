@@ -133,14 +133,23 @@ describe("restoring (UX 9.1, 9.2)", () => {
     expect(text()).toContain("Wiederhergestellt als „Bericht (wiederhergestellt");
   });
 
-  it("resets the whole folder after one question", async () => {
+  // Follow-up check N-1: the shell asks natively with the folder and the files that
+  // disappear, so the window asks nothing before it.
+  it("resets the whole folder after the system's question only", async () => {
     const { mock } = await openVersions();
     await click("Ganzen Ordner auf diesen Stand zurücksetzen");
-    expect(dialogTitle()).toBe("Auf diesen Stand zurücksetzen?");
-    expect(text()).toContain("Der jetzige Stand bleibt als Version erhalten");
-    await click(button(/^Zurücksetzen$/));
+    expect(dialogTitle()).toBe("Frühere Versionen von „Hangar Drive“");
     expect(mock.calls.some((call) => call.startsWith("resetFolder:f-main:t1"))).toBe(true);
     expect(text()).toMatch(/„Hangar Drive“ ist auf dem Stand von heute, \d\d:\d\d\./);
+  });
+
+  it("says nothing after a no in the system's question", async () => {
+    const { mock } = await openVersions();
+    mock.controls.nativeConfirm = "no";
+    await click("Ganzen Ordner auf diesen Stand zurücksetzen");
+    expect(mock.calls.some((call) => call.startsWith("resetFolder:f-main:t1"))).toBe(true);
+    expect(text()).not.toContain("ist auf dem Stand von");
+    expect(dialogTitle()).toBe("Frühere Versionen von „Hangar Drive“");
   });
 });
 

@@ -480,8 +480,9 @@ function DevicesCheck({
           disabled={action.pending}
           onClick={() => {
             void action.run(async () => {
-              await backend.disconnectThisDevice();
-              onAborted();
+              // The shell asks natively first; "no" keeps the device in the account and here.
+              const outcome = await backend.disconnectThisDevice();
+              if (outcome === "confirmed") onAborted();
             });
           }}
         >

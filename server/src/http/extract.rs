@@ -49,18 +49,23 @@ pub async fn read_limited(
     limit: usize,
     total: Duration,
 ) -> Result<Vec<u8>, ApiError> {
-    if let Some(len) = headers
+    let announced = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        if len > limit as u64 {
-            return Err(ErrorCode::TooLarge.into());
-        }
+        .and_then(|v| v.parse::<u64>().ok());
+    if announced.is_some_and(|len| len > limit as u64) {
+        return Err(ErrorCode::TooLarge.into());
     }
+    // The announced length, which is within the limit, is reserved at once (overall review
+    // N4): grown by doubling, a 67 MiB commit body took a 128 MiB buffer, and the copy from
+    // the 64 MiB one into it held both at once.
+    let reserve = announced
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0)
+        .min(limit);
     let read = async {
         let mut stream = body.into_data_stream();
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(reserve);
         loop {
             let next = tokio::time::timeout(BODY_IDLE_TIMEOUT.min(total), stream.next())
                 .await

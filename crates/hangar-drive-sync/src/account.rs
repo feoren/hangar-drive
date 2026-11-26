@@ -127,6 +127,9 @@ pub struct Refresh {
     pub folders_changed: bool,
     /// This device was removed from the account.
     pub removed: bool,
+    /// The server's feed sequence was below this device's cursor, so the whole account was read
+    /// again from cursor 0 (security review M2).
+    pub feed_reset: bool,
 }
 
 /// Entry 1 of a new account, made and verified before the invite is redeemed: the recovery
@@ -340,6 +343,13 @@ impl Account {
 
     /// A device that was just added to the log by another device (pairing, recovery): reads the
     /// log from the server, checks that it lists this device, and fetches its epoch secret.
+    ///
+    /// Refused with [`SyncError::AlreadySetUp`] before anything is written when this device
+    /// already holds an identity or a stored account (security review H1): the join stores its
+    /// identity and epoch secrets under the same keychain names, so joining over a set-up device
+    /// would replace its identity, and the clean-up of a failed join would delete its secrets.
+    /// A failed join removes exactly what it wrote: its identity, the epoch secrets it fetched
+    /// and the account it stored.
     #[allow(clippy::too_many_arguments)]
     pub fn join(
         server: &mut dyn ServerApi,
@@ -351,6 +361,9 @@ impl Account {
         device_name: &str,
         anchors: &[LogHead],
     ) -> Result<Self, SyncError> {
+        if keychain.load(KEY_IDENTITY)?.is_some() || store.account_value(STORE_KEY)?.is_some() {
+            return Err(SyncError::AlreadySetUp);
+        }
         keychain.store(KEY_IDENTITY, &identity.export())?;
         let mut me = Self {
             account,
@@ -373,14 +386,14 @@ impl Account {
         match me.finish_join(server, keychain, store, anchors) {
             Ok(()) => Ok(me),
             Err(error) => {
-                // An aborted join leaves no secret behind (security review L1): the identity
-                // stored above and every epoch secret the refresh fetched.
-                let newest = me
-                    .state
-                    .current_epoch()
-                    .map_or(0, |e| e.epoch.0)
-                    .max(me.secrets.keys().copied().max().unwrap_or(0));
-                let _ = forget_secrets(keychain, newest.saturating_add(FORGET_MARGIN));
+                // An aborted join leaves no secret behind (security review L1), and it removes
+                // only what it wrote itself (H1): the identity stored above, the epoch secrets
+                // its refresh fetched (each is stored before it enters `secrets`) and the
+                // account its refresh saved. Nothing of it existed before, as checked above.
+                let _ = keychain.delete(KEY_IDENTITY);
+                for epoch in me.secrets.keys() {
+                    let _ = keychain.delete(&epoch_key_name(Epoch(*epoch)));
+                }
                 let _ = store.delete_account_value(STORE_KEY);
                 Err(error)
             }
@@ -783,6 +796,17 @@ impl Account {
         let mut log = self.state.is_empty() || self.feed_cursor == 0;
         let (entries, server_sequence) =
             crate::paging::collect_feed(self.feed_cursor, |after| server.feed(after))?;
+        if server_sequence < self.feed_cursor {
+            // An older state of the account's feed (security review M2): an older backup of the
+            // server, or a cursor a server pushed far ahead (up to `u64::MAX`) to hide every
+            // later entry from this device. Taking the larger value would freeze the device for
+            // good, so it starts over from 0 and reads the whole account again, verified as
+            // always; at cursor 0 this branch cannot be taken again.
+            self.feed_cursor = 0;
+            let mut again = self.refresh(server, keychain, store)?;
+            again.feed_reset = true;
+            return Ok(again);
+        }
         let mut cursor = self.feed_cursor;
         {
             for entry in &entries {

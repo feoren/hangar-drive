@@ -12,6 +12,13 @@ use hangar_drive_sync::ports::Keychain;
 /// The argument the uninstaller passes.
 pub const ARG: &str = "--uninstall-cleanup";
 
+/// Whether the process was started for the cleanup: the program and exactly this one argument,
+/// as the uninstaller passes it (security review M5). The argument anywhere else, for example
+/// behind a `hangar-drive://` link another program hands over, starts the app as usual.
+pub fn requested(args: &[String]) -> bool {
+    args.len() == 2 && args[1] == ARG
+}
+
 /// Forgets the account behind the index at `index` with `keychain`, then removes the index and
 /// settings files next to it. Every step is tried; the first failure is returned as a line for the log.
 pub fn forget(index: &Path, keychain: &mut dyn Keychain) -> Result<(), String> {
@@ -109,6 +116,28 @@ mod tests {
         // Again, with nothing left: not an error.
         forget(&index, &mut keychain).unwrap();
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    // Security review M5: only `<program> --uninstall-cleanup` runs the cleanup.
+    #[test]
+    fn only_the_exact_argument_runs_the_cleanup() {
+        let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        assert!(requested(&args(&["hangar-drive.exe", ARG])));
+        for other in [
+            vec!["hangar-drive.exe"],
+            vec!["hangar-drive.exe", "--autostart"],
+            vec!["hangar-drive.exe", "hangar-drive://pair#AQID", ARG],
+            vec!["hangar-drive.exe", ARG, "hangar-drive://pair#AQID"],
+            vec!["hangar-drive.exe", "--autostart", ARG],
+            vec!["hangar-drive.exe", "--uninstall-cleanup=1"],
+            vec![ARG],
+        ] {
+            assert!(!requested(&args(&other)), "{other:?}");
+        }
+        // The app's start uses this check, not a search through the arguments.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("cleanup::requested(&args)"));
+        assert!(!lib.contains("any(|a| a == cleanup::ARG)"));
     }
 
     #[test]

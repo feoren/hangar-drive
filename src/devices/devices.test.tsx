@@ -60,6 +60,19 @@ describe("devices (UX 10)", () => {
     expect(button("Büro, zuletzt")).toBeTruthy();
   });
 
+  // Skeleton check of device names: a name like another device's needs the system's question;
+  // after a "no" the field says why the name was not taken.
+  it("says so when a new name looks like another device's and the question was declined", async () => {
+    const { mock } = await openDevices();
+    mock.controls.nativeConfirm = "no";
+    await click("Aktionen für „Büro-PC“");
+    await click("Umbenennen");
+    await type(field("Name"), "arbeitslaptop");
+    await click("Speichern");
+    expect(mock.calls).toContain("renameDevice");
+    expect(text()).toContain("Es gibt schon ein Gerät, das so heißt.");
+  });
+
   it("shows the safety number group by group", async () => {
     await openDevices();
     await click("Aktionen für „Büro-PC“");
@@ -68,34 +81,34 @@ describe("devices (UX 10)", () => {
     expect(all(".number-group")).toHaveLength(6);
   });
 
-  it("removes a device after naming the one limit", async () => {
+  // Security review M4: the shell asks natively with the device's name, so the window asks
+  // nothing before it; "no" there keeps the device and is not an error.
+  it("removes a device after the native question only", async () => {
     const { mock } = await openDevices();
+    mock.controls.nativeConfirm = "no";
     await click("Aktionen für „Alter Laptop“");
     await click("Entfernen");
-    expect(dialog()?.textContent).toContain(
-      "kann auf einem anderen Gerät nichts aus der Ferne löschen",
-    );
-    expect(document.activeElement?.textContent).toBe("Abbrechen");
-    await click(button(/^Entfernen$/));
     expect(mock.calls).toContain("removeDevice:d-old");
+    expect(dialogTitle()).toBe("Deine Geräte");
+    expect(text()).not.toContain("wurde entfernt");
+    expect(text()).not.toContain("Etwas ist schiefgegangen");
+    mock.controls.nativeConfirm = "yes";
+    await click("Aktionen für „Alter Laptop“");
+    await click("Entfernen");
     expect(text()).toContain("„Alter Laptop“ wurde entfernt.");
   });
 
-  it("disconnects this device, the only one only after a second question", async () => {
+  it("disconnects this device after the native question only", async () => {
     const { mock } = await openDevices();
-    await click("Aktionen für „Alter Laptop“");
-    await click("Entfernen");
-    await click(button(/^Entfernen$/));
-    await click("Aktionen für „Büro-PC“");
-    await click("Entfernen");
-    await click(button(/^Entfernen$/));
+    mock.controls.nativeConfirm = "no";
     await click("Aktionen für „Arbeitslaptop“");
     await click("Dieses Gerät trennen");
-    await click(button(/^Dieses Gerät trennen$/));
-    expect(text()).toContain("Das ist dein einziges Gerät.");
-    expect(mock.calls).not.toContain("disconnectThisDevice");
-    await click("Trotzdem trennen");
     expect(mock.calls).toContain("disconnectThisDevice");
+    expect(dialogTitle()).toBe("Deine Geräte");
+    mock.controls.nativeConfirm = "yes";
+    await click("Aktionen für „Arbeitslaptop“");
+    await click("Dieses Gerät trennen");
+    expect(text()).toContain("Willkommen bei Hangar Drive");
   });
 
   it("creates a new recovery code and checks one group", async () => {
@@ -172,6 +185,25 @@ describe("adding a device (UX 5)", () => {
     expect((await mock.listDevices()).devices.map((device) => device.name)).not.toContain(
       "MacBook",
     );
+  });
+
+  // Skeleton check of device names: a new device whose name looks like one of the account's is
+  // pointed out before the person answers.
+  it("points out a new device whose name looks like an existing one", async () => {
+    const { mock } = await openDevices();
+    mock.controls.pairLookAlike = "Arbeitslaptop";
+    await click("Gerät hinzufügen");
+    await wait(30);
+    expect(text()).toContain(
+      "Es gibt schon ein Gerät, das so heißt: „Arbeitslaptop“. Prüfe die Zahlen besonders genau.",
+    );
+  });
+
+  it("says nothing about the name when it looks like no other device", async () => {
+    await openDevices();
+    await click("Gerät hinzufügen");
+    await wait(30);
+    expect(text()).not.toContain("Es gibt schon ein Gerät");
   });
 
   it("declines with Escape", async () => {

@@ -1,14 +1,16 @@
 // Devices (UX 10): the person's devices, adding one, removing one, the recovery code row.
+// Removing a device and disconnecting this one ask nothing here: the shell asks natively with
+// the device's name, and with the warning for the account's last device (security review M4), so
+// a question of the window's own would only make the person answer twice.
 
 import { useId, useRef, useState } from "react";
 
-import type { Device, DeviceList, NameError } from "../backend/types";
+import type { Device, DeviceList, DeviceNameError } from "../backend/types";
 import { cleanName, nameProblem } from "../domain/names";
 import { nameErrorText } from "../setup/common";
 import { formatDate, formatRelative } from "../format";
 import { useLanguage, useT } from "../i18n";
 import { useBackend, useNow } from "../ui/backendContext";
-import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Dialog } from "../ui/Dialog";
 import { DesktopIcon, LaptopIcon, PlusIcon } from "../ui/icons";
 import { RowMenu } from "../ui/Menu";
@@ -24,9 +26,11 @@ type Sub =
   | { readonly kind: "add" }
   | { readonly kind: "rename"; readonly device: Device }
   | { readonly kind: "safety"; readonly device: Device }
-  | { readonly kind: "remove"; readonly device: Device }
-  | { readonly kind: "disconnect"; readonly lastOne: boolean }
   | { readonly kind: "renew" };
+
+/** What a row's menu asks the dialog to do. */
+type RowAction =
+  Sub | { readonly kind: "remove"; readonly device: Device } | { readonly kind: "disconnect" };
 
 export function DevicesDialog({ onClose }: { readonly onClose: () => void }) {
   const t = useT();
@@ -36,9 +40,29 @@ export function DevicesDialog({ onClose }: { readonly onClose: () => void }) {
   const [list, reload] = useLoad(() => backend.listDevices(), [backend]);
   const [sub, setSub] = useState<Sub | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const action = useAction();
   const closeSub = () => {
     setSub(null);
     reload();
+  };
+  const onRow = (row: RowAction) => {
+    setFeedback(null);
+    if (row.kind === "remove") {
+      void action.run(async () => {
+        const outcome = await backend.removeDevice(row.device.id);
+        if (outcome === "confirmed") {
+          setFeedback(t("devices.removed", { device: row.device.name }));
+          reload();
+        }
+      });
+    } else if (row.kind === "disconnect") {
+      // "Confirmed" forgets the account here; the next snapshot shows the welcome.
+      void action.run(async () => {
+        await backend.disconnectThisDevice();
+      });
+    } else {
+      setSub(row);
+    }
   };
 
   return (
@@ -61,11 +85,12 @@ export function DevicesDialog({ onClose }: { readonly onClose: () => void }) {
       </div>
       <div className="view-body">
         {feedback && <Feedback>{feedback}</Feedback>}
+        {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
         {list.status === "loading" && <Loading />}
         {list.status === "failed" && <Feedback tone="error">{errorText(list.error, t)}</Feedback>}
         {list.status === "ready" && (
           <>
-            <DeviceRows list={list.data} onOpen={setSub} />
+            <DeviceRows list={list.data} onOpen={onRow} />
             <div className="recovery-row">
               <span className="recovery-text">
                 <span className="row-name">{t("devices.recovery")}</span>
@@ -104,22 +129,6 @@ export function DevicesDialog({ onClose }: { readonly onClose: () => void }) {
       )}
       {sub?.kind === "rename" && <RenameDialog device={sub.device} onClose={closeSub} />}
       {sub?.kind === "safety" && <SafetyDialog device={sub.device} onClose={closeSub} />}
-      {sub?.kind === "remove" && (
-        <ConfirmDialog
-          title={t("devices.remove.title", { device: sub.device.name })}
-          confirmLabel={t("devices.remove")}
-          danger
-          onConfirm={async () => {
-            await backend.removeDevice(sub.device.id);
-            setFeedback(t("devices.removed", { device: sub.device.name }));
-          }}
-          onClose={closeSub}
-        >
-          <p>{t("devices.remove.body", { app: t("app.name") })}</p>
-          <p className="muted">{t("devices.remove.lost")}</p>
-        </ConfirmDialog>
-      )}
-      {sub?.kind === "disconnect" && <DisconnectDialog lastOne={sub.lastOne} onClose={closeSub} />}
       {sub?.kind === "renew" && (
         <RenewDialog
           deviceName={
@@ -142,10 +151,9 @@ function DeviceRows({
   onOpen,
 }: {
   readonly list: DeviceList;
-  readonly onOpen: (sub: Sub) => void;
+  readonly onOpen: (row: RowAction) => void;
 }) {
   const roving = useRoving(list.devices.length);
-  const others = list.devices.filter((device) => !device.isThis).length;
   // This device first, then by last seen.
   const sorted = [...list.devices].sort(
     (a, b) => Number(b.isThis) - Number(a.isThis) || (b.lastSeen ?? 0) - (a.lastSeen ?? 0),
@@ -156,7 +164,6 @@ function DeviceRows({
         <DeviceRow
           key={device.id}
           device={device}
-          lastOne={others === 0}
           tabIndex={roving.tabIndex(index)}
           onFocus={() => {
             roving.onItemFocus(index);
@@ -170,16 +177,14 @@ function DeviceRows({
 
 function DeviceRow({
   device,
-  lastOne,
   tabIndex,
   onFocus,
   onOpen,
 }: {
   readonly device: Device;
-  readonly lastOne: boolean;
   readonly tabIndex: 0 | -1;
   readonly onFocus: () => void;
-  readonly onOpen: (sub: Sub) => void;
+  readonly onOpen: (row: RowAction) => void;
 }) {
   const t = useT();
   const language = useLanguage();
@@ -250,7 +255,7 @@ function DeviceRow({
                   danger: true,
                   separated: true,
                   onSelect: () => {
-                    onOpen({ kind: "disconnect", lastOne });
+                    onOpen({ kind: "disconnect" });
                   },
                 }
               : {
@@ -287,7 +292,7 @@ function RenameDialog({
   const inputId = useId();
   const [name, setName] = useState(device.name);
   const action = useAction();
-  const [refused, setRefused] = useState<NameError | null>(null);
+  const [refused, setRefused] = useState<DeviceNameError | null>(null);
   const problem = nameProblem(name) ?? refused;
   const empty = problem !== null;
   return (
@@ -367,47 +372,6 @@ function SafetyDialog({
         </button>
       </div>
     </Dialog>
-  );
-}
-
-/** "Disconnect this device" (UX 10.2); the only device needs a second confirmation. */
-function DisconnectDialog({
-  lastOne,
-  onClose,
-}: {
-  readonly lastOne: boolean;
-  readonly onClose: () => void;
-}) {
-  const t = useT();
-  const backend = useBackend();
-  const [second, setSecond] = useState(false);
-  if (lastOne && !second) {
-    return (
-      <ConfirmDialog
-        title={t("devices.disconnect")}
-        confirmLabel={t("devices.disconnect")}
-        danger
-        onConfirm={() => Promise.resolve()}
-        onClose={onClose}
-        onConfirmed={() => {
-          setSecond(true);
-        }}
-      >
-        <p>{t("devices.disconnect.body")}</p>
-      </ConfirmDialog>
-    );
-  }
-  return (
-    <ConfirmDialog
-      key={second ? "second" : "first"}
-      title={t("devices.disconnect")}
-      confirmLabel={second ? t("devices.lastOne.confirm") : t("devices.disconnect")}
-      danger
-      onConfirm={() => backend.disconnectThisDevice()}
-      onClose={onClose}
-    >
-      <p>{second ? t("devices.lastOne") : t("devices.disconnect.body")}</p>
-    </ConfirmDialog>
   );
 }
 

@@ -124,6 +124,40 @@ function content(
           },
         ],
       };
+    // The server says this device was removed, which the device cannot check (security review
+    // H2); the shell asks natively before it forgets the account here.
+    case "removalReported":
+      return {
+        title: null,
+        body: t("removalReported.body", { app }),
+        buttons: [
+          {
+            label: t("removalReported.confirm"),
+            primary: true,
+            onClick: async () => {
+              await backend.confirmDeviceRemoved();
+              return null;
+            },
+          },
+          copyReport,
+        ],
+      };
+    // The server's newest version of a folder is beyond a folder's limits (security review M3):
+    // an earlier version replaces it.
+    case "treeLimit":
+      return {
+        title: t("treeLimit.title", { folder: warning.folderName }),
+        body: t("treeLimit.body", { app }),
+        buttons: [
+          {
+            label: t("folder.menu.versions"),
+            primary: true,
+            onClick: () => {
+              open({ kind: "restore", folderId: warning.folderId, tab: "versions" });
+            },
+          },
+        ],
+      };
     case "refused":
       return {
         title: null,
@@ -158,6 +192,8 @@ function content(
             onClick: async () => {
               try {
                 const outcome = await backend.installUpdate();
+                // "No" in the native question installs nothing and says nothing.
+                if (outcome.kind === "declined") return null;
                 return outcome.kind === "upToDate"
                   ? t("update.upToDate")
                   : t("update.installed", { version: outcome.version, app });

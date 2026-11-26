@@ -8,10 +8,22 @@
 //! [`Reader::finish`] refuses trailing bytes, so a decoder built on it accepts exactly one byte
 //! string per value.
 
-/// Lengths are bounded far below 4 GiB by the protocol limits; saturate rather than wrap (the
-/// reader then refuses the field, since the bytes cannot follow).
-fn length_prefix(len: usize) -> [u8; 4] {
-    u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes()
+/// The length prefix of a field: `len` as a `u32` big endian.
+///
+/// # Panics
+///
+/// For a field of 4 GiB or more (security review, info). Saturating, as before, would give two
+/// different field lists the same bytes once a field reaches 4 GiB, so a signature or MAC over
+/// one would hold for the other. It is a documented invariant instead of an error value: every
+/// field is bounded far below 4 GiB by the protocol limits before it is framed (objects and
+/// records at a few MiB, request bodies at 80 MiB), so the panic is unreachable from any input,
+/// and an unreachable `Result` would only spread through every format of both crates.
+#[track_caller]
+pub fn length_prefix(len: usize) -> [u8; 4] {
+    match u32::try_from(len) {
+        Ok(len) => len.to_be_bytes(),
+        Err(_) => panic!("a field of 4 GiB or more cannot be framed"),
+    }
 }
 
 /// Builds a byte string of length-prefixed fields and raw fixed-width values.
@@ -217,6 +229,18 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    // Security review, info: a field of 4 GiB or more fails instead of saturating to the prefix
+    // of a shorter one.
+    #[test]
+    fn a_field_of_four_gib_is_refused_not_saturated() {
+        assert_eq!(super::length_prefix(0xffff_ffff), [0xff; 4]);
+        let too_long = usize::try_from(1u64 << 32).unwrap_or(usize::MAX);
+        if too_long == usize::MAX {
+            return; // a 32-bit target cannot even name such a length
+        }
+        assert!(std::panic::catch_unwind(|| super::length_prefix(too_long)).is_err());
+    }
+
     use super::*;
 
     #[test]

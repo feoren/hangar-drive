@@ -355,7 +355,10 @@ function CleanupStep({
               .filter((device) => !kept.has(device.id))
               .map((device) => device.id);
             void action.run(async () => {
-              onNext(await backend.finishRecoveryCleanup(remove));
+              // Removing devices asks natively with their names (follow-up check N-2); after a
+              // "no" there the step stays as it is.
+              const code = await backend.finishRecoveryCleanup(remove);
+              if (code !== null) onNext(code);
             });
           }}
         >

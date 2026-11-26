@@ -122,7 +122,14 @@ pub struct Deps {
     pub limiter: RateLimiter,
     /// Start the garbage collection job (off in tests that drive steps themselves).
     pub gc_job: bool,
+    /// Wraps the file system store (tests that stop the store at a chosen moment); `None`
+    /// uses it as it is.
+    pub store_layer: Option<StoreLayer>,
 }
+
+/// A wrapper around the object store ([`Deps::store_layer`]).
+pub type StoreLayer =
+    Box<dyn FnOnce(Arc<dyn store::ObjectStore>) -> Arc<dyn store::ObjectStore> + Send>;
 
 impl Default for Deps {
     fn default() -> Self {
@@ -131,6 +138,7 @@ impl Default for Deps {
             disk: None,
             limiter: RateLimiter::new(),
             gc_job: true,
+            store_layer: None,
         }
     }
 }
@@ -159,19 +167,25 @@ pub async fn open_app(
     let server_id = service::accounts::ensure_server_id(&db).await?;
     let server_secret = app::load_or_create_secret(&config.data_dir.join("server.secret"))
         .map_err(|e| StartError::DataDir(config.data_dir.display().to_string(), e))?;
+    let store: Arc<dyn store::ObjectStore> = Arc::new(store);
+    let store = match deps.store_layer {
+        Some(layer) => layer(store),
+        None => store,
+    };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let disk = deps
         .disk
         .unwrap_or_else(|| Arc::new(FsDiskSpace::new(&config.data_dir)));
     let app = Arc::new(App {
         db,
-        store: Arc::new(store),
+        store,
         clock: deps.clock,
         disk,
         limits: config.limits,
         server_id,
         public_url: config.public_url.clone(),
         trusted_proxies: config.trusted_proxies.clone(),
+        forwarder_warnings: Default::default(),
         limiter: deps.limiter,
         events: EventHub::new(),
         states: StateCache::default(),
@@ -213,8 +227,16 @@ pub async fn build(config: &Config, deps: Deps) -> Result<Server, StartError> {
     if gc_job {
         tokio::spawn(service::retention::run_job(app.clone(), config.gc_interval));
     }
+    let router = http::router(app.clone());
+    // HSTS only where this server is the TLS end (overall review, info); behind a reverse
+    // proxy the proxy decides, since only it knows whether every client reaches it over https.
+    let router = if tls.is_some() {
+        http::with_hsts(router)
+    } else {
+        router
+    };
     Ok(Server {
-        router: http::router(app.clone()),
+        router,
         app,
         shutdown,
         tls,

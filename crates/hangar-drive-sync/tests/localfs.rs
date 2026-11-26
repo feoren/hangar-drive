@@ -278,6 +278,32 @@ fn links_are_reported_and_not_followed() {
     // to check.
 }
 
+/// Security review N6: a link someone puts in place of a file is never read through, so no
+/// content from outside the root is uploaded as that file's.
+#[test]
+fn a_link_in_place_of_a_file_is_not_read() {
+    let dir = tmp("read-link");
+    let outside = tmp("read-link-outside");
+    let fs = LocalFs::new(&dir).unwrap();
+    std::fs::write(outside.join("private.txt"), b"outside the root").unwrap();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(outside.join("private.txt"), dir.join("doc.txt")).is_ok();
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(outside.join("private.txt"), dir.join("doc.txt"))
+        .is_ok();
+    if !made {
+        // Windows without developer mode cannot create the link; nothing to check.
+        println!("no link privilege: skipped");
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let read = fs.read_at(&p(&["doc.txt"]), 0, &mut buf);
+    assert!(
+        !matches!(read, Ok(n) if n > 0),
+        "read through the link: {read:?}"
+    );
+}
+
 #[test]
 fn the_watcher_reports_changes_below_the_root() {
     let dir = tmp("watch");
@@ -611,6 +637,33 @@ fn quarantined_files_expire_after_thirty_days() {
     hangar_drive_sync::trash::clean_quarantine(&q, now + Duration::from_secs(29 * 86_400));
     assert_eq!(std::fs::read_dir(&q).unwrap().count(), 1, "kept for now");
     hangar_drive_sync::trash::clean_quarantine(&q, now + Duration::from_secs(31 * 86_400));
+    assert_eq!(
+        std::fs::read_dir(&q).unwrap().count(),
+        0,
+        "gone after 30 days"
+    );
+}
+
+/// Security review, info: the quarantine is also cleaned while the root stays open (the hourly
+/// scan calls `housekeeping`), not only when it is opened.
+#[test]
+fn the_quarantine_is_cleaned_while_the_root_stays_open() {
+    let dir = tmp("quarantine-open");
+    let fs = LocalFs::new(&dir).unwrap();
+    let q = dir.join(".hangar-drive").join("trash");
+    std::fs::create_dir_all(q.join("00112233445566778899aabbccddeeff")).unwrap();
+    std::fs::write(
+        q.join("00112233445566778899aabbccddeeff").join("x.txt"),
+        b"marker",
+    )
+    .unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    fs.housekeeping(now_ms + 29 * 86_400_000);
+    assert_eq!(std::fs::read_dir(&q).unwrap().count(), 1, "kept for now");
+    fs.housekeeping(now_ms + 31 * 86_400_000);
     assert_eq!(
         std::fs::read_dir(&q).unwrap().count(),
         0,

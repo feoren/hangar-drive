@@ -10,13 +10,19 @@
 //!
 //! ```text
 //! data = 0x01 || epoch (u32) || version (u64) || sender device (16) || head index (u64)
-//!        || head hash (32) || nonce (24 random bytes) || XChaCha20-Poly1305(K_acct,e, nonce, plaintext, aad)
+//!        || head hash (32) || nonce (24 random bytes) || XChaCha20-Poly1305(K_acct,e, nonce, padded, aad)
 //!        || Ed25519 signature of the sender (64 bytes)
+//! padded = length (u64) || plaintext || zeros, to padme(8 + len(plaintext)) bytes
 //! aad  = field("hangar-drive/v1/record") || field(0x01) || field(account) || field(epoch, u32)
 //!        || field(kind label) || field(record id: folder id or empty) || field(version, u64)
 //!        || field(sender device) || field(head index, u64) || field(head hash)
 //! signed message = field("hangar-drive/v1/record-sig") || field(aad) || field(nonce) || field(ciphertext)
 //! ```
+//!
+//! The plaintext is padded with Padmé as objects are (security review N13), so the server
+//! sees a record's size only to its Padmé length: the number of folders in the folder list, of
+//! devices in the device names and of generations in a ring no longer show byte for byte. The
+//! padding is checked strictly on opening (the exact Padmé length, zeros only).
 //!
 //! The associated data binds a record to account, epoch, kind, record ID, version and sender,
 //! so the server can neither move it to another folder or kind nor present it as another
@@ -56,6 +62,7 @@ use crate::encoding::{framed, sha256, Reader, Writer};
 use crate::entropy::{Entropy, EntropyError};
 use crate::epoch::{AccountKey, AccountSecret, WrapError};
 use crate::identity::{verify, DeviceIdentity};
+use crate::object::padme;
 
 const LABEL_RECORD: &[u8] = b"hangar-drive/v1/record";
 const LABEL_RECORD_SIG: &[u8] = b"hangar-drive/v1/record-sig";
@@ -68,6 +75,10 @@ const SIGNATURE_LEN: usize = 64;
 pub const RECORD_OVERHEAD: usize = HEADER_LEN + NONCE_LEN + TAG_LEN + SIGNATURE_LEN;
 /// The largest plaintext of a record.
 pub const MAX_RECORD_PLAINTEXT: usize = 1 << 20;
+/// The padded part of the largest record: `padme(8 + MAX_RECORD_PLAINTEXT)`, checked by a test.
+pub const MAX_RECORD_PADDED: usize = MAX_RECORD_PLAINTEXT + (1 << 15);
+/// The largest sealed record, the bound the server checks before it reads one.
+pub const MAX_RECORD_LEN: usize = MAX_RECORD_PADDED + RECORD_OVERHEAD;
 
 /// Why a record was not sealed.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -128,6 +139,9 @@ pub enum OpenError {
     /// Signed, but the ciphertext does not open.
     #[error("the record does not decrypt")]
     Decrypt,
+    /// The padding is not exactly the Padmé length of the plaintext with zeros (N13).
+    #[error("the record's padding is invalid")]
+    Padding,
     /// The sender's log differs from this device's at `index`: the server shows the two
     /// devices different logs.
     #[error("the sender's device log differs from this device's at entry {index}")]
@@ -324,8 +338,11 @@ impl RecordCipher {
         })
     }
 
-    /// The cipher of an account key derived elsewhere.
-    pub fn new(key: AccountKey) -> Self {
+    /// The cipher of an account key derived elsewhere. Crate-internal (security review, info):
+    /// outside this crate a cipher comes only from [`RecordCipher::for_epoch`], which checks the
+    /// secret against the epoch's commitment in the verified log.
+    #[cfg(test)]
+    pub(crate) fn new(key: AccountKey) -> Self {
         Self { key }
     }
 
@@ -368,13 +385,14 @@ impl RecordCipher {
         let mut nonce = [0u8; NONCE_LEN];
         entropy.fill(&mut nonce)?;
         let aad = self.aad(key, version, sender, head);
+        let padded = pad(plaintext)?;
         let ciphertext = self
             .cipher()
             .ok_or(SealError::Cipher)?
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
-                    msg: plaintext,
+                    msg: &padded,
                     aad: &aad,
                 },
             )
@@ -449,18 +467,19 @@ impl RecordCipher {
             return Err(OpenError::Signature);
         }
         let nonce: [u8; NONCE_LEN] = parsed.nonce.try_into().map_err(|_| OpenError::Malformed)?;
-        let plaintext = self
-            .cipher()
-            .ok_or(OpenError::Decrypt)?
-            .decrypt(
-                &XNonce::from(nonce),
-                Payload {
-                    msg: parsed.ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| OpenError::Decrypt)?;
-        let plaintext = Zeroizing::new(plaintext);
+        let padded = Zeroizing::new(
+            self.cipher()
+                .ok_or(OpenError::Decrypt)?
+                .decrypt(
+                    &XNonce::from(nonce),
+                    Payload {
+                        msg: parsed.ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| OpenError::Decrypt)?,
+        );
+        let plaintext = unpad(&padded)?;
         if !state.contains(&header.head) {
             return Err(OpenError::Fork {
                 index: header.head.index,
@@ -476,6 +495,39 @@ impl RecordCipher {
             plaintext,
         })
     }
+}
+
+/// `length (u64) || plaintext || zeros` to `padme(8 + len)` bytes (module docs, N13).
+fn pad(plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SealError> {
+    let len = u64::try_from(plaintext.len()).map_err(|_| SealError::TooLarge)?;
+    let padded_len = usize::try_from(padme(len.checked_add(8).ok_or(SealError::TooLarge)?))
+        .map_err(|_| SealError::TooLarge)?;
+    let mut padded = Zeroizing::new(Vec::with_capacity(padded_len));
+    padded.extend_from_slice(&len.to_be_bytes());
+    padded.extend_from_slice(plaintext);
+    padded.resize(padded_len, 0);
+    Ok(padded)
+}
+
+/// The plaintext of a padded record, with the padding checked strictly.
+fn unpad(padded: &[u8]) -> Result<Zeroizing<Vec<u8>>, OpenError> {
+    if padded.len() < 8 {
+        return Err(OpenError::Padding);
+    }
+    let (len, rest) = padded.split_at(8);
+    let len = u64::from_be_bytes(len.try_into().map_err(|_| OpenError::Padding)?);
+    let len_usize = usize::try_from(len).map_err(|_| OpenError::Padding)?;
+    if len_usize > rest.len()
+        || len_usize > MAX_RECORD_PLAINTEXT
+        || u64::try_from(padded.len()).ok() != len.checked_add(8).map(padme)
+    {
+        return Err(OpenError::Padding);
+    }
+    let (plaintext, padding) = rest.split_at(len_usize);
+    if padding.iter().any(|&b| b != 0) {
+        return Err(OpenError::Padding);
+    }
+    Ok(Zeroizing::new(plaintext.to_vec()))
 }
 
 /// Why the replay guard refused a record.
@@ -955,6 +1007,62 @@ pub(crate) mod tests {
             cipher.seal(&key, 1, &s.a.identity, &s.a.id, &head, &big, &mut OsEntropy),
             Err(SealError::TooLarge)
         );
+        // The bound the server checks is the largest padded record.
+        assert_eq!(
+            padme(8 + MAX_RECORD_PLAINTEXT as u64),
+            MAX_RECORD_PADDED as u64
+        );
+        let largest = vec![0u8; MAX_RECORD_PLAINTEXT];
+        let sealed = cipher
+            .seal(
+                &key,
+                1,
+                &s.a.identity,
+                &s.a.id,
+                &head,
+                &largest,
+                &mut OsEntropy,
+            )
+            .unwrap();
+        assert_eq!(sealed.len(), MAX_RECORD_LEN);
+    }
+
+    // Security review N13: a record's size shows only its Padmé length, and a record whose
+    // padding is not exactly that, or not zeros, does not open even though it is signed.
+    #[test]
+    fn records_are_padded_with_padme() {
+        let s = setup();
+        let cipher = RecordCipher::for_epoch(&s.state, &s.secret, Epoch(1)).unwrap();
+        let head = s.state.head().unwrap();
+        let key = ring_key();
+        let mut lengths = std::collections::BTreeSet::new();
+        for len in 300..340 {
+            let data = cipher
+                .seal(
+                    &key,
+                    1,
+                    &s.a.identity,
+                    &s.a.id,
+                    &head,
+                    &vec![1; len],
+                    &mut OsEntropy,
+                )
+                .unwrap();
+            assert_eq!(data.len(), RECORD_OVERHEAD + padme(8 + len as u64) as usize);
+            lengths.insert(data.len());
+        }
+        assert!(lengths.len() < 10, "{lengths:?}");
+        // Padding that is not zeros, sealed and signed by the sender itself, is refused.
+        let ring = vec![1u8; 300];
+        assert_eq!(pad(&ring).unwrap().len(), 320, "padme(308)");
+        let mut padded = pad(&ring).unwrap();
+        let last = padded.len() - 1;
+        padded[last] = 1;
+        assert_eq!(unpad(&padded), Err(OpenError::Padding));
+        let mut short = pad(&ring).unwrap().to_vec();
+        short.pop();
+        assert_eq!(unpad(&short), Err(OpenError::Padding));
+        assert_eq!(*unpad(&pad(&ring).unwrap()).unwrap(), ring);
     }
 
     #[test]

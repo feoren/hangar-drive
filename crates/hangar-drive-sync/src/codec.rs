@@ -10,6 +10,11 @@
 //! **Decoding** opens the server's objects from the root down, checks every format rule, the
 //! keyed ID of every object, that no item ID appears twice and that the tree is valid, and
 //! records the chunk list of every file under its content key.
+//!
+//! **Limits** (security review M3): a tree is a server's input, so decoding stops at
+//! [`MAX_TREE_DEPTH`] levels and [`MAX_TREE_ITEMS`] items, before more objects are fetched,
+//! and [`reachable`] lists a tree's objects without building it, up to
+//! [`MAX_REACHABLE_OBJECTS`], for the commit that replaces a tree beyond the limits.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,6 +30,24 @@ use zeroize::Zeroizing;
 use crate::chunker::DynEntropy;
 use crate::ports::{ChunkList, NetError, ServerApi, Store, StoreError};
 use crate::tree::{ContentKey, FileVersion, Node, NodeKind, Tree, TreeError, ROOT};
+
+/// The deepest tree a device decodes (security review M3): 512 levels. A path of 512 names
+/// needs at least 1024 bytes (one character and one separator per level), which is macOS's
+/// `PATH_MAX`, so no deeper tree can exist on every platform of version 1; Linux allows 4096
+/// bytes and Windows with `\\?\` paths 32,767 UTF-16 units, but a tree a macOS device cannot
+/// create is not worth decoding. 512 levels also keep every walk from an item to the root short.
+pub const MAX_TREE_DEPTH: usize = 512;
+
+/// The most items (files and directories) a decoded tree may hold (security review M3): 2^20.
+/// A device holds three trees per folder in memory, a few hundred bytes per item, so this keeps
+/// one folder below about a gigabyte; it is more than three times the 300,000 files OneDrive and
+/// Dropbox name as the size up to which their clients stay fast [UNVERIFIED].
+pub const MAX_TREE_ITEMS: usize = 1 << 20;
+
+/// The most objects [`reachable`] lists for one tree: eight per item of a tree at
+/// [`MAX_TREE_ITEMS`] (its node or manifest and the chunks of its files), more than any quota
+/// of version 1 holds in 4 MiB chunks next to a full tree.
+pub const MAX_REACHABLE_OBJECTS: usize = 8 * MAX_TREE_ITEMS;
 
 /// Why a tree was not encoded or decoded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +73,10 @@ pub enum CodecError {
     /// An item ID appears twice, or a manifest disagrees with its entry.
     #[error("the server's tree is inconsistent")]
     Inconsistent,
+    /// The server's tree is deeper than [`MAX_TREE_DEPTH`] or holds more than
+    /// [`MAX_TREE_ITEMS`] items, or more objects than [`MAX_REACHABLE_OBJECTS`] (M3).
+    #[error("the server's tree is beyond the limits of a folder")]
+    Limit,
 }
 
 /// The object keys of every generation of a folder's ring, and the generation new objects use.
@@ -171,14 +198,11 @@ pub fn encode(
     };
     let folder = *crypto.folder();
     let mut ids: BTreeMap<ItemId, ObjectId> = BTreeMap::new();
-    // Deepest directories first, so every child ID is known when its parent is encoded.
-    let mut dirs: Vec<(usize, ItemId)> = tree
-        .iter()
-        .filter(|(_, n)| n.is_dir())
-        .map(|(id, _)| (tree.depth(id), *id))
-        .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    let mut order: Vec<ItemId> = dirs.into_iter().map(|(_, id)| id).collect();
+    // Children before their parents, so every child ID is known when its parent is encoded:
+    // the breadth-first order reversed, O(n) (security review M3; the depth of every directory
+    // was O(n x depth)).
+    let mut order = tree.dirs_top_down();
+    order.reverse();
     order.push(ROOT);
     for dir in order {
         let mut entries = Vec::new();
@@ -321,22 +345,30 @@ pub fn decode(
 ) -> Result<Tree, CodecError> {
     let folder = *crypto.folder();
     let mut tree = Tree::new();
-    let mut stack = vec![(ROOT, *root)];
+    // Each directory node with the depth of its entries: the root's entries are at depth 1.
+    let mut stack = vec![(ROOT, *root, 1usize)];
     let mut seen_nodes = BTreeSet::new();
-    while let Some((dir, node_id)) = stack.pop() {
+    while let Some((dir, node_id, depth)) = stack.pop() {
         if !seen_nodes.insert((dir, node_id)) {
             return Err(CodecError::Inconsistent);
         }
         let (plain, _) =
             fetch_plaintext(&node_id, ObjectType::DirectoryNode, crypto, store, server)?;
         let node = DirectoryNode::decode(&plain)?;
+        // The limits are checked before the entries' objects are fetched (M3), so a tree beyond
+        // them costs at most one level or one node's entries more.
+        if tree.len().saturating_add(node.entries().len()) > MAX_TREE_ITEMS
+            || (depth > MAX_TREE_DEPTH && !node.entries().is_empty())
+        {
+            return Err(CodecError::Limit);
+        }
         for entry in node.entries() {
             if entry.item == ROOT || tree.contains(&entry.item) {
                 return Err(CodecError::Inconsistent);
             }
             let kind = match entry.kind {
                 EntryKind::Directory => {
-                    stack.push((entry.item, entry.child));
+                    stack.push((entry.item, entry.child, depth + 1));
                     NodeKind::Directory
                 }
                 EntryKind::File => {
@@ -387,6 +419,49 @@ pub fn decode(
     tree.check()?;
     tree.clear_dirty();
     Ok(tree)
+}
+
+/// Every object reachable from `root` (its directory nodes, manifests and chunks), without
+/// building a tree and without the tree checks (security review M3): the commit that replaces
+/// a tree beyond the limits ("Undo a device") must name what it drops relative to that tree.
+/// The walk is iterative, visits every directory node once, opens and checks every object as
+/// [`decode`] does, and stops at [`MAX_REACHABLE_OBJECTS`].
+pub fn reachable(
+    root: &ObjectId,
+    crypto: &FolderCrypto,
+    store: &mut dyn Store,
+    server: &mut dyn ServerApi,
+) -> Result<BTreeSet<ObjectId>, CodecError> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![*root];
+    out.insert(*root);
+    while let Some(node_id) = stack.pop() {
+        let (plain, _) =
+            fetch_plaintext(&node_id, ObjectType::DirectoryNode, crypto, store, server)?;
+        let node = DirectoryNode::decode(&plain)?;
+        for entry in node.entries() {
+            if !out.insert(entry.child) {
+                continue;
+            }
+            match entry.kind {
+                EntryKind::Directory => stack.push(entry.child),
+                EntryKind::File => {
+                    let (plain, _) = fetch_plaintext(
+                        &entry.child,
+                        ObjectType::FileManifest,
+                        crypto,
+                        store,
+                        server,
+                    )?;
+                    out.extend(FileManifest::decode(&plain)?.chunks().iter().copied());
+                }
+            }
+            if out.len() > MAX_REACHABLE_OBJECTS {
+                return Err(CodecError::Limit);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Remembers that the server now holds the sealed objects of `encoded`.

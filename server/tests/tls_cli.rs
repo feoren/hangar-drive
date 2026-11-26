@@ -110,6 +110,15 @@ async fn the_server_terminates_tls_1_3_itself_when_configured() {
         "{}",
         String::from_utf8_lossy(&reply)
     );
+    // A server that terminates TLS itself tells browsers to stay on https (overall review,
+    // info); behind a proxy the proxy sets it, so a plain server does not (`overall_review.rs`).
+    assert!(
+        String::from_utf8_lossy(&reply)
+            .to_ascii_lowercase()
+            .contains("strict-transport-security: max-age=31536000\r\n"),
+        "{}",
+        String::from_utf8_lossy(&reply)
+    );
     // Plain HTTP on the TLS port gets no HTTP answer.
     let plain = raw_plain(server.addr).await;
     assert!(!plain.starts_with("HTTP/1.1 200"));

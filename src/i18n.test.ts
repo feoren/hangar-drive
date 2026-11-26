@@ -4,6 +4,7 @@ import {
   DICTIONARIES,
   detectLanguage,
   isLanguage,
+  isolateName,
   isPluralKey,
   LANGUAGE_NAMES,
   LANGUAGES,
@@ -257,14 +258,27 @@ describe("translate", () => {
   it("isolates a name with right-to-left letters or bidi controls", () => {
     const fsi = String.fromCharCode(0x2068);
     const pdi = String.fromCharCode(0x2069);
+    const replacement = String.fromCharCode(0xfffd);
     const override = `Laptop${String.fromCharCode(0x202e)}fdp.exe`;
     expect(translate("en", "pair.added", { device: override })).toBe(
-      `“${fsi}${override}${pdi}” has been added.`,
+      `“${fsi}Laptop${replacement}fdp.exe${pdi}” has been added.`,
     );
     const hebrew = String.fromCharCode(0x05d0, 0x05d1);
     expect(translate("en", "pair.added", { device: hebrew })).toBe(
       `“${fsi}${hebrew}${pdi}” has been added.`,
     );
+  });
+
+  // Security review N9: a PDI inside a name would close the isolate early, so every bidi
+  // control is shown as U+FFFD before the name is isolated.
+  it("replaces the bidi controls of a name before isolating it", () => {
+    const fsi = String.fromCharCode(0x2068);
+    const pdi = String.fromCharCode(0x2069);
+    const replacement = String.fromCharCode(0xfffd);
+    const name = `a${pdi}${String.fromCharCode(0x202e)}b${String.fromCharCode(0x2066, 0x200f, 0x061c)}`;
+    const isolated = isolateName(name);
+    expect(isolated).toBe(`${fsi}a${replacement}${replacement}b${replacement.repeat(3)}${pdi}`);
+    expect(isolated.split(pdi)).toHaveLength(2);
   });
 
   it("leaves plain left-to-right names untouched", () => {

@@ -4,7 +4,7 @@
 //! process.
 //!
 //! The limits are checked in the authorization layer, before a handler reads the body
-//! ([`check_route`], finding M6), so a flood of requests costs no body reads. Each public
+//! ([`check_address`], [`check_account`], finding M6), so a flood of requests costs no body reads. Each public
 //! endpoint is limited twice by address: per address (IPv4, IPv6 /64) and, with a higher limit,
 //! per network (IPv4 /16, IPv6 /48), so one network cannot spread its requests over many
 //! addresses (finding M1). Sign-in is limited per account only by failed proofs, keyed by
@@ -51,6 +51,10 @@ pub enum Scope {
     PairingAccount,
     UploadIp,
     UploadAccount,
+    /// Every call with a bearer token, per address and network, counted before the token is
+    /// looked up (overall review, info).
+    CallIp,
+    CallNet,
 }
 
 impl Scope {
@@ -97,6 +101,17 @@ impl Scope {
             // A first upload of many small files: 20 objects a second, sustained.
             Scope::UploadIp | Scope::UploadAccount => Rule {
                 limit: 1200,
+                window_s: 60,
+            },
+            // Above the upload limit with room for the calls around the uploads (missing,
+            // commits, feed, records) of several devices behind one address; it only bounds
+            // how many token lookups a flood of made-up tokens costs.
+            Scope::CallIp => Rule {
+                limit: 3000,
+                window_s: 60,
+            },
+            Scope::CallNet => Rule {
+                limit: 12000,
                 window_s: 60,
             },
         }
@@ -269,44 +284,70 @@ pub struct RateKeys<'a> {
     pub account: Option<&'a [u8]>,
 }
 
-/// The limits of a route, checked before its handler reads the body. The network is counted
-/// first, so a network over its limit does not add address keys either.
+/// The address limits of a route, checked first, before its handler reads the body and, for a
+/// call with a bearer token (`session_call`), before the token is looked up in the database
+/// (overall review, info): a flood of made-up tokens costs no database read beyond the limit.
+/// The network is counted first, so a network over its limit does not add address keys either.
+pub fn check_address(
+    limiter: &RateLimiter,
+    handler: Handler,
+    keys: &RateKeys<'_>,
+    session_call: bool,
+    now_s: u64,
+) -> bool {
+    let route: &[(Scope, &[u8])] = match handler {
+        Handler::CreateAccount => &[(Scope::InviteNet, keys.net), (Scope::InviteIp, keys.ip)],
+        Handler::Challenge => &[
+            (Scope::ChallengeNet, keys.net),
+            (Scope::ChallengeIp, keys.ip),
+        ],
+        Handler::Proof => &[(Scope::ProofNet, keys.net), (Scope::ProofIp, keys.ip)],
+        Handler::PostPairing => &[(Scope::PairingNet, keys.net), (Scope::PairingIp, keys.ip)],
+        Handler::PutObject => &[(Scope::UploadIp, keys.ip)],
+        _ => &[],
+    };
+    let calls: &[(Scope, &[u8])] = if session_call {
+        &[(Scope::CallNet, keys.net), (Scope::CallIp, keys.ip)]
+    } else {
+        &[]
+    };
+    calls
+        .iter()
+        .chain(route)
+        .all(|(scope, key)| limiter.hit(*scope, key, now_s))
+}
+
+/// The account limits of a call, checked once its session is known.
+pub fn check_account(limiter: &RateLimiter, handler: Handler, account: &[u8], now_s: u64) -> bool {
+    match handler {
+        // With a session the account is the key; the address limit is for the public post.
+        Handler::GetPairing | Handler::ReservePairing => {
+            limiter.hit(Scope::PairingAccount, account, now_s)
+        }
+        Handler::PutObject => limiter.hit(Scope::UploadAccount, account, now_s),
+        _ => true,
+    }
+}
+
+/// Every limit of a route at once: the address limits ([`check_address`]) and, with
+/// `keys.account`, the account limits ([`check_account`]). A route with account limits but no
+/// account is refused rather than skipped.
 pub fn check_route(
     limiter: &RateLimiter,
     handler: Handler,
     keys: &RateKeys<'_>,
     now_s: u64,
 ) -> bool {
-    let checks: &[(Scope, Option<&[u8]>)] = match handler {
-        Handler::CreateAccount => &[
-            (Scope::InviteNet, Some(keys.net)),
-            (Scope::InviteIp, Some(keys.ip)),
-        ],
-        Handler::Challenge => &[
-            (Scope::ChallengeNet, Some(keys.net)),
-            (Scope::ChallengeIp, Some(keys.ip)),
-        ],
-        Handler::Proof => &[
-            (Scope::ProofNet, Some(keys.net)),
-            (Scope::ProofIp, Some(keys.ip)),
-        ],
-        Handler::PostPairing => &[
-            (Scope::PairingNet, Some(keys.net)),
-            (Scope::PairingIp, Some(keys.ip)),
-        ],
-        // With a session the account is the key; the address limit is for the public post.
-        Handler::GetPairing | Handler::ReservePairing => &[(Scope::PairingAccount, keys.account)],
-        Handler::PutObject => &[
-            (Scope::UploadIp, Some(keys.ip)),
-            (Scope::UploadAccount, keys.account),
-        ],
-        _ => &[],
-    };
-    checks.iter().all(|(scope, key)| match key {
-        Some(key) => limiter.hit(*scope, key, now_s),
-        // A call without its session never reaches this point; refuse rather than skip.
-        None => false,
-    })
+    if !check_address(limiter, handler, keys, keys.account.is_some(), now_s) {
+        return false;
+    }
+    match keys.account {
+        Some(account) => check_account(limiter, handler, account, now_s),
+        None => !matches!(
+            handler,
+            Handler::GetPairing | Handler::ReservePairing | Handler::PutObject
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-confirm-device-removed"
+description = "Enables the confirm_device_removed command without any pre-configured scope."
+commands.allow = ["confirm_device_removed"]
+
+[[permission]]
+identifier = "deny-confirm-device-removed"
+description = "Denies the confirm_device_removed command without any pre-configured scope."
+commands.deny = ["confirm_device_removed"]

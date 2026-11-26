@@ -78,6 +78,7 @@
     "allow-answer-pair-request",
     "allow-renew-recovery-code",
     "allow-reset-device",
+    "allow-confirm-device-removed",
     "allow-disconnect-this-device",
     "allow-undo",
     "allow-restore-deleted-folder",

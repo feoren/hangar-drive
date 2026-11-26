@@ -13,6 +13,22 @@ use zeroize::Zeroizing;
 pub struct ShownCode {
     /// The code, groups joined by `-`.
     pub code: Zeroizing<String>,
+    /// The group the person types back, counted from 1.
+    pub check_group: u32,
+    /// A renewed code of a set-up account: confirming it ends the old code, so the shell asks
+    /// natively first (security review M4).
+    pub renewal: bool,
+}
+
+impl ShownCode {
+    /// Whether `typed` is the check group, compared as the engine compares it.
+    pub fn group_matches(&self, typed: &str) -> bool {
+        let index = usize::try_from(self.check_group.saturating_sub(1)).unwrap_or(usize::MAX);
+        self.code
+            .split('-')
+            .nth(index)
+            .is_some_and(|group| !group.is_empty() && typed.trim().to_ascii_uppercase() == group)
+    }
 }
 
 impl std::fmt::Debug for ShownCode {

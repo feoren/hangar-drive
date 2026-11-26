@@ -172,6 +172,14 @@ describe("banners", () => {
   it("deletes for good only through the danger button", async () => {
     const { mock } = await renderApp("massDelete");
     expect(button("Ja, löschen").className).toContain("danger");
+    // The shell asks natively with the folder and the number (security review M4); "no" there
+    // leaves the question open and shows no error.
+    mock.controls.nativeConfirm = "no";
+    await click("Ja, löschen");
+    expect(mock.calls).toContain("resolveMassDelete:delete");
+    expect(dialogTitle()).toBe("342 Dateien gelöscht");
+    expect(text()).not.toContain("auf deinen anderen Geräten gelöscht.");
+    mock.controls.nativeConfirm = "yes";
     await click("Ja, löschen");
     expect(mock.calls).toContain("resolveMassDelete:delete");
     expect(text()).toContain("342 Dateien sind jetzt auch auf deinen anderen Geräten gelöscht.");
@@ -249,6 +257,32 @@ describe("banners", () => {
     expect(maybeButton("Jetzt aktualisieren")).toBeUndefined();
     expect(document.querySelector(".feedback-error")).toBeNull();
     expect(banner()?.textContent).toContain("Installiere die neue Version");
+  });
+
+  // Security review H2: a removal only the server reports is forgotten here after the native
+  // question; "no" there keeps the account, and nothing is shown as an error.
+  it("forgets the account after a reported removal only when the person confirms", async () => {
+    const { mock } = await renderApp("removalReported");
+    expect(banner()?.textContent).toContain(
+      "Dein Server meldet, dass dieses Gerät aus deinem Konto entfernt wurde.",
+    );
+    mock.controls.nativeConfirm = "no";
+    await click("Bestätigen");
+    expect(mock.calls).toContain("confirmDeviceRemoved");
+    expect(banner()?.textContent).toContain("Dein Server meldet");
+    expect(document.querySelector(".feedback-error")).toBeNull();
+    mock.controls.nativeConfirm = "yes";
+    await click("Bestätigen");
+    expect(text()).toContain("Willkommen bei Hangar Drive");
+  });
+
+  // Security review M3: a version of a folder beyond the limits leads to the earlier versions.
+  it("leads from an oversized server version to the earlier versions", async () => {
+    await renderApp("treeLimit");
+    expect(banner()?.textContent).toContain("Ein zu großer Stand von „Hangar Drive“");
+    expect(text()).toContain("Angehalten: zu großer Stand auf dem Server");
+    await click("Frühere Versionen");
+    expect(dialogTitle()).toBe("Frühere Versionen von „Hangar Drive“");
   });
 
   it("names no device when the server only said this device was removed", async () => {
@@ -395,18 +429,27 @@ describe("add folder", () => {
     await click("Hierher holen");
     expect(mock.calls.join(",")).toContain("addAccountFolder");
     expect(dialog()).toBeNull();
-    expect(button("Musik, C:\\Users\\Alex\\Musik")).toBeTruthy();
+    // Proposed below the app's folder, never in the home folder itself (H1, N8).
+    expect(button("Musik, C:\\Users\\Alex\\Hangar Drive\\Musik")).toBeTruthy();
   });
 
-  it("asks before merging into a folder that is not empty", async () => {
+  // Security review H1: a place that holds files is asked about natively by the shell, with the
+  // place, the number of files and the server; "Choose another folder" there opens the picker.
+  it("joins a folder that is not empty only after the native question", async () => {
     const { mock } = await renderApp();
     mock.controls.localFiles = 1;
+    mock.controls.nativeConfirm = "no";
+    mock.controls.pick = "cancel";
     await click("Ordner hinzufügen");
     await click("Hierher holen");
-    expect(dialogTitle()).toBe("In diesem Ordner liegt schon 1 Datei");
-    expect(dialog()?.textContent).toContain("Die Datei kommt zu „Musik“ dazu.");
-    await click("Zusammenführen");
     expect(mock.calls).toContain("addAccountFolder");
+    expect(mock.calls).toContain("pickFolder");
+    expect(dialog()?.textContent).toContain("Auf deinen anderen Geräten gibt es noch:");
+    expect(text()).not.toContain("86 Dateien werden heruntergeladen");
+    mock.controls.nativeConfirm = "yes";
+    await click("Hierher holen");
+    expect(dialog()).toBeNull();
+    expect(button("Musik, C:\\Users\\Alex\\Hangar Drive\\Musik")).toBeTruthy();
   });
 
   it("adds any folder and explains a refused one", async () => {

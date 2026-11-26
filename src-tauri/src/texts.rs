@@ -102,27 +102,43 @@ pub fn plural(language: &str, base: &str, n: u64) -> Option<&'static str> {
 const FSI: char = '\u{2068}';
 const PDI: char = '\u{2069}';
 
-/// Whether `c` is a right-to-left letter or a bidi control: the ranges of `BIDI_RELEVANT` in
-/// src/i18n.ts (Hebrew to Arabic Extended-A with the ALM, LRM and RLM, the embeddings and overrides,
-/// the isolates, the Hebrew and Arabic presentation forms).
-fn bidi_relevant(c: char) -> bool {
+/// The character a bidi control of a name is shown as.
+const REPLACEMENT: char = '\u{FFFD}';
+
+/// Whether `c` is a bidi control (UAX #9): the Arabic letter mark, LRM and RLM, the embeddings
+/// and overrides, and the isolates; `BIDI_CONTROLS` in src/i18n.ts.
+fn bidi_control(c: char) -> bool {
     matches!(c,
-        '\u{0590}'..='\u{08FF}'
+        '\u{061C}'
         | '\u{200E}'..='\u{200F}'
         | '\u{202A}'..='\u{202E}'
-        | '\u{2066}'..='\u{2069}'
+        | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether `c` is a right-to-left letter: Hebrew to Arabic Extended-A and the Hebrew and Arabic
+/// presentation forms; `RTL_LETTERS` in src/i18n.ts.
+fn right_to_left(c: char) -> bool {
+    matches!(c,
+        '\u{0590}'..='\u{08FF}'
         | '\u{FB1D}'..='\u{FDFF}'
         | '\u{FE70}'..='\u{FEFC}')
 }
 
-/// A file, folder or device name inside a sentence, isolated (FSI ... PDI) when it carries
-/// right-to-left letters or bidi controls, so it cannot reorder or spoof the text around it
-/// (security review L7); the window's `isolateName` in src/i18n.ts does the same.
+/// A file, folder or device name inside a sentence. Its bidi controls are shown as U+FFFD first:
+/// a name never needs one, and a PDI inside it would close the isolate early and let the rest of
+/// the name act on the sentence (security review N9). The result is isolated (FSI ... PDI) when
+/// it carries right-to-left letters or had a control, so it cannot reorder or spoof the text
+/// around it (security review L7); the window's `isolateName` in src/i18n.ts does the same.
 pub fn isolate_name(value: &str) -> String {
-    if value.chars().any(bidi_relevant) {
-        format!("{FSI}{value}{PDI}")
+    let had_control = value.chars().any(bidi_control);
+    let cleaned: String = value
+        .chars()
+        .map(|c| if bidi_control(c) { REPLACEMENT } else { c })
+        .collect();
+    if had_control || cleaned.chars().any(right_to_left) {
+        format!("{FSI}{cleaned}{PDI}")
     } else {
-        value.to_owned()
+        cleaned
     }
 }
 
@@ -233,16 +249,35 @@ mod tests {
     #[test]
     fn names_with_bidi_characters_are_isolated() {
         let spoof = "Laptop\u{202E}txt.exe".to_owned();
-        let params = BTreeMap::from([("device", spoof.clone())]);
+        let params = BTreeMap::from([("device", spoof)]);
         assert_eq!(
             fill("en", "{device} wants to join", &params),
-            format!("\u{2068}{spoof}\u{2069} wants to join")
+            "\u{2068}Laptop\u{FFFD}txt.exe\u{2069} wants to join"
         );
         let hebrew = BTreeMap::from([("folder", "\u{05D0}\u{05D1}".to_owned())]);
         assert!(fill("de", "„{folder}“", &hebrew).contains('\u{2068}'));
         // Plain names stay plain.
         assert_eq!(isolate_name("Docs"), "Docs");
         assert_eq!(isolate_name("Fotos 2026 ü"), "Fotos 2026 ü");
+    }
+
+    // Security review N9: a PDI inside a name would close the isolate early; every bidi control
+    // is shown as U+FFFD before the name is isolated.
+    #[test]
+    fn bidi_controls_in_a_name_are_replaced_before_isolating() {
+        let isolated = isolate_name("a\u{2069}\u{202E}b\u{2066}c\u{200F}\u{061C}");
+        assert_eq!(
+            isolated,
+            "\u{2068}a\u{FFFD}\u{FFFD}b\u{FFFD}c\u{FFFD}\u{FFFD}\u{2069}"
+        );
+        assert_eq!(isolated.matches('\u{2069}').count(), 1);
+        assert_eq!(isolate_name("\u{05D0}"), "\u{2068}\u{05D0}\u{2069}");
+        // A folder name in a native question is cleaned the same way.
+        let params = BTreeMap::from([("folder", "x\u{2069}y".to_owned())]);
+        assert_eq!(
+            fill("en", "Delete “{folder}”?", &params),
+            "Delete “\u{2068}x\u{FFFD}y\u{2069}”?"
+        );
     }
 
     #[test]

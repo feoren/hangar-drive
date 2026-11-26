@@ -63,6 +63,8 @@ export function RemovedHeadsDialog({
   const take = (undo: boolean) => {
     void action.run(async () => {
       const result = await backend.acceptRemovedHeads(warning.folderId);
+      // "No" in the native question leaves the folder stopped and the question open.
+      if (result.kind === "declined") return;
       if (undo) open(restoreBefore(warning, result.beforeEntryId));
       else setAccepted({ before: result.beforeEntryId });
     });

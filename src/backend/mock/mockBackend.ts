@@ -12,7 +12,11 @@ import { pauseUntil, type TrayModel } from "../../tray/trayModel";
 import { BackendError, type BackendErrorCode } from "../errors";
 import type {
   About,
-  AcceptedHeads,
+  Confirmation,
+  HeadsAnswer,
+  JoinOutcome,
+  MassDeleteOutcome,
+  RecoveryCheck,
   AccountFolder,
   ActivityEntry,
   Backend,
@@ -31,6 +35,7 @@ import type {
   InviteError,
   LinkError,
   Millis,
+  DeviceNameError,
   NameError,
   NameIssue,
   NotSyncedEntry,
@@ -106,6 +111,8 @@ export interface MockControls {
   update: "upToDate" | "installed" | "off";
   /** How a new device answers the next pairing offer of this device. */
   pairAnswer: "link" | "typed" | "none";
+  /** The name of the account's device the new device's name looks like, or null. */
+  pairLookAlike: string | null;
   folderNumber: "number" | "offline";
   olderCheck: "stillOlder" | "resolved";
   clipboard: string;
@@ -132,6 +139,7 @@ const DEFAULT_CONTROLS: MockControls = {
   restore: "done",
   save: "saved",
   nativeConfirm: "yes",
+  pairLookAlike: null,
   update: "installed",
   pairAnswer: "link",
   folderNumber: "number",
@@ -232,7 +240,13 @@ export class MockBackend implements Backend {
     if (!this.offer) return;
     this.emit({
       type: "pairRequest",
-      request: { offerId: this.offer.id, deviceName: "MacBook", path, safety: fx.numberRows(7) },
+      request: {
+        offerId: this.offer.id,
+        deviceName: "MacBook",
+        path,
+        safety: fx.numberRows(7),
+        similarTo: this.controls.pairLookAlike,
+      },
     });
   }
 
@@ -493,14 +507,16 @@ export class MockBackend implements Backend {
     await this.call("copyRecoveryCode");
   }
 
-  async confirmRecoveryGroup(group: string): Promise<boolean> {
+  async confirmRecoveryGroup(group: string): Promise<RecoveryCheck> {
     await this.call("confirmRecoveryGroup");
     const code = this.recovery;
-    if (!code) return false;
+    if (!code) return "wrong";
     const expected = code.groups[code.checkGroup - 1];
-    if (normalizeCode(group) !== expected) return false;
+    if (normalizeCode(group) !== expected) return "wrong";
+    // A renewed code of a set-up account asks natively before it replaces the old one.
+    if (this.state.setup === "done" && this.controls.nativeConfirm === "no") return "declined";
     this.state.recoveryCreated = this.now();
-    return true;
+    return "confirmed";
   }
 
   async defaultFolderPlace(): Promise<FolderPlace> {
@@ -611,7 +627,8 @@ export class MockBackend implements Backend {
   async listAccountFolders(): Promise<{ folders: AccountFolder[]; free: number }> {
     await this.call("listAccountFolders");
     const proposal = (id: string, name: string, size: number): AccountFolder => {
-      const place = this.place(`${fx.HOME}\\${name}`, name);
+      // Always a new folder below the app's folder, never one of the home folder (H1, N8).
+      const place = this.place(`${fx.HOME}\\Hangar Drive\\${name}`, name);
       return { id, name, size, proposedPath: place.path, proposedToken: place.token };
     };
     // The account's folders, and any other folder the other devices have (scenarios add some).
@@ -629,13 +646,18 @@ export class MockBackend implements Backend {
     return { folders, free: 120_000_000_000 };
   }
 
-  async joinFolders(choices: readonly FolderChoice[]): Promise<void> {
+  async joinFolders(choices: readonly FolderChoice[]): Promise<readonly FolderId[]> {
     await this.call("joinFolders");
+    const declined = choices
+      .filter((choice) => this.declinesJoin(choice.token))
+      .map((choice) => choice.folderId);
+    const joined = choices.filter((choice) => !declined.includes(choice.folderId));
+    if (joined.length === 0) return declined;
     const now = this.now();
     const all = await this.listAccountFoldersQuiet();
     this.state = {
       ...baseState(now),
-      folders: choices.map((choice) => ({
+      folders: joined.map((choice) => ({
         id: choice.folderId,
         name: all.find((folder) => folder.id === choice.folderId)?.name ?? choice.folderId,
         path: this.placeOf(choice.token, "joinFolders").path,
@@ -650,6 +672,14 @@ export class MockBackend implements Backend {
     this.state.sync.pendingFiles = 240;
     this.state.sync.bytesLeft = 9_800_000_000;
     this.emitSnapshot();
+    return declined;
+  }
+
+  /** The shell's native question for a place that holds files (H1), answered by the controls. */
+  private declinesJoin(token: string): boolean {
+    const { path } = this.placeOf(token, "join");
+    const files = path.endsWith("\\Bilder") ? 214 : this.controls.localFiles;
+    return files > 0 && this.controls.nativeConfirm === "no";
   }
 
   private listAccountFoldersQuiet(): Promise<{ id: string; name: string }[]> {
@@ -682,10 +712,21 @@ export class MockBackend implements Backend {
     return { ok: true, value: null };
   }
 
-  async setDeviceName(name: string): Promise<Result<null, NameError>> {
+  async setDeviceName(name: string): Promise<Result<null, DeviceNameError>> {
     await this.call("setDeviceName");
     const nameError = strictNameProblem(name);
     return nameError ? { ok: false, error: nameError } : { ok: true, value: null };
+  }
+
+  /**
+   * As the shell: a name that looks like another device's (here: equal ignoring case) is taken
+   * only after the native question; "no" there answers `looksLike`.
+   */
+  private looksLikeOther(deviceId: DeviceId, name: string): boolean {
+    const folded = name.toLocaleLowerCase();
+    return this.state.devices.some(
+      (device) => device.id !== deviceId && device.name.toLocaleLowerCase() === folded,
+    );
   }
 
   async recoveryDevices(): Promise<readonly Device[]> {
@@ -693,8 +734,9 @@ export class MockBackend implements Backend {
     return fx.devices(this.now()).map((device) => ({ ...device, isThis: false }));
   }
 
-  async finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode> {
+  async finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode | null> {
     await this.call(`finishRecoveryCleanup:${String(remove.length)}`);
+    if (remove.length > 0 && this.controls.nativeConfirm === "no") return null;
     this.recovery = this.newRecoveryCode();
     return this.recovery;
   }
@@ -765,8 +807,9 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async addAccountFolder(folderId: FolderId, token: string): Promise<void> {
+  async addAccountFolder(folderId: FolderId, token: string): Promise<JoinOutcome> {
     await this.call("addAccountFolder");
+    if (this.declinesJoin(token)) return "declined";
     const { path } = this.placeOf(token, "addAccountFolder");
     this.places.delete(token);
     const remote = this.state.remoteFolders.find((folder) => folder.id === folderId);
@@ -785,6 +828,7 @@ export class MockBackend implements Backend {
       },
     ];
     this.emitSnapshot();
+    return "joined";
   }
 
   async stopFolder(folderId: FolderId): Promise<void> {
@@ -861,12 +905,16 @@ export class MockBackend implements Backend {
     return fx.massDeleteList(warning?.kind === "massDelete" ? warning.count : 0);
   }
 
-  async resolveMassDelete(warningId: string, decision: "restore" | "delete"): Promise<number> {
+  async resolveMassDelete(
+    warningId: string,
+    decision: "restore" | "delete",
+  ): Promise<MassDeleteOutcome> {
     await this.call(`resolveMassDelete:${decision}`);
+    if (decision === "delete" && this.controls.nativeConfirm === "no") return { kind: "declined" };
     const warning = this.state.warnings.find((item) => item.id === warningId);
     this.removeWarning(warningId);
     this.emitSnapshot();
-    return warning?.kind === "massDelete" ? warning.count : 0;
+    return { kind: "resolved", count: warning?.kind === "massDelete" ? warning.count : 0 };
   }
 
   async findMissingFolder(folderId: FolderId): Promise<PickResult> {
@@ -944,9 +992,11 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async reanchor(folderId: FolderId, compared: boolean): Promise<void> {
+  async reanchor(folderId: FolderId, compared: boolean): Promise<Confirmation> {
     await this.call(`reanchor:${compared ? "compared" : "blind"}`);
+    if (this.controls.nativeConfirm === "no") return "declined";
     this.clearOlder(folderId);
+    return "confirmed";
   }
 
   async dismissSuspect(warningId: string): Promise<void> {
@@ -955,8 +1005,9 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async acceptRemovedHeads(folderId: FolderId): Promise<AcceptedHeads> {
+  async acceptRemovedHeads(folderId: FolderId): Promise<HeadsAnswer> {
     await this.call(`acceptRemovedHeads:${folderId}`);
+    if (this.controls.nativeConfirm === "no") return { kind: "declined" };
     const commits = new Set(
       this.state.removedHeads?.folderId === folderId
         ? this.state.removedHeads.heads.map((head) => head.commit)
@@ -975,11 +1026,23 @@ export class MockBackend implements Backend {
       -1,
     );
     const before = oldest === -1 ? undefined : entries[oldest + 1];
-    return { count: commits.size, beforeEntryId: before?.id ?? null };
+    return { kind: "accepted", count: commits.size, beforeEntryId: before?.id ?? null };
   }
 
   async openStorageSettings(): Promise<void> {
     await this.call("openStorageSettings");
+  }
+
+  async confirmDeviceRemoved(): Promise<Confirmation> {
+    await this.call("confirmDeviceRemoved");
+    if (this.controls.nativeConfirm === "no") return "declined";
+    // As when the account log shows the removal: the account is forgotten, "removed" stays.
+    this.state = {
+      ...scenarioState("setup", this.now()),
+      warnings: [{ kind: "removed", id: "removed", by: "" }],
+    };
+    this.emitSnapshot();
+    return "confirmed";
   }
 
   async installUpdate(): Promise<UpdateOutcome> {
@@ -992,6 +1055,7 @@ export class MockBackend implements Backend {
       case "upToDate":
         return { kind: "upToDate" };
       case "installed":
+        if (this.controls.nativeConfirm === "no") return { kind: "declined" };
         return { kind: "installed", version: "0.2.0" };
     }
   }
@@ -1187,8 +1251,9 @@ export class MockBackend implements Backend {
     this.emitSnapshot();
   }
 
-  async resetFolder(folderId: FolderId, entryId: string): Promise<RestoreOutcome> {
+  async resetFolder(folderId: FolderId, entryId: string): Promise<RestoreOutcome | null> {
     await this.call(`resetFolder:${folderId}:${entryId}`);
+    if (this.controls.nativeConfirm === "no") return null;
     const outcome = this.restoreOutcome(fx.tree(entryId).length, "");
     return outcome.kind === "done" ? { ...outcome, renamedTo: null } : outcome;
   }
@@ -1235,10 +1300,13 @@ export class MockBackend implements Backend {
     return { devices: [...this.state.devices], recoveryCreated: this.state.recoveryCreated };
   }
 
-  async renameDevice(deviceId: DeviceId, name: string): Promise<Result<null, NameError>> {
+  async renameDevice(deviceId: DeviceId, name: string): Promise<Result<null, DeviceNameError>> {
     await this.call("renameDevice");
     const nameError = strictNameProblem(name);
     if (nameError) return { ok: false, error: nameError };
+    if (this.looksLikeOther(deviceId, name) && this.controls.nativeConfirm === "no") {
+      return { ok: false, error: "looksLike" };
+    }
     this.state.devices = this.state.devices.map((device) =>
       device.id === deviceId ? { ...device, name } : device,
     );
@@ -1250,27 +1318,33 @@ export class MockBackend implements Backend {
     return fx.numberRows(deviceId.length * 977);
   }
 
-  async removeDevice(deviceId: DeviceId): Promise<void> {
+  async removeDevice(deviceId: DeviceId): Promise<Confirmation> {
     await this.call(`removeDevice:${deviceId}`);
+    if (this.controls.nativeConfirm === "no") return "declined";
     this.state.devices = this.state.devices.filter((device) => device.id !== deviceId);
     const others = this.state.devices.some((device) => !device.isThis);
     if (this.state.account) this.state.account = { ...this.state.account, hasOtherDevices: others };
     this.emitSnapshot();
+    return "confirmed";
   }
 
-  async resetDevice(): Promise<void> {
+  async resetDevice(): Promise<Confirmation> {
     await this.call("resetDevice");
+    if (this.controls.nativeConfirm === "no") return "declined";
     this.state = scenarioState("setup", this.now());
     this.recovery = null;
     this.offer = null;
     this.places.clear();
     this.emitSnapshot();
+    return "confirmed";
   }
 
-  async disconnectThisDevice(): Promise<void> {
+  async disconnectThisDevice(): Promise<Confirmation> {
     await this.call("disconnectThisDevice");
+    if (this.controls.nativeConfirm === "no") return "declined";
     this.state = scenarioState("setup", this.now());
     this.emitSnapshot();
+    return "confirmed";
   }
 
   async createPairingOffer(): Promise<PairingOffer> {
@@ -1338,9 +1412,11 @@ export class MockBackend implements Backend {
     return this.state.settings;
   }
 
-  async setAutostart(on: boolean): Promise<void> {
+  async setAutostart(on: boolean): Promise<Confirmation> {
     await this.call("setAutostart");
+    if (!on && this.controls.nativeConfirm === "no") return "declined";
     this.state.settings = { ...this.state.settings, autostart: on };
+    return "confirmed";
   }
 
   async setLanguage(language: Language | "system"): Promise<void> {

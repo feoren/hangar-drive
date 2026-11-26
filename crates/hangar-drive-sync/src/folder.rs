@@ -55,6 +55,8 @@ use crate::tree::{ContentKey, FileVersion, Node, NodeKind, Tree, ROOT};
 pub const MARKER_NAME: &str = "marker";
 /// Name of the park directory inside the reserved directory.
 pub const PARK_DIR: &str = "park";
+/// How soon a folder stopped as too large tries again after a change in it.
+const TOO_LARGE_RETRY_MS: i64 = 60 * 1000;
 
 /// The path of the root marker.
 pub fn marker_path() -> Vec<String> {
@@ -80,6 +82,10 @@ pub struct FolderSettings {
     /// ([`hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS`]; smaller in tests). A publish
     /// that adds more goes out as several commits ([`stage_tree`]).
     pub max_delta_ids: usize,
+    /// The most items a folder may hold ([`codec::MAX_TREE_ITEMS`]; smaller in tests).
+    pub max_tree_items: usize,
+    /// The deepest item a folder may hold ([`codec::MAX_TREE_DEPTH`]; smaller in tests).
+    pub max_tree_depth: usize,
 }
 
 impl Default for FolderSettings {
@@ -92,6 +98,8 @@ impl Default for FolderSettings {
             hash_threads: 4,
             max_publish_attempts: 5,
             max_delta_ids: hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS,
+            max_tree_items: codec::MAX_TREE_ITEMS,
+            max_tree_depth: codec::MAX_TREE_DEPTH,
         }
     }
 }
@@ -110,6 +118,18 @@ pub enum StopReason {
     /// H1). The folder waits until the person decides; the heads are in
     /// [`FolderMeta::removed_heads`].
     RemovedHeads,
+    /// The server's head holds a tree beyond the limits of a folder (deeper than
+    /// `codec::MAX_TREE_DEPTH` or with more than `codec::MAX_TREE_ITEMS` items, security review
+    /// M3). The head's commit verified and is the folder's frontier, but its tree was never
+    /// taken in, so nothing of it reaches the disk. A restore ("Undo a device") publishes on
+    /// that head without decoding its tree and makes the folder active again.
+    TreeLimit,
+    /// The folder on this disk is beyond the same limits (follow-up check N-4): more items
+    /// than [`FolderSettings::max_tree_items`] or one deeper than
+    /// [`FolderSettings::max_tree_depth`], found by the scan or in the tree to publish. Nothing
+    /// is published, since no other device would take such a tree in. The folder tries again
+    /// with a full scan once the person changed something in it, or with the hourly scan.
+    LocalTooLarge,
 }
 
 /// A head of a removed device the person is asked about (security review H1, N2).
@@ -423,6 +443,9 @@ pub struct FolderSync {
     meta: FolderMeta,
     view: FolderView,
     scan_scope: ScanScope,
+    /// When the scan last found the folder too large ([`StopReason::LocalTooLarge`]); a
+    /// change in the folder tries again at most once a minute. Not stored.
+    too_large_at: Option<i64>,
     /// What the last commit of a person's action changed ([`FolderSync::publish_tree`]), until
     /// the engine takes it for an undo; not stored.
     last_action: Option<UndoState>,
@@ -685,6 +708,7 @@ impl FolderSync {
             },
             view: FolderView::new(*account.id(), folder),
             scan_scope: ScanScope::Full,
+            too_large_at: None,
             last_action: None,
         }
     }
@@ -717,6 +741,7 @@ impl FolderSync {
             meta,
             view,
             scan_scope: ScanScope::Full,
+            too_large_at: None,
             last_action: None,
         }))
     }
@@ -883,6 +908,13 @@ impl FolderSync {
     /// One round of the control loop (module docs).
     pub fn round(&mut self, cx: &mut Ctx<'_>) -> Result<RoundReport, SyncError> {
         let mut report = RoundReport::default();
+        if self.meta.state == FolderState::Stopped(StopReason::LocalTooLarge) {
+            if !self.retry_too_large(cx.clock.now_ms()) {
+                return Ok(report);
+            }
+            self.meta.state = FolderState::Active;
+            self.request_full_scan();
+        }
         if self.meta.state != FolderState::Active {
             return Ok(report);
         }
@@ -897,6 +929,9 @@ impl FolderSync {
         }
         self.scan(cx)?;
         self.save(cx.store)?;
+        if self.meta.state != FolderState::Active {
+            return Ok(report);
+        }
         match self.pull(cx) {
             Ok(n) => report.pulled = n,
             Err(e) if e.is_offline() => {
@@ -918,6 +953,16 @@ impl FolderSync {
             if !p.publish {
                 planned = Some(p);
                 break;
+            }
+            // The merged tree can be larger than the disk's and the server's tree alone; one
+            // beyond the limits is never published (follow-up check N-4).
+            if !p
+                .merged
+                .within(cx.settings.max_tree_items, cx.settings.max_tree_depth)
+            {
+                self.stop_too_large(cx.clock.now_ms());
+                self.save(cx.store)?;
+                return Ok(report);
             }
             match self.publish(cx, &p) {
                 Ok(()) => {
@@ -978,6 +1023,29 @@ impl FolderSync {
         report.in_sync = self.in_sync();
         self.save(cx.store)?;
         Ok(report)
+    }
+
+    /// Stops the folder as too large for a folder (follow-up check N-4); the next try waits for
+    /// a change in the folder or the hourly scan ([`Self::retry_too_large`]).
+    fn stop_too_large(&mut self, now: i64) {
+        self.meta.state = FolderState::Stopped(StopReason::LocalTooLarge);
+        self.scan_scope = ScanScope::Paths(BTreeSet::new());
+        self.too_large_at = Some(now);
+    }
+
+    /// Whether a folder stopped as too large tries again now: after the hourly full scan was
+    /// requested, or after a change the watcher reported, at most once a minute, so a folder
+    /// that keeps changing is not walked up to its limit in every round.
+    fn retry_too_large(&self, now: i64) -> bool {
+        match &self.scan_scope {
+            ScanScope::Full => true,
+            ScanScope::Paths(paths) => {
+                !paths.is_empty()
+                    && self
+                        .too_large_at
+                        .is_none_or(|at| !(0..TOO_LARGE_RETRY_MS).contains(&(now - at)))
+            }
+        }
     }
 
     fn stop_on(&mut self, e: SyncError, store: &mut dyn Store) -> Result<RoundReport, SyncError> {
@@ -1154,7 +1222,18 @@ impl FolderSync {
                 .collect(),
         };
         let mut dirs: Vec<Vec<String>> = vec![Vec::new()];
+        // The limits of a folder (follow-up check N-4), checked while walking, so a folder far
+        // beyond them is not read to its end: more items than a device decodes, or an item
+        // deeper than it decodes.
+        let (max_items, max_depth) = (cx.settings.max_tree_items, cx.settings.max_tree_depth);
+        let beyond = |found: &[(Vec<String>, Stat)]| {
+            found.len() > max_items || found.last().is_some_and(|(p, _)| p.len() > max_depth)
+        };
         while let Some(dir) = dirs.pop() {
+            if beyond(&found) {
+                self.stop_too_large(cx.clock.now_ms());
+                return Ok(());
+            }
             if let Some(set) = &relist {
                 let known = if dir.is_empty() {
                     Some(ROOT)
@@ -1232,6 +1311,10 @@ impl FolderSync {
                     }
                 }
             }
+        }
+        if beyond(&found) {
+            self.stop_too_large(cx.clock.now_ms());
+            return Ok(());
         }
         found.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
         not_synced.sort();
@@ -1563,7 +1646,23 @@ impl FolderSync {
             return Ok(0);
         };
         let reader = cx.account.folder_reader(&self.folder)?;
-        let tree = codec::decode(&head.commit.root, &reader, cx.store, cx.server)?;
+        let tree = match codec::decode(&head.commit.root, &reader, cx.store, cx.server) {
+            Ok(tree) => tree,
+            Err(codec::CodecError::Limit) => {
+                // The commits verified, so they are the folder's chain and its history; only
+                // the head's tree stays out (security review M3). The remote tree keeps the last
+                // one taken in, and the folder waits for a restore.
+                self.record_timeline(&outcome, &delta, cx.clock.now_ms());
+                let n = outcome.heads.len();
+                self.view = outcome.view;
+                self.meta.remote_root = Some(head.commit.root);
+                self.meta.frontier_wire = Some(Blob(head.wire.clone()));
+                self.meta.sync_base = None;
+                self.meta.state = FolderState::Stopped(StopReason::TreeLimit);
+                return Ok(n);
+            }
+            Err(e) => return Err(e.into()),
+        };
         self.record_timeline(&outcome, &delta, cx.clock.now_ms());
         let n = outcome.heads.len();
         self.view = outcome.view;
@@ -1662,14 +1761,9 @@ impl FolderSync {
         let Some(root) = root else {
             return Ok(BTreeSet::new());
         };
-        let tree = codec::decode(&root, crypto, cx.store, cx.server)?;
-        let encoded = codec::encode(&tree, crypto, cx.store, cx.entropy)?;
-        if encoded.root != root {
-            // A tree whose objects are not all in the cache: fall back to declaring every
-            // object of the new tree as added (a superset is always accepted).
-            return Ok(BTreeSet::new());
-        }
-        Ok(encoded.reachable)
+        // The objects themselves, not a decoded tree (security review M3): the parent may be a
+        // head beyond the limits of a folder that a restore replaces.
+        Ok(codec::reachable(&root, crypto, cx.store, cx.server)?)
     }
 
     /// Uploads every object of `encoded` the server lacks: sealed nodes and manifests, and
@@ -2093,6 +2187,12 @@ impl FolderSync {
         match self.publish(cx, &p) {
             Ok(()) => {
                 self.last_action = Some(change);
+                // A restore replaced a head beyond the limits (M3): the folder syncs again.
+                if self.meta.state == FolderState::Stopped(StopReason::TreeLimit) {
+                    self.meta.state = FolderState::Active;
+                    self.request_full_scan();
+                    self.save(cx.store)?;
+                }
                 Ok(())
             }
             Err(PublishFailure::HeadMoved) => Err(SyncError::Net(NetError::Server(

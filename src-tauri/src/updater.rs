@@ -43,6 +43,8 @@ pub enum UpdateOutcome {
     UpToDate,
     /// The signed update was installed; on Windows the installer ends the app.
     Installed { version: String },
+    /// An update was found, and the person said no in the native dialog.
+    Declined,
 }
 
 #[cfg(test)]

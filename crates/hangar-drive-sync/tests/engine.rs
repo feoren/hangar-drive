@@ -226,13 +226,14 @@ fn setup_pairing_and_sync_through_the_engine() {
         host,
         account,
         pinned,
+        punycode,
     }) = b.inspect_link(&offer.link)
     else {
         panic!("inspect");
     };
     assert_eq!(host, "localhost:8080");
     assert_eq!(account, offer.account);
-    assert!(!pinned);
+    assert!(!pinned && !punycode);
     assert!(matches!(
         b.inspect_link("hangar-drive://pair#AQID"),
         ApiResult::Err(hangar_drive_sync::api::LinkProblem::Damaged)

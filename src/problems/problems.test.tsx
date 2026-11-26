@@ -169,14 +169,14 @@ describe("older state (UX 8.6)", () => {
     await click("Fortsetzen …");
     expect(dialogTitle()).toBe("Erst mit einem anderen Gerät vergleichen");
     await wait(ARM_DELAY_MS + 50);
+    // The shell asks natively with the folder and what is lost (security review M4); the
+    // window asks nothing more after the comparison, and "no" there keeps the screen.
+    mock.controls.nativeConfirm = "no";
     await click("Ja, gleiche Zahlen");
-    expect(dialogTitle()).toBe("„Hangar Drive“ fortsetzen?");
-    expect(text()).toContain(
-      "Frühere Versionen aus der Zeit nach der Sicherung gehen dabei verloren.",
-    );
-    await wait(ARM_DELAY_MS + 50);
-    await click(button(/^Fortsetzen$/));
     expect(mock.calls).toContain("reanchor:compared");
+    expect(dialogTitle()).toBe("Erst mit einem anderen Gerät vergleichen");
+    mock.controls.nativeConfirm = "yes";
+    await click("Ja, gleiche Zahlen");
     expect(dialogTitle()).toBe("„Hangar Drive“ läuft wieder.");
     expect(text()).toContain("bestätige es dort genauso");
   });
@@ -212,10 +212,13 @@ describe("suspected ransomware (UX 9.4)", () => {
       "Prüfe das Gerät mit deinem Virenschutz.",
       "Hol den Stand von davor zurück.",
     ]);
+    // The shell asks natively with the device's name (security review M4).
+    mock.controls.nativeConfirm = "no";
     await click("Entfernen");
-    expect(text()).toContain("„Büro-PC“ entfernen?");
-    await click(all(".inline-confirm button")[1] ?? document.body);
     expect(mock.calls).toContain("removeDevice:d-office");
+    expect(text()).not.toContain("wurde entfernt");
+    mock.controls.nativeConfirm = "yes";
+    await click("Entfernen");
     expect(text()).toContain("„Büro-PC“ wurde entfernt.");
     await click("Stand vor den Änderungen ansehen");
     expect(dialogTitle()).toBe("Frühere Versionen von „Hangar Drive“");

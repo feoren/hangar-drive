@@ -25,6 +25,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 hangar-drive-crypto = { path = ".." }
 hangar-drive-protocol = { path = "../../hangar-drive-protocol" }
+# The API JSON target decodes the wire types with the parser server and client use. MIT OR
+# Apache-2.0, the workspace's versions.
+serde = "1"
+serde_json = "1"
 
 [profile.release]
 debug = 1
@@ -102,6 +106,27 @@ bench = false
 [[bin]]
 name = "verify_delta"
 path = "fuzz_targets/verify_delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_sheet"
+path = "fuzz_targets/decode_sheet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_name"
+path = "fuzz_targets/open_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_api_json"
+path = "fuzz_targets/decode_api_json.rs"
 test = false
 doc = false
 bench = false

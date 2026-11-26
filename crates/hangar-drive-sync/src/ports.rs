@@ -243,6 +243,10 @@ pub trait FileSystem: Sync {
     fn exec_supported(&self) -> bool {
         true
     }
+    /// Periodic upkeep of the sync root's reserved directory at `now_ms` (Unix ms), called with
+    /// the hourly full scan: quarantined files past their days go (security review, info), not
+    /// only when the root is opened.
+    fn housekeeping(&self, _now_ms: i64) {}
 }
 
 impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
@@ -302,6 +306,9 @@ impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
     }
     fn exec_supported(&self) -> bool {
         (**self).exec_supported()
+    }
+    fn housekeeping(&self, now_ms: i64) {
+        (**self).housekeeping(now_ms)
     }
 }
 
@@ -389,6 +396,15 @@ pub enum NetError {
     /// The server speaks another protocol version.
     #[error("the server needs another version of the app")]
     Version,
+    /// The server answered this device's own sign-in proof with `device_removed` (security
+    /// review H2). Only the answer to the proof call means this; the same code on any other
+    /// route is a [`NetError::Protocol`] error, because only a proof made with this device's
+    /// key tells the server which device asks. It carries the device log from the head this
+    /// device named up to the removal, when the server sent it; the engine forgets the account
+    /// only when those entries continue its own verified log with a valid removal of this
+    /// device, never on the code alone (`engine`, "reported removed").
+    #[error("the server says this device was removed")]
+    DeviceRemoved(Option<LogPage>),
 }
 
 impl NetError {
@@ -396,6 +412,7 @@ impl NetError {
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             NetError::Server(body) => Some(body.code),
+            NetError::DeviceRemoved(_) => Some(ErrorCode::DeviceRemoved),
             _ => None,
         }
     }
@@ -496,6 +513,10 @@ pub trait ServerApi {
     fn seen_pin(&self) -> Option<[u8; 32]> {
         None
     }
+    /// The length of the device log this device verified, sent with the next sign-in proof
+    /// (`ProofRequest::log_length`), so a server that answers "removed" sends the log from there
+    /// (security review H2). Implementations without sessions ignore it.
+    fn set_known_log_length(&mut self, _length: u64) {}
 }
 
 // ------------------------------------------------------------------------------------------

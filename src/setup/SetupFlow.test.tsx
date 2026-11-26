@@ -10,7 +10,6 @@ import {
   button,
   cleanup,
   click,
-  dialogTitle,
   field,
   flush,
   renderApp,
@@ -380,21 +379,25 @@ describe("additional device", () => {
     expect(text()).toContain("Verbunden mit drive.example.org");
   });
 
-  it("warns when the folders do not fit and asks before merging", async () => {
+  // Security review H1: places that hold files are asked about natively by the shell; "Choose
+  // another folder" there opens the picker for that folder, and "Done" tries again.
+  it("warns when the folders do not fit and joins full places after the native question", async () => {
     const { mock } = await pastServerQuestion(MOCK_INPUTS.pair, 0);
     mock.controls.localFiles = 3;
     await wait(1100);
     await click("Ja, das sind meine");
     await wait(100);
     expect(text()).toContain("Auf diesem Computer sind 120 GB frei.");
+    expect(text()).toContain("Hangar Drive\\Fotos");
+    mock.controls.nativeConfirm = "no";
+    mock.controls.pick = "cancel";
     await click("Fertig");
-    expect(dialogTitle()).toBe("In diesem Ordner liegen schon 3 Dateien");
-    expect(document.activeElement?.textContent).toBe("Zusammenführen");
-    await click("Zusammenführen");
-    expect(dialogTitle()).toBe("In diesem Ordner liegen schon 3 Dateien");
-    await click("Zusammenführen");
-    await click("Zusammenführen");
     expect(mock.calls).toContain("joinFolders");
+    expect(mock.calls).toContain("pickFolder");
+    expect(text()).toContain("Welche Ordner sollen auf dieses Gerät?");
+    mock.controls.nativeConfirm = "yes";
+    await click("Fertig");
+    expect(text()).not.toContain("Welche Ordner sollen auf dieses Gerät?");
   });
 
   it("cannot finish without a folder", async () => {
@@ -506,6 +509,18 @@ describe("recovery with the sheet", () => {
     await type(field(`Gruppe ${String(index)}`), groups[index - 1] ?? "");
     await click("Bestätigen");
     expect(heading()).toBe("Welche Ordner sollen auf dieses Gerät?");
+  });
+
+  // Follow-up check N-2: removing old devices asks natively with their names; after a "no"
+  // the step stays and nothing went on.
+  it("stays at the old devices after a no in the system's question", async () => {
+    const { mock } = await enterSheet(MOCK_INPUTS.recoverLink);
+    await click("Weiter");
+    expect(heading()).toBe("Alte Geräte entfernen");
+    mock.controls.nativeConfirm = "no";
+    await click("Weiter");
+    expect(mock.calls).toContain("finishRecoveryCleanup:3");
+    expect(heading()).toBe("Alte Geräte entfernen");
   });
 
   it("takes a link that broke over lines", async () => {

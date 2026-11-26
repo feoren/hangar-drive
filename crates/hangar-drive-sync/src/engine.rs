@@ -57,6 +57,10 @@ pub const POLL_INTERVAL_MS: i64 = 60 * 1000;
 const MAX_ACTIVITY: usize = 50;
 /// Undo tokens kept: the window offers "Undo" only right after an action.
 const MAX_UNDO: usize = 20;
+/// Hidden warnings kept (follow-up check N-3): warning IDs are per folder and kind, so a device
+/// collects only a few; the bound keeps a window that hides in a loop from growing the
+/// settings file, and the oldest ones fall out first.
+pub const MAX_DISMISSED: usize = 64;
 /// How often a restore that waits for the upload budget is tried again (UX 9.1: it runs by
 /// itself once the budget allows, at the latest within a day).
 pub const RESTORE_RETRY_MS: i64 = 15 * 60 * 1000;
@@ -64,6 +68,9 @@ pub const RESTORE_RETRY_MS: i64 = 15 * 60 * 1000;
 /// say it (ADR 0001, section 5: 30 days by default).
 const RETENTION_DAYS: i64 = 30;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// While the server reports this device as removed (security review H2), it signs in again
+/// this often, each time with a fresh challenge and proof, instead of at every pass.
+pub const REMOVAL_PROBE_MS: i64 = 60 * 60 * 1000;
 /// The server CLI command that prints the server key number (`server/src/main.rs`), shown in
 /// the comparison dialog (UX 8.3).
 pub const SERVER_NUMBER_COMMAND: &str = "hangar-drive-server server-key-number";
@@ -146,7 +153,8 @@ struct Persisted {
     folders: Vec<(FolderId, String)>,
     paused_until: Option<Option<i64>>,
     ignored_names: BTreeSet<String>,
-    dismissed: BTreeSet<String>,
+    /// Warnings hidden on this device, oldest first, at most [`MAX_DISMISSED`].
+    dismissed: Vec<String>,
     /// This device was removed from its account, by the device named here (empty when the name
     /// is not known); its secrets and its account are forgotten (security review L1). Cleared
     /// once the device belongs to an account again.
@@ -154,6 +162,10 @@ struct Persisted {
     /// Restores that wait for the upload budget (UX 9.1), tried again by the loop.
     #[serde(default)]
     restore_jobs: Vec<RestoreJob>,
+    /// The server answered this device's own proof with `device_removed` (security review H2).
+    /// Kept across restarts; cleared by the first call the server accepts again.
+    #[serde(default)]
+    removal_report: Option<RemovalReport>,
     /// The account's folders as this device last saw them, to notice one that left the list.
     #[serde(default)]
     known_folders: Vec<(FolderId, String)>,
@@ -161,6 +173,14 @@ struct Persisted {
     /// brought back (UX 6, "Gelöschte Ordner").
     #[serde(default)]
     deleted_folders: Vec<(FolderId, String, i64)>,
+}
+
+/// The server's reports that this device was removed that came without a removal this device
+/// could verify (security review H2, `Persisted`): the first and the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RemovalReport {
+    first_ms: i64,
+    last_ms: i64,
 }
 
 /// A restore that waits for the upload budget. It is computed again when it runs, on the then
@@ -500,15 +520,35 @@ impl EngineCore {
 
     /// One pass of the control loop (module docs). Returns the events for the window.
     pub fn tick(&mut self) -> Vec<BackendEvent> {
-        match self.tick_inner() {
-            Ok(()) => {}
-            // The server answered this device's own proof with "removed" (finding E2E-3): it
-            // can no longer read the log that says so, so it forgets the account now, as when
-            // the log shows the removal. The name of the removing device is not known here.
-            Err(e) if e.is_device_removed() && self.account.is_some() => {
-                let _ = self.forget_device(Some(String::new()));
+        // While the server reports this device as removed, sync stays stopped and the device
+        // only signs in again now and then (security review H2).
+        let report = self.persisted.removal_report;
+        // A clock set back since the last report makes the probe due as well, or the device
+        // would stay stopped until the clock caught up again, even once the server accepts it.
+        let probe_due = report.is_none_or(|r| {
+            let since = self.now() - r.last_ms;
+            !(0..REMOVAL_PROBE_MS).contains(&since)
+        });
+        if probe_due {
+            match self.tick_inner() {
+                Ok(()) => {}
+                // The server answered this device's own proof with "removed" (finding E2E-3).
+                // A server can say that of any device, so the device forgets the account only
+                // when the log the server sent with it continues its own verified log with a
+                // valid removal of itself; otherwise it waits for the person (H2).
+                Err(e) if e.is_device_removed() && self.account.is_some() => {
+                    match self.verified_removal(&e) {
+                        Some(by) => {
+                            let _ = self.forget_device(Some(by));
+                        }
+                        None => self.note_removal_report(),
+                    }
+                }
+                Err(e) => self.note_net(&e),
             }
-            Err(e) => self.note_net(&e),
+            if self.account.is_some() && self.persisted.removal_report != report {
+                let _ = self.save();
+            }
         }
         self.poll_joining();
         let snapshot = self.snapshot();
@@ -519,6 +559,49 @@ impl EngineCore {
             });
         }
         self.take_events()
+    }
+
+    /// The name of the device that removed this one, when the "removed" answer of the server
+    /// carries device log entries that continue this device's own verified log (from the entry
+    /// after its head, chained to its hash) and hold a valid removal of this device, checked by
+    /// the device log verifier (security review H2). `None` for a bare code, forged or invalid
+    /// entries and a chain that does not start at the own head: then nothing is forgotten
+    /// without the person.
+    fn verified_removal(&self, error: &SyncError) -> Option<String> {
+        let SyncError::Net(NetError::DeviceRemoved(Some(log))) = error else {
+            return None;
+        };
+        let account = self.account.as_ref()?;
+        let by = account.state().removal_in(
+            log.first_index,
+            log.entries.iter().map(|e| e.as_bytes()),
+            account.device(),
+        )?;
+        Some(account.device_display_name(&by).unwrap_or_default())
+    }
+
+    /// One more "removed" from the server without a removal this device could verify (security
+    /// review H2). The account is never forgotten on it alone: only when the person confirms
+    /// ([`Self::confirm_device_removed`]), or when a later answer carries a verified removal.
+    fn note_removal_report(&mut self) {
+        let now = self.now();
+        let report = self.persisted.removal_report.get_or_insert(RemovalReport {
+            first_ms: now,
+            last_ms: now,
+        });
+        report.first_ms = report.first_ms.min(now);
+        report.last_ms = now;
+    }
+
+    /// The person confirmed the server's "this device was removed" (`confirmDeviceRemoved`,
+    /// security review H2): the account is forgotten as when the log shows the removal (L1),
+    /// and the window keeps the "removed" warning until the device is set up again. Refused
+    /// while the server reported nothing.
+    pub fn confirm_device_removed(&mut self) -> Result<(), SyncError> {
+        if self.persisted.removal_report.is_none() || self.account.is_none() {
+            return Err(SyncError::Invalid("the server did not report a removal"));
+        }
+        self.forget_device(Some(String::new()))
     }
 
     fn paused(&self) -> bool {
@@ -534,6 +617,8 @@ impl EngineCore {
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Ok(());
         };
+        // Named in the next sign-in proof, so a "removed" answer brings the log from here (H2).
+        server.set_known_log_length(account.state().len());
         // A new account whose first epoch or device names did not make it yet (finding E2E-1):
         // carried on here, also after a restart, before anything else uses the account.
         if account.setup_pending() {
@@ -551,6 +636,9 @@ impl EngineCore {
             &mut *self.ports.store,
         );
         let refresh = refresh?;
+        // The server accepted this device's proof again: whatever it said before was not a
+        // removal (security review H2).
+        self.persisted.removal_report = None;
         self.last_ok_ms = now;
         self.connection = Connection::Online;
         self.pin_mismatch = false;
@@ -561,6 +649,9 @@ impl EngineCore {
                 .and_then(|issuer| account.device_display_name(issuer))
                 .unwrap_or_default();
             return self.forget_device(Some(by));
+        }
+        if refresh.feed_reset {
+            self.notices.push(ServerNotice::OlderAccountState);
         }
         for notice in &refresh.notices {
             match notice {
@@ -630,6 +721,10 @@ impl EngineCore {
             if now - folder.last_full_scan >= FULL_SCAN_INTERVAL_MS {
                 folder.sync.request_full_scan();
                 folder.last_full_scan = now;
+                // The quarantine is cleaned with every hourly scan, not only when the app
+                // starts (security review, info), so an app that runs for weeks keeps no file
+                // past its 30 days.
+                folder.fs.housekeeping(now);
             }
             // The head before the round still holds what another device deletes in it.
             let head_before = folder.sync.view().frontier().map(|e| e.commit);
@@ -842,6 +937,12 @@ impl EngineCore {
             FolderState::Stopped(StopReason::RemovedHeads) => FolderStatus::Stopped {
                 reason: StopReasonApi::RemovedHeads,
             },
+            FolderState::Stopped(StopReason::TreeLimit) => FolderStatus::Stopped {
+                reason: StopReasonApi::TreeLimit,
+            },
+            FolderState::Stopped(StopReason::LocalTooLarge) => FolderStatus::Stopped {
+                reason: StopReasonApi::TooLarge,
+            },
             FolderState::Stopped(_) => FolderStatus::Stopped {
                 reason: StopReasonApi::Missing,
             },
@@ -927,6 +1028,11 @@ impl EngineCore {
                         folder_name: meta.name.clone(),
                     })
                 }
+                FolderState::Stopped(StopReason::TreeLimit) => warnings.push(Warning::TreeLimit {
+                    id: format!("treeLimit-{id}"),
+                    folder_id: hex_id(id),
+                    folder_name: meta.name.clone(),
+                }),
                 FolderState::Stopped(StopReason::RemovedHeads) => {
                     let mut devices: Vec<String> = meta
                         .removed_heads
@@ -985,6 +1091,12 @@ impl EngineCore {
                 }),
             });
         }
+        if let (Some(report), Some(_)) = (&self.persisted.removal_report, &self.account) {
+            warnings.push(Warning::RemovalReported {
+                id: "removalReported".into(),
+                since: report.first_ms,
+            });
+        }
         if let (Some(by), None) = (&self.persisted.removed_by, &self.account) {
             warnings.push(Warning::Removed {
                 id: "removed".into(),
@@ -1003,7 +1115,7 @@ impl EngineCore {
                 count: names,
             });
         }
-        warnings.retain(|w| !self.persisted.dismissed.contains(&warning_id(w)));
+        warnings.retain(|w| !dismissible(w) || !self.persisted.dismissed.contains(&warning_id(w)));
         let remote_folders = self
             .account
             .as_ref()
@@ -1678,15 +1790,17 @@ impl EngineCore {
             &request.device,
             &verified.keys,
         ));
+        offer.request = Some(request);
+        let similar_to = self.similar_device_name(&verified.name, None);
         self.events.push(BackendEvent::PairRequest {
             request: PairRequestView {
                 offer_id: id.to_owned(),
                 device_name: verified.name,
                 path: PairPath::Link,
                 safety,
+                similar_to,
             },
         });
-        offer.request = Some(request);
     }
 
     /// The new device that answered an open offer, with its safety number, as the window was
@@ -1699,6 +1813,7 @@ impl EngineCore {
         let verified = offer.secret.verify_request(account.id(), request).ok()?;
         Some(PairRequestView {
             offer_id: offer_id.to_owned(),
+            similar_to: self.similar_device_name(&verified.name, None),
             device_name: verified.name,
             path: PairPath::Link,
             safety: NumberRows::of(&safety_number(
@@ -1766,6 +1881,7 @@ impl EngineCore {
         let host_of = |url: &str| url_host(url).ok_or(LinkProblem::Damaged);
         let inspected = match crate::links::parse_invite(link) {
             Ok(invite) => host_of(invite.server_url.as_str()).map(|host| InspectedLink::Invite {
+                punycode: has_punycode(&host),
                 host,
                 pinned: invite.pin.is_some(),
             }),
@@ -1773,6 +1889,7 @@ impl EngineCore {
                 Ok(bytes) => match PairingOffer::decode(&bytes) {
                     Ok(offer) => {
                         host_of(offer.content.server_url.as_str()).map(|host| InspectedLink::Pair {
+                            punycode: has_punycode(&host),
                             host,
                             account: offer.content.account.to_hex(),
                             pinned: offer.content.spki_pin.is_some(),
@@ -1783,6 +1900,7 @@ impl EngineCore {
                 Err(LinkError::NotALink) => match crate::links::parse_recovery_link(link) {
                     Ok(sheet) => {
                         host_of(sheet.server_url.as_str()).map(|host| InspectedLink::Recover {
+                            punycode: has_punycode(&host),
                             host,
                             account: sheet.account.to_hex(),
                             pinned: sheet.pin.is_some(),
@@ -1806,6 +1924,16 @@ impl EngineCore {
         link: &str,
         device_name: &str,
     ) -> Result<ApiResult<NumberRows, PairError>, SyncError> {
+        // Only a device without an account pairs (security review H1). A set-up device that
+        // joined another account would overwrite its own identity in the keychain, and the
+        // clean-up of a failed join would delete its epoch secrets; a window that called this
+        // on a set-up device could so move it, and the folders the person then adds, into a
+        // stranger's account. A second pairing while one is open is refused for the same reason.
+        if self.account.is_some() || self.joining.is_some() {
+            return Err(SyncError::Invalid(
+                "this device already belongs to an account or is pairing",
+            ));
+        }
         let Ok(bytes) = crate::links::parse_pairing_link(link) else {
             return Ok(ApiResult::Err(PairError::NotALink));
         };
@@ -1972,9 +2100,21 @@ impl EngineCore {
             &joining.name,
             &[joining.offer.content.head],
         );
-        let Ok(mut account) = joined else {
+        let mut account = match joined {
+            Ok(account) => account,
+            Err(SyncError::AlreadySetUp) => {
+                // An identity or account is already stored here (security review H1): the join
+                // touched nothing and never will, so the pairing ends instead of retrying.
+                self.joining = None;
+                self.events.push(BackendEvent::PairResult {
+                    result: PairResult::Failed {
+                        error: PairError::OtherAccount,
+                    },
+                });
+                return;
+            }
             // Not added yet (or the server is down): try again at the next tick.
-            return;
+            Err(_) => return,
         };
         if hangar_drive_crypto::pairing::check_joined(
             account.state(),
@@ -2434,17 +2574,29 @@ impl EngineCore {
         Ok(ServerNumberView {
             number: NumberRows::of(&server_key_number(&server, &pin)),
             command: SERVER_NUMBER_COMMAND.to_owned(),
+            pin,
         })
     }
 
     /// The person confirmed that the server number matches the server CLI's
     /// (`confirmServerNumber`): the key whose number was shown becomes the pin, and the device
-    /// connects with it. Never any other key.
-    pub fn confirm_server_number(&mut self) -> Result<(), SyncError> {
-        let pin = self
+    /// connects with it. Never any other key: `expected_pin` is the pin of the number the
+    /// person compared ([`ServerNumberView::pin`]), and it is taken only while it is still the
+    /// candidate of the last shown number (security review N7). A number shown again for
+    /// another key in between, by another window call or because the server presented another
+    /// key, makes this fail and keeps the old pin.
+    pub fn confirm_server_number(&mut self, expected_pin: &[u8; 32]) -> Result<(), SyncError> {
+        let candidate = self
             .server_candidate
-            .take()
             .ok_or(SyncError::Invalid("no server number was shown"))?;
+        // A pin is a public key hash, not a secret: a plain comparison is enough.
+        if candidate != *expected_pin {
+            return Err(SyncError::Invalid(
+                "the server number shown is not the one confirmed",
+            ));
+        }
+        self.server_candidate = None;
+        let pin = candidate;
         self.persisted.pin = Some(pin);
         self.save()?;
         self.connect()?;
@@ -2498,33 +2650,42 @@ impl EngineCore {
         Ok(ApiResult::Ok(()))
     }
 
-    /// An offer whose log head is newer than this device's verified log: the log is fetched
-    /// through the offered address and verified from this device's anchor, then the offer is
-    /// checked again (ADR 0001, section 6). On any failure the old address stays.
+    /// An offer whose log head is newer than this device's verified log (ADR 0001, section 6).
+    /// The offer's signature is checked before anything of the offered server is used
+    /// (security review M2): the log is read through a temporary connection to the offered
+    /// address into a fresh `AccountState`, which must contain this device's own verified head,
+    /// and the offer is checked against that state. Nothing is stored and the account is not
+    /// refreshed, so a forged offer that points at a server of the attacker's changes no feed
+    /// cursor, record or log of this device; the old address stays on any failure. Only once
+    /// the address is taken does the normal refresh read the log through it.
     fn address_after_log_check(
         &mut self,
         offer: &PairingOffer,
         server: &ServerId,
     ) -> Result<Option<ServerAddress>, SyncError> {
-        let previous = (self.persisted.server_url.clone(), self.persisted.pin);
-        self.persisted.server_url = Some(offer.content.server_url.to_string());
-        self.persisted.pin = offer.content.spki_pin;
-        let checked = self.connect().and_then(|()| {
-            let (Some(account), Some(connection)) = (self.account.as_mut(), self.server.as_mut())
-            else {
-                return Err(SyncError::NotSetUp("no account"));
-            };
-            account.refresh(
-                connection.as_mut(),
-                &mut *self.ports.keychain,
-                &mut *self.ports.store,
-            )?;
-            Ok(offer.server_address(account.state(), server).ok())
-        });
-        if !matches!(checked, Ok(Some(_))) {
-            (self.persisted.server_url, self.persisted.pin) = previous;
-            self.connect()?;
-        }
+        let account = self
+            .account
+            .as_ref()
+            .ok_or(SyncError::NotSetUp("no account"))?;
+        let own_head = account.log_head()?;
+        let mut config =
+            ServerConfig::new(offer.content.server_url.as_str(), offer.content.spki_pin)?;
+        config.server = Some(*server);
+        let identity = DeviceIdentity::import(&account.identity().export())
+            .map_err(|_| SyncError::Corrupt("device identity".into()))?;
+        let session = SessionIdentity {
+            account: *account.id(),
+            device: *account.device(),
+            prover: prover(identity),
+        };
+        let checked = (self.ports.server)(&config, Some(session))
+            .map_err(SyncError::from)
+            .and_then(|mut temporary| {
+                let state = crate::recovery::fetch_log(temporary.as_mut(), *account.id())?;
+                // Verified from this device's own anchor: the log it already verified.
+                state.check_anchor(&own_head)?;
+                Ok(offer.server_address(&state, server).ok())
+            });
         match checked {
             Ok(address) => Ok(address),
             Err(e) if e.is_offline() => Err(e),
@@ -2533,9 +2694,20 @@ impl EngineCore {
     }
 
     /// Hides a warning on this device only (`dismissSuspect`; ADR 0001, section 5: no shared
-    /// dismissal).
+    /// dismissal). Only a warning the engine shows right now and that may be hidden (follow-up
+    /// check N-3): an ID the window makes up would otherwise hide a warning before it appears,
+    /// and "removed, the server says" is only ever confirmed, never hidden. The list keeps the
+    /// newest [`MAX_DISMISSED`] IDs.
     pub fn dismiss_warning(&mut self, warning_id: &str) -> Result<(), SyncError> {
-        self.persisted.dismissed.insert(warning_id.to_owned());
+        let shown = self.snapshot().warnings;
+        let warning = shown
+            .iter()
+            .find(|w| self::warning_id(w) == warning_id)
+            .ok_or(SyncError::Invalid("no such warning is shown"))?;
+        if !dismissible(warning) {
+            return Err(SyncError::Invalid("this warning cannot be hidden"));
+        }
+        remember_dismissed(&mut self.persisted.dismissed, warning_id);
         self.save()
     }
 
@@ -2729,7 +2901,9 @@ impl EngineCore {
                     Some(WindowsNameProblem::ForbiddenCharacter(c)) => NameReason::Char {
                         char: c.to_string(),
                     },
-                    Some(WindowsNameProblem::Reserved) => NameReason::Reserved {
+                    // A short name alias is reserved on Windows too (security review N14).
+                    Some(WindowsNameProblem::Reserved)
+                    | Some(WindowsNameProblem::ShortNameAlias) => NameReason::Reserved {
                         name: node.name.clone(),
                     },
                     Some(WindowsNameProblem::TrailingDotOrSpace) => NameReason::Trailing,
@@ -2952,6 +3126,29 @@ impl EngineCore {
         };
         let result = self.run_restore(id, &kind);
         Ok(self.restore_answer(id, kind, result))
+    }
+
+    /// What [`Self::reset_folder`] to `entry` would change, for the native question asked
+    /// before every reset (follow-up check N-1): the folder's name and how many files of its
+    /// current state the entry does not hold, which disappear on every device.
+    pub fn reset_folder_preview(
+        &mut self,
+        folder: &str,
+        entry: &str,
+    ) -> Result<ResetPreview, SyncError> {
+        let commit = CommitId::from_hex(entry).map_err(|_| SyncError::Invalid("entry"))?;
+        self.with_ctx(folder, |sync, cx| {
+            let old = sync.tree_at(cx, &commit)?;
+            let now = sync.remote();
+            let vanishing = now
+                .iter()
+                .filter(|(id, node)| !node.is_dir() && !old.contains(id))
+                .count() as u64;
+            Ok(ResetPreview {
+                folder_name: sync.meta().name.clone(),
+                vanishing,
+            })
+        })
     }
 
     /// Restores the whole folder to a timeline entry (`resetFolder`), with an undo token; a
@@ -3299,14 +3496,36 @@ impl EngineCore {
         )))
     }
 
-    /// Renames a device (`renameDevice`, `setDeviceName`).
+    /// The name of a current device of the account (recovery devices aside, `except` aside)
+    /// that looks the same as `name` (`hangar_drive_protocol::name::looks_alike`: NFKC, default
+    /// ignorables dropped, case folded, Latin, Cyrillic and Greek homoglyphs), checked when a
+    /// device is named, renamed or paired. `None` without an account.
+    pub fn similar_device_name(&self, name: &str, except: Option<&str>) -> Option<String> {
+        let account = self.account.as_ref()?;
+        let except = except.and_then(|e| DeviceId::from_hex(e).ok());
+        account
+            .state()
+            .current_devices()
+            .filter(|d| !d.recovery && Some(d.id) != except)
+            .filter_map(|d| account.device_display_name(&d.id))
+            .find(|other| hangar_drive_protocol::name::looks_alike(other, name))
+    }
+
+    /// Renames a device (`renameDevice`, `setDeviceName`). A name that looks the same as
+    /// another device's ([`Self::similar_device_name`]) is refused with
+    /// [`DeviceNameError::LooksLike`] unless `allow_look_alike`, which the app passes only after
+    /// the native question that names the other device.
     pub fn rename_device(
         &mut self,
         device: &str,
         name: &str,
-    ) -> Result<ApiResult<(), NameError>, SyncError> {
+        allow_look_alike: bool,
+    ) -> Result<ApiResult<(), DeviceNameError>, SyncError> {
         if let Some(e) = name_error(name) {
-            return Ok(ApiResult::Err(e));
+            return Ok(ApiResult::Err(e.into()));
+        }
+        if !allow_look_alike && self.similar_device_name(name, Some(device)).is_some() {
+            return Ok(ApiResult::Err(DeviceNameError::LooksLike));
         }
         let id = DeviceId::from_hex(device).map_err(|_| SyncError::Invalid("device"))?;
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
@@ -3320,6 +3539,16 @@ impl EngineCore {
             &mut *self.ports.entropy,
         )?;
         Ok(ApiResult::Ok(()))
+    }
+
+    /// Sets the limits this device holds its own folders to (`FolderSettings::max_tree_items`,
+    /// `max_tree_depth`). Only for tests that play a device which ignores them, such as a
+    /// compromised one; what a device takes in from the server stays bounded by
+    /// `codec::MAX_TREE_ITEMS` and `MAX_TREE_DEPTH` whatever is set here.
+    #[doc(hidden)]
+    pub fn set_tree_limits(&mut self, max_items: usize, max_depth: usize) {
+        self.folder_settings.max_tree_items = max_items;
+        self.folder_settings.max_tree_depth = max_depth;
     }
 
     /// Removes a device (`removeDevice`): removal and rotation, re-seal, barriers (N1), and the
@@ -3434,6 +3663,24 @@ impl EngineCore {
     pub fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+}
+
+/// Adds `id` as the newest hidden warning and lets the oldest fall out beyond
+/// [`MAX_DISMISSED`].
+fn remember_dismissed(dismissed: &mut Vec<String>, id: &str) {
+    dismissed.retain(|d| d != id);
+    dismissed.push(id.to_owned());
+    let over = dismissed.len().saturating_sub(MAX_DISMISSED);
+    dismissed.drain(..over);
+}
+
+/// Whether the person may hide `w` on this device. An allowlist: only "suspect device" has a
+/// "That was me" in the window (`dismissSuspect`); every other kind stays until its cause is
+/// gone or the person decides in its dialog. A removal the server reports in particular is
+/// only confirmed (`confirmDeviceRemoved`): hidden, the device would stay stopped without a
+/// word (follow-up check N-3). A new kind is not hideable until it is added here.
+fn dismissible(w: &Warning) -> bool {
+    matches!(w, Warning::Suspect { .. })
 }
 
 fn warning_id(w: &Warning) -> String {
@@ -3574,5 +3821,59 @@ impl Engine {
             .map_err(|_| SyncError::Stopped)?;
         ready_rx.recv().map_err(|_| SyncError::Stopped)??;
         Ok((EngineHandle { jobs }, events))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Follow-up check N-3: the hidden warnings are bounded, the oldest fall out first, and one
+    // hidden again counts as the newest.
+    #[test]
+    fn hidden_warnings_are_bounded_and_the_oldest_fall_out() {
+        let mut list = Vec::new();
+        for n in 0..(MAX_DISMISSED + 10) {
+            remember_dismissed(&mut list, &format!("w{n}"));
+        }
+        assert_eq!(list.len(), MAX_DISMISSED);
+        assert_eq!(list.first().map(String::as_str), Some("w10"));
+        remember_dismissed(&mut list, "w10");
+        assert_eq!(list.len(), MAX_DISMISSED);
+        assert_eq!(list.last().map(String::as_str), Some("w10"));
+        assert_eq!(list.first().map(String::as_str), Some("w11"));
+    }
+
+    // Only "suspect device" may be hidden; every other kind is refused, the removal report
+    // above all.
+    #[test]
+    fn only_the_suspect_warning_can_be_hidden() {
+        assert!(dismissible(&Warning::Suspect {
+            id: "suspect-d-f".into(),
+            device_id: "d".into(),
+            device_name: "Laptop".into(),
+            folder_id: "f".into(),
+            folder_name: "Docs".into(),
+            entry_id: "e".into(),
+            days: 30,
+        }));
+        assert!(!dismissible(&Warning::RemovalReported {
+            id: "removalReported".into(),
+            since: 0,
+        }));
+        assert!(!dismissible(&Warning::Refused {
+            id: "refused".into(),
+        }));
+        assert!(!dismissible(&Warning::Conflicts {
+            id: "conflicts".into(),
+            count: 1,
+        }));
+        assert!(!dismissible(&Warning::Names {
+            id: "names".into(),
+            count: 1,
+        }));
+        assert!(!dismissible(&Warning::UpdateRequired {
+            id: "updateRequired".into(),
+        }));
     }
 }

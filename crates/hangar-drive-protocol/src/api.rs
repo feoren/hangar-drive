@@ -226,6 +226,13 @@ pub struct ProofRequest {
     pub server_url: String,
     /// Ed25519 signature with the device's key from the account log.
     pub signature: Signature,
+    /// The length of the device log this device verified (its head's index). Not part of the
+    /// signed statement and only a hint: a server that answers [`ErrorCode::DeviceRemoved`]
+    /// sends the entries after it up to the removal ([`ErrorBody::removal_log`]), which the
+    /// device checks from its own verified head (security review H2). A wrong value only costs
+    /// the device the automatic forgetting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_length: Option<u64>,
 }
 
 /// A session: the bearer token and its lifetime.
@@ -558,8 +565,14 @@ pub struct PairingRequest {
     pub tag: Blob,
 }
 
-/// Bytes a sealed device name adds to the name: the nonce and the AEAD tag.
+/// Bytes a sealed device name adds to its padded part: the nonce and the AEAD tag.
 pub const SEALED_NAME_OVERHEAD: usize = 24 + 16;
+/// The padded part of the shortest sealed name: the Padmé length of an 8-byte length and one
+/// byte of name (security review N13; checked against the crypto crate's Padmé by its tests).
+pub const SEALED_NAME_MIN_PADDED: usize = 10;
+/// The padded part of the longest sealed name: the Padmé length of an 8-byte length and
+/// [`MAX_DEVICE_NAME_LEN`] bytes of name.
+pub const SEALED_NAME_MAX_PADDED: usize = 144;
 
 /// Reserved pairing slots one account may hold at a time.
 pub const MAX_OPEN_PAIRINGS: usize = 4;
@@ -575,11 +588,12 @@ pub struct PairingReservation {
 }
 
 impl PairingRequest {
-    /// The sizes of the sealed name (one to [`MAX_DEVICE_NAME_LEN`] bytes of name) and of the
-    /// tag. The name itself is checked by the inviting device once it opened it
-    /// ([`crate::name::check_display_name`]); the server cannot read it.
+    /// The sizes of the sealed name (one to [`MAX_DEVICE_NAME_LEN`] bytes of name, padded) and
+    /// of the tag. The name itself and its padding are checked by the inviting device once it
+    /// opened it ([`crate::name::check_display_name`]); the server cannot read it.
     pub fn validate(&self) -> Result<(), RequestError> {
-        let names = SEALED_NAME_OVERHEAD + 1..=SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN;
+        let names = SEALED_NAME_OVERHEAD + SEALED_NAME_MIN_PADDED
+            ..=SEALED_NAME_OVERHEAD + SEALED_NAME_MAX_PADDED;
         if !names.contains(&self.sealed_name.0.len()) || self.tag.0.len() != 32 {
             return Err(RequestError::Invalid);
         }
@@ -877,8 +891,9 @@ pub enum ErrorCode {
     ProofInvalid,
     /// The session proof verifies with the key the account log last listed for this device,
     /// but the log removed the device. Only the device itself (or a holder of its key) can
-    /// produce such a proof, so nobody else learns from this code whether a device was removed;
-    /// the device then forgets the account (ADR 0001, section 6, "Sessions").
+    /// produce such a proof, so nobody else learns from this code whether a device was removed.
+    /// The answer carries [`ErrorBody::removal_log`]; the device forgets the account only on a
+    /// removal it verified there (ADR 0001, section 6, "Sessions").
     DeviceRemoved,
     /// The account, device or folder ID is already taken.
     AlreadyExists,
@@ -950,6 +965,14 @@ pub struct ErrorBody {
     /// With [`ErrorCode::MissingObjects`]: some of the missing IDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<ObjectId>,
+    /// With [`ErrorCode::DeviceRemoved`], only as the answer to the proof: the device log
+    /// entries after [`ProofRequest::log_length`] up to and including the entry that removed
+    /// the device, at most [`MAX_LOG_PAGE`] of them (security review H2). The device verifies
+    /// them from its own verified head and forgets the account only if they hold a valid
+    /// removal of itself; the server's word alone never makes it forget. The entries stop at
+    /// the removal, so a removed device learns nothing the account did after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_log: Option<LogPage>,
 }
 
 impl ErrorBody {
@@ -959,6 +982,7 @@ impl ErrorBody {
             code,
             current_head: None,
             missing: Vec::new(),
+            removal_log: None,
         }
     }
 }
@@ -1262,18 +1286,20 @@ mod tests {
             sign: PublicKey::from_bytes([2; 32]),
             kem: PublicKey::from_bytes([3; 32]),
             proof: Signature::from_bytes([4; 64]),
-            sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 6]),
+            sealed_name: Blob(vec![6; SEALED_NAME_OVERHEAD + 14]),
             tag: Blob(vec![5; 32]),
         };
         assert_eq!(request.validate(), Ok(()));
         let mut longest = request.clone();
-        longest.sealed_name = Blob(vec![6; SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN]);
+        longest.sealed_name = Blob(vec![6; SEALED_NAME_OVERHEAD + SEALED_NAME_MAX_PADDED]);
         assert_eq!(longest.validate(), Ok(()));
-        // An empty name, or one longer than any name, does not fit.
+        // An empty name, or one longer than any padded name, does not fit (security review
+        // N13: the sealed name is padded with Padme).
         for len in [
             0,
             SEALED_NAME_OVERHEAD,
-            SEALED_NAME_OVERHEAD + MAX_DEVICE_NAME_LEN + 1,
+            SEALED_NAME_OVERHEAD + SEALED_NAME_MIN_PADDED - 1,
+            SEALED_NAME_OVERHEAD + SEALED_NAME_MAX_PADDED + 1,
         ] {
             let mut bad = request.clone();
             bad.sealed_name = Blob(vec![6; len]);
@@ -1387,6 +1413,7 @@ mod tests {
             code: ErrorCode::HeadMoved,
             current_head: Some(CommitId::from_bytes([3; 32])),
             missing: vec![],
+            removal_log: None,
         };
         assert_eq!(
             serde_json::to_value(&body).unwrap(),
@@ -1402,6 +1429,22 @@ mod tests {
         assert_eq!(ErrorCode::RateLimited.http_status(), 429);
         assert_eq!(ErrorCode::FolderRetired.http_status(), 410);
         assert_eq!(ErrorCode::NotFound.http_status(), 404);
+        // Security review H2: the log after the device's head comes with `device_removed`.
+        let removed = ErrorBody {
+            removal_log: Some(LogPage {
+                first_index: 5,
+                entries: vec![Blob(vec![1, 2])],
+                length: 5,
+            }),
+            ..ErrorBody::new(ErrorCode::DeviceRemoved)
+        };
+        let value = serde_json::to_value(&removed).unwrap();
+        assert_eq!(
+            value,
+            json!({ "code": "device_removed",
+                    "removal_log": { "first_index": 5, "entries": ["AQI"], "length": 5 } })
+        );
+        assert_eq!(serde_json::from_value::<ErrorBody>(value).unwrap(), removed);
     }
 
     #[test]

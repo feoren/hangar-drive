@@ -169,7 +169,7 @@ export class TauriBackend implements Backend {
     await this.run("copyRecoveryCode");
   }
   confirmRecoveryGroup(group: string) {
-    return this.call("confirmRecoveryGroup", { group }, d.bool);
+    return this.call("confirmRecoveryGroup", { group }, d.recoveryCheck);
   }
   defaultFolderPlace() {
     return this.call("defaultFolderPlace", {}, d.folderPlace);
@@ -199,8 +199,8 @@ export class TauriBackend implements Backend {
   listAccountFolders() {
     return this.call("listAccountFolders", {}, d.accountFolders);
   }
-  async joinFolders(choices: readonly FolderChoice[]) {
-    await this.run("joinFolders", { choices });
+  joinFolders(choices: readonly FolderChoice[]) {
+    return this.call("joinFolders", { choices }, d.array(d.str));
   }
   recoverAccount(sheet: string, code: string, deviceName: string) {
     return this.call(
@@ -220,16 +220,20 @@ export class TauriBackend implements Backend {
     );
   }
   setDeviceName(name: string) {
-    return this.call("setDeviceName", { name }, d.result(d.nothing, "blank", "edgeWhitespace"));
+    return this.call(
+      "setDeviceName",
+      { name },
+      d.result(d.nothing, "blank", "edgeWhitespace", "looksLike"),
+    );
   }
   recoveryDevices() {
     return this.call("recoveryDevices", {}, d.array(d.device));
   }
   finishRecoveryCleanup(remove: readonly DeviceId[]) {
-    return this.call("finishRecoveryCleanup", { remove }, d.recoveryCode);
+    return this.call("finishRecoveryCleanup", { remove }, d.nullableRecoveryCode);
   }
-  async resetDevice() {
-    await this.run("resetDevice");
+  resetDevice() {
+    return this.call("resetDevice", {}, d.confirmation);
   }
 
   async openFolder(folderId: FolderId | null, path?: string) {
@@ -256,8 +260,8 @@ export class TauriBackend implements Backend {
   async addFolder(token: string) {
     await this.run("addFolder", { token });
   }
-  async addAccountFolder(folderId: FolderId, token: string) {
-    await this.run("addAccountFolder", { folderId, token });
+  addAccountFolder(folderId: FolderId, token: string) {
+    return this.call("addAccountFolder", { folderId, token }, d.joinOutcome);
   }
   async stopFolder(folderId: FolderId) {
     await this.run("stopFolder", { folderId });
@@ -283,7 +287,7 @@ export class TauriBackend implements Backend {
     return this.call("listMassDelete", { warningId }, d.array(d.str));
   }
   resolveMassDelete(warningId: string, decision: "restore" | "delete") {
-    return this.call("resolveMassDelete", { warningId, decision }, d.num);
+    return this.call("resolveMassDelete", { warningId, decision }, d.massDeleteOutcome);
   }
   findMissingFolder(folderId: FolderId) {
     return this.call("findMissingFolder", { folderId }, d.pickResult);
@@ -308,17 +312,20 @@ export class TauriBackend implements Backend {
   checkOlderState(folderId: FolderId) {
     return this.call("checkOlderState", { folderId }, d.olderCheck);
   }
-  async reanchor(folderId: FolderId, compared: boolean) {
-    await this.run("reanchor", { folderId, compared });
+  reanchor(folderId: FolderId, compared: boolean) {
+    return this.call("reanchor", { folderId, compared }, d.confirmation);
   }
   async dismissSuspect(warningId: string) {
     await this.run("dismissSuspect", { warningId });
   }
   acceptRemovedHeads(folderId: FolderId) {
-    return this.call("acceptRemovedHeads", { folderId }, d.acceptedHeads);
+    return this.call("acceptRemovedHeads", { folderId }, d.headsAnswer);
   }
   async openStorageSettings() {
     await this.run("openStorageSettings");
+  }
+  confirmDeviceRemoved() {
+    return this.call("confirmDeviceRemoved", {}, d.confirmation);
   }
   installUpdate() {
     return this.call("installUpdate", {}, d.updateOutcome);
@@ -372,7 +379,7 @@ export class TauriBackend implements Backend {
     return this.call("restoreFile", { folderId, entryId, path, mode }, d.restoreOutcome);
   }
   resetFolder(folderId: FolderId, entryId: string) {
-    return this.call("resetFolder", { folderId, entryId }, d.restoreOutcome);
+    return this.call("resetFolder", { folderId, entryId }, d.nullableRestoreOutcome);
   }
   async cancelRestore(jobId: string) {
     await this.run("cancelRestore", { jobId });
@@ -394,17 +401,17 @@ export class TauriBackend implements Backend {
     return this.call(
       "renameDevice",
       { deviceId, name },
-      d.result(d.nothing, "blank", "edgeWhitespace"),
+      d.result(d.nothing, "blank", "edgeWhitespace", "looksLike"),
     );
   }
   getSafetyNumber(deviceId: DeviceId) {
     return this.call("getSafetyNumber", { deviceId }, d.numberRows);
   }
-  async removeDevice(deviceId: DeviceId) {
-    await this.run("removeDevice", { deviceId });
+  removeDevice(deviceId: DeviceId) {
+    return this.call("removeDevice", { deviceId }, d.confirmation);
   }
-  async disconnectThisDevice() {
-    await this.run("disconnectThisDevice");
+  disconnectThisDevice() {
+    return this.call("disconnectThisDevice", {}, d.confirmation);
   }
   createPairingOffer() {
     return this.call("createPairingOffer", {}, d.pairingOffer);
@@ -423,8 +430,8 @@ export class TauriBackend implements Backend {
   getSettings() {
     return this.call("getSettings", {}, d.settings);
   }
-  async setAutostart(on: boolean) {
-    await this.run("setAutostart", { on });
+  setAutostart(on: boolean) {
+    return this.call("setAutostart", { on }, d.confirmation);
   }
   async setLanguage(language: Language | "system") {
     await this.run("setLanguage", { language });

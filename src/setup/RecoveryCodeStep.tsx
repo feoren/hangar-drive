@@ -64,9 +64,10 @@ export function RecoveryCodeStep({
           event.preventDefault();
           if (typed.trim() === "") return;
           void action.run(async () => {
-            const ok = await backend.confirmRecoveryGroup(normalizeCode(typed));
-            if (ok) onConfirmed();
-            else setWrong(true);
+            const check = await backend.confirmRecoveryGroup(normalizeCode(typed));
+            // "declined": the person kept the old code in the native question; nothing to say.
+            if (check === "confirmed") onConfirmed();
+            else if (check === "wrong") setWrong(true);
           });
         }}
       >

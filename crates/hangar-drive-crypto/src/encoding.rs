@@ -6,7 +6,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-pub(crate) use hangar_drive_protocol::framing::{framed, Reader, Writer};
+pub(crate) use hangar_drive_protocol::framing::{framed, length_prefix, Reader, Writer};
 
 pub(crate) type HmacSha256 = Hmac<Sha256>;
 
@@ -36,7 +36,7 @@ pub(crate) fn hmac(key: &[u8]) -> Option<HmacSha256> {
 pub(crate) fn sha256_framed(parts: &[&[u8]]) -> [u8; 32] {
     let mut sha = Sha256::new();
     for part in parts {
-        sha.update(u32::try_from(part.len()).unwrap_or(u32::MAX).to_be_bytes());
+        sha.update(length_prefix(part.len()));
         sha.update(part);
     }
     sha.finalize().into()
@@ -49,7 +49,7 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 /// Updates a MAC with `field(part)` without copying `part`.
 pub(crate) fn mac_field(mac: &mut HmacSha256, part: &[u8]) {
-    mac.update(&u32::try_from(part.len()).unwrap_or(u32::MAX).to_be_bytes());
+    mac.update(&length_prefix(part.len()));
     mac.update(part);
 }
 

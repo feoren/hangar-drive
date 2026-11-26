@@ -1,7 +1,9 @@
 // Continuing with the server's state after it showed an older one (UX 8.6): one decision per
-// screen. Compare the folder number with another device, then confirm. Without another device,
-// continue without comparing, after a sentence that says what that costs. Different numbers end
-// the flow. Every confirm button holds back clicks for a second.
+// screen. Compare the folder number with another device; the same numbers lead straight to the
+// shell's native question, which names the folder and what is lost (security review M4), so the
+// window does not ask that again. Without another device, continue without comparing, after a
+// sentence that says what that costs. Different numbers end the flow. Every confirm button holds
+// back clicks for a second.
 
 import { useId, useState } from "react";
 
@@ -11,7 +13,7 @@ import { Dialog } from "../ui/Dialog";
 import { ArmedButton, Feedback, Loading, NumberRows } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
 
-type Screen = "compare" | "confirm" | "blind" | "mismatch" | "done";
+type Screen = "compare" | "blind" | "mismatch" | "done";
 
 export function ReanchorDialog({
   folderId,
@@ -31,16 +33,17 @@ export function ReanchorDialog({
   const action = useAction();
   const app = t("app.name");
 
+  // The shell asks natively with the folder and what is lost (security review M4), so the
+  // window asks nothing more after the comparison; "no" there keeps the screen as it is.
   const go = (compared: boolean) => {
     void action.run(async () => {
-      await backend.reanchor(folderId, compared);
-      setScreen("done");
+      const outcome = await backend.reanchor(folderId, compared);
+      if (outcome === "confirmed") setScreen("done");
     });
   };
 
   const title = {
     compare: t("older.compare.title"),
-    confirm: t("older.confirm.title", { folder: folderName }),
     blind: t("older.blind.title"),
     mismatch: t("older.mismatch.title"),
     done: t("older.done", { folder: folderName }),
@@ -62,7 +65,7 @@ export function ReanchorDialog({
           folderId={folderId}
           folderName={folderName}
           onSame={() => {
-            setScreen("confirm");
+            go(true);
           }}
           onDifferent={() => {
             setScreen("mismatch");
@@ -72,12 +75,13 @@ export function ReanchorDialog({
           }}
         />
       )}
-      {(screen === "confirm" || screen === "blind") && (
+      {screen === "compare" && action.error !== null && (
+        <Feedback tone="error">{errorText(action.error, t)}</Feedback>
+      )}
+      {screen === "blind" && (
         <>
           <div className="dialog-body">
-            {screen === "blind" && <p>{t("older.blind.body", { app })}</p>}
-            <p>{t("older.confirm.merge")}</p>
-            <p>{t("older.confirm.loss")}</p>
+            <p>{t("older.blind.body", { app })}</p>
           </div>
           {action.error !== null && <Feedback tone="error">{errorText(action.error, t)}</Feedback>}
           <div className="dialog-actions">
@@ -87,10 +91,10 @@ export function ReanchorDialog({
             <ArmedButton
               armKey={screen}
               onClick={() => {
-                go(screen === "confirm");
+                go(false);
               }}
             >
-              {screen === "confirm" ? t("older.confirm.go") : t("older.blind.go")}
+              {t("older.blind.go")}
             </ArmedButton>
           </div>
         </>

@@ -81,6 +81,20 @@ describe("changes from a removed device (UX 8.9)", () => {
     expect(dialogTitle()).toBe("Frühere Versionen von „Fotos“");
   });
 
+  // Security review M4: taking the changes in asks natively; "no" there leaves the folder
+  // stopped and the question open.
+  it("takes nothing in when the native question is answered with no", async () => {
+    const { mock } = await renderApp("removedHeads");
+    mock.controls.nativeConfirm = "no";
+    await wait(ARM_DELAY_MS + 50);
+    await click("Übernehmen");
+    expect(mock.calls).toContain("acceptRemovedHeads:f-photos");
+    expect(dialogTitle()).toBe("Änderungen von einem entfernten Gerät");
+    expect(text()).not.toContain("Übernommen.");
+    await click("Ansehen und rückgängig machen");
+    expect(dialogTitle()).toBe("Änderungen von einem entfernten Gerät");
+  });
+
   it("names the devices by number when it does not know every name", async () => {
     await renderApp("removedHeadsMany");
     expect(text()).toContain(

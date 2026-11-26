@@ -7,7 +7,9 @@
 //! so a client cannot pick its own rate limit key. With several header lines the lines are read
 //! as one list in order.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
 
 use axum::http::HeaderMap;
 
@@ -42,6 +44,67 @@ pub fn client_ip(
         }
     }
     Some(client)
+}
+
+/// Whether `ip` is an address a reverse proxy in front of this server usually has: private
+/// (RFC 1918, IPv6 unique local), shared (RFC 6598, carrier NAT), loopback or link-local.
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_local(IpAddr::V4(v4)),
+            None => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        },
+    }
+}
+
+/// A peer that sends `X-Forwarded-For` without being a trusted proxy, from a local address
+/// (overall review N3). That is almost always a reverse proxy the operator did not list in
+/// `HANGAR_DRIVE_TRUSTED_PROXIES`: every client behind it then shares the proxy's address, its
+/// rate limits and its connection cap, so one client can use up the limits of all. The header
+/// is still ignored, as for any untrusted peer; this only finds the address to warn about.
+/// A public peer with the header is an ordinary client that sets it itself, not worth a warning.
+pub fn untrusted_forwarder(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trusted: &[IpNet],
+) -> Option<IpAddr> {
+    let peer = peer?.ip();
+    (headers.contains_key("x-forwarded-for")
+        && is_local(peer)
+        && !trusted.iter().any(|net| net.contains(peer)))
+    .then_some(peer)
+}
+
+/// Addresses warned about once each ([`untrusted_forwarder`]), at most [`Self::MAX`] of them, so
+/// a misconfigured proxy gives one log line, not one per request, and nobody can grow the set
+/// without bound.
+#[derive(Default)]
+pub struct ForwarderWarnings(Mutex<HashSet<IpAddr>>);
+
+impl ForwarderWarnings {
+    /// Addresses remembered; after that, nothing more is logged.
+    pub const MAX: usize = 64;
+
+    /// Whether `ip` is new and should be warned about now.
+    pub fn first(&self, ip: IpAddr) -> bool {
+        let Ok(mut seen) = self.0.lock() else {
+            return false;
+        };
+        if seen.len() >= Self::MAX {
+            return false;
+        }
+        seen.insert(ip)
+    }
 }
 
 /// The rate limit key of an address: IPv6 per /64, since one connection usually gets a whole
@@ -132,6 +195,50 @@ mod tests {
         // Garbage stops the walk at the last trusted hop.
         let junk = headers(&["198.51.100.1, junk"]);
         assert_eq!(client_ip(&junk, peer("10.0.0.1"), &trusted), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn a_local_peer_with_a_forwarded_header_that_is_not_trusted_is_found_once() {
+        let trusted = vec![IpNet::parse("10.0.0.1").unwrap()];
+        let h = headers(&["198.51.100.1"]);
+        // An unlisted proxy on a private, loopback, shared or link-local address.
+        for local in [
+            "172.18.0.2",
+            "192.168.1.5",
+            "127.0.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "fd00::2",
+            "fe80::1",
+            "::1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert_eq!(
+                untrusted_forwarder(&h, peer(local), &trusted),
+                ip(local),
+                "{local}"
+            );
+        }
+        // The trusted proxy, a public client that sets the header itself, no header at all.
+        assert_eq!(untrusted_forwarder(&h, peer("10.0.0.1"), &trusted), None);
+        assert_eq!(untrusted_forwarder(&h, peer("203.0.113.9"), &trusted), None);
+        assert_eq!(untrusted_forwarder(&h, peer("100.128.0.1"), &trusted), None);
+        assert_eq!(
+            untrusted_forwarder(&HeaderMap::new(), peer("172.18.0.2"), &trusted),
+            None
+        );
+        // One warning per address, and a bounded set.
+        let warned = ForwarderWarnings::default();
+        let first = "172.18.0.2".parse().unwrap();
+        assert!(warned.first(first));
+        assert!(!warned.first(first));
+        for i in 0..ForwarderWarnings::MAX as u32 {
+            warned.first(IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)));
+        }
+        assert!(
+            !warned.first("192.168.9.9".parse().unwrap()),
+            "the set is full"
+        );
     }
 
     #[test]

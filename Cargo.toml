@@ -42,3 +42,14 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Integer overflow panics in release builds too (security review, info), as it does in debug
+# builds and tests. Without it an overflow wraps silently in the shipped app and server: a
+# length, counter, sequence or byte count computed from a server's or a client's input would
+# turn into a small value and pass a bound it should fail. The code uses checked and
+# saturating arithmetic where an overflow is expected; anywhere else a panic ends one request
+# or round instead of corrupting state. The setting covers the dependencies as well; crates
+# that mean to wrap (the hash and cipher code) use explicit wrapping arithmetic, so only their
+# speed can change, by a few percent in arithmetic-heavy code [UNVERIFIED: not measured here].
+[profile.release]
+overflow-checks = true

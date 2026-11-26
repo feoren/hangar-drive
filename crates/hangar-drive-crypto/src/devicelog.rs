@@ -588,6 +588,38 @@ impl AccountState {
         self.last_removal_issuer.as_ref()
     }
 
+    /// The device that removed `device`, if the entries `first_index, first_index + 1, ...`
+    /// continue this verified log (the first one at the index after its head, chained to its
+    /// head's hash) and one of them is a valid removal of `device` (security review H2). Every
+    /// entry goes through [`AccountState::apply`] on a copy, so a forged signature, an entry
+    /// of another account, a chain that does not start at this head and an issuer the log does
+    /// not allow are all `None`; `self` is not changed. Entries after the removal are not read.
+    pub fn removal_in<'a>(
+        &self,
+        first_index: u64,
+        entries: impl IntoIterator<Item = &'a [u8]>,
+        device: &DeviceId,
+    ) -> Option<DeviceId> {
+        if self.is_empty() || first_index != self.len() + 1 {
+            return None;
+        }
+        if !self
+            .devices
+            .get(device)
+            .is_some_and(DeviceRecord::is_current)
+        {
+            return None;
+        }
+        let mut state = self.clone();
+        for entry in entries {
+            state.apply(entry).ok()?;
+            if state.device(device).is_some_and(|d| !d.is_current()) {
+                return state.last_removal_issuer().copied();
+            }
+        }
+        None
+    }
+
     /// The log safety number at the head.
     pub fn safety_number(&self) -> Option<SafetyNumber> {
         Some(log_safety_number(&self.account, &self.head()?))
@@ -1010,6 +1042,64 @@ pub(crate) mod tests {
             kind,
             signature: Signature::from_bytes([0; 64]),
         }
+    }
+
+    // Security review H2: the removal a server shows a removed device must continue the
+    // device's own verified log and be a valid entry; nothing else counts.
+    fn entries(t: &[Vec<u8>]) -> Vec<&[u8]> {
+        t.iter().map(Vec::as_slice).collect()
+    }
+
+    #[test]
+    fn a_removal_counts_only_from_the_own_head() {
+        let a = dev(1);
+        let b = dev(2);
+        let mut server = created(&a);
+        add(&mut server, &a, &b, false).unwrap();
+        // B's view: everything up to its own addition.
+        let view = server.clone();
+        let from = view.len() + 1;
+        let mut tail = Vec::new();
+        let rot = server
+            .next_entry(&a.identity, a.id, 5, rotate_kind())
+            .unwrap();
+        server.apply(&rot).unwrap();
+        tail.push(rot);
+        let removal = server
+            .next_entry(&a.identity, a.id, 6, EntryKind::RemoveDevice(b.id))
+            .unwrap();
+        server.apply(&removal).unwrap();
+        tail.push(removal.clone());
+
+        assert_eq!(view.removal_in(from, entries(&tail), &b.id), Some(a.id));
+        assert_eq!(view.len(), from - 1, "the view is not changed");
+        // Not for another device, and not without the removal.
+        assert_eq!(view.removal_in(from, entries(&tail), &a.id), None);
+        assert_eq!(view.removal_in(from, entries(&tail[..1]), &b.id), None);
+        assert_eq!(view.removal_in(from, entries(&[]), &b.id), None);
+        // A chain that does not start at the own head: a gap, or a wrong first index.
+        assert_eq!(view.removal_in(from + 1, entries(&tail[1..]), &b.id), None);
+        assert_eq!(view.removal_in(from, entries(&tail[1..]), &b.id), None);
+        assert_eq!(view.removal_in(from - 1, entries(&tail), &b.id), None);
+        // A forged signature, and a removal signed by a key the log does not list.
+        let mut forged = removal.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert_eq!(
+            view.removal_in(from, entries(&[tail[0].clone(), forged]), &b.id),
+            None
+        );
+        let stranger = dev(9);
+        let mut before = view.clone();
+        before.apply(&tail[0]).unwrap();
+        let fake = sign_raw(
+            &stranger.identity,
+            raw_entry(&before, a.id, EntryKind::RemoveDevice(b.id)),
+        );
+        assert_eq!(
+            view.removal_in(from, entries(&[tail[0].clone(), fake]), &b.id),
+            None
+        );
     }
 
     #[test]

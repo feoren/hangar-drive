@@ -15,9 +15,7 @@
 //!
 //! Devices verify signature, seal and the replay guard themselves.
 
-use hangar_drive_crypto::record::{
-    record_header, verify_record_signature, MAX_RECORD_PLAINTEXT, RECORD_OVERHEAD,
-};
+use hangar_drive_crypto::record::{record_header, verify_record_signature, MAX_RECORD_LEN};
 use hangar_drive_protocol::api::{ErrorCode, FeedChange, RecordKey, RecordPut, RecordResponse};
 use hangar_drive_protocol::ids::Blob;
 
@@ -30,7 +28,7 @@ use crate::service::sessions::Session;
 /// Records one account may hold at most (one `folder-keys` per folder plus two).
 pub const MAX_RECORDS_PER_ACCOUNT: i64 = 4096;
 /// The largest sealed record.
-pub const MAX_RECORD_BYTES: usize = MAX_RECORD_PLAINTEXT + RECORD_OVERHEAD;
+pub const MAX_RECORD_BYTES: usize = MAX_RECORD_LEN;
 
 fn folder_bytes(key: &RecordKey) -> Vec<u8> {
     key.id_bytes()

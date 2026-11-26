@@ -789,6 +789,10 @@ pub struct ServerState {
     /// every call with [`NetError::PinMismatch`] and reports this one as seen (ADR 0001,
     /// section 6, "Pin rotation"); `None` presents whatever a connection pinned.
     pub presented_pin: Option<[u8; 32]>,
+    /// While set, a device the log removed gets `device_removed` on every call, with the log
+    /// from the length it last named up to its removal, as the real server answers its proof
+    /// (security review H2). Off by default, so tests can let a removed device read on.
+    pub refuse_removed: bool,
     server: ServerId,
     account: Option<AccountId>,
     log: Vec<Vec<u8>>,
@@ -812,6 +816,7 @@ impl ServerState {
             expire_bases: false,
             refuse_commits: None,
             presented_pin: None,
+            refuse_removed: false,
             server: ServerId::from_bytes([0x5e; 16]),
             account: None,
             log: Vec::new(),
@@ -917,6 +922,7 @@ pub struct MemServer {
     shared: Rc<RefCell<ServerState>>,
     device: DeviceId,
     pin: Option<[u8; 32]>,
+    known_log_length: Option<u64>,
 }
 
 impl MemServer {
@@ -940,6 +946,7 @@ impl MemServer {
             shared: Rc::clone(shared),
             device,
             pin,
+            known_log_length: None,
         }
     }
 
@@ -964,6 +971,35 @@ impl MemServer {
         }
         if self.other_key(&s).is_some() {
             return Err(NetError::PinMismatch);
+        }
+        if s.refuse_removed {
+            let removed_at = s
+                .state
+                .as_ref()
+                .and_then(|state| state.device(&self.device))
+                .and_then(|d| d.removed_at);
+            if let Some(removed_at) = removed_at {
+                let log = self
+                    .known_log_length
+                    .filter(|after| *after < removed_at)
+                    .map(|after| {
+                        let start = usize::try_from(after).unwrap_or(usize::MAX);
+                        let end = usize::try_from(removed_at).unwrap_or(usize::MAX);
+                        LogPage {
+                            first_index: after + 1,
+                            entries: s
+                                .log
+                                .get(start..end.min(s.log.len()))
+                                .unwrap_or_default()
+                                .iter()
+                                .take(hangar_drive_protocol::api::MAX_LOG_PAGE)
+                                .map(|e| Blob(e.clone()))
+                                .collect(),
+                            length: s.log.len() as u64,
+                        }
+                    });
+                return Err(NetError::DeviceRemoved(log));
+            }
         }
         Ok(s)
     }
@@ -1250,6 +1286,7 @@ impl ServerApi for MemServer {
                 code: ErrorCode::HeadMoved,
                 current_head: f.head,
                 missing: Vec::new(),
+                removal_log: None,
             }));
         }
         let head = SignedCommit::decode(request.head.commit.as_bytes())
@@ -1311,6 +1348,7 @@ impl ServerApi for MemServer {
                 code: ErrorCode::MissingObjects,
                 current_head: None,
                 missing,
+                removal_log: None,
             }));
         }
         f.sequence += 1;
@@ -1394,6 +1432,10 @@ impl ServerApi for MemServer {
 
     fn seen_pin(&self) -> Option<[u8; 32]> {
         self.other_key(&self.shared.borrow())
+    }
+
+    fn set_known_log_length(&mut self, length: u64) {
+        self.known_log_length = Some(length);
     }
 }
 

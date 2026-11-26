@@ -146,9 +146,9 @@ const de = {
     "Die Datei kommt zu „{folder}“ dazu. Ist sie anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten.",
   "merge.body.other":
     "Die Dateien kommen zu „{folder}“ dazu. Ist eine Datei anders als auf deinen anderen Geräten, bleiben beide Fassungen erhalten.",
-  "merge.counting": "Dateien werden gezählt …",
   "merge.confirm": "Zusammenführen",
   "merge.chooseOther": "Anderen Ordner wählen",
+  "merge.host": "Die Dateien werden auf {host} hochgeladen.",
   "setup.ready.title": "Alles bereit",
   "setup.ready.body": "Leg Dateien in deinen Ordner, den Rest erledigt {app}.",
   "setup.ready.open": "Ordner öffnen",
@@ -286,6 +286,7 @@ const de = {
   "folder.reason.missing": "Ordner nicht gefunden",
   "folder.reason.olderState": "älterer Stand auf dem Server",
   "folder.reason.removedHeads": "Änderungen eines entfernten Geräts",
+  "folder.reason.treeLimit": "zu großer Stand auf dem Server",
   "folder.menu.open": "Im Explorer öffnen",
   "folder.menu.versions": "Frühere Versionen",
   "folder.menu.trash": "Papierkorb",
@@ -414,6 +415,8 @@ const de = {
   "heads.accept": "Übernehmen",
   "heads.accepted": "Übernommen. „{folder}“ wird wieder synchronisiert.",
   "heads.undoLater": "Doch rückgängig machen",
+  "heads.confirm":
+    "Danach wird „{folder}“ wieder synchronisiert, und du kannst die Änderungen in den früheren Versionen rückgängig machen.",
   "removedHeads.title": "Änderungen des entfernten Geräts „{device}“ in „{folder}“",
   "missing.title": "„{folder}“ ist nicht mehr da",
   "missing.body":
@@ -453,6 +456,8 @@ const de = {
     "{count} Dateien warten, weil heute schon sehr viel hochgeladen wurde. Die Dateien gehen spätestens morgen raus.",
   "notice.retained":
     "Alte Versionen belegen auf deinem Server gerade viel Platz. Der Betreiber weiß Bescheid. Du musst nichts tun.",
+  "notice.olderAccountState":
+    "Dein Server hatte einen älteren Stand deines Kontos. {app} hat alles neu eingelesen, es fehlt nichts.",
   "notice.budgetDevice":
     "„{device}“ hat heute sehr viel hochgeladen. Warst du das nicht, schau unter Geräte nach.",
   "notice.minCount.one":
@@ -466,6 +471,9 @@ const de = {
   "disk.body": "{app} lädt weiter herunter, sobald wieder {size} frei sind.",
   "disk.open": "Speicher anzeigen",
   "older.title": "„{folder}“ ist angehalten",
+  "treeLimit.title": "Ein zu großer Stand von „{folder}“",
+  "treeLimit.body":
+    "Auf dem Server liegt ein Stand dieses Ordners, der zu groß oder zu tief verschachtelt ist. {app} hat ihn nicht übernommen. Hol einen früheren Stand zurück.",
   "older.body":
     "Dein Server zeigt einen älteren Stand, als dieses Gerät schon kannte. Meist hat der Betreiber eine Sicherung zurückgespielt. Deine Dateien hier sind sicher.",
   "older.resume": "Fortsetzen …",
@@ -508,10 +516,19 @@ const de = {
     "Dieses Gerät wurde aus deinem Konto entfernt. Deine Dateien bleiben hier, werden aber nicht mehr synchronisiert.",
   "removed.repair": "Wieder koppeln",
   "removed.notMe": "Das war ich nicht",
+  "removalReported.body":
+    "Dein Server meldet, dass dieses Gerät aus deinem Konto entfernt wurde. Bis du das bestätigst, synchronisiert {app} hier nicht.",
+  "removalReported.confirm": "Bestätigen",
+  "removalReported.question": "Wurde dieses Gerät aus deinem Konto entfernt?",
+  "removalReported.questionBody":
+    "Dann vergisst {app} das Konto auf diesem Gerät. Deine Dateien bleiben hier.",
+  "removalReported.yes": "Ja, Konto hier vergessen",
   "removed.notMeBody":
     "Dann hat jemand Zugriff auf eines deiner Geräte. Richte {app} mit deinem Wiederherstellungsblatt neu ein und entferne dabei die Geräte, die du nicht kennst.",
   "update.body": "{app} braucht ein Update, um weiter zu synchronisieren.",
   "update.now": "Jetzt aktualisieren",
+  "update.confirm.title": "Version {version} jetzt installieren?",
+  "update.confirm.yes": "Installieren",
   "update.bodyManual":
     "{app} braucht ein Update, um weiter zu synchronisieren. Installiere die neue Version, dann geht es von selbst weiter.",
   "update.upToDate": "Es gibt noch keine neuere Version. Versuch es später noch einmal.",
@@ -576,11 +593,27 @@ const de = {
   "restore.beforeDevice.advice":
     "Entferne dieses Gerät zuerst, sonst ändert es die Dateien gleich wieder.",
   "restore.folder": "Ganzen Ordner auf diesen Stand zurücksetzen",
-  "restore.folder.title": "Auf diesen Stand zurücksetzen?",
-  "restore.folder.body":
-    "„{folder}“ wird auf den Stand von {when} zurückgesetzt. Der jetzige Stand bleibt als Version erhalten, du kannst also auch das rückgängig machen.",
   "restore.folder.confirm": "Zurücksetzen",
   "restore.folder.done": "„{folder}“ ist auf dem Stand von {when}.",
+  // Follow-up check of the overall security review (native questions, names, limits).
+  "restore.folder.ask": "„{folder}“ auf allen Geräten auf diesen Stand zurücksetzen?",
+  "restore.folder.askGone.one": "Dabei verschwindet {count} Datei, die es damals noch nicht gab.",
+  "restore.folder.askGone.other":
+    "Dabei verschwinden {count} Dateien, die es damals noch nicht gab.",
+  "restore.folder.askNoneGone": "Dabei verschwindet keine Datei.",
+  "restore.folder.askBody":
+    "Geänderte Dateien bekommen ihren damaligen Inhalt. Der jetzige Stand bleibt als Version erhalten, du kannst das also rückgängig machen.",
+  "recover.cleanup.ask.one": "{count} Gerät aus deinem Konto entfernen?",
+  "recover.cleanup.ask.other": "{count} Geräte aus deinem Konto entfernen?",
+  "recover.cleanup.askBody":
+    "Danach können diese Geräte nichts mehr synchronisieren und keine neuen Dateien mehr lesen.",
+  "pair.request.lookAlike":
+    "Es gibt schon ein Gerät, das so heißt: „{device}“. Prüfe die Zahlen besonders genau.",
+  "devices.lookAlike.question":
+    "„{name}“ sieht aus wie „{device}“, ein anderes Gerät in deinem Konto. Trotzdem so nennen?",
+  "devices.lookAlike.yes": "Trotzdem so nennen",
+  "devices.name.lookAlike": "Es gibt schon ein Gerät, das so heißt.",
+  "folder.reason.tooLarge": "zu groß für einen Ordner",
   "restore.retention.one": "Versionen bleiben {days} Tag erhalten. Das legt dein Server fest.",
   "restore.retention.other": "Versionen bleiben {days} Tage erhalten. Das legt dein Server fest.",
   "restore.otherVersion": "Andere Version wählen",
@@ -650,11 +683,17 @@ const de = {
   "devices.recovery.renewBody":
     "Der neue Code ersetzt den alten. Der alte funktioniert danach nicht mehr. Wirf das alte Blatt weg.",
   "devices.recovery.renewed": "Neuer Code gilt. Der alte funktioniert nicht mehr.",
+  "devices.recovery.renewConfirm": "Den neuen Wiederherstellungscode übernehmen?",
+  "devices.recovery.renewYes": "Neuen Code übernehmen",
 
   // Settings (UX 13.10)
   "settings.title": "Einstellungen",
   "settings.autostart": "Beim Anmelden starten",
   "settings.autostartHelp": "Dann bleiben deine Ordner aktuell, ohne dass du daran denken musst.",
+  "settings.autostart.offTitle": "{app} nicht mehr beim Anmelden starten?",
+  "settings.autostart.offBody":
+    "Dann bleiben deine Ordner nur aktuell, solange du {app} selbst öffnest.",
+  "settings.autostart.offConfirm": "Nicht mehr starten",
   "settings.language": "Sprache",
   "settings.languageSystem": "Wie das System",
   "settings.account": "Konto",
@@ -856,9 +895,9 @@ const en: Dictionary = {
     "It is added to “{folder}”. If it differs from the one on your other devices, both versions are kept.",
   "merge.body.other":
     "They are added to “{folder}”. If a file differs from the one on your other devices, both versions are kept.",
-  "merge.counting": "Counting files …",
   "merge.confirm": "Merge",
   "merge.chooseOther": "Choose another folder",
+  "merge.host": "They are uploaded to {host}.",
   "setup.ready.title": "All set",
   "setup.ready.body": "Put files in your folder, {app} does the rest.",
   "setup.ready.open": "Open folder",
@@ -988,6 +1027,7 @@ const en: Dictionary = {
   "folder.reason.missing": "folder not found",
   "folder.reason.olderState": "older state on the server",
   "folder.reason.removedHeads": "changes from a removed device",
+  "folder.reason.treeLimit": "version on the server too large",
   "folder.menu.open": "Show in Explorer",
   "folder.menu.versions": "Earlier versions",
   "folder.menu.trash": "Trash",
@@ -1112,6 +1152,8 @@ const en: Dictionary = {
   "heads.accept": "Accept",
   "heads.accepted": "Accepted. “{folder}” syncs again.",
   "heads.undoLater": "Undo after all",
+  "heads.confirm":
+    "“{folder}” then syncs again, and you can undo the changes in the earlier versions.",
   "removedHeads.title": "Changes from the removed device “{device}” in “{folder}”",
   "missing.title": "“{folder}” is gone",
   "missing.body":
@@ -1150,6 +1192,8 @@ const en: Dictionary = {
     "{count} files are waiting because a lot was uploaded today. They go out by tomorrow at the latest.",
   "notice.retained":
     "Old versions take up a lot of space on your server right now. The operator has been told. You do not need to do anything.",
+  "notice.olderAccountState":
+    "Your server had an older state of your account. {app} read everything again; nothing is missing.",
   "notice.budgetDevice":
     "“{device}” uploaded a lot today. If that was not you, check under Devices.",
   "notice.minCount.one":
@@ -1163,6 +1207,9 @@ const en: Dictionary = {
   "disk.body": "{app} continues downloading once {size} are free again.",
   "disk.open": "Show storage",
   "older.title": "“{folder}” is paused",
+  "treeLimit.title": "An oversized version of “{folder}”",
+  "treeLimit.body":
+    "The server holds a version of this folder that is too large or nested too deeply. {app} did not take it in. Bring back an earlier version.",
   "older.body":
     "Your server shows an older state than this device already knew. Usually the operator has restored a backup. Your files here are safe.",
   "older.resume": "Continue …",
@@ -1204,10 +1251,19 @@ const en: Dictionary = {
     "This device was removed from your account. Your files stay here but no longer sync.",
   "removed.repair": "Pair again",
   "removed.notMe": "That was not me",
+  "removalReported.body":
+    "Your server reports that this device was removed from your account. Until you confirm it, {app} does not sync here.",
+  "removalReported.confirm": "Confirm",
+  "removalReported.question": "Was this device removed from your account?",
+  "removalReported.questionBody":
+    "Then {app} forgets the account on this device. Your files stay here.",
+  "removalReported.yes": "Yes, forget the account here",
   "removed.notMeBody":
     "Then someone has access to one of your devices. Set up {app} again with your recovery sheet and remove the devices you do not recognize.",
   "update.body": "{app} needs an update to keep syncing.",
   "update.now": "Update now",
+  "update.confirm.title": "Install version {version} now?",
+  "update.confirm.yes": "Install",
   "update.bodyManual":
     "{app} needs an update to keep syncing. Install the new version and it carries on by itself.",
   "update.upToDate": "There is no newer version yet. Try again later.",
@@ -1271,11 +1327,24 @@ const en: Dictionary = {
   "restore.beforeDevice.advice":
     "Remove this device first, or it will change the files again right away.",
   "restore.folder": "Reset the whole folder to this state",
-  "restore.folder.title": "Reset to this state?",
-  "restore.folder.body":
-    "“{folder}” will be reset to the state of {when}. The current state stays as a version, so you can undo this too.",
   "restore.folder.confirm": "Reset",
   "restore.folder.done": "“{folder}” is back to the state of {when}.",
+  "restore.folder.ask": "Reset “{folder}” to this state on all devices?",
+  "restore.folder.askGone.one": "{count} file that did not exist then will disappear.",
+  "restore.folder.askGone.other": "{count} files that did not exist then will disappear.",
+  "restore.folder.askNoneGone": "No file will disappear.",
+  "restore.folder.askBody":
+    "Changed files get their content from then. The current state stays as a version, so you can undo this.",
+  "recover.cleanup.ask.one": "Remove {count} device from your account?",
+  "recover.cleanup.ask.other": "Remove {count} devices from your account?",
+  "recover.cleanup.askBody": "These devices can then no longer sync or read new files.",
+  "pair.request.lookAlike":
+    "There is already a device with this name: “{device}”. Check the numbers especially carefully.",
+  "devices.lookAlike.question":
+    "“{name}” looks like “{device}”, another device in your account. Use this name anyway?",
+  "devices.lookAlike.yes": "Use it anyway",
+  "devices.name.lookAlike": "There is already a device with this name.",
+  "folder.reason.tooLarge": "too large for a folder",
   "restore.retention.one": "Versions are kept for {days} day. Your server sets this.",
   "restore.retention.other": "Versions are kept for {days} days. Your server sets this.",
   "restore.otherVersion": "Choose another version",
@@ -1342,10 +1411,16 @@ const en: Dictionary = {
   "devices.recovery.renewBody":
     "The new code replaces the old one. The old one stops working. Throw the old sheet away.",
   "devices.recovery.renewed": "The new code is active. The old one no longer works.",
+  "devices.recovery.renewConfirm": "Use the new recovery code?",
+  "devices.recovery.renewYes": "Use new code",
 
   "settings.title": "Settings",
   "settings.autostart": "Start at sign-in",
   "settings.autostartHelp": "Keeps your folders up to date without you having to think of it.",
+  "settings.autostart.offTitle": "Stop starting {app} at sign-in?",
+  "settings.autostart.offBody":
+    "Your folders then stay up to date only while you open {app} yourself.",
+  "settings.autostart.offConfirm": "Stop starting",
   "settings.language": "Language",
   "settings.languageSystem": "Same as system",
   "settings.account": "Account",
@@ -1519,9 +1594,9 @@ const el: Dictionary = {
     "Προστίθεται στον φάκελο «{folder}». Αν διαφέρει από αυτό στις άλλες συσκευές σου, διατηρούνται και οι δύο εκδοχές.",
   "merge.body.other":
     "Προστίθενται στον φάκελο «{folder}». Αν ένα αρχείο διαφέρει από αυτό στις άλλες συσκευές σου, διατηρούνται και οι δύο εκδοχές.",
-  "merge.counting": "Καταμέτρηση αρχείων …",
   "merge.confirm": "Συγχώνευση",
   "merge.chooseOther": "Επιλογή άλλου φακέλου",
+  "merge.host": "Ανεβαίνουν στο {host}.",
   "setup.ready.title": "Όλα έτοιμα",
   "setup.ready.body": "Βάλε αρχεία στον φάκελό σου, το {app} κάνει τα υπόλοιπα.",
   "setup.ready.open": "Άνοιγμα φακέλου",
@@ -1650,6 +1725,7 @@ const el: Dictionary = {
   "folder.reason.missing": "ο φάκελος δεν βρέθηκε",
   "folder.reason.olderState": "παλαιότερη κατάσταση στον διακομιστή",
   "folder.reason.removedHeads": "αλλαγές από συσκευή που αφαιρέθηκε",
+  "folder.reason.treeLimit": "πολύ μεγάλη έκδοση στον διακομιστή",
   "folder.menu.open": "Εμφάνιση στην Εξερεύνηση",
   "folder.menu.versions": "Προηγούμενες εκδόσεις",
   "folder.menu.trash": "Κάδος",
@@ -1774,6 +1850,8 @@ const el: Dictionary = {
   "heads.accept": "Αποδοχή",
   "heads.accepted": "Έγινε αποδοχή. Το «{folder}» συγχρονίζεται ξανά.",
   "heads.undoLater": "Αναίρεση τελικά",
+  "heads.confirm":
+    "Μετά το «{folder}» συγχρονίζεται ξανά και μπορείς να αναιρέσεις τις αλλαγές στις προηγούμενες εκδόσεις.",
   "removedHeads.title": "Αλλαγές από τη συσκευή «{device}» που αφαιρέθηκε στο «{folder}»",
   "missing.title": "Ο φάκελος «{folder}» δεν υπάρχει πια",
   "missing.body":
@@ -1813,6 +1891,8 @@ const el: Dictionary = {
     "{count} αρχεία περιμένουν, επειδή σήμερα ανέβηκαν πολλά. Θα σταλούν το αργότερο αύριο.",
   "notice.retained":
     "Οι παλιές εκδόσεις πιάνουν αυτή τη στιγμή πολύ χώρο στον διακομιστή σου. Ο διαχειριστής ενημερώθηκε. Δεν χρειάζεται να κάνεις τίποτα.",
+  "notice.olderAccountState":
+    "Ο διακομιστής σου είχε μια παλαιότερη κατάσταση του λογαριασμού σου. Το {app} τα διάβασε όλα ξανά· δεν λείπει τίποτα.",
   "notice.budgetDevice":
     "Η συσκευή «{device}» ανέβασε πολλά σήμερα. Αν δεν ήσουν εσύ, έλεγξε στις Συσκευές.",
   "notice.minCount.one":
@@ -1826,6 +1906,9 @@ const el: Dictionary = {
   "disk.body": "Το {app} θα συνεχίσει τη λήψη μόλις ελευθερωθούν ξανά {size}.",
   "disk.open": "Εμφάνιση χώρου αποθήκευσης",
   "older.title": "Ο φάκελος «{folder}» είναι σε παύση",
+  "treeLimit.title": "Υπερβολικά μεγάλη έκδοση του «{folder}»",
+  "treeLimit.body":
+    "Ο διακομιστής έχει μια έκδοση αυτού του φακέλου που είναι πολύ μεγάλη ή έχει πολύ βαθιά ένθεση. Το {app} δεν την πήρε. Επανάφερε μια προηγούμενη έκδοση.",
   "older.body":
     "Ο διακομιστής σου δείχνει παλαιότερη κατάσταση από αυτή που ήξερε ήδη αυτή η συσκευή. Συνήθως ο διαχειριστής έχει επαναφέρει ένα αντίγραφο ασφαλείας. Τα αρχεία σου εδώ είναι ασφαλή.",
   "older.resume": "Συνέχεια …",
@@ -1868,10 +1951,19 @@ const el: Dictionary = {
     "Αυτή η συσκευή αφαιρέθηκε από τον λογαριασμό σου. Τα αρχεία σου μένουν εδώ, αλλά δεν συγχρονίζονται πια.",
   "removed.repair": "Νέα σύζευξη",
   "removed.notMe": "Δεν ήμουν εγώ",
+  "removalReported.body":
+    "Ο διακομιστής σου αναφέρει ότι αυτή η συσκευή αφαιρέθηκε από τον λογαριασμό σου. Μέχρι να το επιβεβαιώσεις, το {app} δεν συγχρονίζει εδώ.",
+  "removalReported.confirm": "Επιβεβαίωση",
+  "removalReported.question": "Αφαιρέθηκε αυτή η συσκευή από τον λογαριασμό σου;",
+  "removalReported.questionBody":
+    "Τότε το {app} ξεχνά τον λογαριασμό σε αυτή τη συσκευή. Τα αρχεία σου μένουν εδώ.",
+  "removalReported.yes": "Ναι, ξέχασε τον λογαριασμό εδώ",
   "removed.notMeBody":
     "Τότε κάποιος έχει πρόσβαση σε μία από τις συσκευές σου. Ρύθμισε ξανά το {app} με το φύλλο ανάκτησης και αφαίρεσε τις συσκευές που δεν αναγνωρίζεις.",
   "update.body": "Το {app} χρειάζεται ενημέρωση για να συνεχίσει τον συγχρονισμό.",
   "update.now": "Ενημέρωση τώρα",
+  "update.confirm.title": "Να εγκατασταθεί τώρα η έκδοση {version};",
+  "update.confirm.yes": "Εγκατάσταση",
   "update.bodyManual":
     "Το {app} χρειάζεται ενημέρωση για να συνεχίσει τον συγχρονισμό. Εγκατάστησε τη νέα έκδοση και θα συνεχίσει μόνο του.",
   "update.upToDate": "Δεν υπάρχει ακόμα νεότερη έκδοση. Δοκίμασε ξανά αργότερα.",
@@ -1934,11 +2026,26 @@ const el: Dictionary = {
   "restore.beforeDevice.advice":
     "Αφαίρεσε πρώτα αυτή τη συσκευή, αλλιώς θα αλλάξει ξανά τα αρχεία αμέσως.",
   "restore.folder": "Επαναφορά όλου του φακέλου σε αυτή την κατάσταση",
-  "restore.folder.title": "Επαναφορά σε αυτή την κατάσταση;",
-  "restore.folder.body":
-    "Ο φάκελος «{folder}» θα επανέλθει στην κατάσταση της στιγμής {when}. Η τρέχουσα κατάσταση μένει ως έκδοση, οπότε μπορείς να το αναιρέσεις κι αυτό.",
   "restore.folder.confirm": "Επαναφορά",
   "restore.folder.done": "Ο φάκελος «{folder}» επανήλθε στην κατάσταση της στιγμής {when}.",
+  "restore.folder.ask":
+    "Επαναφορά του φακέλου «{folder}» σε αυτή την κατάσταση σε όλες τις συσκευές;",
+  "restore.folder.askGone.one": "Θα εξαφανιστεί {count} αρχείο που δεν υπήρχε τότε.",
+  "restore.folder.askGone.other": "Θα εξαφανιστούν {count} αρχεία που δεν υπήρχαν τότε.",
+  "restore.folder.askNoneGone": "Δεν θα εξαφανιστεί κανένα αρχείο.",
+  "restore.folder.askBody":
+    "Τα αρχεία που άλλαξαν παίρνουν το τότε περιεχόμενό τους. Η τρέχουσα κατάσταση μένει ως έκδοση, οπότε μπορείς να το αναιρέσεις.",
+  "recover.cleanup.ask.one": "Αφαίρεση {count} συσκευής από τον λογαριασμό σου;",
+  "recover.cleanup.ask.other": "Αφαίρεση {count} συσκευών από τον λογαριασμό σου;",
+  "recover.cleanup.askBody":
+    "Μετά από αυτό, αυτές οι συσκευές δεν μπορούν πια να συγχρονίζουν ούτε να διαβάζουν νέα αρχεία.",
+  "pair.request.lookAlike":
+    "Υπάρχει ήδη συσκευή με αυτό το όνομα: «{device}». Έλεγξε τους αριθμούς ιδιαίτερα προσεκτικά.",
+  "devices.lookAlike.question":
+    "Το «{name}» μοιάζει με το «{device}», μια άλλη συσκευή στον λογαριασμό σου. Να χρησιμοποιηθεί παρ’ όλα αυτά;",
+  "devices.lookAlike.yes": "Χρήση παρ’ όλα αυτά",
+  "devices.name.lookAlike": "Υπάρχει ήδη συσκευή με αυτό το όνομα.",
+  "folder.reason.tooLarge": "πολύ μεγάλος για φάκελο",
   "restore.retention.one":
     "Οι εκδόσεις διατηρούνται για {days} ημέρα. Αυτό το ορίζει ο διακομιστής σου.",
   "restore.retention.other":
@@ -2008,10 +2115,16 @@ const el: Dictionary = {
   "devices.recovery.renewBody":
     "Ο νέος κωδικός αντικαθιστά τον παλιό. Ο παλιός σταματά να λειτουργεί. Πέτα το παλιό φύλλο.",
   "devices.recovery.renewed": "Ο νέος κωδικός είναι ενεργός. Ο παλιός δεν λειτουργεί πια.",
+  "devices.recovery.renewConfirm": "Να χρησιμοποιηθεί ο νέος κωδικός ανάκτησης;",
+  "devices.recovery.renewYes": "Χρήση νέου κωδικού",
   "settings.title": "Ρυθμίσεις",
   "settings.autostart": "Εκκίνηση κατά τη σύνδεση",
   "settings.autostartHelp":
     "Κρατά τους φακέλους σου ενημερωμένους χωρίς να χρειάζεται να το σκέφτεσαι.",
+  "settings.autostart.offTitle": "Να μην ξεκινά πλέον το {app} κατά τη σύνδεση;",
+  "settings.autostart.offBody":
+    "Τότε οι φάκελοί σου μένουν ενημερωμένοι μόνο όσο ανοίγεις μόνος σου το {app}.",
+  "settings.autostart.offConfirm": "Να μην ξεκινά",
   "settings.language": "Γλώσσα",
   "settings.languageSystem": "Όπως το σύστημα",
   "settings.account": "Λογαριασμός",
@@ -2194,9 +2307,9 @@ const es: Dictionary = {
     "Se añaden a «{folder}». Si un archivo es distinto del de tus otros dispositivos, se conservan las dos versiones.",
   "merge.body.other":
     "Se añaden a «{folder}». Si un archivo es distinto del de tus otros dispositivos, se conservan las dos versiones.",
-  "merge.counting": "Contando archivos …",
   "merge.confirm": "Combinar",
   "merge.chooseOther": "Elegir otra carpeta",
+  "merge.host": "Se suben a {host}.",
   "setup.ready.title": "Todo listo",
   "setup.ready.body": "Pon archivos en tu carpeta, {app} se encarga del resto.",
   "setup.ready.open": "Abrir carpeta",
@@ -2329,6 +2442,7 @@ const es: Dictionary = {
   "folder.reason.missing": "no se encuentra la carpeta",
   "folder.reason.olderState": "estado más antiguo en el servidor",
   "folder.reason.removedHeads": "cambios de un dispositivo eliminado",
+  "folder.reason.treeLimit": "versión del servidor demasiado grande",
   "folder.menu.open": "Mostrar en el Explorador",
   "folder.menu.versions": "Versiones anteriores",
   "folder.menu.trash": "Papelera",
@@ -2474,6 +2588,8 @@ const es: Dictionary = {
   "heads.accept": "Aceptar",
   "heads.accepted": "Aceptado. «{folder}» vuelve a sincronizarse.",
   "heads.undoLater": "Deshacer de todos modos",
+  "heads.confirm":
+    "Después «{folder}» vuelve a sincronizarse y puedes deshacer los cambios en las versiones anteriores.",
   "removedHeads.title": "Cambios del dispositivo eliminado «{device}» en «{folder}»",
   "missing.title": "«{folder}» ya no está",
   "missing.body":
@@ -2514,6 +2630,8 @@ const es: Dictionary = {
     "{count} archivos están esperando porque hoy se ha subido mucho. Se enviarán como muy tarde mañana.",
   "notice.retained":
     "Las versiones antiguas ocupan ahora mucho espacio en tu servidor. Ya se ha avisado al administrador. No tienes que hacer nada.",
+  "notice.olderAccountState":
+    "Tu servidor tenía un estado anterior de tu cuenta. {app} lo ha leído todo de nuevo; no falta nada.",
   "notice.budgetDevice":
     "«{device}» ha subido mucho hoy. Si no has sido tú, revísalo en Dispositivos.",
   "notice.minCount.one":
@@ -2529,6 +2647,9 @@ const es: Dictionary = {
   "disk.body": "{app} seguirá descargando en cuanto vuelvan a quedar libres {size}.",
   "disk.open": "Mostrar almacenamiento",
   "older.title": "«{folder}» está en pausa",
+  "treeLimit.title": "Una versión demasiado grande de «{folder}»",
+  "treeLimit.body":
+    "El servidor tiene una versión de esta carpeta demasiado grande o con demasiados niveles. {app} no la ha tomado. Recupera una versión anterior.",
   "older.body":
     "Tu servidor muestra un estado más antiguo del que este dispositivo ya conocía. Normalmente, el administrador ha restaurado una copia de seguridad. Tus archivos de aquí están a salvo.",
   "older.resume": "Continuar …",
@@ -2573,10 +2694,19 @@ const es: Dictionary = {
     "Este dispositivo se ha quitado de tu cuenta. Tus archivos se quedan aquí, pero ya no se sincronizan.",
   "removed.repair": "Vincular de nuevo",
   "removed.notMe": "No he sido yo",
+  "removalReported.body":
+    "Tu servidor informa de que este dispositivo se eliminó de tu cuenta. Hasta que lo confirmes, {app} no sincroniza aquí.",
+  "removalReported.confirm": "Confirmar",
+  "removalReported.question": "¿Se eliminó este dispositivo de tu cuenta?",
+  "removalReported.questionBody":
+    "Entonces {app} olvida la cuenta en este dispositivo. Tus archivos se quedan aquí.",
+  "removalReported.yes": "Sí, olvidar la cuenta aquí",
   "removed.notMeBody":
     "Entonces alguien tiene acceso a uno de tus dispositivos. Vuelve a configurar {app} con tu hoja de recuperación y quita los dispositivos que no reconozcas.",
   "update.body": "{app} necesita una actualización para seguir sincronizando.",
   "update.now": "Actualizar ahora",
+  "update.confirm.title": "¿Instalar ahora la versión {version}?",
+  "update.confirm.yes": "Instalar",
   "update.bodyManual":
     "{app} necesita una actualización para seguir sincronizando. Instala la nueva versión y seguirá por sí solo.",
   "update.upToDate": "Todavía no hay una versión más nueva. Vuelve a intentarlo más tarde.",
@@ -2644,11 +2774,27 @@ const es: Dictionary = {
   "restore.beforeDevice.advice":
     "Quita antes este dispositivo, o volverá a cambiar los archivos enseguida.",
   "restore.folder": "Devolver toda la carpeta a este estado",
-  "restore.folder.title": "¿Volver a este estado?",
-  "restore.folder.body":
-    "«{folder}» volverá al estado de {when}. El estado actual se queda como versión, así que también puedes deshacerlo.",
   "restore.folder.confirm": "Volver",
   "restore.folder.done": "«{folder}» ha vuelto al estado de {when}.",
+  "restore.folder.ask": "¿Devolver «{folder}» a este estado en todos los dispositivos?",
+  "restore.folder.askGone.one": "Desaparecerá {count} archivo que entonces no existía.",
+  "restore.folder.askGone.many": "Desaparecerán {count} de archivos que entonces no existían.",
+  "restore.folder.askGone.other": "Desaparecerán {count} archivos que entonces no existían.",
+  "restore.folder.askNoneGone": "No desaparecerá ningún archivo.",
+  "restore.folder.askBody":
+    "Los archivos modificados recuperan el contenido de entonces. El estado actual se queda como versión, así que puedes deshacerlo.",
+  "recover.cleanup.ask.one": "¿Quitar {count} dispositivo de tu cuenta?",
+  "recover.cleanup.ask.many": "¿Quitar {count} de dispositivos de tu cuenta?",
+  "recover.cleanup.ask.other": "¿Quitar {count} dispositivos de tu cuenta?",
+  "recover.cleanup.askBody":
+    "Después, estos dispositivos ya no podrán sincronizar ni leer archivos nuevos.",
+  "pair.request.lookAlike":
+    "Ya hay un dispositivo con este nombre: «{device}». Compara los números con especial cuidado.",
+  "devices.lookAlike.question":
+    "«{name}» se parece a «{device}», otro dispositivo de tu cuenta. ¿Usar este nombre de todos modos?",
+  "devices.lookAlike.yes": "Usarlo de todos modos",
+  "devices.name.lookAlike": "Ya hay un dispositivo con este nombre.",
+  "folder.reason.tooLarge": "demasiado grande para una carpeta",
   "restore.retention.one": "Las versiones se guardan durante {days} día. Lo decide tu servidor.",
   "restore.retention.many":
     "Las versiones se guardan durante {days} de días. Lo decide tu servidor.",
@@ -2724,9 +2870,15 @@ const es: Dictionary = {
   "devices.recovery.renewBody":
     "El código nuevo sustituye al antiguo. El antiguo deja de funcionar. Tira la hoja antigua.",
   "devices.recovery.renewed": "El código nuevo está activo. El antiguo ya no funciona.",
+  "devices.recovery.renewConfirm": "¿Usar el nuevo código de recuperación?",
+  "devices.recovery.renewYes": "Usar el nuevo código",
   "settings.title": "Ajustes",
   "settings.autostart": "Iniciar al iniciar sesión",
   "settings.autostartHelp": "Mantiene tus carpetas al día sin que tengas que acordarte.",
+  "settings.autostart.offTitle": "¿Dejar de iniciar {app} al iniciar sesión?",
+  "settings.autostart.offBody":
+    "Así tus carpetas solo estarán al día mientras abras {app} tú mismo.",
+  "settings.autostart.offConfirm": "Dejar de iniciar",
   "settings.language": "Idioma",
   "settings.languageSystem": "Igual que el sistema",
   "settings.account": "Cuenta",
@@ -2903,9 +3055,9 @@ const fr: Dictionary = {
     "Ils sont ajoutés à « {folder} ». Si un fichier diffère de celui de tes autres appareils, les deux versions sont conservées.",
   "merge.body.other":
     "Ils sont ajoutés à « {folder} ». Si un fichier diffère de celui de tes autres appareils, les deux versions sont conservées.",
-  "merge.counting": "Comptage des fichiers …",
   "merge.confirm": "Fusionner",
   "merge.chooseOther": "Choisir un autre dossier",
+  "merge.host": "Ils sont envoyés sur {host}.",
   "setup.ready.title": "Tout est prêt",
   "setup.ready.body": "Mets tes fichiers dans ton dossier, {app} s’occupe du reste.",
   "setup.ready.open": "Ouvrir le dossier",
@@ -3038,6 +3190,7 @@ const fr: Dictionary = {
   "folder.reason.missing": "dossier introuvable",
   "folder.reason.olderState": "état plus ancien sur le serveur",
   "folder.reason.removedHeads": "modifications d’un appareil retiré",
+  "folder.reason.treeLimit": "version du serveur trop grande",
   "folder.menu.open": "Afficher dans l’Explorateur",
   "folder.menu.versions": "Versions précédentes",
   "folder.menu.trash": "Corbeille",
@@ -3184,6 +3337,8 @@ const fr: Dictionary = {
   "heads.accept": "Accepter",
   "heads.accepted": "Accepté. « {folder} » se synchronise de nouveau.",
   "heads.undoLater": "Annuler quand même",
+  "heads.confirm":
+    "Ensuite, « {folder} » se synchronise de nouveau et tu peux annuler les modifications dans les versions précédentes.",
   "removedHeads.title": "Modifications de l’appareil retiré « {device} » dans « {folder} »",
   "missing.title": "« {folder} » a disparu",
   "missing.body":
@@ -3225,6 +3380,8 @@ const fr: Dictionary = {
     "{count} fichiers attendent, car beaucoup de données ont été envoyées aujourd’hui. Ils partiront au plus tard demain.",
   "notice.retained":
     "Les anciennes versions occupent beaucoup de place sur ton serveur en ce moment. L’administrateur a été prévenu. Tu n’as rien à faire.",
+  "notice.olderAccountState":
+    "Ton serveur avait un état plus ancien de ton compte. {app} a tout relu ; rien ne manque.",
   "notice.budgetDevice":
     "« {device} » a beaucoup envoyé aujourd’hui. Si ce n’était pas toi, vérifie sous Appareils.",
   "notice.minCount.one":
@@ -3240,6 +3397,9 @@ const fr: Dictionary = {
   "disk.body": "{app} reprend le téléchargement dès que {size} sont à nouveau libres.",
   "disk.open": "Afficher le stockage",
   "older.title": "« {folder} » est en pause",
+  "treeLimit.title": "Une version trop grande de « {folder} »",
+  "treeLimit.body":
+    "Le serveur contient une version de ce dossier trop grande ou trop imbriquée. {app} ne l’a pas reprise. Récupère une version précédente.",
   "older.body":
     "Ton serveur affiche un état plus ancien que celui que cet appareil connaissait déjà. En général, l’administrateur a restauré une sauvegarde. Tes fichiers ici sont en sécurité.",
   "older.resume": "Continuer …",
@@ -3284,10 +3444,19 @@ const fr: Dictionary = {
     "Cet appareil a été retiré de ton compte. Tes fichiers restent ici, mais ne sont plus synchronisés.",
   "removed.repair": "Associer à nouveau",
   "removed.notMe": "Ce n’était pas moi",
+  "removalReported.body":
+    "Ton serveur signale que cet appareil a été retiré de ton compte. Tant que tu ne l’as pas confirmé, {app} ne synchronise pas ici.",
+  "removalReported.confirm": "Confirmer",
+  "removalReported.question": "Cet appareil a-t-il été retiré de ton compte ?",
+  "removalReported.questionBody":
+    "{app} oublie alors le compte sur cet appareil. Tes fichiers restent ici.",
+  "removalReported.yes": "Oui, oublier le compte ici",
   "removed.notMeBody":
     "Alors quelqu’un a accès à l’un de tes appareils. Configure à nouveau {app} avec ta feuille de récupération et retire les appareils que tu ne reconnais pas.",
   "update.body": "{app} a besoin d’une mise à jour pour continuer à synchroniser.",
   "update.now": "Mettre à jour",
+  "update.confirm.title": "Installer la version {version} maintenant ?",
+  "update.confirm.yes": "Installer",
   "update.bodyManual":
     "{app} a besoin d’une mise à jour pour continuer à synchroniser. Installe la nouvelle version, puis tout reprend tout seul.",
   "update.upToDate": "Il n’y a pas encore de version plus récente. Réessaie plus tard.",
@@ -3356,11 +3525,28 @@ const fr: Dictionary = {
   "restore.beforeDevice.advice":
     "Retire d’abord cet appareil, sinon il modifiera aussitôt à nouveau les fichiers.",
   "restore.folder": "Remettre tout le dossier dans cet état",
-  "restore.folder.title": "Revenir à cet état ?",
-  "restore.folder.body":
-    "« {folder} » sera remis tel qu’il était {when}. L’état actuel reste disponible comme version, tu peux donc aussi annuler cela.",
   "restore.folder.confirm": "Revenir",
   "restore.folder.done": "« {folder} » est de nouveau tel qu’il était {when}.",
+  "restore.folder.ask": "Remettre « {folder} » dans cet état sur tous les appareils ?",
+  "restore.folder.askGone.one": "{count} fichier qui n’existait pas encore va disparaître.",
+  "restore.folder.askGone.many":
+    "{count} de fichiers qui n’existaient pas encore vont disparaître.",
+  "restore.folder.askGone.other": "{count} fichiers qui n’existaient pas encore vont disparaître.",
+  "restore.folder.askNoneGone": "Aucun fichier ne va disparaître.",
+  "restore.folder.askBody":
+    "Les fichiers modifiés retrouvent leur contenu d’alors. L’état actuel reste disponible comme version, tu peux donc annuler cela.",
+  "recover.cleanup.ask.one": "Retirer {count} appareil de ton compte ?",
+  "recover.cleanup.ask.many": "Retirer {count} d’appareils de ton compte ?",
+  "recover.cleanup.ask.other": "Retirer {count} appareils de ton compte ?",
+  "recover.cleanup.askBody":
+    "Ensuite, ces appareils ne pourront plus synchroniser ni lire de nouveaux fichiers.",
+  "pair.request.lookAlike":
+    "Il existe déjà un appareil portant ce nom : « {device} ». Compare les chiffres avec une attention particulière.",
+  "devices.lookAlike.question":
+    "« {name} » ressemble à « {device} », un autre appareil de ton compte. Utiliser ce nom quand même ?",
+  "devices.lookAlike.yes": "L’utiliser quand même",
+  "devices.name.lookAlike": "Il existe déjà un appareil portant ce nom.",
+  "folder.reason.tooLarge": "trop grand pour un dossier",
   "restore.retention.one":
     "Les versions sont conservées {days} jour. C’est ton serveur qui le définit.",
   "restore.retention.many":
@@ -3437,9 +3623,15 @@ const fr: Dictionary = {
   "devices.recovery.renewBody":
     "Le nouveau code remplace l’ancien. L’ancien ne fonctionne plus. Jette l’ancienne feuille.",
   "devices.recovery.renewed": "Le nouveau code est actif. L’ancien ne fonctionne plus.",
+  "devices.recovery.renewConfirm": "Utiliser le nouveau code de récupération ?",
+  "devices.recovery.renewYes": "Utiliser le nouveau code",
   "settings.title": "Paramètres",
   "settings.autostart": "Démarrer à l’ouverture de session",
   "settings.autostartHelp": "Garde tes dossiers à jour sans que tu aies à y penser.",
+  "settings.autostart.offTitle": "Ne plus démarrer {app} à l’ouverture de session ?",
+  "settings.autostart.offBody":
+    "Tes dossiers ne restent alors à jour que lorsque tu ouvres {app} toi-même.",
+  "settings.autostart.offConfirm": "Ne plus démarrer",
   "settings.language": "Langue",
   "settings.languageSystem": "Comme le système",
   "settings.account": "Compte",
@@ -3618,9 +3810,9 @@ const it: Dictionary = {
     "Vengono aggiunti a «{folder}». Se un file è diverso da quello sugli altri tuoi dispositivi, vengono mantenute entrambe le versioni.",
   "merge.body.other":
     "Vengono aggiunti a «{folder}». Se un file è diverso da quello sugli altri tuoi dispositivi, vengono mantenute entrambe le versioni.",
-  "merge.counting": "Conto i file …",
   "merge.confirm": "Unisci",
   "merge.chooseOther": "Scegli un’altra cartella",
+  "merge.host": "Vengono caricati su {host}.",
   "setup.ready.title": "Tutto pronto",
   "setup.ready.body": "Metti i file nella tua cartella, al resto pensa {app}.",
   "setup.ready.open": "Apri cartella",
@@ -3757,6 +3949,7 @@ const it: Dictionary = {
   "folder.reason.missing": "cartella non trovata",
   "folder.reason.olderState": "stato più vecchio sul server",
   "folder.reason.removedHeads": "modifiche da un dispositivo rimosso",
+  "folder.reason.treeLimit": "versione sul server troppo grande",
   "folder.menu.open": "Mostra in Esplora file",
   "folder.menu.versions": "Versioni precedenti",
   "folder.menu.trash": "Cestino",
@@ -3904,6 +4097,8 @@ const it: Dictionary = {
   "heads.accept": "Accetta",
   "heads.accepted": "Accettato. «{folder}» viene di nuovo sincronizzata.",
   "heads.undoLater": "Annulla comunque",
+  "heads.confirm":
+    "Poi «{folder}» viene di nuovo sincronizzata e puoi annullare le modifiche nelle versioni precedenti.",
   "removedHeads.title": "Modifiche dal dispositivo rimosso «{device}» in «{folder}»",
   "missing.title": "«{folder}» non c’è più",
   "missing.body":
@@ -3945,6 +4140,8 @@ const it: Dictionary = {
     "{count} file sono in attesa perché oggi è stato caricato molto. Partiranno al più tardi domani.",
   "notice.retained":
     "Le vecchie versioni occupano molto spazio sul tuo server in questo momento. Il gestore è stato avvisato. Non devi fare nulla.",
+  "notice.olderAccountState":
+    "Il tuo server aveva uno stato precedente del tuo account. {app} ha riletto tutto; non manca niente.",
   "notice.budgetDevice":
     "«{device}» ha caricato molto oggi. Se non sei stato tu, controlla in Dispositivi.",
   "notice.minCount.one":
@@ -3960,6 +4157,9 @@ const it: Dictionary = {
   "disk.body": "{app} continua a scaricare appena saranno di nuovo liberi {size}.",
   "disk.open": "Mostra spazio",
   "older.title": "«{folder}» è in pausa",
+  "treeLimit.title": "Una versione troppo grande di «{folder}»",
+  "treeLimit.body":
+    "Il server ha una versione di questa cartella troppo grande o troppo annidata. {app} non l’ha acquisita. Ripristina una versione precedente.",
   "older.body":
     "Il tuo server mostra uno stato più vecchio di quello che questo dispositivo conosceva già. Di solito il gestore ha ripristinato un backup. I tuoi file qui sono al sicuro.",
   "older.resume": "Continua …",
@@ -4004,10 +4204,19 @@ const it: Dictionary = {
     "Questo dispositivo è stato rimosso dal tuo account. I tuoi file restano qui ma non vengono più sincronizzati.",
   "removed.repair": "Abbina di nuovo",
   "removed.notMe": "Non sono stato io",
+  "removalReported.body":
+    "Il tuo server segnala che questo dispositivo è stato rimosso dal tuo account. Finché non lo confermi, {app} non sincronizza qui.",
+  "removalReported.confirm": "Conferma",
+  "removalReported.question": "Questo dispositivo è stato rimosso dal tuo account?",
+  "removalReported.questionBody":
+    "Allora {app} dimentica l’account su questo dispositivo. I tuoi file restano qui.",
+  "removalReported.yes": "Sì, dimentica l’account qui",
   "removed.notMeBody":
     "Allora qualcuno ha accesso a uno dei tuoi dispositivi. Configura di nuovo {app} con il foglio di recupero e rimuovi i dispositivi che non riconosci.",
   "update.body": "{app} ha bisogno di un aggiornamento per continuare a sincronizzare.",
   "update.now": "Aggiorna ora",
+  "update.confirm.title": "Installare ora la versione {version}?",
+  "update.confirm.yes": "Installa",
   "update.bodyManual":
     "{app} ha bisogno di un aggiornamento per continuare a sincronizzare. Installa la nuova versione e riprenderà da solo.",
   "update.upToDate": "Non c’è ancora una versione più recente. Riprova più tardi.",
@@ -4077,11 +4286,27 @@ const it: Dictionary = {
   "restore.beforeDevice.advice":
     "Prima rimuovi questo dispositivo, altrimenti modificherà di nuovo subito i file.",
   "restore.folder": "Riporta tutta la cartella a questo stato",
-  "restore.folder.title": "Riportare a questo stato?",
-  "restore.folder.body":
-    "«{folder}» viene riportata allo stato di {when}. Lo stato attuale resta come versione, quindi puoi annullare anche questo.",
   "restore.folder.confirm": "Riporta",
   "restore.folder.done": "«{folder}» è tornata allo stato di {when}.",
+  "restore.folder.ask": "Riportare «{folder}» a questo stato su tutti i dispositivi?",
+  "restore.folder.askGone.one": "Scomparirà {count} file che allora non esisteva.",
+  "restore.folder.askGone.many": "Scompariranno {count} di file che allora non esistevano.",
+  "restore.folder.askGone.other": "Scompariranno {count} file che allora non esistevano.",
+  "restore.folder.askNoneGone": "Non scomparirà nessun file.",
+  "restore.folder.askBody":
+    "I file modificati riprendono il contenuto di allora. Lo stato attuale resta come versione, quindi puoi annullare.",
+  "recover.cleanup.ask.one": "Rimuovere {count} dispositivo dal tuo account?",
+  "recover.cleanup.ask.many": "Rimuovere {count} di dispositivi dal tuo account?",
+  "recover.cleanup.ask.other": "Rimuovere {count} dispositivi dal tuo account?",
+  "recover.cleanup.askBody":
+    "Dopo, questi dispositivi non potranno più sincronizzare né leggere file nuovi.",
+  "pair.request.lookAlike":
+    "Esiste già un dispositivo con questo nome: «{device}». Confronta i numeri con particolare attenzione.",
+  "devices.lookAlike.question":
+    "«{name}» somiglia a «{device}», un altro dispositivo del tuo account. Usare comunque questo nome?",
+  "devices.lookAlike.yes": "Usalo comunque",
+  "devices.name.lookAlike": "Esiste già un dispositivo con questo nome.",
+  "folder.reason.tooLarge": "troppo grande per una cartella",
   "restore.retention.one":
     "Le versioni vengono conservate per {days} giorno. Lo stabilisce il tuo server.",
   "restore.retention.many":
@@ -4160,10 +4385,16 @@ const it: Dictionary = {
   "devices.recovery.renewBody":
     "Il nuovo codice sostituisce quello vecchio. Quello vecchio smette di funzionare. Butta via il vecchio foglio.",
   "devices.recovery.renewed": "Il nuovo codice è attivo. Quello vecchio non funziona più.",
+  "devices.recovery.renewConfirm": "Usare il nuovo codice di recupero?",
+  "devices.recovery.renewYes": "Usa il nuovo codice",
 
   "settings.title": "Impostazioni",
   "settings.autostart": "Avvia all’accesso",
   "settings.autostartHelp": "Tiene aggiornate le tue cartelle senza che tu ci debba pensare.",
+  "settings.autostart.offTitle": "Non avviare più {app} all’accesso?",
+  "settings.autostart.offBody":
+    "Le tue cartelle restano aggiornate solo quando apri {app} tu stesso.",
+  "settings.autostart.offConfirm": "Non avviare più",
   "settings.language": "Lingua",
   "settings.languageSystem": "Come il sistema",
   "settings.account": "Account",
@@ -4336,9 +4567,9 @@ const ja: Dictionary = {
   "merge.title.other": "このフォルダーにはすでに {count} 個のファイルがあります",
   "merge.body.other":
     "「{folder}」に追加されます。ほかのデバイスのファイルと内容が違う場合は、両方の版が残ります。",
-  "merge.counting": "ファイルを数えています…",
   "merge.confirm": "統合する",
   "merge.chooseOther": "別のフォルダーを選ぶ",
+  "merge.host": "これらは {host} にアップロードされます。",
   "setup.ready.title": "準備ができました",
   "setup.ready.body": "フォルダーにファイルを入れるだけで、あとは {app} が行います。",
   "setup.ready.open": "フォルダーを開く",
@@ -4467,6 +4698,7 @@ const ja: Dictionary = {
   "folder.reason.missing": "フォルダーが見つかりません",
   "folder.reason.olderState": "サーバーの状態が古くなっています",
   "folder.reason.removedHeads": "削除したデバイスからの変更",
+  "folder.reason.treeLimit": "サーバー上の版が大きすぎます",
   "folder.menu.open": "エクスプローラーで表示",
   "folder.menu.versions": "以前の版",
   "folder.menu.trash": "ごみ箱",
@@ -4570,6 +4802,7 @@ const ja: Dictionary = {
   "heads.accept": "受け入れる",
   "heads.accepted": "受け入れました。「{folder}」の同期を再開します。",
   "heads.undoLater": "やはり元に戻す",
+  "heads.confirm": "その後「{folder}」の同期が再開し、以前のバージョンで変更を元に戻せます。",
   "removedHeads.title": "削除したデバイス「{device}」から「{folder}」への変更",
   "missing.title": "「{folder}」が見つかりません",
   "missing.body":
@@ -4607,6 +4840,8 @@ const ja: Dictionary = {
     "今日は多くのファイルをアップロードしたため、{count} 個のファイルが待機中です。遅くとも明日までに送られます。",
   "notice.retained":
     "現在、古い版がサーバーの容量を多く使っています。管理者には通知済みです。特に操作は必要ありません。",
+  "notice.olderAccountState":
+    "サーバーにあったアカウントの状態は古いものでした。{app} はすべてを読み直しました。足りないものはありません。",
   "notice.budgetDevice":
     "「{device}」が今日多くのファイルをアップロードしました。心当たりがない場合は「デバイス」を確認してください。",
   "notice.minCount.other":
@@ -4618,6 +4853,9 @@ const ja: Dictionary = {
   "disk.body": "{size} の空きができると、{app} はダウンロードを再開します。",
   "disk.open": "ストレージを表示",
   "older.title": "「{folder}」は一時停止中です",
+  "treeLimit.title": "「{folder}」の大きすぎる版",
+  "treeLimit.body":
+    "サーバーにあるこのフォルダーの版は、大きすぎるか階層が深すぎます。{app} は取り込んでいません。以前の版を戻してください。",
   "older.body":
     "サーバーが、このデバイスが知っているより古い状態を示しています。通常は管理者がバックアップを復元したためです。ここにあるファイルは安全です。",
   "older.resume": "続ける…",
@@ -4658,10 +4896,19 @@ const ja: Dictionary = {
     "このデバイスはアカウントから削除されました。ファイルはここに残りますが、同期はされなくなります。",
   "removed.repair": "再びペアリング",
   "removed.notMe": "自分ではありません",
+  "removalReported.body":
+    "このデバイスがアカウントから削除されたとサーバーが報告しています。確認するまで、{app} はここで同期しません。",
+  "removalReported.confirm": "確認する",
+  "removalReported.question": "このデバイスはアカウントから削除されましたか？",
+  "removalReported.questionBody":
+    "その場合、{app} はこのデバイスでアカウントを忘れます。ファイルはここに残ります。",
+  "removalReported.yes": "はい、ここでアカウントを忘れる",
   "removed.notMeBody":
     "その場合、誰かがあなたのデバイスのどれかにアクセスしています。復元シートで {app} を設定し直し、見覚えのないデバイスを削除してください。",
   "update.body": "同期を続けるには {app} の更新が必要です。",
   "update.now": "今すぐ更新",
+  "update.confirm.title": "バージョン {version} を今すぐインストールしますか？",
+  "update.confirm.yes": "インストール",
   "update.bodyManual":
     "同期を続けるには {app} の更新が必要です。新しいバージョンをインストールすると、自動的に再開します。",
   "update.upToDate": "新しいバージョンはまだありません。しばらくしてからもう一度お試しください。",
@@ -4719,11 +4966,23 @@ const ja: Dictionary = {
   "restore.beforeDevice.advice":
     "先にこのデバイスを削除してください。そうしないと、すぐにまたファイルを変更します。",
   "restore.folder": "フォルダー全体をこの状態に戻す",
-  "restore.folder.title": "この状態に戻しますか？",
-  "restore.folder.body":
-    "「{folder}」を {when} の状態に戻します。現在の状態は版として残るため、これも元に戻せます。",
   "restore.folder.confirm": "戻す",
   "restore.folder.done": "「{folder}」を {when} の状態に戻しました。",
+  "restore.folder.ask": "すべてのデバイスで「{folder}」をこの状態に戻しますか？",
+  "restore.folder.askGone.other": "当時存在しなかった {count} 個のファイルが消えます。",
+  "restore.folder.askNoneGone": "消えるファイルはありません。",
+  "restore.folder.askBody":
+    "変更されたファイルは当時の内容に戻ります。現在の状態は版として残るため、元に戻せます。",
+  "recover.cleanup.ask.other": "{count} 台のデバイスをアカウントから削除しますか？",
+  "recover.cleanup.askBody":
+    "削除したデバイスは、今後同期することも新しいファイルを読むこともできなくなります。",
+  "pair.request.lookAlike":
+    "同じ名前のデバイスがすでにあります:「{device}」。数字を特に注意して比べてください。",
+  "devices.lookAlike.question":
+    "「{name}」は、このアカウントの別のデバイス「{device}」と同じに見えます。この名前を使いますか？",
+  "devices.lookAlike.yes": "この名前を使う",
+  "devices.name.lookAlike": "同じ名前のデバイスがすでにあります。",
+  "folder.reason.tooLarge": "フォルダーとして大きすぎます",
   "restore.retention.other": "版は {days} 日間保持されます。期間はサーバーで決まります。",
   "restore.otherVersion": "別の版を選ぶ",
   "restore.beforeDevice": "次のデバイスによる変更の前の状態…",
@@ -4785,10 +5044,16 @@ const ja: Dictionary = {
   "devices.recovery.renewBody":
     "新しいコードが古いコードに置き換わります。古いコードは使えなくなります。古いシートは処分してください。",
   "devices.recovery.renewed": "新しいコードが有効になりました。古いコードはもう使えません。",
+  "devices.recovery.renewConfirm": "新しい復元コードを使いますか？",
+  "devices.recovery.renewYes": "新しいコードを使う",
 
   "settings.title": "設定",
   "settings.autostart": "サインイン時に起動",
   "settings.autostartHelp": "意識しなくてもフォルダーが常に最新の状態になります。",
+  "settings.autostart.offTitle": "サインイン時に {app} を起動しないようにしますか？",
+  "settings.autostart.offBody":
+    "その場合、フォルダーが最新になるのは自分で {app} を開いている間だけです。",
+  "settings.autostart.offConfirm": "起動しない",
   "settings.language": "言語",
   "settings.languageSystem": "システムと同じ",
   "settings.account": "アカウント",
@@ -4971,9 +5236,9 @@ const pl: Dictionary = {
     "Zostaną dodane do folderu „{folder}”. Jeśli plik różni się od tego na twoich innych urządzeniach, zostaną zachowane obie wersje.",
   "merge.body.other":
     "Zostaną dodane do folderu „{folder}”. Jeśli plik różni się od tego na twoich innych urządzeniach, zostaną zachowane obie wersje.",
-  "merge.counting": "Liczę pliki …",
   "merge.confirm": "Połącz",
   "merge.chooseOther": "Wybierz inny folder",
+  "merge.host": "Zostaną przesłane na {host}.",
   "setup.ready.title": "Wszystko gotowe",
   "setup.ready.body": "Wrzucaj pliki do swojego folderu, resztą zajmie się {app}.",
   "setup.ready.open": "Otwórz folder",
@@ -5113,6 +5378,7 @@ const pl: Dictionary = {
   "folder.reason.missing": "nie znaleziono folderu",
   "folder.reason.olderState": "starszy stan na serwerze",
   "folder.reason.removedHeads": "zmiany z usuniętego urządzenia",
+  "folder.reason.treeLimit": "za duża wersja na serwerze",
   "folder.menu.open": "Pokaż w Eksploratorze",
   "folder.menu.versions": "Wcześniejsze wersje",
   "folder.menu.trash": "Kosz",
@@ -5281,6 +5547,8 @@ const pl: Dictionary = {
   "heads.accept": "Zaakceptuj",
   "heads.accepted": "Zaakceptowano. „{folder}” znów się synchronizuje.",
   "heads.undoLater": "Jednak cofnij",
+  "heads.confirm":
+    "Potem „{folder}” znów się synchronizuje, a zmiany możesz cofnąć we wcześniejszych wersjach.",
   "removedHeads.title": "Zmiany z usuniętego urządzenia „{device}” w „{folder}”",
   "missing.title": "Folder „{folder}” zniknął",
   "missing.body":
@@ -5324,6 +5592,8 @@ const pl: Dictionary = {
     "{count} pliku czeka, bo dziś przesłano już bardzo dużo. Zostaną wysłane najpóźniej jutro.",
   "notice.retained":
     "Stare wersje zajmują teraz dużo miejsca na twoim serwerze. Administrator już o tym wie. Nie musisz nic robić.",
+  "notice.olderAccountState":
+    "Twój serwer miał starszy stan twojego konta. {app} wczytał wszystko od nowa, niczego nie brakuje.",
   "notice.budgetDevice":
     "Urządzenie „{device}” przesłało dziś bardzo dużo. Jeśli to nie ty, sprawdź w sekcji Urządzenia.",
   "notice.minCount.one":
@@ -5341,6 +5611,9 @@ const pl: Dictionary = {
   "disk.body": "{app} wznowi pobieranie, gdy znów będzie wolne {size}.",
   "disk.open": "Pokaż pamięć",
   "older.title": "Folder „{folder}” jest wstrzymany",
+  "treeLimit.title": "Za duża wersja „{folder}”",
+  "treeLimit.body":
+    "Na serwerze jest wersja tego folderu, która jest za duża lub zbyt głęboko zagnieżdżona. {app} jej nie przejął. Przywróć wcześniejszą wersję.",
   "older.body":
     "Twój serwer pokazuje starszy stan niż ten, który znało już to urządzenie. Zwykle oznacza to, że administrator przywrócił kopię zapasową. Twoje pliki tutaj są bezpieczne.",
   "older.resume": "Kontynuuj …",
@@ -5387,10 +5660,19 @@ const pl: Dictionary = {
     "To urządzenie zostało usunięte z twojego konta. Twoje pliki zostają tutaj, ale nie są już synchronizowane.",
   "removed.repair": "Sparuj ponownie",
   "removed.notMe": "To nie ja",
+  "removalReported.body":
+    "Twój serwer zgłasza, że to urządzenie zostało usunięte z twojego konta. Dopóki tego nie potwierdzisz, {app} nie synchronizuje tutaj.",
+  "removalReported.confirm": "Potwierdź",
+  "removalReported.question": "Czy to urządzenie zostało usunięte z twojego konta?",
+  "removalReported.questionBody":
+    "Wtedy {app} zapomni konto na tym urządzeniu. Twoje pliki zostaną tutaj.",
+  "removalReported.yes": "Tak, zapomnij konto tutaj",
   "removed.notMeBody":
     "W takim razie ktoś ma dostęp do jednego z twoich urządzeń. Skonfiguruj {app} od nowa z kartą odzyskiwania i usuń urządzenia, których nie rozpoznajesz.",
   "update.body": "{app} potrzebuje aktualizacji, aby dalej synchronizować.",
   "update.now": "Aktualizuj teraz",
+  "update.confirm.title": "Zainstalować teraz wersję {version}?",
+  "update.confirm.yes": "Zainstaluj",
   "update.bodyManual":
     "{app} potrzebuje aktualizacji, aby dalej synchronizować. Zainstaluj nową wersję, a synchronizacja ruszy sama.",
   "update.upToDate": "Nie ma jeszcze nowszej wersji. Spróbuj ponownie później.",
@@ -5466,11 +5748,29 @@ const pl: Dictionary = {
   "restore.beforeDevice.advice":
     "Najpierw usuń to urządzenie, bo inaczej od razu znowu zmieni pliki.",
   "restore.folder": "Przywróć cały folder do tego stanu",
-  "restore.folder.title": "Przywrócić ten stan?",
-  "restore.folder.body":
-    "Folder „{folder}” zostanie przywrócony do stanu z {when}. Obecny stan zostanie zachowany jako wersja, więc to też możesz cofnąć.",
   "restore.folder.confirm": "Przywróć",
   "restore.folder.done": "Folder „{folder}” jest znowu w stanie z {when}.",
+  "restore.folder.ask": "Przywrócić „{folder}” do tego stanu na wszystkich urządzeniach?",
+  "restore.folder.askGone.one": "Zniknie {count} plik, którego wtedy jeszcze nie było.",
+  "restore.folder.askGone.few": "Znikną {count} pliki, których wtedy jeszcze nie było.",
+  "restore.folder.askGone.many": "Zniknie {count} plików, których wtedy jeszcze nie było.",
+  "restore.folder.askGone.other": "Zniknie {count} pliku, których wtedy jeszcze nie było.",
+  "restore.folder.askNoneGone": "Żaden plik nie zniknie.",
+  "restore.folder.askBody":
+    "Zmienione pliki odzyskają ówczesną zawartość. Obecny stan zostanie zachowany jako wersja, więc możesz to cofnąć.",
+  "recover.cleanup.ask.one": "Usunąć {count} urządzenie z twojego konta?",
+  "recover.cleanup.ask.few": "Usunąć {count} urządzenia z twojego konta?",
+  "recover.cleanup.ask.many": "Usunąć {count} urządzeń z twojego konta?",
+  "recover.cleanup.ask.other": "Usunąć {count} urządzenia z twojego konta?",
+  "recover.cleanup.askBody":
+    "Potem te urządzenia nie będą już mogły synchronizować ani czytać nowych plików.",
+  "pair.request.lookAlike":
+    "Jest już urządzenie o tej nazwie: „{device}”. Porównaj liczby szczególnie uważnie.",
+  "devices.lookAlike.question":
+    "„{name}” wygląda jak „{device}”, inne urządzenie na twoim koncie. Mimo to użyć tej nazwy?",
+  "devices.lookAlike.yes": "Użyj mimo to",
+  "devices.name.lookAlike": "Jest już urządzenie o tej nazwie.",
+  "folder.reason.tooLarge": "za duży na jeden folder",
   "restore.retention.one": "Wersje są przechowywane przez {days} dzień. Ustala to twój serwer.",
   "restore.retention.few": "Wersje są przechowywane przez {days} dni. Ustala to twój serwer.",
   "restore.retention.many": "Wersje są przechowywane przez {days} dni. Ustala to twój serwer.",
@@ -5552,10 +5852,16 @@ const pl: Dictionary = {
   "devices.recovery.renewBody":
     "Nowy kod zastępuje stary. Stary przestaje działać. Wyrzuć starą kartę.",
   "devices.recovery.renewed": "Nowy kod jest aktywny. Stary już nie działa.",
+  "devices.recovery.renewConfirm": "Użyć nowego kodu odzyskiwania?",
+  "devices.recovery.renewYes": "Użyj nowego kodu",
 
   "settings.title": "Ustawienia",
   "settings.autostart": "Uruchamiaj po zalogowaniu",
   "settings.autostartHelp": "Twoje foldery są aktualne, a ty nie musisz o tym pamiętać.",
+  "settings.autostart.offTitle": "Nie uruchamiać już {app} po zalogowaniu?",
+  "settings.autostart.offBody":
+    "Wtedy twoje foldery są aktualne tylko wtedy, gdy sam otworzysz {app}.",
+  "settings.autostart.offConfirm": "Nie uruchamiaj",
   "settings.language": "Język",
   "settings.languageSystem": "Jak w systemie",
   "settings.account": "Konto",
@@ -5736,9 +6042,9 @@ const pt: Dictionary = {
     "Eles serão adicionados a “{folder}”. Se um arquivo for diferente do que está nos seus outros dispositivos, as duas versões serão mantidas.",
   "merge.body.other":
     "Eles serão adicionados a “{folder}”. Se um arquivo for diferente do que está nos seus outros dispositivos, as duas versões serão mantidas.",
-  "merge.counting": "Contando arquivos …",
   "merge.confirm": "Juntar",
   "merge.chooseOther": "Escolher outra pasta",
+  "merge.host": "Eles são enviados para {host}.",
   "setup.ready.title": "Tudo pronto",
   "setup.ready.body": "Coloque arquivos na sua pasta, o {app} cuida do resto.",
   "setup.ready.open": "Abrir pasta",
@@ -5875,6 +6181,7 @@ const pt: Dictionary = {
   "folder.reason.missing": "pasta não encontrada",
   "folder.reason.olderState": "estado mais antigo no servidor",
   "folder.reason.removedHeads": "alterações de um dispositivo removido",
+  "folder.reason.treeLimit": "versão no servidor grande demais",
   "folder.menu.open": "Mostrar no Explorador",
   "folder.menu.versions": "Versões anteriores",
   "folder.menu.trash": "Lixeira",
@@ -6023,6 +6330,8 @@ const pt: Dictionary = {
   "heads.accept": "Aceitar",
   "heads.accepted": "Aceito. “{folder}” volta a ser sincronizada.",
   "heads.undoLater": "Desfazer mesmo assim",
+  "heads.confirm":
+    "Depois, “{folder}” volta a ser sincronizada e você pode desfazer as alterações nas versões anteriores.",
   "removedHeads.title": "Alterações do dispositivo removido “{device}” em “{folder}”",
   "missing.title": "“{folder}” sumiu",
   "missing.body":
@@ -6063,6 +6372,8 @@ const pt: Dictionary = {
     "{count} arquivos estão esperando porque muita coisa foi enviada hoje. Eles vão ser enviados até amanhã, no máximo.",
   "notice.retained":
     "Versões antigas estão ocupando muito espaço no seu servidor agora. O administrador já foi avisado. Você não precisa fazer nada.",
+  "notice.olderAccountState":
+    "Seu servidor tinha um estado anterior da sua conta. O {app} leu tudo de novo; não falta nada.",
   "notice.budgetDevice":
     "“{device}” enviou muita coisa hoje. Se não foi você, confira em Dispositivos.",
   "notice.minCount.one":
@@ -6078,6 +6389,9 @@ const pt: Dictionary = {
   "disk.body": "O {app} continua baixando assim que houver {size} livres de novo.",
   "disk.open": "Mostrar armazenamento",
   "older.title": "“{folder}” está pausada",
+  "treeLimit.title": "Uma versão grande demais de “{folder}”",
+  "treeLimit.body":
+    "O servidor tem uma versão desta pasta grande demais ou aninhada demais. O {app} não a aceitou. Recupere uma versão anterior.",
   "older.body":
     "Seu servidor mostra um estado mais antigo do que este dispositivo já conhecia. Normalmente o administrador restaurou um backup. Seus arquivos aqui estão seguros.",
   "older.resume": "Continuar …",
@@ -6122,10 +6436,19 @@ const pt: Dictionary = {
     "Este dispositivo foi removido da sua conta. Seus arquivos ficam aqui, mas não são mais sincronizados.",
   "removed.repair": "Parear de novo",
   "removed.notMe": "Não fui eu",
+  "removalReported.body":
+    "Seu servidor informa que este dispositivo foi removido da sua conta. Até você confirmar, o {app} não sincroniza aqui.",
+  "removalReported.confirm": "Confirmar",
+  "removalReported.question": "Este dispositivo foi removido da sua conta?",
+  "removalReported.questionBody":
+    "Então o {app} esquece a conta neste dispositivo. Seus arquivos ficam aqui.",
+  "removalReported.yes": "Sim, esquecer a conta aqui",
   "removed.notMeBody":
     "Então alguém tem acesso a um dos seus dispositivos. Configure o {app} de novo com sua folha de recuperação e remova os dispositivos que você não reconhece.",
   "update.body": "O {app} precisa de uma atualização para continuar sincronizando.",
   "update.now": "Atualizar agora",
+  "update.confirm.title": "Instalar a versão {version} agora?",
+  "update.confirm.yes": "Instalar",
   "update.bodyManual":
     "O {app} precisa de uma atualização para continuar sincronizando. Instale a nova versão e ele continua sozinho.",
   "update.upToDate": "Ainda não há uma versão mais nova. Tente de novo mais tarde.",
@@ -6195,11 +6518,27 @@ const pt: Dictionary = {
   "restore.beforeDevice.advice":
     "Remova este dispositivo primeiro, senão ele vai alterar os arquivos de novo na hora.",
   "restore.folder": "Voltar a pasta inteira para este estado",
-  "restore.folder.title": "Voltar para este estado?",
-  "restore.folder.body":
-    "“{folder}” vai voltar ao estado de {when}. O estado atual fica guardado como versão, então você também pode desfazer isso.",
   "restore.folder.confirm": "Voltar",
   "restore.folder.done": "“{folder}” voltou ao estado de {when}.",
+  "restore.folder.ask": "Voltar “{folder}” a este estado em todos os dispositivos?",
+  "restore.folder.askGone.one": "Vai sumir {count} arquivo que ainda não existia na época.",
+  "restore.folder.askGone.many": "Vão sumir {count} de arquivos que ainda não existiam na época.",
+  "restore.folder.askGone.other": "Vão sumir {count} arquivos que ainda não existiam na época.",
+  "restore.folder.askNoneGone": "Nenhum arquivo vai sumir.",
+  "restore.folder.askBody":
+    "Os arquivos alterados voltam ao conteúdo da época. O estado atual fica guardado como versão, então você pode desfazer isso.",
+  "recover.cleanup.ask.one": "Remover {count} dispositivo da sua conta?",
+  "recover.cleanup.ask.many": "Remover {count} de dispositivos da sua conta?",
+  "recover.cleanup.ask.other": "Remover {count} dispositivos da sua conta?",
+  "recover.cleanup.askBody":
+    "Depois disso, esses dispositivos não poderão mais sincronizar nem ler arquivos novos.",
+  "pair.request.lookAlike":
+    "Já existe um dispositivo com este nome: “{device}”. Compare os números com atenção redobrada.",
+  "devices.lookAlike.question":
+    "“{name}” parece “{device}”, outro dispositivo da sua conta. Usar este nome mesmo assim?",
+  "devices.lookAlike.yes": "Usar mesmo assim",
+  "devices.name.lookAlike": "Já existe um dispositivo com este nome.",
+  "folder.reason.tooLarge": "grande demais para uma pasta",
   "restore.retention.one":
     "As versões ficam guardadas por {days} dia. Quem define isso é o seu servidor.",
   "restore.retention.many":
@@ -6277,10 +6616,16 @@ const pt: Dictionary = {
   "devices.recovery.renewBody":
     "O novo código substitui o antigo. O antigo para de funcionar. Jogue a folha antiga fora.",
   "devices.recovery.renewed": "O novo código está ativo. O antigo não funciona mais.",
+  "devices.recovery.renewConfirm": "Usar o novo código de recuperação?",
+  "devices.recovery.renewYes": "Usar o novo código",
 
   "settings.title": "Configurações",
   "settings.autostart": "Iniciar ao entrar no sistema",
   "settings.autostartHelp": "Mantém suas pastas em dia sem que você precise lembrar disso.",
+  "settings.autostart.offTitle": "Deixar de iniciar o {app} ao entrar no sistema?",
+  "settings.autostart.offBody":
+    "Assim, suas pastas só ficam em dia enquanto você mesmo abrir o {app}.",
+  "settings.autostart.offConfirm": "Deixar de iniciar",
   "settings.language": "Idioma",
   "settings.languageSystem": "Igual ao sistema",
   "settings.account": "Conta",
@@ -6464,9 +6809,9 @@ const ru: Dictionary = {
     "Они будут добавлены в «{folder}». Если файл отличается от файла на других твоих устройствах, сохранятся обе версии.",
   "merge.body.other":
     "Они будут добавлены в «{folder}». Если файл отличается от файла на других твоих устройствах, сохранятся обе версии.",
-  "merge.counting": "Считаю файлы …",
   "merge.confirm": "Объединить",
   "merge.chooseOther": "Выбрать другую папку",
+  "merge.host": "Они будут загружены на {host}.",
   "setup.ready.title": "Всё готово",
   "setup.ready.body": "Клади файлы в свою папку, остальное сделает {app}.",
   "setup.ready.open": "Открыть папку",
@@ -6605,6 +6950,7 @@ const ru: Dictionary = {
   "folder.reason.missing": "папка не найдена",
   "folder.reason.olderState": "на сервере более старое состояние",
   "folder.reason.removedHeads": "изменения с удалённого устройства",
+  "folder.reason.treeLimit": "слишком большая версия на сервере",
   "folder.menu.open": "Показать в Проводнике",
   "folder.menu.versions": "Предыдущие версии",
   "folder.menu.trash": "Корзина",
@@ -6772,6 +7118,8 @@ const ru: Dictionary = {
   "heads.accept": "Принять",
   "heads.accepted": "Принято. «{folder}» снова синхронизируется.",
   "heads.undoLater": "Всё же отменить",
+  "heads.confirm":
+    "После этого «{folder}» снова синхронизируется, а изменения можно отменить в предыдущих версиях.",
   "removedHeads.title": "Изменения с удалённого устройства «{device}» в «{folder}»",
   "missing.title": "Папка «{folder}» пропала",
   "missing.body":
@@ -6814,6 +7162,8 @@ const ru: Dictionary = {
     "{count} файла ждут, потому что сегодня отправлено уже очень много. Они уйдут не позже завтрашнего дня.",
   "notice.retained":
     "Старые версии сейчас занимают много места на твоём сервере. Администратор уже в курсе. Тебе ничего не нужно делать.",
+  "notice.olderAccountState":
+    "На твоём сервере было более старое состояние учётной записи. {app} всё перечитал, ничего не пропало.",
   "notice.budgetDevice":
     "Устройство «{device}» сегодня отправило очень много. Если это не ты, проверь в разделе Устройства.",
   "notice.minCount.one":
@@ -6831,6 +7181,9 @@ const ru: Dictionary = {
   "disk.body": "{app} продолжит скачивание, как только снова освободится {size}.",
   "disk.open": "Показать хранилище",
   "older.title": "Папка «{folder}» приостановлена",
+  "treeLimit.title": "Слишком большая версия «{folder}»",
+  "treeLimit.body":
+    "На сервере лежит версия этой папки, которая слишком велика или слишком глубоко вложена. {app} её не принял. Верни более раннюю версию.",
   "older.body":
     "Твой сервер показывает более старое состояние, чем уже знало это устройство. Обычно это значит, что администратор восстановил резервную копию. Твои файлы здесь в безопасности.",
   "older.resume": "Продолжить …",
@@ -6876,10 +7229,19 @@ const ru: Dictionary = {
     "Это устройство удалено из твоей учётной записи. Твои файлы остаются здесь, но больше не синхронизируются.",
   "removed.repair": "Привязать снова",
   "removed.notMe": "Это не я",
+  "removalReported.body":
+    "Твой сервер сообщает, что это устройство удалено из твоей учётной записи. Пока ты это не подтвердишь, {app} здесь не синхронизирует.",
+  "removalReported.confirm": "Подтвердить",
+  "removalReported.question": "Это устройство было удалено из твоей учётной записи?",
+  "removalReported.questionBody":
+    "Тогда {app} забудет учётную запись на этом устройстве. Твои файлы останутся здесь.",
+  "removalReported.yes": "Да, забыть учётную запись здесь",
   "removed.notMeBody":
     "Значит, кто-то имеет доступ к одному из твоих устройств. Настрой {app} заново с листом восстановления и удали устройства, которые ты не узнаёшь.",
   "update.body": "Чтобы синхронизация продолжалась, {app} нужно обновить.",
   "update.now": "Обновить сейчас",
+  "update.confirm.title": "Установить версию {version} сейчас?",
+  "update.confirm.yes": "Установить",
   "update.bodyManual":
     "Чтобы синхронизация продолжалась, {app} нужно обновить. Установи новую версию, и всё продолжится само.",
   "update.upToDate": "Новой версии пока нет. Попробуй позже.",
@@ -6955,11 +7317,29 @@ const ru: Dictionary = {
   "restore.beforeDevice.advice":
     "Сначала удали это устройство, иначе оно сразу снова изменит файлы.",
   "restore.folder": "Вернуть всю папку к этому состоянию",
-  "restore.folder.title": "Вернуть к этому состоянию?",
-  "restore.folder.body":
-    "Папка «{folder}» будет возвращена к состоянию на {when}. Текущее состояние сохранится как версия, поэтому и это можно отменить.",
   "restore.folder.confirm": "Вернуть",
   "restore.folder.done": "Папка «{folder}» снова в состоянии на {when}.",
+  "restore.folder.ask": "Вернуть «{folder}» к этому состоянию на всех устройствах?",
+  "restore.folder.askGone.one": "Исчезнет {count} файл, которого тогда ещё не было.",
+  "restore.folder.askGone.few": "Исчезнут {count} файла, которых тогда ещё не было.",
+  "restore.folder.askGone.many": "Исчезнут {count} файлов, которых тогда ещё не было.",
+  "restore.folder.askGone.other": "Исчезнут {count} файла, которых тогда ещё не было.",
+  "restore.folder.askNoneGone": "Ни один файл не исчезнет.",
+  "restore.folder.askBody":
+    "Изменённые файлы получат тогдашнее содержимое. Текущее состояние сохранится как версия, поэтому это можно отменить.",
+  "recover.cleanup.ask.one": "Удалить {count} устройство из твоей учётной записи?",
+  "recover.cleanup.ask.few": "Удалить {count} устройства из твоей учётной записи?",
+  "recover.cleanup.ask.many": "Удалить {count} устройств из твоей учётной записи?",
+  "recover.cleanup.ask.other": "Удалить {count} устройства из твоей учётной записи?",
+  "recover.cleanup.askBody":
+    "После этого эти устройства больше не смогут синхронизировать и читать новые файлы.",
+  "pair.request.lookAlike":
+    "Устройство с таким именем уже есть: «{device}». Сравни числа особенно внимательно.",
+  "devices.lookAlike.question":
+    "«{name}» выглядит как «{device}», другое устройство в твоей учётной записи. Всё равно использовать это имя?",
+  "devices.lookAlike.yes": "Всё равно использовать",
+  "devices.name.lookAlike": "Устройство с таким именем уже есть.",
+  "folder.reason.tooLarge": "слишком большая для одной папки",
   "restore.retention.one": "Версии хранятся {days} день. Это задаёт твой сервер.",
   "restore.retention.few": "Версии хранятся {days} дня. Это задаёт твой сервер.",
   "restore.retention.many": "Версии хранятся {days} дней. Это задаёт твой сервер.",
@@ -7042,10 +7422,16 @@ const ru: Dictionary = {
   "devices.recovery.renewBody":
     "Новый код заменяет старый. Старый перестаёт работать. Выбрось старый лист.",
   "devices.recovery.renewed": "Новый код действует. Старый больше не работает.",
+  "devices.recovery.renewConfirm": "Использовать новый код восстановления?",
+  "devices.recovery.renewYes": "Использовать новый код",
 
   "settings.title": "Настройки",
   "settings.autostart": "Запускать при входе в систему",
   "settings.autostartHelp": "Твои папки остаются актуальными, и тебе не нужно об этом думать.",
+  "settings.autostart.offTitle": "Больше не запускать {app} при входе в систему?",
+  "settings.autostart.offBody":
+    "Тогда твои папки будут актуальны, только пока ты сам открываешь {app}.",
+  "settings.autostart.offConfirm": "Не запускать",
   "settings.language": "Язык",
   "settings.languageSystem": "Как в системе",
   "settings.account": "Учётная запись",
@@ -7219,9 +7605,9 @@ const tr: Dictionary = {
     "“{folder}” klasörüne eklenir. Diğer cihazlarındakinden farklıysa iki sürüm de saklanır.",
   "merge.body.other":
     "“{folder}” klasörüne eklenirler. Bir dosya diğer cihazlarındakinden farklıysa iki sürüm de saklanır.",
-  "merge.counting": "Dosyalar sayılıyor …",
   "merge.confirm": "Birleştir",
   "merge.chooseOther": "Başka bir klasör seç",
+  "merge.host": "Bunlar {host} sunucusuna yüklenir.",
   "setup.ready.title": "Her şey hazır",
   "setup.ready.body": "Dosyaları klasörüne koy, gerisini {app} halleder.",
   "setup.ready.open": "Klasörü aç",
@@ -7353,6 +7739,7 @@ const tr: Dictionary = {
   "folder.reason.missing": "klasör bulunamadı",
   "folder.reason.olderState": "sunucuda daha eski durum",
   "folder.reason.removedHeads": "kaldırılan bir cihazdan gelen değişiklikler",
+  "folder.reason.treeLimit": "sunucudaki sürüm çok büyük",
   "folder.menu.open": "Dosya Gezgini’nde göster",
   "folder.menu.versions": "Önceki sürümler",
   "folder.menu.trash": "Çöp kutusu",
@@ -7477,6 +7864,8 @@ const tr: Dictionary = {
   "heads.accept": "Kabul et",
   "heads.accepted": "Kabul edildi. “{folder}” yeniden eşitleniyor.",
   "heads.undoLater": "Yine de geri al",
+  "heads.confirm":
+    "Ardından “{folder}” yeniden eşitlenir ve değişiklikleri önceki sürümlerde geri alabilirsin.",
   "removedHeads.title": "Kaldırılan “{device}” cihazından “{folder}” klasöründe değişiklikler",
   "missing.title": "“{folder}” bulunamıyor",
   "missing.body":
@@ -7515,6 +7904,8 @@ const tr: Dictionary = {
     "Bugün çok şey yüklendiği için {count} dosya bekliyor. En geç yarın gönderilirler.",
   "notice.retained":
     "Eski sürümler şu an sunucunda çok yer kaplıyor. Yöneticiye haber verildi. Senin bir şey yapmana gerek yok.",
+  "notice.olderAccountState":
+    "Sunucunda hesabının daha eski bir durumu vardı. {app} her şeyi yeniden okudu, eksik bir şey yok.",
   "notice.budgetDevice": "“{device}” bugün çok şey yükledi. Bu sen değilsen Cihazlar bölümüne bak.",
   "notice.minCount.one":
     "Sunucun eski sürümleri artık yalnızca {days} gün saklıyor, seyrek değişen klasörlerde de. Yöneticiye haber verildi.",
@@ -7527,6 +7918,9 @@ const tr: Dictionary = {
   "disk.body": "Yeniden {size} boş alan olunca {app} indirmeye devam eder.",
   "disk.open": "Depolamayı göster",
   "older.title": "“{folder}” duraklatıldı",
+  "treeLimit.title": "“{folder}” için çok büyük bir sürüm",
+  "treeLimit.body":
+    "Sunucuda bu klasörün çok büyük ya da çok derin iç içe geçmiş bir sürümü var. {app} bunu almadı. Daha önceki bir sürümü geri getir.",
   "older.body":
     "Sunucun, bu cihazın zaten bildiğinden daha eski bir durum gösteriyor. Genellikle yönetici bir yedeği geri yüklemiştir. Buradaki dosyaların güvende.",
   "older.resume": "Devam et …",
@@ -7569,10 +7963,19 @@ const tr: Dictionary = {
     "Bu cihaz hesabından kaldırıldı. Dosyaların burada kalır ama artık eşitlenmez.",
   "removed.repair": "Yeniden eşleştir",
   "removed.notMe": "Bu ben değildim",
+  "removalReported.body":
+    "Sunucun bu cihazın hesabından kaldırıldığını bildiriyor. Sen onaylayana kadar {app} burada eşitleme yapmaz.",
+  "removalReported.confirm": "Onayla",
+  "removalReported.question": "Bu cihaz hesabından kaldırıldı mı?",
+  "removalReported.questionBody":
+    "O zaman {app} bu cihazdaki hesabı unutur. Dosyaların burada kalır.",
+  "removalReported.yes": "Evet, hesabı burada unut",
   "removed.notMeBody":
     "O zaman biri cihazlarından birine erişebiliyor. {app} uygulamasını kurtarma kâğıdınla yeniden kur ve tanımadığın cihazları kaldır.",
   "update.body": "{app} eşitlemeye devam etmek için güncellenmeli.",
   "update.now": "Şimdi güncelle",
+  "update.confirm.title": "{version} sürümü şimdi yüklensin mi?",
+  "update.confirm.yes": "Yükle",
   "update.bodyManual":
     "{app} eşitlemeye devam etmek için güncellenmeli. Yeni sürümü kur, gerisi kendiliğinden devam eder.",
   "update.upToDate": "Henüz daha yeni bir sürüm yok. Daha sonra yeniden dene.",
@@ -7635,11 +8038,25 @@ const tr: Dictionary = {
   "restore.beforeDevice.none": "Bu cihaz o süre içinde burada hiçbir şey değiştirmedi.",
   "restore.beforeDevice.advice": "Önce bu cihazı kaldır, yoksa dosyaları hemen yeniden değiştirir.",
   "restore.folder": "Tüm klasörü bu duruma döndür",
-  "restore.folder.title": "Bu duruma döndürülsün mü?",
-  "restore.folder.body":
-    "“{folder}” şu durumuna döndürülecek: {when}. Mevcut durum bir sürüm olarak kalır, böylece bunu da geri alabilirsin.",
   "restore.folder.confirm": "Döndür",
   "restore.folder.done": "“{folder}” yeniden şu durumda: {when}.",
+  "restore.folder.ask": "“{folder}” tüm cihazlarda bu duruma döndürülsün mü?",
+  "restore.folder.askGone.one": "O zaman henüz olmayan {count} dosya kaybolacak.",
+  "restore.folder.askGone.other": "O zaman henüz olmayan {count} dosya kaybolacak.",
+  "restore.folder.askNoneGone": "Hiçbir dosya kaybolmayacak.",
+  "restore.folder.askBody":
+    "Değişen dosyalar o zamanki içeriklerine döner. Mevcut durum bir sürüm olarak kalır, böylece bunu geri alabilirsin.",
+  "recover.cleanup.ask.one": "{count} cihaz hesabından kaldırılsın mı?",
+  "recover.cleanup.ask.other": "{count} cihaz hesabından kaldırılsın mı?",
+  "recover.cleanup.askBody":
+    "Bundan sonra bu cihazlar artık eşitleme yapamaz ve yeni dosyaları okuyamaz.",
+  "pair.request.lookAlike":
+    "Bu adda bir cihaz zaten var: “{device}”. Sayıları özellikle dikkatle karşılaştır.",
+  "devices.lookAlike.question":
+    "“{name}”, hesabındaki başka bir cihaz olan “{device}” gibi görünüyor. Yine de bu ad kullanılsın mı?",
+  "devices.lookAlike.yes": "Yine de kullan",
+  "devices.name.lookAlike": "Bu adda bir cihaz zaten var.",
+  "folder.reason.tooLarge": "bir klasör için çok büyük",
   "restore.retention.one": "Sürümler {days} gün saklanır. Bunu sunucun belirler.",
   "restore.retention.other": "Sürümler {days} gün saklanır. Bunu sunucun belirler.",
   "restore.otherVersion": "Başka bir sürüm seç",
@@ -7706,10 +8123,16 @@ const tr: Dictionary = {
   "devices.recovery.renewBody":
     "Yeni kod eskisinin yerini alır. Eskisi artık çalışmaz. Eski kâğıdı at.",
   "devices.recovery.renewed": "Yeni kod etkin. Eskisi artık çalışmıyor.",
+  "devices.recovery.renewConfirm": "Yeni kurtarma kodu kullanılsın mı?",
+  "devices.recovery.renewYes": "Yeni kodu kullan",
 
   "settings.title": "Ayarlar",
   "settings.autostart": "Oturum açınca başlat",
   "settings.autostartHelp": "Sen hiç düşünmeden klasörlerin güncel kalır.",
+  "settings.autostart.offTitle": "{app} oturum açınca artık başlatılmasın mı?",
+  "settings.autostart.offBody":
+    "O zaman klasörlerin yalnızca {app} uygulamasını kendin açtığında güncel kalır.",
+  "settings.autostart.offConfirm": "Başlatma",
   "settings.language": "Dil",
   "settings.languageSystem": "Sistemle aynı",
   "settings.account": "Hesap",
@@ -7871,9 +8294,9 @@ const zh: Dictionary = {
   "merge.title.other": "此文件夹中已有 {count} 个文件",
   "merge.body.other":
     "它们将添加到“{folder}”中。如果某个文件与其他设备上的不同，两个版本都会保留。",
-  "merge.counting": "正在统计文件…",
   "merge.confirm": "合并",
   "merge.chooseOther": "选择其他文件夹",
+  "merge.host": "它们会上传到 {host}。",
   "setup.ready.title": "一切就绪",
   "setup.ready.body": "把文件放进文件夹，其余的交给 {app}。",
   "setup.ready.open": "打开文件夹",
@@ -7995,6 +8418,7 @@ const zh: Dictionary = {
   "folder.reason.missing": "找不到文件夹",
   "folder.reason.olderState": "服务器上的状态较旧",
   "folder.reason.removedHeads": "来自已移除设备的更改",
+  "folder.reason.treeLimit": "服务器上的版本过大",
   "folder.menu.open": "在资源管理器中显示",
   "folder.menu.versions": "早期版本",
   "folder.menu.trash": "回收站",
@@ -8089,6 +8513,7 @@ const zh: Dictionary = {
   "heads.accept": "接受",
   "heads.accepted": "已接受。“{folder}”恢复同步。",
   "heads.undoLater": "仍然撤销",
+  "heads.confirm": "之后“{folder}”会恢复同步，你可以在早期版本中撤销这些更改。",
   "removedHeads.title": "已移除设备“{device}”对“{folder}”的更改",
   "missing.title": "“{folder}”不见了",
   "missing.body": "{app} 已暂停此文件夹。服务器和其他设备上没有删除任何内容。",
@@ -8120,6 +8545,8 @@ const zh: Dictionary = {
     "由于没有剩余空间，目前连删除也无法进行。现在只有管理员能腾出空间。请把错误报告发给管理员。本机上的文件保持不变。",
   "budget.line.other": "今天上传的内容很多，{count} 个文件正在等待。最迟明天发送。",
   "notice.retained": "旧版本目前占用了服务器上大量空间。已通知管理员，无需进行任何操作。",
+  "notice.olderAccountState":
+    "你的服务器上是账户的较早状态。{app} 已重新读取全部内容，没有缺少任何东西。",
   "notice.budgetDevice": "“{device}”今天上传了大量内容。如果不是自己操作的，请在“设备”中检查。",
   "notice.minCount.other":
     "服务器现在只保留 {days} 天内的旧版本，很少变动的文件夹也是如此。已通知管理员。",
@@ -8130,6 +8557,8 @@ const zh: Dictionary = {
   "disk.body": "可用空间恢复到 {size} 后，{app} 会继续下载。",
   "disk.open": "查看存储",
   "older.title": "“{folder}”已暂停",
+  "treeLimit.title": "“{folder}”的版本过大",
+  "treeLimit.body": "服务器上此文件夹的版本过大或嵌套过深。{app} 没有接收它。请恢复一个早期版本。",
   "older.body":
     "服务器显示的状态比此设备已知的更旧。通常是管理员恢复了备份。本机上的文件是安全的。",
   "older.resume": "继续…",
@@ -8166,10 +8595,18 @@ const zh: Dictionary = {
   "removed.bodyUnknown": "此设备已从账户中移除。文件仍保留在这里，但不再同步。",
   "removed.repair": "重新配对",
   "removed.notMe": "不是我操作的",
+  "removalReported.body":
+    "你的服务器报告此设备已从你的账户中移除。在你确认之前，{app} 不会在这里同步。",
+  "removalReported.confirm": "确认",
+  "removalReported.question": "此设备已从你的账户中移除了吗？",
+  "removalReported.questionBody": "这样 {app} 会在此设备上忘记该账户。你的文件会留在这里。",
+  "removalReported.yes": "是，在这里忘记账户",
   "removed.notMeBody":
     "这说明有人能访问其中某台设备。请用恢复单重新设置 {app}，并移除不认识的设备。",
   "update.body": "{app} 需要更新才能继续同步。",
   "update.now": "立即更新",
+  "update.confirm.title": "现在安装版本 {version}？",
+  "update.confirm.yes": "安装",
   "update.bodyManual": "{app} 需要更新才能继续同步。安装新版本后会自动继续。",
   "update.upToDate": "暂时还没有更新的版本。请稍后再试。",
   "update.installed": "已安装版本 {version}。如果 {app} 没有自动重启，请手动重启。",
@@ -8222,11 +8659,21 @@ const zh: Dictionary = {
   "restore.beforeDevice.none": "该设备在这段时间内没有更改这里的任何内容。",
   "restore.beforeDevice.advice": "请先移除此设备，否则它会立即再次更改这些文件。",
   "restore.folder": "将整个文件夹恢复到此状态",
-  "restore.folder.title": "恢复到此状态？",
-  "restore.folder.body":
-    "“{folder}”将恢复到 {when} 的状态。当前状态会保留为一个版本，因此这一步也可以撤销。",
   "restore.folder.confirm": "恢复",
   "restore.folder.done": "“{folder}”已恢复到 {when} 的状态。",
+  "restore.folder.ask": "要在所有设备上将“{folder}”恢复到此状态吗？",
+  "restore.folder.askGone.other": "当时还不存在的 {count} 个文件将会消失。",
+  "restore.folder.askNoneGone": "不会有文件消失。",
+  "restore.folder.askBody":
+    "已更改的文件会恢复为当时的内容。当前状态会保留为一个版本，因此可以撤销。",
+  "recover.cleanup.ask.other": "要从你的账户中移除 {count} 台设备吗？",
+  "recover.cleanup.askBody": "此后，这些设备将无法再同步，也无法读取新文件。",
+  "pair.request.lookAlike": "已经有一台同名设备：“{device}”。请特别仔细地核对数字。",
+  "devices.lookAlike.question":
+    "“{name}”看起来与你账户中的另一台设备“{device}”相同。仍要使用这个名称吗？",
+  "devices.lookAlike.yes": "仍然使用",
+  "devices.name.lookAlike": "已经有一台同名设备。",
+  "folder.reason.tooLarge": "对一个文件夹来说过大",
   "restore.retention.other": "版本保留 {days} 天，由服务器设定。",
   "restore.otherVersion": "选择其他版本",
   "restore.beforeDevice": "以下设备更改之前的状态…",
@@ -8281,10 +8728,15 @@ const zh: Dictionary = {
   "devices.recovery.renew": "重新生成",
   "devices.recovery.renewBody": "新的恢复码会替换旧的，旧的将失效。请丢弃旧的恢复单。",
   "devices.recovery.renewed": "新的恢复码已生效，旧的已失效。",
+  "devices.recovery.renewConfirm": "使用新的恢复码？",
+  "devices.recovery.renewYes": "使用新码",
 
   "settings.title": "设置",
   "settings.autostart": "登录时启动",
   "settings.autostartHelp": "无需操心，文件夹始终保持最新。",
+  "settings.autostart.offTitle": "登录时不再启动 {app}？",
+  "settings.autostart.offBody": "这样只有在你自己打开 {app} 时，文件夹才会保持最新。",
+  "settings.autostart.offConfirm": "不再启动",
   "settings.language": "语言",
   "settings.languageSystem": "跟随系统",
   "settings.account": "账户",
@@ -8455,24 +8907,30 @@ function lookup(language: Language, key: MessageKey, params: Params | undefined)
 }
 
 /**
- * Right-to-left letters and the bidi control characters (marks, embeddings, overrides, isolates).
- * A value with one of them could reorder the sentence around it.
+ * The bidi control characters (Arabic letter mark, LRM and RLM, embeddings, overrides,
+ * isolates); `bidi_control` in src-tauri/src/texts.rs.
  */
-const BIDI_RELEVANT = /[֐-ࣿ‎‏؜‪-‮⁦-⁩יִ-﷿ﹰ-ﻼ]/u;
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+/** Right-to-left letters; `right_to_left` in src-tauri/src/texts.rs. */
+const RTL_LETTERS = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/u;
+const REPLACEMENT = String.fromCharCode(0xfffd);
 const FIRST_STRONG_ISOLATE = String.fromCharCode(0x2068);
 const POP_DIRECTIONAL_ISOLATE = String.fromCharCode(0x2069);
 
 /**
- * A file, folder or device name inside a sentence, isolated so that right-to-left letters or
- * bidi controls in it cannot reorder or spoof the text around it (Unicode UAX #9, FSI ... PDI).
- * All twelve UI languages run left to right, so a value without such characters looks the same
- * with or without the isolate; it is added only where it can matter, which keeps plain texts
- * plain for tests and the tray.
+ * A file, folder or device name inside a sentence. Its bidi controls are shown as U+FFFD first:
+ * a name never needs one, and a PDI inside it would close the isolate early and let the rest of
+ * the name act on the sentence (security review N9). The result is isolated when it carries
+ * right-to-left letters or had a control, so it cannot reorder or spoof the text around it
+ * (Unicode UAX #9, FSI ... PDI). All twelve UI languages run left to right, so a value without
+ * such characters looks the same with or without the isolate; it is added only where it can
+ * matter, which keeps plain texts plain for tests and the tray.
  */
 export function isolateName(value: string): string {
-  return BIDI_RELEVANT.test(value)
-    ? `${FIRST_STRONG_ISOLATE}${value}${POP_DIRECTIONAL_ISOLATE}`
-    : value;
+  const cleaned = value.replace(BIDI_CONTROLS, REPLACEMENT);
+  return cleaned !== value || RTL_LETTERS.test(cleaned)
+    ? `${FIRST_STRONG_ISOLATE}${cleaned}${POP_DIRECTIONAL_ISOLATE}`
+    : cleaned;
 }
 
 export function translate(language: Language, key: MessageKey, params?: Params): string {

@@ -30,9 +30,10 @@
 //! ```text
 //! P_mac  = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-mac"), 32 bytes)
 //! P_id   = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-id"), 16 bytes)
-//! P_name = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-name"), 32 bytes)
-//! sealed name = nonce (24 random bytes) || XChaCha20-Poly1305(P_name, nonce, name (UTF-8),
+//! P_name = HKDF-SHA256(ikm = P, info = field("hangar-drive/v1/pairing-name-key"), 32 bytes)
+//! sealed name = nonce (24 random bytes) || XChaCha20-Poly1305(P_name, nonce, padded,
 //!               aad = field("hangar-drive/v1/pairing-name") || field(account) || field(new device id))
+//! padded = length (u64) || name (UTF-8) || zeros, to padme(8 + len(name)) bytes
 //! tag    = HMAC-SHA-256(P_mac, field("hangar-drive/v1/pairing-request") || field(account)
 //!                       || field(new device id) || field(sign key) || field(kem key)
 //!                       || field(proof) || field(sealed name))
@@ -40,7 +41,10 @@
 //!
 //! The server routes the request by `P_id` and learns neither P nor anything that lets it forge
 //! the tag or read the name: device names are sealed records everywhere else (ADR 0001, section
-//! 4), and a request waits on the server until it is answered. Only who holds P (the inviting
+//! 4), and a request waits on the server until it is answered. The name is padded with Padmé
+//! (security review N13), so its length shows only to its Padmé length; the key's HKDF info and
+//! the AEAD's associated data carry labels of their own (`pairing-name-key`, `pairing-name`), so
+//! no byte string serves two purposes (security review, info). Only who holds P (the inviting
 //! device, and the new device that read the offer) can open the name. The key seals one request
 //! of one offer, so a random nonce is ample. The inviting device checks the tag in constant
 //! time, then opens the name, then checks the proof of possession, then asks the person `Add
@@ -79,6 +83,7 @@ use crate::entropy::{Entropy, EntropyError};
 use crate::identity::{
     is_valid_kem_key, is_valid_sign_key, verify, verify_proof, DeviceIdentity, DevicePublicKeys,
 };
+use crate::object::padme;
 use crate::recovery::{decode_code, encode_code, CodeError, ENTROPY_LEN};
 
 const LABEL_CODE: &[u8] = b"hangar-drive/v1/pairing-code";
@@ -87,6 +92,7 @@ const LABEL_ID: &[u8] = b"hangar-drive/v1/pairing-id";
 const LABEL_REQUEST: &[u8] = b"hangar-drive/v1/pairing-request";
 const LABEL_OFFER: &[u8] = b"hangar-drive/v1/pairing-offer";
 const LABEL_NAME: &[u8] = b"hangar-drive/v1/pairing-name";
+const LABEL_NAME_KEY: &[u8] = b"hangar-drive/v1/pairing-name-key";
 /// Bytes of the random nonce in front of a sealed name.
 const NAME_NONCE_LEN: usize = 24;
 const CODE_VERSION: u8 = 1;
@@ -190,7 +196,8 @@ impl PairingSecret {
     }
 
     fn name_cipher(&self) -> Result<XChaCha20Poly1305, PairingError> {
-        let key = hkdf::<32>(self.0.as_ref(), &framed(&[LABEL_NAME])).ok_or(PairingError::Key)?;
+        let key =
+            hkdf::<32>(self.0.as_ref(), &framed(&[LABEL_NAME_KEY])).ok_or(PairingError::Key)?;
         XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| PairingError::Key)
     }
 
@@ -205,25 +212,33 @@ impl PairingSecret {
         let mut nonce = [0u8; NAME_NONCE_LEN];
         entropy.fill(&mut nonce)?;
         let aad = framed(&[LABEL_NAME, account.as_bytes(), device.as_bytes()]);
+        let len = u64::try_from(name.len()).map_err(|_| PairingError::Name)?;
+        let padded_len = usize::try_from(padme(len + 8)).map_err(|_| PairingError::Name)?;
+        let mut padded = Zeroizing::new(Vec::with_capacity(padded_len));
+        padded.extend_from_slice(&len.to_be_bytes());
+        padded.extend_from_slice(name.as_bytes());
+        padded.resize(padded_len, 0);
         let ciphertext = self
             .name_cipher()?
             .encrypt(
                 &XNonce::from(nonce),
                 Payload {
-                    msg: name.as_bytes(),
+                    msg: &padded,
                     aad: &aad,
                 },
             )
             .map_err(|_| PairingError::Key)?;
-        let mut sealed = Vec::with_capacity(name.len() + SEALED_NAME_OVERHEAD);
+        let mut sealed = Vec::with_capacity(padded_len + SEALED_NAME_OVERHEAD);
         sealed.extend_from_slice(&nonce);
         sealed.extend_from_slice(&ciphertext);
         Ok(sealed)
     }
 
     /// Opens a sealed name: [`PairingError::Name`] if it does not open with this secret for
-    /// this account and device, or is not a valid name.
-    fn open_name(
+    /// this account and device, its padding is not exactly the Padmé length with zeros, or it
+    /// is not a valid name. Public for the fuzz target; the inviting device calls it through
+    /// [`PairingSecret::verify_request`] after the tag.
+    pub fn open_name(
         &self,
         account: &AccountId,
         device: &DeviceId,
@@ -245,7 +260,24 @@ impl PairingSecret {
                 },
             )
             .map_err(|_| PairingError::Name)?;
-        let name = String::from_utf8(plain).map_err(|_| PairingError::Name)?;
+        let plain = Zeroizing::new(plain);
+        if plain.len() < 8 {
+            return Err(PairingError::Name);
+        }
+        let (len, rest) = plain.split_at(8);
+        let len = u64::from_be_bytes(len.try_into().map_err(|_| PairingError::Name)?);
+        let len_usize = usize::try_from(len).map_err(|_| PairingError::Name)?;
+        if len_usize > rest.len()
+            || len_usize > MAX_DEVICE_NAME_LEN
+            || u64::try_from(plain.len()).ok() != Some(padme(len + 8))
+        {
+            return Err(PairingError::Name);
+        }
+        let (name, padding) = rest.split_at(len_usize);
+        if padding.iter().any(|&b| b != 0) {
+            return Err(PairingError::Name);
+        }
+        let name = String::from_utf8(name.to_vec()).map_err(|_| PairingError::Name)?;
         check_name(&name)?;
         Ok(name)
     }
@@ -583,6 +615,16 @@ impl PairingOffer {
         if c.account != *state.account() || c.server != *server {
             return Err(PairingError::OtherAccount);
         }
+        // An inviter this device already knows signs before anything else counts (security
+        // review M2): a forged offer in its name with a head far ahead would otherwise send the
+        // device to fetch a log from the offer's server first. Only an inviter the verified log
+        // does not list yet makes the device fetch the log.
+        if state
+            .device(&c.inviter)
+            .is_some_and(|d| d.is_current() && !d.recovery)
+        {
+            self.verify_inviter(state)?;
+        }
         if c.head.index > state.len() {
             return Err(PairingError::AheadOfLog {
                 index: c.head.index,
@@ -653,6 +695,38 @@ mod tests {
         )
         .sign(&inviter.identity)
         .unwrap()
+    }
+
+    // Security review N13: the sealed name shows its length only to its Padme length, and the
+    // server's size bounds are the Padme lengths of the shortest and the longest name.
+    #[test]
+    fn sealed_names_are_padded_with_padme() {
+        use hangar_drive_protocol::api::{SEALED_NAME_MAX_PADDED, SEALED_NAME_MIN_PADDED};
+        assert_eq!(SEALED_NAME_MIN_PADDED as u64, padme(8 + 1));
+        assert_eq!(
+            SEALED_NAME_MAX_PADDED as u64,
+            padme(8 + MAX_DEVICE_NAME_LEN as u64)
+        );
+        let secret = PairingSecret::generate(&mut OsEntropy).unwrap();
+        let b = dev(2);
+        let mut sizes = std::collections::BTreeSet::new();
+        for len in 1..=MAX_DEVICE_NAME_LEN {
+            let name = "a".repeat(len);
+            let request = secret
+                .request(&b.identity, &ACCOUNT, b.id, &name, &mut OsEntropy)
+                .unwrap();
+            assert_eq!(
+                request.sealed_name.as_bytes().len(),
+                SEALED_NAME_OVERHEAD + padme(8 + len as u64) as usize
+            );
+            assert_eq!(request.validate(), Ok(()));
+            assert_eq!(
+                secret.verify_request(&ACCOUNT, &request).unwrap().name,
+                name
+            );
+            sizes.insert(request.sealed_name.as_bytes().len());
+        }
+        assert!(sizes.len() < 70, "{}", sizes.len());
     }
 
     #[test]
@@ -982,6 +1056,32 @@ mod tests {
         let ahead = signed(&a, LogHead { index: 9, ..head });
         assert_eq!(
             ahead.server_address(&state, &SERVER),
+            Err(PairingError::AheadOfLog { index: 9 })
+        );
+        // Security review M2: a forged offer in the name of a known inviter with a head ahead
+        // is refused for its signature, before the device would fetch any log for it.
+        let forged_ahead = content(
+            PairingSecret::generate(&mut OsEntropy).unwrap(),
+            a.id,
+            LogHead { index: 9, ..head },
+        )
+        .sign(&stranger.identity)
+        .unwrap();
+        assert_eq!(
+            forged_ahead.server_address(&state, &SERVER),
+            Err(PairingError::Signature)
+        );
+        // An inviter the log does not list yet: the log has to be fetched first.
+        let newcomer = dev(7);
+        let unknown = content(
+            PairingSecret::generate(&mut OsEntropy).unwrap(),
+            newcomer.id,
+            LogHead { index: 9, ..head },
+        )
+        .sign(&newcomer.identity)
+        .unwrap();
+        assert_eq!(
+            unknown.server_address(&state, &SERVER),
             Err(PairingError::AheadOfLog { index: 9 })
         );
         let forked = signed(

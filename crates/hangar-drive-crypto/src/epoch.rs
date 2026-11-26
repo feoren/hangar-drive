@@ -195,9 +195,11 @@ impl fmt::Debug for AccountKey {
 }
 
 impl AccountKey {
-    /// Derives the key of `epoch` from its secret and the hash of its rotate entry. Prefer
-    /// [`AccountKey::for_epoch`], which takes both from the verified log.
-    pub fn derive(
+    /// Derives the key of `epoch` from its secret and the hash of its rotate entry, without
+    /// checking the secret against the epoch's commitment. Crate-internal (security review,
+    /// info): outside this crate a key comes only from [`AccountKey::for_epoch`], which takes
+    /// both from the verified log and checks the commitment.
+    pub(crate) fn derive(
         secret: &AccountSecret,
         account: &AccountId,
         epoch: Epoch,

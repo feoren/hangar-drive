@@ -71,10 +71,13 @@ export type FolderStatus =
   | { readonly kind: "stopped"; readonly reason: StopReason };
 
 /**
- * Why a folder stopped: its folder is missing, the server shows an older state (UX 8.6), or
- * changes of a removed device wait for the person's decision (UX 8.9, security review H1).
+ * Why a folder stopped: its folder is missing, the server shows an older state (UX 8.6),
+ * changes of a removed device wait for the person's decision (UX 8.9, security review H1), or
+ * the server's newest version of the folder is too deep or too large to be one (security review
+ * M3), which a restore replaces.
  */
-export type StopReason = "missing" | "olderState" | "removedHeads";
+/** `tooLarge`: the folder on this disk is beyond the limits of a folder; nothing is published. */
+export type StopReason = "missing" | "olderState" | "removedHeads" | "treeLimit" | "tooLarge";
 
 export interface Folder {
   readonly id: FolderId;
@@ -179,6 +182,23 @@ export type Warning =
    * that is unknown (the server only answered `deviceRemoved` at sign-in).
    */
   | { readonly kind: "removed"; readonly id: string; readonly by: string }
+  /**
+   * The server answered this device's sign-in with "removed", which this device cannot check
+   * (security review H2). Sync stops; the account is forgotten here only once the person
+   * confirms (`confirmDeviceRemoved`) or the server has said so for a day. `since` is when the
+   * server said it first.
+   */
+  | { readonly kind: "removalReported"; readonly id: string; readonly since: Millis }
+  /**
+   * The server's newest version of a folder is too deep or too large to be a folder (security
+   * review M3): it was not taken in, and the folder waits for a restore of an earlier version.
+   */
+  | {
+      readonly kind: "treeLimit";
+      readonly id: string;
+      readonly folderId: FolderId;
+      readonly folderName: string;
+    }
   | { readonly kind: "updateRequired"; readonly id: string }
   | { readonly kind: "refused"; readonly id: string }
   | {
@@ -202,7 +222,12 @@ export type WarningKind = Warning["kind"];
 export type ServerNotice =
   | { readonly kind: "retained" }
   | { readonly kind: "budgetDevice"; readonly device: string }
-  | { readonly kind: "minCount"; readonly days: number };
+  | { readonly kind: "minCount"; readonly days: number }
+  /**
+   * The server's change list was behind this device (an older backup of the server): the device
+   * read the whole account again (security review M2). Nothing is lost.
+   */
+  | { readonly kind: "olderAccountState" };
 
 export interface Account {
   readonly host: string;
@@ -290,6 +315,12 @@ export type InspectedLink =
  * whitespace at the edges. The window trims before sending; the backend checks again.
  */
 export type NameError = "blank" | "edgeWhitespace";
+
+/**
+ * Why naming or renaming a device was refused: the name rule, or `looksLike`, a name that looks
+ * the same as another device's of the account and was not confirmed in the native question.
+ */
+export type DeviceNameError = NameError | "looksLike";
 
 export interface RecoveryCode {
   /** Eight groups of four characters. */
@@ -562,6 +593,8 @@ export interface PairRequest {
   readonly deviceName: string;
   readonly path: "link" | "typed";
   readonly safety: NumberRows;
+  /** A device of the account whose name looks the same, or null. */
+  readonly similarTo: string | null;
 }
 
 /** One saved state of a removed device that stopped a folder (`removedHeads` event). */
@@ -608,7 +641,9 @@ export interface About {
 export type UpdateOutcome =
   | { readonly kind: "upToDate" }
   /** The signed update is installed; on Windows the installer ends the app. */
-  | { readonly kind: "installed"; readonly version: string };
+  | { readonly kind: "installed"; readonly version: string }
+  /** An update was found, and the person said no in the native dialog. */
+  | { readonly kind: "declined" };
 
 /**
  * The answer of the native confirmation behind `deleteFolderEverywhere`, an accepted
@@ -617,7 +652,35 @@ export type UpdateOutcome =
  */
 export type DeleteOutcome = "deleted" | "kept";
 export type PairAnswer = "added" | "declined";
-export type ServerConfirm = "confirmed" | "declined";
+export type ServerConfirm = Confirmation;
+
+/**
+ * The answer of the native confirmation behind removing a device, resetting or disconnecting
+ * this device, re-anchoring a folder and turning autostart off (security review M4). The window
+ * asks nothing before these; "declined" means the person said no there, which is not an error.
+ */
+export type Confirmation = "confirmed" | "declined";
+
+/**
+ * How the group check ended: "wrong" for a group that does not match, "declined" when the
+ * person said no to taking a renewed code in the native dialog (the old code stays valid).
+ */
+export type RecoveryCheck = "confirmed" | "wrong" | "declined";
+
+/** How `resolveMassDelete` ended; "declined" when "delete" was declined natively. */
+export type MassDeleteOutcome =
+  { readonly kind: "resolved"; readonly count: number } | { readonly kind: "declined" };
+
+/** How `acceptRemovedHeads` ended; "declined" leaves the folder stopped. */
+export type HeadsAnswer =
+  ({ readonly kind: "accepted" } & AcceptedHeads) | { readonly kind: "declined" };
+
+/**
+ * How joining an account folder at a place ended. A place that already holds files asks
+ * natively with the place, the number of files and the server (security review H1, UX 6.5);
+ * "declined" means "choose another folder" there, and nothing was joined.
+ */
+export type JoinOutcome = "joined" | "declined";
 
 export type PauseDuration = "hour" | "tomorrow" | "manual";
 
@@ -693,7 +756,7 @@ export interface Backend {
    * Checks the typed group (already normalized). On success the account comes into being (4.2.1),
    * or the renewed code replaces the old one (10.3).
    */
-  confirmRecoveryGroup(group: string): Promise<boolean>;
+  confirmRecoveryGroup(group: string): Promise<RecoveryCheck>;
   defaultFolderPlace(): Promise<FolderPlace>;
   pickFolder(purpose: PickPurpose): Promise<PickResult>;
   /** Number of local files at a place (its token), ignoring the built-in ignore list (6.5). */
@@ -715,7 +778,8 @@ export interface Backend {
     readonly folders: readonly AccountFolder[];
     readonly free: Bytes;
   }>;
-  joinFolders(choices: readonly FolderChoice[]): Promise<void>;
+  /** Joins the chosen folders; answers the IDs of those declined natively (see `JoinOutcome`). */
+  joinFolders(choices: readonly FolderChoice[]): Promise<readonly FolderId[]>;
   /**
    * Recovery with the sheet (UX 4.4): `sheet` is the sheet's link `hangar-drive://recover#...`
    * (pasted or scanned, white space removed), `code` the typed code (normalized), `deviceName`
@@ -727,15 +791,19 @@ export interface Backend {
     deviceName: string,
   ): Promise<Result<null, RecoverError | NameError>>;
   /** No longer called by the window (the name goes with `recoverAccount`); kept for the shell. */
-  setDeviceName(name: string): Promise<Result<null, NameError>>;
+  setDeviceName(name: string): Promise<Result<null, DeviceNameError>>;
   recoveryDevices(): Promise<readonly Device[]>;
-  /** Removes the chosen old devices and the used recovery device, returns the new code. */
-  finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode>;
+  /**
+   * Removes the chosen old devices and the used recovery device, returns the new code. Removing
+   * devices asks natively first with their names; null when the person said no there (nothing
+   * was removed). The window asks nothing before it.
+   */
+  finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode | null>;
   /**
    * Forgets the account on this device: secrets, stored account and the folders' sync state; the
    * files stay. The next snapshot says `setup: "needed"`, so the window shows the welcome again.
    */
-  resetDevice(): Promise<void>;
+  resetDevice(): Promise<Confirmation>;
 
   // Everyday (6)
   openFolder(folderId: FolderId | null, path?: string): Promise<void>;
@@ -747,7 +815,7 @@ export interface Backend {
   pauseFolder(folderId: FolderId): Promise<void>;
   resumeFolder(folderId: FolderId): Promise<void>;
   addFolder(token: string): Promise<void>;
-  addAccountFolder(folderId: FolderId, token: string): Promise<void>;
+  addAccountFolder(folderId: FolderId, token: string): Promise<JoinOutcome>;
   stopFolder(folderId: FolderId): Promise<void>;
   /** Asks once more in a native dialog that names the folder; "no" there keeps it. */
   deleteFolderEverywhere(folderId: FolderId): Promise<DeleteOutcome>;
@@ -763,7 +831,8 @@ export interface Backend {
 
   // Problems (8)
   listMassDelete(warningId: string): Promise<readonly string[]>;
-  resolveMassDelete(warningId: string, decision: "restore" | "delete"): Promise<number>;
+  /** "delete" asks once more natively with the folder and the number of files. */
+  resolveMassDelete(warningId: string, decision: "restore" | "delete"): Promise<MassDeleteOutcome>;
   findMissingFolder(folderId: FolderId): Promise<PickResult>;
   redownloadFolder(folderId: FolderId): Promise<void>;
   getServerNumber(): Promise<{ readonly number: NumberRows; readonly command: string }>;
@@ -771,14 +840,20 @@ export interface Backend {
   confirmServerNumber(): Promise<ServerConfirm>;
   fixServerWithOffer(link: string): Promise<Result<null, "notALink" | "otherAccount" | "expired">>;
   checkOlderState(folderId: FolderId): Promise<"stillOlder" | "resolved">;
-  reanchor(folderId: FolderId, compared: boolean): Promise<void>;
+  /** Asks natively with the folder and what is lost; the window asks nothing more before it. */
+  reanchor(folderId: FolderId, compared: boolean): Promise<Confirmation>;
   dismissSuspect(warningId: string): Promise<void>;
   /**
    * Takes in the changes of a removed device that stopped a folder (UX 8.9): the barrier after
    * them is written and the folder syncs again. The window then offers to undo them.
    */
-  acceptRemovedHeads(folderId: FolderId): Promise<AcceptedHeads>;
+  acceptRemovedHeads(folderId: FolderId): Promise<HeadsAnswer>;
   openStorageSettings(): Promise<void>;
+  /**
+   * Forgets the account here after the server reported this device as removed
+   * (`removalReported`); the shell asks natively first. "declined" changes nothing.
+   */
+  confirmDeviceRemoved(): Promise<Confirmation>;
   /** Rejects with "updatesOff" while this build has no updater key (see `About.updates`). */
   installUpdate(): Promise<UpdateOutcome>;
   copyErrorReport(): Promise<void>;
@@ -804,7 +879,11 @@ export interface Backend {
     path: string,
     mode: "replace" | "copy",
   ): Promise<RestoreOutcome>;
-  resetFolder(folderId: FolderId, entryId: string): Promise<RestoreOutcome>;
+  /**
+   * Asks natively every time, with the folder and the number of files that disappear on every
+   * device; null when the person said no there. The window asks nothing before it.
+   */
+  resetFolder(folderId: FolderId, entryId: string): Promise<RestoreOutcome | null>;
   cancelRestore(jobId: string): Promise<void>;
   /** The entry for "state before changes from ..." (9.4), null when there is none. */
   findBeforeDevice(folderId: FolderId, deviceId: DeviceId, from: Millis): Promise<string | null>;
@@ -813,10 +892,13 @@ export interface Backend {
 
   // Devices (10)
   listDevices(): Promise<DeviceList>;
-  renameDevice(deviceId: DeviceId, name: string): Promise<Result<null, NameError>>;
+  /** A name that looks like another device's is taken only after a native question. */
+  renameDevice(deviceId: DeviceId, name: string): Promise<Result<null, DeviceNameError>>;
   getSafetyNumber(deviceId: DeviceId): Promise<NumberRows>;
-  removeDevice(deviceId: DeviceId): Promise<void>;
-  disconnectThisDevice(): Promise<void>;
+  /** Asks natively with the device's name; the window asks nothing before it. */
+  removeDevice(deviceId: DeviceId): Promise<Confirmation>;
+  /** Asks natively, with the warning for the account's last device. */
+  disconnectThisDevice(): Promise<Confirmation>;
   createPairingOffer(): Promise<PairingOffer>;
   copyPairingLink(offerId: string): Promise<void>;
   /**
@@ -829,7 +911,8 @@ export interface Backend {
 
   // Settings (11)
   getSettings(): Promise<Settings>;
-  setAutostart(on: boolean): Promise<void>;
+  /** Turning it off asks natively first. */
+  setAutostart(on: boolean): Promise<Confirmation>;
   setLanguage(language: Language | "system"): Promise<void>;
   getAbout(): Promise<About>;
 

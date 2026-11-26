@@ -187,6 +187,11 @@ function RequestView({
       <h2 id={titleId} className="dialog-title">
         {t("pair.confirm.title", { device: request.deviceName })}
       </h2>
+      {request.similarTo !== null && (
+        <Feedback tone="error">
+          {t("pair.request.lookAlike", { device: request.similarTo })}
+        </Feedback>
+      )}
       <p className="dialog-body">{t("pair.request.body")}</p>
       {typed ? (
         <NumberRows rows={request.safety} label={t("safety.label")} />

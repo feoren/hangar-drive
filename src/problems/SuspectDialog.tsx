@@ -24,9 +24,7 @@ export function SuspectDialog({
   const backend = useBackend();
   const titleId = useId();
   const action = useAction();
-  const [asking, setAsking] = useState(false);
   const [removed, setRemoved] = useState(false);
-  const app = t("app.name");
 
   return (
     <Dialog labelledBy={titleId} size="medium" onClose={onClose}>
@@ -38,50 +36,18 @@ export function SuspectDialog({
           <p>{t("suspect.step1", { device: warning.deviceName })}</p>
           {removed ? (
             <Feedback>{t("devices.removed", { device: warning.deviceName })}</Feedback>
-          ) : asking ? (
-            <div
-              className="inline-confirm"
-              role="group"
-              aria-label={t("devices.remove.title", { device: warning.deviceName })}
-            >
-              <p className="inline-confirm-title">
-                {t("devices.remove.title", { device: warning.deviceName })}
-              </p>
-              <p className="muted">{t("devices.remove.body", { app })}</p>
-              <div className="group-actions">
-                <button
-                  type="button"
-                  className="button secondary small"
-                  autoFocus
-                  onClick={() => {
-                    setAsking(false);
-                  }}
-                >
-                  {t("common.cancel")}
-                </button>
-                <button
-                  type="button"
-                  className="button danger small"
-                  disabled={action.pending}
-                  onClick={() => {
-                    void action.run(async () => {
-                      await backend.removeDevice(warning.deviceId);
-                      setRemoved(true);
-                      setAsking(false);
-                    });
-                  }}
-                >
-                  {t("devices.remove")}
-                </button>
-              </div>
-            </div>
           ) : (
             <button
               type="button"
               className="button secondary small"
               data-autofocus
+              disabled={action.pending}
               onClick={() => {
-                setAsking(true);
+                // The shell asks natively with the device's name (security review M4).
+                void action.run(async () => {
+                  const outcome = await backend.removeDevice(warning.deviceId);
+                  if (outcome === "confirmed") setRemoved(true);
+                });
               }}
             >
               {t("devices.remove")}

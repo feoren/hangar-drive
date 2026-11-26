@@ -13,21 +13,29 @@
 //! bytes as before; the wire format is unchanged.
 //!
 //! Failed proofs count against [`Scope::ProofFailures`], keyed by account and device and only
-//! for devices the account's log lists, so the table holds only real devices.
+//! for devices the account's log lists, so the table holds only real devices. They count only
+//! after the check failed, and the counter never refuses a valid proof (overall review M1):
+//! anyone can send a bad proof in a device's name, so a limit that refused the device's own
+//! valid proof would let a third party lock it out. Over the limit, a failing proof is answered
+//! `rate_limited` instead of `proof_invalid`.
 //!
 //! **Removed devices** (finding E2E-3): a proof that verifies with the key the log last listed
 //! for a device the log removed is answered with [`ErrorCode::DeviceRemoved`] instead of
-//! [`ErrorCode::ProofInvalid`], so the removed device learns it and forgets the account; it
-//! could no longer read the log that says so. Only a holder of that key can make such a proof,
+//! [`ErrorCode::ProofInvalid`], so the removed device learns it; it could no longer read the
+//! log that says so through a session. Only a holder of that key can make such a proof,
 //! so nobody else can ask whether a device was removed. The challenge is used up as for a
-//! session, and the answer does not count as a failed proof.
+//! session, and the answer does not count as a failed proof. With the answer goes the device
+//! log from the head the device names (`ProofRequest::log_length`) up to its removal
+//! (`ErrorBody::removal_log`), so the device can check the removal itself and does not depend
+//! on the server's word (security review H2).
 
 use hangar_drive_crypto::session::{verify_session, SessionError};
 use hangar_drive_crypto::{Entropy, OsEntropy};
 use hangar_drive_protocol::api::{
-    ChallengeRequest, ChallengeResponse, ErrorCode, ProofRequest, SessionResponse, SessionScope,
+    ChallengeRequest, ChallengeResponse, ErrorCode, LogPage, ProofRequest, SessionResponse,
+    SessionScope, MAX_LOG_PAGE,
 };
-use hangar_drive_protocol::ids::{AccountId, Challenge, DeviceId, SessionToken};
+use hangar_drive_protocol::ids::{AccountId, Blob, Challenge, DeviceId, SessionToken};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -141,9 +149,6 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
     let now = app.now_ms();
     let expires_challenge = check_challenge(app, request).ok_or(ErrorCode::ChallengeInvalid)?;
     let key = failure_key(&request.account, &request.device);
-    if app.limiter.exceeded(Scope::ProofFailures, &key, now / 1000) {
-        return Err(ErrorCode::RateLimited.into());
-    }
     let mut conn = app.db.acquire().await?;
     let Some(account) = account_by_id(&mut conn, &request.account).await? else {
         return Err(ErrorCode::ProofInvalid.into());
@@ -158,9 +163,22 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
     let Some(server_url) = app.public_url.as_deref() else {
         return Err(ApiError::internal(&"sign-in without a public URL"));
     };
-    if server_url != request.server_url {
+    // A proof that fails, for another address or with a bad signature, counts against the
+    // device only after the check and only for a device the log lists (finding M1). The
+    // counter only slows failing proofs: a valid proof always goes through, so a third party
+    // who sends bad proofs in a device's name cannot lock that device out.
+    let failed = || {
+        if state.device(&request.device).is_none() {
+            return ApiError::from(ErrorCode::ProofInvalid);
+        }
+        if app.limiter.exceeded(Scope::ProofFailures, &key, now / 1000) {
+            return ErrorCode::RateLimited.into();
+        }
         app.limiter.hit(Scope::ProofFailures, &key, now / 1000);
-        return Err(ErrorCode::ProofInvalid.into());
+        ErrorCode::ProofInvalid.into()
+    };
+    if server_url != request.server_url {
+        return Err(failed());
     }
     let record = match verify_session(
         &state,
@@ -174,14 +192,18 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         Err(SessionError::Removed) => {
             // Used up like a sign-in's challenge, so a replay of this proof learns nothing new.
             use_challenge(app, request, now, expires_challenge).await?;
-            return Err(ErrorCode::DeviceRemoved.into());
+            let removed_at = state
+                .device(&request.device)
+                .and_then(|record| record.removed_at);
+            let removal_log = match (request.log_length, removed_at) {
+                (Some(after), Some(removed_at)) => {
+                    removal_log(app, account.pk, after, removed_at, account.log_length).await?
+                }
+                _ => None,
+            };
+            return Err(ApiError::device_removed(removal_log));
         }
-        Err(_) => {
-            if state.device(&request.device).is_some() {
-                app.limiter.hit(Scope::ProofFailures, &key, now / 1000);
-            }
-            return Err(ErrorCode::ProofInvalid.into());
-        }
+        Err(_) => return Err(failed()),
     };
     let mut token = [0u8; 32];
     OsEntropy
@@ -219,6 +241,39 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         token,
         expires_in_secs: SESSION_SECS,
     })
+}
+
+/// The device log entries after `after` up to and including `removed_at`, the entry that
+/// removed the device, at most [`MAX_LOG_PAGE`] of them (security review H2): the removed device
+/// checks them from its own verified head and forgets the account only on a valid removal of
+/// itself. `None` when the device already holds the removal or names a head beyond the log; a
+/// longer gap is cut at the page size and then holds no removal, so the device keeps waiting for
+/// the person instead of forgetting.
+async fn removal_log(
+    app: &App,
+    account_pk: i64,
+    after: u64,
+    removed_at: u64,
+    length: u64,
+) -> ApiResult<Option<LogPage>> {
+    if after >= removed_at || after > length {
+        return Ok(None);
+    }
+    let count = (removed_at - after).min(MAX_LOG_PAGE as u64);
+    let mut conn = app.db.acquire().await?;
+    let entries: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT entry FROM log_entries WHERE account_pk = ? AND idx > ? ORDER BY idx LIMIT ?",
+    )
+    .bind(account_pk)
+    .bind(i64_of(after))
+    .bind(i64_of(count))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Some(LogPage {
+        first_index: after + 1,
+        entries: entries.into_iter().map(Blob).collect(),
+        length,
+    }))
 }
 
 /// Marks the challenge of a proof that verified as used (a removed device's proof); a second

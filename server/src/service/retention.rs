@@ -84,7 +84,9 @@ pub enum Mode {
 /// Files to remove after the transaction.
 struct Doomed {
     objects: Vec<ObjectKey>,
+    /// Deleted folders of the account, each with a tombstone until its files are gone.
     folders: Vec<(AccountId, FolderId)>,
+    account_pk: i64,
 }
 
 /// One step over every account, then the housekeeping of expired rows.
@@ -134,6 +136,7 @@ pub async fn account_step(app: &App, account_pk: i64, mode: Mode) -> ApiResult<O
     let mut doomed = Doomed {
         objects: Vec::new(),
         folders: Vec::new(),
+        account_pk,
     };
 
     // Pins that ended (all of them in a purge).
@@ -172,9 +175,15 @@ pub async fn account_step(app: &App, account_pk: i64, mode: Mode) -> ApiResult<O
             .bind(pk)
             .execute(&mut *tx)
             .await?;
-        if let Some(folder) = FolderId::from_slice(&id) {
-            doomed.folders.push((account.id, folder));
-        }
+        // Until its files are removed, the folder cannot be made again (overall review N2).
+        sqlx::query(
+            "INSERT OR IGNORE INTO folder_tombstones (account_pk, folder_id, created_ms) VALUES (?, ?, ?)",
+        )
+        .bind(account_pk)
+        .bind(id.as_slice())
+        .bind(i64_of(now))
+        .execute(&mut *tx)
+        .await?;
         outcome.deleted_folders += 1;
     }
 
@@ -480,6 +489,17 @@ pub async fn account_step(app: &App, account_pk: i64, mode: Mode) -> ApiResult<O
     .execute(&mut *tx)
     .await?;
 
+    // Every tombstone of the account, also one a crash left behind before its files went.
+    let tombstones: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT folder_id FROM folder_tombstones WHERE account_pk = ?")
+            .bind(account_pk)
+            .fetch_all(&mut *tx)
+            .await?;
+    doomed.folders = tombstones
+        .iter()
+        .filter_map(|id| FolderId::from_slice(id))
+        .map(|folder| (account.id, folder))
+        .collect();
     tx.commit().await?;
     feed::notify_all(app, &pushed);
     remove_files(app, doomed).await;
@@ -552,10 +572,27 @@ async fn keep_tree(tx: &mut Tx, folder_pk: i64, seq: u64) -> ApiResult<()> {
 async fn remove_files(app: &App, doomed: Doomed) {
     for (account, folder) in doomed.folders {
         let store = app.store.clone();
-        if let Ok(Err(error)) =
-            tokio::task::spawn_blocking(move || store.delete_folder(&account, &folder)).await
-        {
-            tracing::error!(%error, "removing a deleted folder's objects failed");
+        match tokio::task::spawn_blocking(move || store.delete_folder(&account, &folder)).await {
+            Ok(Ok(())) => {
+                // Only now may the folder ID be used again (overall review N2). Should this
+                // fail, the next step removes the (empty) directory again and retries.
+                let cleared = sqlx::query(
+                    "DELETE FROM folder_tombstones WHERE account_pk = ? AND folder_id = ?",
+                )
+                .bind(doomed.account_pk)
+                .bind(folder.as_bytes().as_slice())
+                .execute(&app.db)
+                .await;
+                if let Err(error) = cleared {
+                    tracing::error!(%error, "clearing a deleted folder's tombstone failed");
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "removing a deleted folder's objects failed");
+            }
+            Err(error) => {
+                tracing::error!(%error, "removing a deleted folder's objects failed");
+            }
         }
     }
     for key in doomed.objects {

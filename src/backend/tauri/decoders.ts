@@ -8,13 +8,17 @@ import type {
   ActivityEntry,
   AcceptedHeads,
   BackendEvent,
+  Confirmation,
   ConflictGroup,
   DeleteOutcome,
   Device,
   DeviceList,
   FolderPlace,
+  HeadsAnswer,
   InspectedLink,
   InviteCheck,
+  JoinOutcome,
+  MassDeleteOutcome,
   NameIssue,
   NotSyncedEntry,
   NumberRows,
@@ -23,6 +27,7 @@ import type {
   PairingOffer,
   PairWaiting,
   PickResult,
+  RecoveryCheck,
   RecoveryCode,
   RecoverySheet,
   RestoreOutcome,
@@ -63,7 +68,7 @@ const folderStatus = union("kind", {
   uploading: { count: num },
   downloading: { count: num },
   paused: {},
-  stopped: { reason: literal("missing", "olderState", "removedHeads") },
+  stopped: { reason: literal("missing", "olderState", "removedHeads", "treeLimit", "tooLarge") },
 });
 
 const fileAction = literal(
@@ -103,6 +108,8 @@ const warning = union("kind", {
   olderState: { id: str, folderId: str, folderName: str },
   removedHeads: { id: str, folderId: str, folderName: str, devices: array(str), count: num },
   removed: { id: str, by: str },
+  removalReported: { id: str, since: num },
+  treeLimit: { id: str, folderId: str, folderName: str },
   updateRequired: { id: str },
   refused: { id: str },
   suspect: {
@@ -122,6 +129,7 @@ const notice = union("kind", {
   retained: {},
   budgetDevice: { device: str },
   minCount: { days: num },
+  olderAccountState: {},
 });
 
 export const snapshot = object({
@@ -330,6 +338,10 @@ export const restoreOutcome = union("kind", {
   failed: {},
 }) satisfies Decoder<RestoreOutcome>;
 
+export const nullableRestoreOutcome = nullable(restoreOutcome);
+
+export const nullableRecoveryCode = nullable(recoveryCode);
+
 export const trash = array(
   object({
     id: str,
@@ -371,6 +383,7 @@ export const about = object({
 export const updateOutcome = union("kind", {
   upToDate: {},
   installed: { version: str },
+  declined: {},
 }) satisfies Decoder<UpdateOutcome>;
 
 /**
@@ -380,6 +393,15 @@ export const updateOutcome = union("kind", {
 export const deleteOutcome: Decoder<DeleteOutcome> = literal("deleted", "kept");
 export const pairAnswer: Decoder<PairAnswer> = literal("added", "declined");
 export const serverConfirm: Decoder<ServerConfirm> = literal("confirmed", "declined");
+
+/** The native questions of the overall security review (commands.rs `Confirmation` and kin). */
+export const confirmation: Decoder<Confirmation> = literal("confirmed", "declined");
+export const recoveryCheck: Decoder<RecoveryCheck> = literal("confirmed", "wrong", "declined");
+export const joinOutcome: Decoder<JoinOutcome> = literal("joined", "declined");
+export const massDeleteOutcome = union("kind", {
+  resolved: { count: num },
+  declined: {},
+}) satisfies Decoder<MassDeleteOutcome>;
 
 export const undoToken = object({ undoToken: str });
 
@@ -402,6 +424,7 @@ export const event = union("type", {
       deviceName: str,
       path: literal("link", "typed"),
       safety: numberRows,
+      similarTo: nullable(str),
     }),
   },
   pairRequestGone: { offerId: str },
@@ -421,6 +444,11 @@ export const acceptedHeads = object({
   count: num,
   beforeEntryId: nullable(str),
 }) satisfies Decoder<AcceptedHeads>;
+
+export const headsAnswer = union("kind", {
+  accepted: { count: num, beforeEntryId: nullable(str) },
+  declined: {},
+}) satisfies Decoder<HeadsAnswer>;
 
 export const nullableStr = nullable(str);
 

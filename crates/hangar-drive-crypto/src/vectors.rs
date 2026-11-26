@@ -59,7 +59,7 @@ const CASE_NAMES: [&str; 6] = [
 
 /// Display names across every rule of [`check_display_name`], checked with a bound of 16
 /// bytes.
-const DISPLAY_NAMES: [&str; 14] = [
+const DISPLAY_NAMES: [&str; 24] = [
     "Laptop",
     "",
     "seventeen bytes!!",
@@ -74,6 +74,18 @@ const DISPLAY_NAMES: [&str; 14] = [
     "My Laptop",
     "\u{d55c}\u{3164}",
     "\u{3164}a",
+    // Security review N12: blank characters, and fillers at the edge.
+    "\u{2800}",
+    "\u{34f}",
+    "\u{fe0f}\u{e0100}",
+    "\u{e000}",
+    "a\u{2800}",
+    "\u{34f}a",
+    "Anna \u{2764}\u{fe0f}",
+    "a \u{fe0f}",
+    // Default ignorable code points, a reserved one alone and one at the edge.
+    "\u{2065}",
+    "\u{180b}a",
 ];
 
 /// The verdict of [`check_display_name`] on each of [`DISPLAY_NAMES`].

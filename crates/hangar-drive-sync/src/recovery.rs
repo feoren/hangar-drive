@@ -29,7 +29,7 @@ use hangar_drive_crypto::devicelog::{AccountState, LogDevice, MAX_LOG_ENTRIES};
 use hangar_drive_crypto::epoch;
 use hangar_drive_crypto::recovery::RecoveryCode;
 use hangar_drive_crypto::Entropy;
-use hangar_drive_protocol::api::{ErrorCode, LogAppendRequest, WrappedKeyEntry};
+use hangar_drive_protocol::api::{LogAppendRequest, WrappedKeyEntry};
 use hangar_drive_protocol::ids::{AccountId, Blob, LogHash, LogHead};
 
 use crate::chunker::DynEntropy;
@@ -113,9 +113,7 @@ pub fn add_device_with_code(
         .map_err(|_| SyncError::Invalid("the recovery device ID"))?;
     let state = match fetch_log(server, account) {
         Ok(state) => state,
-        Err(SyncError::Net(e)) if e.code() == Some(ErrorCode::DeviceRemoved) => {
-            return Err(RecoveryError::Used)
-        }
+        Err(SyncError::Net(NetError::DeviceRemoved(_))) => return Err(RecoveryError::Used),
         Err(e) => return Err(e.into()),
     };
     if state.hash_at(1) != Some(genesis) {
@@ -231,7 +229,11 @@ mod tests {
 
     impl ServerApi for Refusing {
         fn log(&mut self, _after: u64) -> Result<LogPage, NetError> {
-            Err(NetError::Server(ErrorBody::new(self.0)))
+            // As the HTTP client reports it: `device_removed` only as the proof's answer.
+            Err(match self.0 {
+                ErrorCode::DeviceRemoved => NetError::DeviceRemoved(None),
+                code => NetError::Server(ErrorBody::new(code)),
+            })
         }
         refuse! {
             create_account(&CreateAccountRequest) -> CreateAccountResponse;

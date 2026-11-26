@@ -481,18 +481,25 @@ def nfc(text):
     return unicodedata.normalize("NFC", text)
 
 
+def case_base(name):
+    """The comparison key without the code points HFS+ ignores (security review N15)."""
+    ignorable = lambda c: (0x200C <= ord(c) <= 0x200F or 0x202A <= ord(c) <= 0x202E
+                           or 0x206A <= ord(c) <= 0x206F or ord(c) == 0xFEFF)
+    return "".join(c for c in nfc(name) if not ignorable(c))
+
+
 def case_key(name):
-    return nfc(nfc(name).lower())
+    return nfc(case_base(name).lower())
 
 
 def fold_key(name):
     """Full case folding (CaseFolding.txt C and F): Python's str.casefold."""
-    return nfc(nfc(name).casefold())
+    return nfc(case_base(name).casefold())
 
 
 def upper_key(name):
     out = []
-    for c in nfc(name):
+    for c in case_base(name):
         upper = c.upper()
         out.append(upper if len(upper) == 1 else c)
     return nfc("".join(out))
@@ -528,10 +535,55 @@ DISPLAY_NAMES = [
     "My Laptop",
     "한ㅤ",
     "ㅤa",
+    # Security review N12: blank characters, and fillers at the edge.
+    "\u2800",
+    "\u034f",
+    "\ufe0f\U000e0100",
+    "\ue000",
+    "a\u2800",
+    "\u034fa",
+    "Anna \u2764\ufe0f",
+    "a \ufe0f",
+    # Default ignorable code points, a reserved one alone and one at the edge.
+    "\u2065",
+    "\u180ba",
 ]
 
-# Hangul fillers: letters (Lo) that render blank.
-FILLERS = "ᅟᅠㅤﾠ"
+# Default_Ignorable_Code_Point (Unicode 15.1, reserved code points included), as
+# DEFAULT_IGNORABLE_RANGES in crates/hangar-drive-protocol/src/name.rs.
+DEFAULT_IGNORABLE = [
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+    (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+    (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+]
+
+
+def default_ignorable(c):
+    return any(low <= ord(c) <= high for low, high in DEFAULT_IGNORABLE)
+
+# Hangul fillers (Lo) and the blank Braille pattern (So): they render blank.
+FILLERS = "ᅟᅠㅤﾠ\u2800"
+
+
+def visible(c):
+    """A letter, number, punctuation or symbol that is no filler (security review N12), decided
+    by what it is not, as in Rust: white space, Cc, Cf, Zl, Zp, M, Co, a filler."""
+    if c.isspace() or c in FILLERS or default_ignorable(c):
+        return False
+    return unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp", "Mn", "Mc", "Me", "Co")
+
+
+def variation_selector(c):
+    return 0xFE00 <= ord(c) <= 0xFE0F or 0xE0100 <= ord(c) <= 0xE01EF
+
+
+def edge_filler(c):
+    return (
+        c.isspace() or c in FILLERS or c == "\u034f" or variation_selector(c)
+        or default_ignorable(c)
+    )
 
 
 def display_verdict(name, max_len):
@@ -547,9 +599,14 @@ def display_verdict(name, max_len):
         return "control"
     if any(unicodedata.category(c) in ("Cf", "Zl", "Zp") for c in name):
         return "format"
-    if all(c.isspace() or c in FILLERS for c in name):
+    if not any(visible(c) for c in name):
         return "blank"
-    if name[0].isspace() or name[-1].isspace():
+    # Trailing variation selectors right after a visible character belong to it (an emoji).
+    base = name
+    while base and variation_selector(base[-1]):
+        base = base[:-1]
+    last = base[-1] if base and len(base) < len(name) and visible(base[-1]) else name[-1]
+    if edge_filler(name[0]) or edge_filler(last):
         return "edge-whitespace"
     return "ok"
 
@@ -562,12 +619,19 @@ def log_entry(seed, index, prev, issued_at, issuer, kind_fields):
     return entry, sha256(framed(label("device-log"), u64(index), prev, entry))
 
 
+def pad(plaintext):
+    """length (u64) || plaintext || zeros to padme(8 + len): objects, records and sealed names
+    (security review N13)."""
+    padded = u64(len(plaintext)) + plaintext
+    return padded + b"\x00" * (padme(8 + len(plaintext)) - len(padded))
+
+
 def seal_record(account_key, kind, record_id, version, nonce, plaintext, sign_seed, rotate_hash):
     aad = framed(
         label("record"), b"\x01", ACCOUNT, u32(1), kind, record_id, u64(version), DEVICE,
         u64(2), rotate_hash,
     )
-    sealed = xchacha20poly1305_seal(account_key, nonce, plaintext, aad)
+    sealed = xchacha20poly1305_seal(account_key, nonce, pad(plaintext), aad)
     sig = ed25519_sign(sign_seed, framed(label("record-sig"), aad, nonce, sealed))
     header = b"\x01" + u32(1) + u64(version) + DEVICE + u64(2) + rotate_hash + nonce
     return header + sealed + sig
@@ -761,9 +825,11 @@ def compute():
     # Pairing: code, routing ID, the sealed name, the request tag over it, and the offer.
     out["pairing.code"] = crockford_code("pairing-code", PAIRING_SECRET)
     out["pairing.id"] = hkdf(PAIRING_SECRET, framed(label("pairing-id")), 16).hex()
-    name_key = hkdf(PAIRING_SECRET, framed(label("pairing-name")), 32)
+    # The key's HKDF info and the associated data carry labels of their own; the name is
+    # padded with Padme (security review N13).
+    name_key = hkdf(PAIRING_SECRET, framed(label("pairing-name-key")), 32)
     sealed_name = PAIRING_NAME_NONCE + xchacha20poly1305_seal(
-        name_key, PAIRING_NAME_NONCE, b"Laptop", framed(label("pairing-name"), ACCOUNT, DEVICE)
+        name_key, PAIRING_NAME_NONCE, pad(b"Laptop"), framed(label("pairing-name"), ACCOUNT, DEVICE)
     )
     out["pairing.sealed_name"] = sealed_name.hex()
     mac_key = hkdf(PAIRING_SECRET, framed(label("pairing-mac")), 32)

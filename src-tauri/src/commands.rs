@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hangar_drive_sync::api::{
-    AcceptedHeads, ApiResult, BeginError, ConflictGroup, Device, DeviceList, FixServerError,
-    FolderRefusal, FolderRefusalView, InspectedLink, InviteCheck, InviteError, LinkProblem,
-    NameError, NameIssue, NotSyncedEntry, NumberRows, PairError, PauseDuration, QrMatrix,
-    RecoverError, RecoveryCodeView, RenameError, RestoreOutcome, ServerNumberView, Snapshot,
-    Timeline, TrashItem, VersionTree, Warning,
+    AcceptedHeads, ApiResult, BeginError, ConflictGroup, Device, DeviceList, DeviceNameError,
+    FixServerError, FolderRefusal, FolderRefusalView, InspectedLink, InviteCheck, InviteError,
+    LinkProblem, NameError, NameIssue, NotSyncedEntry, NumberRows, PairError, PauseDuration,
+    QrMatrix, RecoverError, RecoveryCodeView, RenameError, RestoreOutcome, ServerNumberView,
+    Snapshot, Timeline, TrashItem, VersionTree, Warning,
 };
 use hangar_drive_sync::error::SyncError;
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,107 @@ pub enum ServerConfirm {
     Declined,
 }
 
+/// How an action behind a native confirmation ended (security review M4): removing a device,
+/// resetting or disconnecting this device, re-anchoring a folder, turning autostart off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Confirmation {
+    /// The person confirmed; the action ran.
+    Confirmed,
+    /// The person said no in the native dialog; nothing changed.
+    Declined,
+}
+
+impl From<bool> for Confirmation {
+    fn from(yes: bool) -> Self {
+        if yes {
+            Self::Confirmed
+        } else {
+            Self::Declined
+        }
+    }
+}
+
+/// How `confirmRecoveryGroup` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryCheck {
+    /// The group matched: the account came into being, or the renewed code replaced the old one.
+    Confirmed,
+    /// The typed group is not the asked one.
+    Wrong,
+    /// The group matched a renewed code, but the person said no in the native dialog; the old
+    /// code stays valid.
+    Declined,
+}
+
+/// How `resolveMassDelete` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MassDeleteOutcome {
+    /// Restored or deleted, `count` files.
+    Resolved { count: u64 },
+    /// "Delete" was declined in the native dialog; the deletions still wait.
+    Declined,
+}
+
+/// How `acceptRemovedHeads` ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum HeadsAnswer {
+    /// The changes are taken in.
+    Accepted(AcceptedHeads),
+    /// The person said no in the native dialog; the folder stays stopped.
+    Declined,
+}
+
+/// How joining an account folder at a place ended (`addAccountFolder`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JoinOutcome {
+    /// The folder syncs at the place.
+    Joined,
+    /// The place holds files and the person chose another folder in the native dialog
+    /// (security review H1); nothing was joined.
+    Declined,
+}
+
+/// Who answers a native confirmation: the operating system's dialog ([`Native`]), or in tests a
+/// fixed answer. Generic rather than an enum, so a test never instantiates the native dialog:
+/// its Windows API (`TaskDialogIndirect`) needs the Common Controls 6 manifest, which only the
+/// app's binary carries, not the test binary.
+pub trait Ask: Sync {
+    fn ask(
+        &self,
+        shell: &Shell,
+        confirm: crate::confirm::Confirm,
+    ) -> impl std::future::Future<Output = Answer<bool>> + Send;
+}
+
+/// The operating system's dialog, one at a time, off the async runtime.
+pub struct Native<'a>(pub &'a AppHandle);
+
+impl Ask for Native<'_> {
+    async fn ask(&self, shell: &Shell, confirm: crate::confirm::Confirm) -> Answer<bool> {
+        native_confirm(self.0, shell, confirm).await
+    }
+}
+
+/// A fixed answer that keeps the questions it was asked.
+#[cfg(test)]
+pub struct Fixed<'a>(
+    pub bool,
+    pub &'a std::sync::Mutex<Vec<crate::confirm::Confirm>>,
+);
+
+#[cfg(test)]
+impl Ask for Fixed<'_> {
+    async fn ask(&self, _shell: &Shell, confirm: crate::confirm::Confirm) -> Answer<bool> {
+        lock(self.1).push(confirm);
+        Ok(self.0)
+    }
+}
+
 /// How `answerPairRequest` ended, after the native confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,8 +379,9 @@ fn folder_name_of(path: &str) -> String {
         .unwrap_or_else(|| "Hangar Drive".to_owned())
 }
 
-/// A folder name as a directory name in the home folder: the characters no platform allows
-/// become `_`, and the result never names a parent.
+/// A folder name as a directory name: the characters no platform allows become `_`, a leading
+/// dot becomes `_` too, so the folder is never hidden and never named like the dot folders of
+/// other programs (security review N8), and the result never names a parent.
 pub fn safe_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -291,12 +393,35 @@ pub fn safe_dir_name(name: &str) -> String {
             }
         })
         .collect();
-    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_owned();
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "Hangar Drive".to_owned()
-    } else {
-        cleaned
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
+        return "Hangar Drive".to_owned();
     }
+    match cleaned.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None => cleaned.to_owned(),
+    }
+}
+
+/// How many places `proposed_place` tries for one folder: `Name`, `Name (2)` ... `Name (99)`.
+const PROPOSAL_TRIES: u32 = 99;
+
+/// The place proposed for an account folder: always a new folder below `base` (`~/Hangar
+/// Drive`), never an existing one and never a direct child of the home folder, where folders
+/// like Documents live that a stranger's account must not be offered (security review H1, N8).
+/// `taken` says whether a candidate is out (it exists, the engine refuses it, or another folder
+/// of the same list got it).
+pub fn proposed_place(base: &Path, name: &str, taken: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let dir = safe_dir_name(name);
+    (1..=PROPOSAL_TRIES)
+        .map(|n| {
+            if n == 1 {
+                base.join(&dir)
+            } else {
+                base.join(format!("{dir} ({n})"))
+            }
+        })
+        .find(|candidate| !taken(candidate))
 }
 
 /// `inside`, a `/` separated path in a synced folder, below `root`; `None` for anything that
@@ -333,9 +458,11 @@ fn name_error(name: &str) -> Option<NameError> {
     }
 }
 
-fn remember_code(shell: &Shell, view: &RecoveryCodeView) {
+fn remember_code(shell: &Shell, view: &RecoveryCodeView, renewal: bool) {
     *lock(&shell.shown) = Some(ShownCode {
         code: Zeroizing::new(view.groups.join("-")),
+        check_group: view.check_group,
+        renewal,
     });
 }
 
@@ -462,6 +589,30 @@ fn inside_synced_folder(path: &Path, snapshot: &Snapshot) -> bool {
     })
 }
 
+/// Writes a file only this user may read: on Unix it is created with mode 0600, and a file the
+/// save dialog lets the person replace is narrowed to 0600 before its new content goes in
+/// (security review N11). On Windows the file inherits the ACL of its folder, which for the
+/// user's own folders admits only the user, the system and administrators.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, PRIVATE_MODE);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_MODE))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Owner read and write, nothing for anyone else.
+#[cfg(unix)]
+const PRIVATE_MODE: u32 = 0o600;
+
 async fn fresh_snapshot(shell: &Shell) -> Answer<Snapshot> {
     shell.engine(|core| Ok(core.snapshot())).await
 }
@@ -540,7 +691,7 @@ pub async fn begin_account(
         .await?;
     if let ApiResult::Ok(view) = &result {
         *lock(&shell.device_name) = Some(name);
-        remember_code(&shell, view);
+        remember_code(&shell, view, false);
     }
     Ok(result)
 }
@@ -618,7 +769,7 @@ pub async fn save_recovery_file(
     {
         return Ok(SaveResult::InCloudFolder);
     }
-    std::fs::write(&path, document.text().as_bytes())?;
+    write_private(&path, document.text().as_bytes())?;
     Ok(SaveResult::Saved {
         path: path_text(&path),
     })
@@ -633,15 +784,41 @@ pub async fn copy_recovery_code(app: AppHandle, shell: State<'_, Shell>) -> Answ
     copy_and_clear(&app, &shell, code)
 }
 
+/// Checks the typed group. For a renewed code the old one stops working on success, so a
+/// matching group is confirmed once more in a native dialog first (security review M4); "no"
+/// there keeps the old code and is not an error.
 #[tauri::command]
-pub async fn confirm_recovery_group(shell: State<'_, Shell>, group: String) -> Answer<bool> {
+pub async fn confirm_recovery_group(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    group: String,
+) -> Answer<RecoveryCheck> {
+    check_recovery_group(&shell, &Native(&app), group).await
+}
+
+async fn check_recovery_group(
+    shell: &Shell,
+    asker: &impl Ask,
+    group: String,
+) -> Answer<RecoveryCheck> {
+    let renewal_matches = lock(&shell.shown)
+        .as_ref()
+        .is_some_and(|shown| shown.renewal && shown.group_matches(&group));
+    if renewal_matches
+        && !asker
+            .ask(shell, crate::confirm::renew_code(shell.language()))
+            .await?
+    {
+        return Ok(RecoveryCheck::Declined);
+    }
     let ok = shell
         .engine(move |core| core.confirm_recovery_group(&group))
         .await?;
-    if ok {
-        *lock(&shell.shown) = None;
+    if !ok {
+        return Ok(RecoveryCheck::Wrong);
     }
-    Ok(ok)
+    *lock(&shell.shown) = None;
+    Ok(RecoveryCheck::Confirmed)
 }
 
 #[tauri::command]
@@ -726,6 +903,20 @@ pub async fn start_pairing(
     input: PairInput,
     device_name: String,
 ) -> Answer<ApiResult<PairWaiting, PairStartError>> {
+    pair(&shell, input, device_name).await
+}
+
+async fn pair(
+    shell: &Shell,
+    input: PairInput,
+    device_name: String,
+) -> Answer<ApiResult<PairWaiting, PairStartError>> {
+    // Only a device without an account pairs (security review H1): a set-up device that joined
+    // another account would hand that account the folders the person adds next. The engine
+    // refuses as well; the shell does not even pass the link on.
+    if fresh_snapshot(shell).await?.account.is_some() {
+        return Err(SyncError::AlreadySetUp.into());
+    }
     let PairInput::Link { link } = input else {
         // The typed path needs the offer's log head, which a typed code does not carry; the
         // engine of version 1 pairs through the link or QR code only.
@@ -762,31 +953,66 @@ pub async fn cancel_pairing(shell: State<'_, Shell>) -> Answer<()> {
 
 #[tauri::command]
 pub async fn list_account_folders(shell: State<'_, Shell>) -> Answer<AccountFolders> {
-    let snapshot = fresh_snapshot(&shell).await?;
-    let home = dirs::home_dir().ok_or_else(|| CommandError::unexpected("no home folder"))?;
-    let mut folders = Vec::with_capacity(snapshot.remote_folders.len());
-    for f in &snapshot.remote_folders {
-        let place = home.join(safe_dir_name(&f.name));
+    account_folders(&shell).await
+}
+
+async fn account_folders(shell: &Shell) -> Answer<AccountFolders> {
+    let base = crate::platform::default_folder()
+        .ok_or_else(|| CommandError::unexpected("no home folder"))?;
+    let probe = base.clone();
+    let proposals = shell
+        .engine(move |core| {
+            let mut chosen: Vec<PathBuf> = Vec::new();
+            let mut out = Vec::new();
+            for f in core.snapshot().remote_folders {
+                let used = |p: &Path| p.exists() || chosen.iter().any(|c| c == p);
+                // A place the engine would refuse (inside a synced folder) only when nothing
+                // else is free, so the window shows that refusal instead of no proposal.
+                let place = proposed_place(&probe, &f.name, |p| {
+                    used(p) || core.check_folder(&path_text(p), None).is_some()
+                })
+                .or_else(|| proposed_place(&probe, &f.name, used))
+                .ok_or(SyncError::Invalid("no free place for an account folder"))?;
+                chosen.push(place.clone());
+                out.push((f, place));
+            }
+            Ok(out)
+        })
+        .await?;
+    let mut folders = Vec::with_capacity(proposals.len());
+    for (f, place) in proposals {
         folders.push(AccountFolder {
-            id: f.id.clone(),
-            name: f.name.clone(),
+            id: f.id,
+            name: f.name,
             size: f.size,
             proposed_path: path_text(&place),
             proposed_token: shell.places.issue(place)?,
         });
     }
+    let home = base.parent().map(Path::to_path_buf).unwrap_or(base);
     Ok(AccountFolders {
         folders,
         free: crate::platform::free_bytes(&home).unwrap_or(0),
     })
 }
 
+/// Joins every chosen folder; answers the IDs of those whose place holds files and for which
+/// the person chose another folder in the native dialog (security review H1).
 #[tauri::command]
-pub async fn join_folders(shell: State<'_, Shell>, choices: Vec<FolderChoice>) -> Answer<()> {
+pub async fn join_folders(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    choices: Vec<FolderChoice>,
+) -> Answer<Vec<String>> {
+    let mut declined = Vec::new();
     for choice in choices {
-        add_account_folder(shell.clone(), choice.folder_id, choice.token).await?;
+        let outcome =
+            join_account_folder(&shell, &Native(&app), &choice.folder_id, &choice.token).await?;
+        if outcome == JoinOutcome::Declined {
+            declined.push(choice.folder_id);
+        }
     }
-    Ok(())
+    Ok(declined)
 }
 
 /// `sheet` is the sheet's link `hangar-drive://recover#...`: only the link carries the genesis
@@ -809,30 +1035,33 @@ pub async fn recover_account(
     Ok(result)
 }
 
+/// With an account, a name that looks like another device's is taken only after a native
+/// question that names that device (skeleton check of device names).
 #[tauri::command]
 pub async fn set_device_name(
+    app: AppHandle,
     shell: State<'_, Shell>,
     name: String,
-) -> Answer<ApiResult<(), NameError>> {
+) -> Answer<ApiResult<(), DeviceNameError>> {
     let snapshot = fresh_snapshot(&shell).await?;
     if snapshot.account.is_none() {
         if let Some(error) = name_error(&name) {
-            return Ok(ApiResult::Err(error));
+            return Ok(ApiResult::Err(error.into()));
         }
         *lock(&shell.device_name) = Some(name);
         return Ok(ApiResult::Ok(()));
     }
-    shell
-        .engine(move |core| {
-            let this = core
-                .list_devices()?
+    let this = shell
+        .engine(|core| {
+            core.list_devices()?
                 .devices
                 .into_iter()
                 .find(|d| d.is_this)
-                .ok_or(SyncError::NotSetUp("this device is not in the list"))?;
-            core.rename_device(&this.id, &name)
+                .map(|d| d.id)
+                .ok_or(SyncError::NotSetUp("this device is not in the list"))
         })
-        .await
+        .await?;
+    rename_checked(&shell, &Native(&app), this, name).await
 }
 
 #[tauri::command]
@@ -840,16 +1069,39 @@ pub async fn recovery_devices(shell: State<'_, Shell>) -> Answer<Vec<Device>> {
     shell.engine(|core| core.recovery_devices()).await
 }
 
+/// Removing regular devices asks natively first and names them (follow-up check N-2); the
+/// window asks nothing before it. `None`: the person said no and nothing was removed. Only
+/// devices the engine offered for removal are passed on, so nothing is removed that the
+/// question did not name.
 #[tauri::command]
 pub async fn finish_recovery_cleanup(
+    app: AppHandle,
     shell: State<'_, Shell>,
     remove: Vec<String>,
-) -> Answer<RecoveryCodeView> {
+) -> Answer<Option<RecoveryCodeView>> {
+    cleanup_after_recovery(&shell, &Native(&app), remove).await
+}
+
+async fn cleanup_after_recovery(
+    shell: &Shell,
+    asker: &impl Ask,
+    remove: Vec<String>,
+) -> Answer<Option<RecoveryCodeView>> {
+    let offered = shell.engine(|core| core.recovery_devices()).await?;
+    let chosen: Vec<&Device> = offered.iter().filter(|d| remove.contains(&d.id)).collect();
+    if !chosen.is_empty() {
+        let names: Vec<String> = chosen.iter().map(|d| d.name.clone()).collect();
+        let confirm = crate::confirm::recovery_cleanup(shell.language(), &names);
+        if !asker.ask(shell, confirm).await? {
+            return Ok(None);
+        }
+    }
+    let remove: Vec<String> = chosen.into_iter().map(|d| d.id.clone()).collect();
     let view = shell
         .engine(move |core| core.finish_recovery_cleanup(&remove))
         .await?;
-    remember_code(&shell, &view);
-    Ok(view)
+    remember_code(shell, &view, false);
+    Ok(Some(view))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -930,19 +1182,68 @@ pub async fn add_folder(shell: State<'_, Shell>, token: String) -> Answer<()> {
 
 #[tauri::command]
 pub async fn add_account_folder(
+    app: AppHandle,
     shell: State<'_, Shell>,
     folder_id: String,
     token: String,
-) -> Answer<()> {
-    let place = shell.places.path(&token)?;
-    check_then_create(&shell, &place, None)
+) -> Answer<JoinOutcome> {
+    join_account_folder(&shell, &Native(&app), &folder_id, &token).await
+}
+
+/// Joins the account folder `folder_id` at the place behind `token`. A place that already holds
+/// files is merged with the folder and uploaded to the server, so the device joins it only after
+/// a native question that names the place, the folder and the server (security review H1); the
+/// window asks nothing before it (ux-concept 6.5).
+async fn join_account_folder(
+    shell: &Shell,
+    asker: &impl Ask,
+    folder_id: &str,
+    token: &str,
+) -> Answer<JoinOutcome> {
+    let place = shell.places.path(token)?;
+    let files = files_at(&place).await?;
+    if files > 0 {
+        let snapshot = fresh_snapshot(shell).await?;
+        let name = snapshot
+            .remote_folders
+            .iter()
+            .find(|f| f.id == folder_id)
+            .map_or_else(|| folder_id.to_owned(), |f| f.name.clone());
+        let host = snapshot
+            .account
+            .as_ref()
+            .map(|a| a.host.clone())
+            .unwrap_or_default();
+        let confirm =
+            crate::confirm::join_folder(shell.language(), &path_text(&place), &name, files, &host);
+        if !asker.ask(shell, confirm).await? {
+            return Ok(JoinOutcome::Declined);
+        }
+    }
+    check_then_create(shell, &place, None)
         .await?
         .map_err(refused)?;
-    shell.places.take(&token)?;
+    shell.places.take(token)?;
     let path = path_text(&place);
+    let folder = folder_id.to_owned();
     shell
-        .engine(move |core| core.add_account_folder(&folder_id, &path))
-        .await
+        .engine(move |core| core.add_account_folder(&folder, &path))
+        .await?;
+    Ok(JoinOutcome::Joined)
+}
+
+/// The files at `place` as the sync would see them (the built-in ignore list skips the rest);
+/// 0 for a place that does not exist yet.
+async fn files_at(place: &Path) -> Answer<u64> {
+    if !place.exists() {
+        return Ok(0);
+    }
+    let place = place.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        hangar_drive_sync::roots::count_files(&place, COUNT_LIMIT)
+    })
+    .await
+    .map_err(|e| CommandError::unexpected(e.to_string()))
 }
 
 #[tauri::command]
@@ -1055,19 +1356,52 @@ pub async fn list_mass_delete(shell: State<'_, Shell>, warning_id: String) -> An
         .await
 }
 
+/// "Restore" runs at once; "delete" asks once more in a native dialog with the folder and the
+/// number of files (security review M4), and "no" there leaves the deletions waiting.
 #[tauri::command]
 pub async fn resolve_mass_delete(
+    app: AppHandle,
     shell: State<'_, Shell>,
     warning_id: String,
     decision: MassDeleteDecision,
-) -> Answer<u64> {
-    shell
+) -> Answer<MassDeleteOutcome> {
+    resolve_deletes(&shell, &Native(&app), warning_id, decision).await
+}
+
+async fn resolve_deletes(
+    shell: &Shell,
+    asker: &impl Ask,
+    warning_id: String,
+    decision: MassDeleteDecision,
+) -> Answer<MassDeleteOutcome> {
+    if decision == MassDeleteDecision::Delete {
+        let snapshot = fresh_snapshot(shell).await?;
+        let (folder, count) = snapshot
+            .warnings
+            .iter()
+            .find_map(|w| match w {
+                Warning::MassDelete {
+                    id,
+                    folder_name,
+                    count,
+                    ..
+                } if *id == warning_id => Some((folder_name.clone(), *count)),
+                _ => None,
+            })
+            .ok_or_else(|| CommandError::invalid("unknown warning"))?;
+        let confirm = crate::confirm::mass_delete(shell.language(), &folder, count);
+        if !asker.ask(shell, confirm).await? {
+            return Ok(MassDeleteOutcome::Declined);
+        }
+    }
+    let count = shell
         .engine(move |core| {
             let folder = folder_of_warning(&core.snapshot(), &warning_id)
                 .ok_or(SyncError::Invalid("unknown warning"))?;
             core.resolve_mass_delete(&folder, decision == MassDeleteDecision::Restore)
         })
-        .await
+        .await?;
+    Ok(MassDeleteOutcome::Resolved { count })
 }
 
 #[tauri::command]
@@ -1131,12 +1465,22 @@ pub async fn confirm_server_number(
     app: AppHandle,
     shell: State<'_, Shell>,
 ) -> Answer<ServerConfirm> {
+    trust_server_number(&shell, &Native(&app)).await
+}
+
+/// The pin of the number in the dialog is taken before the dialog opens and handed back as it
+/// is (security review N7): should another number be shown meanwhile, the engine refuses
+/// instead of trusting a key the person never compared.
+async fn trust_server_number(shell: &Shell, asker: &impl Ask) -> Answer<ServerConfirm> {
     let shown = shell.engine(|core| core.server_number()).await?;
+    let pin = shown.pin;
     let confirm = crate::confirm::server_number(shell.language(), &shown.number.groups);
-    if !native_confirm(&app, &shell, confirm).await? {
+    if !asker.ask(shell, confirm).await? {
         return Ok(ServerConfirm::Declined);
     }
-    shell.engine(|core| core.confirm_server_number()).await?;
+    shell
+        .engine(move |core| core.confirm_server_number(&pin))
+        .await?;
     Ok(ServerConfirm::Confirmed)
 }
 
@@ -1160,12 +1504,38 @@ pub async fn check_older_state(shell: State<'_, Shell>, folder_id: String) -> An
     Ok(if older { "stillOlder" } else { "resolved" })
 }
 
+/// Continues a folder with the server's older state after a native question that names the
+/// folder and what is lost (security review M4); `compared` picks the words of the path with or
+/// without the folder number comparison. The engine's re-anchor is the same either way.
 #[tauri::command]
-pub async fn reanchor(shell: State<'_, Shell>, folder_id: String, compared: bool) -> Answer<()> {
-    // Whether the person compared is the window's business (its texts differ); the engine's
-    // re-anchor is the same either way.
-    let _ = compared;
-    shell.engine(move |core| core.reanchor(&folder_id)).await
+pub async fn reanchor(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    folder_id: String,
+    compared: bool,
+) -> Answer<Confirmation> {
+    continue_older(&shell, &Native(&app), folder_id, compared).await
+}
+
+async fn continue_older(
+    shell: &Shell,
+    asker: &impl Ask,
+    folder_id: String,
+    compared: bool,
+) -> Answer<Confirmation> {
+    let snapshot = fresh_snapshot(shell).await?;
+    let name = snapshot
+        .folders
+        .iter()
+        .find(|f| f.id == folder_id)
+        .map(|f| f.name.clone())
+        .ok_or_else(|| CommandError::invalid("unknown folder"))?;
+    let confirm = crate::confirm::reanchor(shell.language(), &name, compared);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(Confirmation::Declined);
+    }
+    shell.engine(move |core| core.reanchor(&folder_id)).await?;
+    Ok(Confirmation::Confirmed)
 }
 
 #[tauri::command]
@@ -1177,14 +1547,45 @@ pub async fn dismiss_suspect(shell: State<'_, Shell>, warning_id: String) -> Ans
 
 /// Security review H1: the person takes the heads of a removed device in; the window then
 /// offers "Undo a device" from the entry before them.
+///
+/// Asks once more in a native dialog that names the folder and the removed devices (security
+/// review M4); "no" there leaves the folder stopped.
 #[tauri::command]
 pub async fn accept_removed_heads(
+    app: AppHandle,
     shell: State<'_, Shell>,
     folder_id: String,
-) -> Answer<AcceptedHeads> {
-    shell
+) -> Answer<HeadsAnswer> {
+    take_removed_heads(&shell, &Native(&app), folder_id).await
+}
+
+async fn take_removed_heads(
+    shell: &Shell,
+    asker: &impl Ask,
+    folder_id: String,
+) -> Answer<HeadsAnswer> {
+    let snapshot = fresh_snapshot(shell).await?;
+    let (folder, devices) = snapshot
+        .warnings
+        .iter()
+        .find_map(|w| match w {
+            Warning::RemovedHeads {
+                folder_id: id,
+                folder_name,
+                devices,
+                ..
+            } if *id == folder_id => Some((folder_name.clone(), devices.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| CommandError::invalid("no changes of a removed device wait here"))?;
+    let confirm = crate::confirm::accept_heads(shell.language(), &folder, &devices);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(HeadsAnswer::Declined);
+    }
+    let accepted = shell
         .engine(move |core| core.accept_removed_heads(&folder_id))
-        .await
+        .await?;
+    Ok(HeadsAnswer::Accepted(accepted))
 }
 
 #[tauri::command]
@@ -1349,15 +1750,38 @@ pub async fn restore_file(
         .await
 }
 
+/// Resetting a folder changes it on every device, so it asks natively every time, with the
+/// folder's name and the number of files that disappear, which the engine counts first
+/// (follow-up check N-1); the window asks nothing before it. `None`: the person said no.
 #[tauri::command]
 pub async fn reset_folder(
+    app: AppHandle,
     shell: State<'_, Shell>,
     folder_id: String,
     entry_id: String,
-) -> Answer<RestoreOutcome> {
-    shell
+) -> Answer<Option<RestoreOutcome>> {
+    reset_to_entry(&shell, &Native(&app), folder_id, entry_id).await
+}
+
+async fn reset_to_entry(
+    shell: &Shell,
+    asker: &impl Ask,
+    folder_id: String,
+    entry_id: String,
+) -> Answer<Option<RestoreOutcome>> {
+    let (folder, entry) = (folder_id.clone(), entry_id.clone());
+    let preview = shell
+        .engine(move |core| core.reset_folder_preview(&folder, &entry))
+        .await?;
+    let confirm =
+        crate::confirm::reset_folder(shell.language(), &preview.folder_name, preview.vanishing);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(None);
+    }
+    let outcome = shell
         .engine(move |core| core.reset_folder(&folder_id, &entry_id))
-        .await
+        .await?;
+    Ok(Some(outcome))
 }
 
 /// Stops a restore that waits for the upload budget (UX 9.1).
@@ -1404,14 +1828,42 @@ pub async fn list_devices(shell: State<'_, Shell>) -> Answer<DeviceList> {
     shell.engine(|core| core.list_devices()).await
 }
 
+/// A name that looks like another device's is taken only after a native question that names
+/// that device (skeleton check of device names); "no" answers `looksLike`.
 #[tauri::command]
 pub async fn rename_device(
+    app: AppHandle,
     shell: State<'_, Shell>,
     device_id: String,
     name: String,
-) -> Answer<ApiResult<(), NameError>> {
+) -> Answer<ApiResult<(), DeviceNameError>> {
+    rename_checked(&shell, &Native(&app), device_id, name).await
+}
+
+async fn rename_checked(
+    shell: &Shell,
+    asker: &impl Ask,
+    device_id: String,
+    name: String,
+) -> Answer<ApiResult<(), DeviceNameError>> {
+    let (device, probe) = (device_id.clone(), name.clone());
+    let first = shell
+        .engine(move |core| core.rename_device(&device, &probe, false))
+        .await?;
+    if first != ApiResult::Err(DeviceNameError::LooksLike) {
+        return Ok(first);
+    }
+    let (device, probe) = (device_id.clone(), name.clone());
+    let other = shell
+        .engine(move |core| Ok(core.similar_device_name(&probe, Some(&device))))
+        .await?
+        .unwrap_or_default();
+    let confirm = crate::confirm::look_alike_name(shell.language(), &name, &other);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(first);
+    }
     shell
-        .engine(move |core| core.rename_device(&device_id, &name))
+        .engine(move |core| core.rename_device(&device_id, &name, true))
         .await
 }
 
@@ -1422,11 +1874,37 @@ pub async fn get_safety_number(shell: State<'_, Shell>, device_id: String) -> An
         .await
 }
 
+/// Asks in a native dialog that names the device (security review M4); the window asks nothing
+/// before it. "No" there keeps the device.
 #[tauri::command]
-pub async fn remove_device(shell: State<'_, Shell>, device_id: String) -> Answer<()> {
+pub async fn remove_device(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    device_id: String,
+) -> Answer<Confirmation> {
+    remove_one_device(&shell, &Native(&app), device_id).await
+}
+
+async fn remove_one_device(
+    shell: &Shell,
+    asker: &impl Ask,
+    device_id: String,
+) -> Answer<Confirmation> {
+    let devices = shell.engine(|core| core.list_devices()).await?;
+    let name = devices
+        .devices
+        .iter()
+        .find(|d| d.id == device_id && !d.is_this)
+        .map(|d| d.name.clone())
+        .ok_or_else(|| CommandError::invalid("unknown device"))?;
+    let confirm = crate::confirm::remove_device(shell.language(), &name);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(Confirmation::Declined);
+    }
     shell
         .engine(move |core| core.remove_device(&device_id).map(drop))
-        .await
+        .await?;
+    Ok(Confirmation::Confirmed)
 }
 
 #[tauri::command]
@@ -1479,6 +1957,7 @@ pub async fn answer_pair_request(
             shell.language(),
             &request.device_name,
             &request.safety.groups,
+            request.similar_to.as_deref(),
         );
         accept = native_confirm(&app, &shell, confirm).await?;
     }
@@ -1492,36 +1971,97 @@ pub async fn answer_pair_request(
     })
 }
 
+/// The server reported this device as removed, which this device cannot check (security review
+/// H2): the account is forgotten here only after a native question; "no" keeps it, and the
+/// engine keeps sync stopped while the server says so.
+#[tauri::command]
+pub async fn confirm_device_removed(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+) -> Answer<Confirmation> {
+    forget_removed(&shell, &Native(&app)).await
+}
+
+async fn forget_removed(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation> {
+    let reported = fresh_snapshot(shell)
+        .await?
+        .warnings
+        .iter()
+        .any(|w| matches!(w, Warning::RemovalReported { .. }));
+    if !reported {
+        return Err(CommandError::invalid("the server did not report a removal"));
+    }
+    let confirm = crate::confirm::removal_reported(shell.language());
+    if !asker.ask(shell, confirm).await? {
+        return Ok(Confirmation::Declined);
+    }
+    shell.engine(|core| core.confirm_device_removed()).await?;
+    *lock(&shell.shown) = None;
+    *lock(&shell.device_name) = None;
+    Ok(Confirmation::Confirmed)
+}
+
 /// Forgets the account on this device (security review L1): secrets, stored account and the
 /// folders' sync state; the files stay. For "pair again" after a removal and for starting over.
+///
+/// Asks in a native dialog first (security review M4); the window asks nothing before it.
 #[tauri::command]
-pub async fn reset_device(shell: State<'_, Shell>) -> Answer<()> {
+pub async fn reset_device(app: AppHandle, shell: State<'_, Shell>) -> Answer<Confirmation> {
+    reset(&shell, &Native(&app)).await
+}
+
+async fn reset(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation> {
+    if !asker
+        .ask(shell, crate::confirm::reset(shell.language()))
+        .await?
+    {
+        return Ok(Confirmation::Declined);
+    }
     shell.engine(|core| core.reset_device()).await?;
     *lock(&shell.shown) = None;
     *lock(&shell.device_name) = None;
-    Ok(())
+    Ok(Confirmation::Confirmed)
 }
 
 /// Disconnects this device from its account (N2 "these are not my devices", and the device
 /// list): the engine forgets the account here at once, as a reset does. The device stays in the
 /// account's log until a device of that account removes it; it has no keys left to use it.
+/// Asks in a native dialog first, with the warning for the account's last device (security
+/// review M4, ux-concept 10.2); the window asks nothing before it.
 #[tauri::command]
-pub async fn disconnect_this_device(shell: State<'_, Shell>) -> Answer<()> {
-    disconnect(&shell).await
+pub async fn disconnect_this_device(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+) -> Answer<Confirmation> {
+    disconnect(&shell, &Native(&app)).await
 }
 
-async fn disconnect(shell: &Shell) -> Answer<()> {
+async fn disconnect(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation> {
+    // The last device unless the list names another regular one; a list that cannot be read
+    // (no connection) asks the plain question.
+    let last_one = shell
+        .engine(|core| core.list_devices())
+        .await
+        .is_ok_and(|list| list.devices.iter().all(|d| d.is_this));
+    let confirm = crate::confirm::disconnect(shell.language(), last_one);
+    if !asker.ask(shell, confirm).await? {
+        return Ok(Confirmation::Declined);
+    }
     shell.engine(|core| core.disconnect_this_device()).await?;
     *lock(&shell.shown) = None;
     *lock(&shell.device_name) = None;
-    Ok(())
+    Ok(Confirmation::Confirmed)
 }
 
 /// Installs a signed update (`tauri-plugin-updater`, [`crate::updater`]); a clear error while
 /// tauri.conf.json carries no updater public key.
+///
+/// A found update is installed only after a native question that names its version (security
+/// review, information finding); "no" there installs nothing.
 #[tauri::command]
 pub async fn install_update(
     app: AppHandle,
+    shell: State<'_, Shell>,
     updates: State<'_, crate::updater::Updates>,
 ) -> Answer<crate::updater::UpdateOutcome> {
     use tauri_plugin_updater::UpdaterExt as _;
@@ -1539,6 +2079,10 @@ pub async fn install_update(
         return Ok(crate::updater::UpdateOutcome::UpToDate);
     };
     let version = update.version.clone();
+    let confirm = crate::confirm::install_update(shell.language(), &version);
+    if !Native(&app).ask(&shell, confirm).await? {
+        return Ok(crate::updater::UpdateOutcome::Declined);
+    }
     update
         .download_and_install(|_, _| {}, || {})
         .await
@@ -1549,7 +2093,7 @@ pub async fn install_update(
 #[tauri::command]
 pub async fn renew_recovery_code(shell: State<'_, Shell>) -> Answer<RecoveryCodeView> {
     let view = shell.engine(|core| core.renew_recovery_code()).await?;
-    remember_code(&shell, &view);
+    remember_code(&shell, &view, true);
     Ok(view)
 }
 
@@ -1564,15 +2108,29 @@ pub async fn get_settings(app: AppHandle, shell: State<'_, Shell>) -> Answer<Set
     })
 }
 
+/// Turning autostart off asks in a native dialog first (security review M4): a page that was
+/// taken over must not stop the sync from starting unnoticed. Turning it on asks nothing.
 #[tauri::command]
-pub async fn set_autostart(app: AppHandle, on: bool) -> Answer<()> {
+pub async fn set_autostart(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    on: bool,
+) -> Answer<Confirmation> {
     let launcher = app.autolaunch();
-    let result = if on {
-        launcher.enable()
-    } else {
-        launcher.disable()
-    };
-    result.map_err(|e| CommandError::unexpected(e.to_string()))
+    if on {
+        launcher
+            .enable()
+            .map_err(|e| CommandError::unexpected(e.to_string()))?;
+        return Ok(Confirmation::Confirmed);
+    }
+    let confirm = crate::confirm::autostart_off(shell.language());
+    if !Native(&app).ask(&shell, confirm).await? {
+        return Ok(Confirmation::Declined);
+    }
+    launcher
+        .disable()
+        .map_err(|e| CommandError::unexpected(e.to_string()))?;
+    Ok(Confirmation::Confirmed)
 }
 
 /// The backend's texts (notifications, the recovery file) follow at once; the engine's
@@ -1712,6 +2270,7 @@ macro_rules! command_handler {
             $crate::commands::confirm_server_number,
             $crate::commands::fix_server_with_offer,
             $crate::commands::restore_remote_deleted,
+            $crate::commands::confirm_device_removed,
             $crate::commands::install_update,
             $crate::commands::get_settings,
             $crate::commands::set_autostart,
@@ -1806,6 +2365,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "confirm_server_number",
     "fix_server_with_offer",
     "restore_remote_deleted",
+    "confirm_device_removed",
     "install_update",
     "get_settings",
     "set_autostart",
@@ -1948,6 +2508,17 @@ mod tests {
         Shell,
         std::sync::mpsc::Receiver<hangar_drive_sync::api::BackendEvent>,
     ) {
+        engine_shell_on(None)
+    }
+
+    /// [`engine_shell`] whose every sync root is `disk` when one is given, so a test can put
+    /// files into a folder.
+    fn engine_shell_on(
+        disk: Option<std::sync::Arc<hangar_drive_sync::memory::MemFs>>,
+    ) -> (
+        Shell,
+        std::sync::mpsc::Receiver<hangar_drive_sync::api::BackendEvent>,
+    ) {
         use hangar_drive_sync::engine::{Engine, EngineCore, EnginePorts, EngineSettings};
         use hangar_drive_sync::memory::{
             ManualClock, MemFs, MemKeychain, MemServer, MemStore, SeededRandom,
@@ -1960,8 +2531,10 @@ mod tests {
                     keychain: Box::new(MemKeychain::default()),
                     clock: Box::new(ManualClock::at(1_795_651_200_000)),
                     entropy: Box::new(SeededRandom::new(5)),
-                    fs: Box::new(|_path: &Path| {
-                        let fs = std::sync::Arc::new(MemFs::new(true));
+                    fs: Box::new(move |_path: &Path| {
+                        let fs = disk
+                            .clone()
+                            .unwrap_or_else(|| std::sync::Arc::new(MemFs::new(true)));
                         Ok((
                             Box::new(fs) as Box<dyn hangar_drive_sync::ports::FileSystem>,
                             None,
@@ -2009,7 +2582,7 @@ mod tests {
         let ApiResult::Ok(view) = begun else {
             panic!("begin");
         };
-        remember_code(&shell, &view);
+        remember_code(&shell, &view, false);
         assert!(lock(&shell.shown).is_some());
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["groups"].as_array().unwrap().len(), 8);
@@ -2063,7 +2636,7 @@ mod tests {
             shell.engine(move |core| core.confirm_recovery_group(&group))
         )
         .unwrap());
-        remember_code(&shell, &view);
+        remember_code(&shell, &view, false);
         *lock(&shell.device_name) = Some("Laptop".into());
         let snapshot = tauri::async_runtime::block_on(fresh_snapshot(&shell)).unwrap();
         assert_eq!(
@@ -2071,7 +2644,11 @@ mod tests {
             json!("done")
         );
 
-        tauri::async_runtime::block_on(disconnect(&shell)).unwrap();
+        let asked = std::sync::Mutex::new(Vec::new());
+        assert_eq!(
+            tauri::async_runtime::block_on(disconnect(&shell, &Fixed(true, &asked))).unwrap(),
+            Confirmation::Confirmed
+        );
 
         let snapshot = tauri::async_runtime::block_on(fresh_snapshot(&shell)).unwrap();
         assert_eq!(
@@ -2103,6 +2680,473 @@ mod tests {
         assert!(checked_inside(&root, "../outside").is_err());
         assert!(checked_inside(&root, "missing.txt").is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A shell whose device has an account, its recovery code confirmed.
+    fn set_up_shell() -> (
+        Shell,
+        std::sync::mpsc::Receiver<hangar_drive_sync::api::BackendEvent>,
+    ) {
+        set_up_shell_on(None)
+    }
+
+    fn set_up_shell_on(
+        disk: Option<std::sync::Arc<hangar_drive_sync::memory::MemFs>>,
+    ) -> (
+        Shell,
+        std::sync::mpsc::Receiver<hangar_drive_sync::api::BackendEvent>,
+    ) {
+        let (shell, events) = engine_shell_on(disk);
+        let link = format!(
+            "http://localhost:8080/join#{}",
+            hangar_drive_protocol::ids::base64url(&[9; 16])
+        );
+        let ApiResult::Ok(view) = tauri::async_runtime::block_on(
+            shell.engine(move |core| core.begin_account(&link, "Laptop")),
+        )
+        .unwrap() else {
+            panic!("begin");
+        };
+        let group = view.groups[view.check_group as usize - 1].clone();
+        assert!(tauri::async_runtime::block_on(
+            shell.engine(move |core| core.confirm_recovery_group(&group))
+        )
+        .unwrap());
+        (shell, events)
+    }
+
+    fn setup_state(shell: &Shell) -> serde_json::Value {
+        let snapshot = tauri::async_runtime::block_on(fresh_snapshot(shell)).unwrap();
+        serde_json::to_value(&snapshot).unwrap()["setup"].clone()
+    }
+
+    // Security review M4: resetting and disconnecting ask natively; "no" changes nothing and is
+    // not an error, and the question carries the warning for the last device.
+    #[test]
+    fn reset_and_disconnect_run_only_after_a_yes() {
+        let (shell, _events) = set_up_shell();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let no = Fixed(false, &asked);
+        assert_eq!(
+            tauri::async_runtime::block_on(reset(&shell, &no)).unwrap(),
+            Confirmation::Declined
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(disconnect(&shell, &no)).unwrap(),
+            Confirmation::Declined
+        );
+        assert_eq!(setup_state(&shell), json!("done"));
+        {
+            let asked = lock(&asked);
+            assert_eq!(asked.len(), 2);
+            assert_eq!(asked[0], crate::confirm::reset(shell.language()));
+            // The only device of the account: the question warns about it.
+            assert_eq!(asked[1], crate::confirm::disconnect(shell.language(), true));
+        }
+        let yes = Fixed(true, &asked);
+        assert_eq!(
+            tauri::async_runtime::block_on(reset(&shell, &yes)).unwrap(),
+            Confirmation::Confirmed
+        );
+        assert_eq!(setup_state(&shell), json!("needed"));
+    }
+
+    // Security review M4: a renewed code replaces the old one only after a native yes, asked
+    // once the typed group matched; a wrong group asks nothing.
+    #[test]
+    fn a_renewed_code_takes_over_only_after_a_yes() {
+        let (shell, _events) = set_up_shell();
+        let view = tauri::async_runtime::block_on(shell.engine(|core| core.renew_recovery_code()))
+            .unwrap();
+        remember_code(&shell, &view, true);
+        let group = view.groups[view.check_group as usize - 1].clone();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let no = Fixed(false, &asked);
+        let check = |asker: &Fixed<'_>, typed: &str| {
+            tauri::async_runtime::block_on(check_recovery_group(&shell, asker, typed.to_owned()))
+                .unwrap()
+        };
+        assert_eq!(check(&no, "ZZZZ"), RecoveryCheck::Wrong);
+        assert!(lock(&asked).is_empty());
+        assert_eq!(
+            check(&no, &group.to_ascii_lowercase()),
+            RecoveryCheck::Declined
+        );
+        assert_eq!(lock(&asked).len(), 1);
+        // The renewal still waits: the same group confirms it after a yes.
+        assert!(lock(&shell.shown).is_some());
+        let yes = Fixed(true, &asked);
+        assert_eq!(check(&yes, &group), RecoveryCheck::Confirmed);
+        assert!(lock(&shell.shown).is_none());
+        assert_eq!(
+            serde_json::to_value(RecoveryCheck::Declined).unwrap(),
+            json!("declined")
+        );
+    }
+
+    // Security review H1: a device that belongs to an account does not pair, so a window call
+    // cannot move it into a stranger's account. The shell refuses before the engine.
+    // Security review H2: the account is forgotten on a server's "removed" only after it said
+    // so and the person confirmed; without a report nothing is asked and nothing forgotten.
+    #[test]
+    fn a_removal_nobody_reported_forgets_nothing() {
+        let (shell, _events) = set_up_shell();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let error = tauri::async_runtime::block_on(forget_removed(&shell, &Fixed(true, &asked)))
+            .unwrap_err();
+        assert_eq!(error.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+        assert!(lock(&asked).is_empty());
+        assert_eq!(setup_state(&shell), json!("done"));
+    }
+
+    // Follow-up check N-1: a folder reset asks every time, with the folder and the number of
+    // files that disappear; "no" resets nothing and is no error.
+    #[test]
+    fn a_folder_reset_runs_only_after_a_yes() {
+        let disk = std::sync::Arc::new(hangar_drive_sync::memory::MemFs::new(true));
+        let (shell, _events) = set_up_shell_on(Some(std::sync::Arc::clone(&disk)));
+        // Before the folder is added, so its first scan sees the file whenever it runs.
+        disk.user_write(&["first.txt".to_owned()], b"1");
+        let folder = tauri::async_runtime::block_on(
+            shell.engine(|core| core.add_folder("mem:/Docs", "Docs")),
+        )
+        .unwrap();
+        let probe = folder.clone();
+        let entry = tauri::async_runtime::block_on(shell.engine(move |core| {
+            core.tick();
+            core.get_timeline(&probe, 10)
+        }))
+        .unwrap()
+        .entries
+        .last()
+        .map(|e| e.id.clone())
+        .expect("a first entry");
+        // Two files the folder's first entry does not hold; the clock of the test
+        // engine stands still, so the same place again asks for the full scan.
+        disk.user_write(&["new.txt".to_owned()], b"n");
+        disk.user_write(&["more.txt".to_owned()], b"m");
+        let probe = folder.clone();
+        tauri::async_runtime::block_on(shell.engine(move |core| {
+            assert!(core.relocate_folder(&probe, "mem:/Docs")?);
+            core.tick();
+            Ok(())
+        }))
+        .unwrap();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let outcome = tauri::async_runtime::block_on(reset_to_entry(
+            &shell,
+            &Fixed(false, &asked),
+            folder.clone(),
+            entry.clone(),
+        ))
+        .unwrap();
+        assert_eq!(outcome, None);
+        {
+            let asked = lock(&asked);
+            assert_eq!(asked.len(), 1);
+            assert_eq!(
+                asked[0],
+                crate::confirm::reset_folder(shell.language(), "Docs", 2)
+            );
+        }
+        assert!(
+            disk.read_all(&["new.txt".to_owned()]).is_some(),
+            "nothing was reset"
+        );
+        let outcome = tauri::async_runtime::block_on(reset_to_entry(
+            &shell,
+            &Fixed(true, &asked),
+            folder,
+            entry,
+        ))
+        .unwrap();
+        assert!(
+            matches!(outcome, Some(RestoreOutcome::Done { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(lock(&asked).len(), 2);
+    }
+
+    // Follow-up check N-2: without a regular device to remove nothing is asked, and a device ID
+    // the engine did not offer is never passed on.
+    #[test]
+    fn the_recovery_cleanup_passes_on_only_offered_devices() {
+        let (shell, _events) = set_up_shell();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let error = tauri::async_runtime::block_on(cleanup_after_recovery(
+            &shell,
+            &Fixed(true, &asked),
+            vec!["00112233445566778899aabbccddeeff".to_owned()],
+        ))
+        .unwrap_err();
+        // No recovery runs on this device; the engine refuses, and nothing was asked.
+        assert_eq!(error.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+        assert!(lock(&asked).is_empty());
+        assert_eq!(setup_state(&shell), json!("done"));
+    }
+
+    #[test]
+    fn a_set_up_device_does_not_pair() {
+        let (shell, _events) = set_up_shell();
+        let input = PairInput::Link {
+            link: "hangar-drive://pair#AQID".to_owned(),
+        };
+        let error =
+            tauri::async_runtime::block_on(pair(&shell, input, "Laptop".to_owned())).unwrap_err();
+        assert_eq!(error.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+        assert_eq!(error.message, SyncError::AlreadySetUp.to_string());
+        assert_eq!(setup_state(&shell), json!("done"));
+    }
+
+    // Security review H1: a place that holds files is joined only after a native question that
+    // names the place, the number of files and the server; "no" joins nothing and keeps the
+    // place's token for another try.
+    #[test]
+    fn a_folder_with_files_is_joined_only_after_a_yes() {
+        let (shell, _events) = set_up_shell();
+        let place = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("join")
+            .join("Documents");
+        let _ = std::fs::remove_dir_all(&place);
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::write(place.join("letter.txt"), b"x").unwrap();
+        std::fs::write(place.join("notes.txt"), b"y").unwrap();
+        let token = shell.places.issue(place.clone()).unwrap();
+        let asked = std::sync::Mutex::new(Vec::new());
+        let outcome = tauri::async_runtime::block_on(join_account_folder(
+            &shell,
+            &Fixed(false, &asked),
+            "00112233445566778899aabbccddeeff",
+            &token,
+        ))
+        .unwrap();
+        assert_eq!(outcome, JoinOutcome::Declined);
+        let asked = lock(&asked);
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].message.contains(&path_text(&place)),
+            "{}",
+            asked[0].message
+        );
+        assert!(asked[0].message.contains('2'), "{}", asked[0].message);
+        assert!(
+            asked[0].message.contains("localhost:8080"),
+            "{}",
+            asked[0].message
+        );
+        assert!(shell.places.path(&token).is_ok(), "the token stays");
+        assert!(place.join("letter.txt").exists());
+        let _ = std::fs::remove_dir_all(place.parent().unwrap());
+    }
+
+    // Security review H1, N8: proposals are new folders below ~/Hangar Drive, never an existing
+    // place and never a direct child of the home folder; a leading dot is replaced.
+    #[test]
+    fn proposed_places_are_new_folders_below_the_app_folder() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("proposals")
+            .join("Hangar Drive");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Documents")).unwrap();
+        std::fs::create_dir_all(base.join("Documents (2)")).unwrap();
+        let place = proposed_place(&base, "Documents", |p| p.exists()).unwrap();
+        assert_eq!(place, base.join("Documents (3)"));
+        assert_eq!(
+            proposed_place(&base, ".ssh", |p| p.exists()).unwrap(),
+            base.join("_ssh")
+        );
+        assert_eq!(
+            proposed_place(&base, "..", |p| p.exists()).unwrap(),
+            base.join("Hangar Drive")
+        );
+        assert_eq!(proposed_place(&base, "x", |_| true), None);
+        // The app folder itself is the default place, not the home folder.
+        let default = crate::platform::default_folder().unwrap();
+        assert!(default.ends_with("Hangar Drive"));
+        assert!(proposed_place(&default, "Documents", |_| false)
+            .unwrap()
+            .starts_with(&default));
+        let source = include_str!("commands.rs");
+        let at = source.find("async fn account_folders").unwrap();
+        let body = &source[at..at + source[at..].find("\n}\n").unwrap()];
+        assert!(body.contains("default_folder()"), "{body}");
+        assert!(!body.contains("home_dir()"), "{body}");
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    // Security review N8: a leading dot never reaches the file system.
+    #[test]
+    fn folder_names_lose_a_leading_dot() {
+        assert_eq!(safe_dir_name(".config"), "_config");
+        assert_eq!(safe_dir_name("..hidden"), "_.hidden");
+        assert_eq!(safe_dir_name(" .x "), "_x");
+        assert_eq!(safe_dir_name("a.b"), "a.b");
+    }
+
+    // Security review N11: the recovery file is readable by its owner only.
+    #[test]
+    fn the_recovery_file_is_private() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("private");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Recovery sheet.txt");
+        std::fs::write(&path, b"old and longer").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        write_private(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let fresh = dir.join("fresh.txt");
+            write_private(&fresh, b"x").unwrap();
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let source = include_str!("commands.rs");
+        let at = source.find("pub async fn save_recovery_file").unwrap();
+        let body = &source[at..at + source[at..].find("\n}\n").unwrap()];
+        assert!(body.contains("write_private(&path"), "{body}");
+        assert!(!body.contains("std::fs::write"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The body of `pub async fn {name}(` or `async fn {name}(` up to its closing line.
+    fn body_of<'a>(source: &'a str, name: &str) -> &'a str {
+        let at = source
+            .find(&format!("pub async fn {name}("))
+            .or_else(|| source.find(&format!("async fn {name}(")))
+            .unwrap_or_else(|| panic!("no function {name}"));
+        let end = source[at..].find("\n}\n").unwrap();
+        &source[at..at + end]
+    }
+
+    // Security review M4 and N7: every destructive command asks natively before the engine
+    // acts, and the server number confirms exactly the pin taken before the dialog.
+    #[test]
+    fn destructive_commands_ask_natively_first() {
+        let source = include_str!("commands.rs");
+        for (command, helper, acts) in [
+            ("remove_device", "remove_one_device", "core.remove_device("),
+            ("reset_device", "reset", "core.reset_device()"),
+            (
+                "disconnect_this_device",
+                "disconnect",
+                "core.disconnect_this_device()",
+            ),
+            (
+                "confirm_recovery_group",
+                "check_recovery_group",
+                "core.confirm_recovery_group(",
+            ),
+            ("reanchor", "continue_older", "core.reanchor("),
+            (
+                "accept_removed_heads",
+                "take_removed_heads",
+                "core.accept_removed_heads(",
+            ),
+            (
+                "resolve_mass_delete",
+                "resolve_deletes",
+                "core.resolve_mass_delete(",
+            ),
+            (
+                "add_account_folder",
+                "join_account_folder",
+                "core.add_account_folder(",
+            ),
+            (
+                "join_folders",
+                "join_account_folder",
+                "core.add_account_folder(",
+            ),
+            (
+                "confirm_server_number",
+                "trust_server_number",
+                "core.confirm_server_number(",
+            ),
+            ("set_autostart", "set_autostart", ".disable()"),
+            ("install_update", "install_update", ".download_and_install("),
+            (
+                "confirm_device_removed",
+                "forget_removed",
+                "core.confirm_device_removed()",
+            ),
+            // Follow-up check N-1 and N-2.
+            ("reset_folder", "reset_to_entry", "core.reset_folder("),
+            (
+                "finish_recovery_cleanup",
+                "cleanup_after_recovery",
+                "core.finish_recovery_cleanup(",
+            ),
+        ] {
+            let outer = body_of(source, command);
+            assert!(outer.contains("Native(&app)"), "{command}");
+            let inner = body_of(source, helper);
+            let asks = inner
+                .find(".ask(")
+                .unwrap_or_else(|| panic!("{helper} asks nothing"));
+            let acts = inner
+                .find(acts)
+                .unwrap_or_else(|| panic!("{helper} does not act"));
+            assert!(asks < acts, "{helper} acts before it asks");
+        }
+        // Skeleton check: a look-alike name is taken (`true`) only after the question.
+        for command in ["rename_device", "set_device_name"] {
+            assert!(
+                body_of(source, command).contains("Native(&app)"),
+                "{command}"
+            );
+        }
+        let rename = body_of(source, "rename_checked");
+        let asks = rename.find(".ask(").unwrap();
+        let takes = rename
+            .find("core.rename_device(&device_id, &name, true)")
+            .unwrap();
+        assert!(asks < takes);
+        assert!(!rename[..asks].contains(", true)"));
+        let trust = body_of(source, "trust_server_number");
+        let pin = trust.find("let pin = shown.pin;").unwrap();
+        let asks = trust.find(".ask(").unwrap();
+        assert!(pin < asks);
+        assert!(trust.contains("core.confirm_server_number(&pin)"));
+        // "No" is an answer, not an error.
+        assert_eq!(
+            serde_json::to_value(Confirmation::Declined).unwrap(),
+            json!("declined")
+        );
+        assert_eq!(
+            serde_json::to_value(MassDeleteOutcome::Resolved { count: 3 }).unwrap(),
+            json!({ "kind": "resolved", "count": 3 })
+        );
+        assert_eq!(
+            serde_json::to_value(HeadsAnswer::Accepted(AcceptedHeads {
+                count: 2,
+                before_entry_id: None
+            }))
+            .unwrap(),
+            json!({ "kind": "accepted", "count": 2, "beforeEntryId": null })
+        );
+        assert_eq!(
+            serde_json::to_value(JoinOutcome::Declined).unwrap(),
+            json!("declined")
+        );
+        assert_eq!(
+            serde_json::to_value(crate::updater::UpdateOutcome::Declined).unwrap(),
+            json!({ "kind": "declined" })
+        );
     }
 
     #[test]

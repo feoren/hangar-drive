@@ -10,8 +10,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hangar_drive_protocol::api::ErrorCode;
-use hangar_drive_protocol::ids::{AccountId, DeviceId, FolderId, Signature};
+use hangar_drive_protocol::api::{ErrorCode, LogPage};
+use hangar_drive_protocol::ids::{AccountId, Blob, DeviceId, FolderId, Signature};
 use hangar_drive_sync::http::{
     HttpServer, PinVerifier, RetryPolicy, ServerConfig, SessionIdentity,
 };
@@ -353,4 +353,106 @@ fn a_used_challenge_starts_the_sign_in_once_more() {
         .filter(|r| r.starts_with("POST /api/v1/session/challenge"))
         .count();
     assert_eq!(challenges, 2);
+}
+
+/// Security review H2: `device_removed` means "removed" only as the answer to this device's own
+/// proof; on any other route (here the feed, with a token) it is a protocol error, so a server
+/// cannot make the device forget its account with the code on an arbitrary call.
+#[test]
+fn device_removed_counts_only_as_the_answer_to_the_proof() {
+    let challenge = r#"{"server":"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e","challenge":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","expires_in_secs":60}"#;
+    let session =
+        r#"{"token":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","expires_in_secs":3600}"#;
+    let removed = r#"{"code":"device_removed"}"#;
+    let identity = || SessionIdentity {
+        account: AccountId::from_bytes([1; 16]),
+        device: DeviceId::from_bytes([2; 16]),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
+    };
+    let (port, _) = script_server(vec![("200 OK", challenge), ("403 Forbidden", removed)]);
+    let config = one_attempt(ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap());
+    let mut server = HttpServer::new(config, Some(identity())).unwrap();
+    assert_eq!(server.feed(0).unwrap_err(), NetError::DeviceRemoved(None));
+
+    // The proof names the log length this device verified, and the log the server sends with
+    // the answer reaches the engine as it is (checked there against the own head).
+    let removed_with_log =
+        r#"{"code":"device_removed","removal_log":{"first_index":8,"entries":["AQI"],"length":9}}"#;
+    let (port, seen) = script_server(vec![
+        ("200 OK", challenge),
+        ("403 Forbidden", removed_with_log),
+    ]);
+    let config = one_attempt(ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap());
+    let mut server = HttpServer::new(config, Some(identity())).unwrap();
+    server.set_known_log_length(7);
+    assert_eq!(
+        server.feed(0).unwrap_err(),
+        NetError::DeviceRemoved(Some(LogPage {
+            first_index: 8,
+            entries: vec![Blob(vec![1, 2])],
+            length: 9,
+        }))
+    );
+    let requests = seen.lock().unwrap();
+    let proof = requests
+        .iter()
+        .find(|r| r.starts_with("POST /api/v1/session/proof"))
+        .expect("a proof");
+    assert!(proof.contains(r#""log_length":7"#), "{proof}");
+    drop(requests);
+
+    let (port, _) = script_server(vec![
+        ("200 OK", challenge),
+        ("200 OK", session),
+        ("403 Forbidden", removed),
+    ]);
+    let config = one_attempt(ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap());
+    let mut server = HttpServer::new(config, Some(identity())).unwrap();
+    let error = server.feed(0).unwrap_err();
+    assert!(matches!(error, NetError::Protocol(_)), "{error:?}");
+}
+
+/// Security review, info: the pin mismatch flag counts only for the handshake that set it. A
+/// later failure that is no TLS failure (here a server that stops answering) is "unreachable",
+/// not another "the server identifies itself differently".
+#[test]
+fn a_later_timeout_is_not_reported_as_a_pin_mismatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(hex(CB))],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(hex(KB))),
+        )
+        .unwrap(),
+    );
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for (n, tcp) in listener.incoming().enumerate() {
+            let Ok(mut tcp) = tcp else { continue };
+            if n == 0 {
+                // The first connection presents key B.
+                let Ok(mut conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                    continue;
+                };
+                let _ = conn.complete_io(&mut tcp);
+            } else {
+                // Later ones are accepted and never answered.
+                held.push(tcp);
+            }
+        }
+    });
+    let mut config = one_attempt(
+        ServerConfig::new(&format!("https://127.0.0.1:{port}"), Some(pin(CA))).unwrap(),
+    );
+    config.timeout = Duration::from_millis(500);
+    let mut server = HttpServer::new(config, None).unwrap();
+    assert_eq!(server.check_health().unwrap_err(), NetError::PinMismatch);
+    assert_eq!(server.check_health().unwrap_err(), NetError::Unreachable);
 }

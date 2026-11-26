@@ -74,6 +74,10 @@ pub enum SyncError {
     /// The request does not fit the current state (for example an unknown timeline entry).
     #[error("invalid request: {0}")]
     Invalid(&'static str),
+    /// This device already holds an identity or an account, so it cannot join another one
+    /// (security review H1).
+    #[error("this device already belongs to an account")]
+    AlreadySetUp,
     /// A stored value does not decode.
     #[error("stored state is invalid: {0}")]
     Corrupt(String),
@@ -124,6 +128,7 @@ impl SyncError {
             SyncError::Net(NetError::PinMismatch) => ErrorKind::ServerIdentity,
             SyncError::Net(NetError::Tls(_)) => ErrorKind::Insecure,
             SyncError::Net(NetError::Version) => ErrorKind::UpdateRequired,
+            SyncError::Net(NetError::DeviceRemoved(_)) => ErrorKind::Refused,
             SyncError::Net(NetError::Server(body)) => match body.code {
                 ErrorCode::QuotaExceeded => ErrorKind::QuotaFull,
                 ErrorCode::BudgetExceeded => ErrorKind::Budget,
@@ -134,7 +139,9 @@ impl SyncError {
             SyncError::Fs(FsError::DiskFull) => ErrorKind::DiskFull,
             SyncError::Chain(ChainError::OlderState) => ErrorKind::OlderState,
             SyncError::NotSetUp(_) => ErrorKind::NotSetUp,
-            SyncError::Invalid(_) | SyncError::Root(_) => ErrorKind::Invalid,
+            SyncError::Invalid(_) | SyncError::Root(_) | SyncError::AlreadySetUp => {
+                ErrorKind::Invalid
+            }
             _ => ErrorKind::Unexpected,
         }
     }
@@ -147,7 +154,7 @@ impl SyncError {
     /// Whether the server said that this device was removed from its account: its own proof,
     /// made with its key, was answered with `DeviceRemoved` (never a mere `ProofInvalid`).
     pub fn is_device_removed(&self) -> bool {
-        matches!(self, SyncError::Net(e) if e.code() == Some(ErrorCode::DeviceRemoved))
+        matches!(self, SyncError::Net(NetError::DeviceRemoved(_)))
     }
 }
 
@@ -171,9 +178,14 @@ mod tests {
             ErrorKind::OlderState
         );
         assert!(SyncError::Net(NetError::Unreachable).is_offline());
-        let removed = SyncError::Net(NetError::Server(ErrorBody::new(ErrorCode::DeviceRemoved)));
+        let removed = SyncError::Net(NetError::DeviceRemoved(None));
         assert!(removed.is_device_removed() && !removed.is_offline());
-        for other in [ErrorCode::ProofInvalid, ErrorCode::Unauthorized] {
+        // The bare code from a server is not the proof's answer (security review H2).
+        for other in [
+            ErrorCode::DeviceRemoved,
+            ErrorCode::ProofInvalid,
+            ErrorCode::Unauthorized,
+        ] {
             assert!(!SyncError::Net(NetError::Server(ErrorBody::new(other))).is_device_removed());
         }
     }

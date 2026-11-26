@@ -616,6 +616,14 @@ fn set_executable(_file: &File, _on: bool) -> io::Result<()> {
 }
 
 /// Opens an existing file for reading without following a link in its last component.
+///
+/// On Windows `FILE_FLAG_OPEN_REPARSE_POINT` opens a symbolic link, junction or cloud
+/// placeholder that someone put in place of the file as itself, never what it points at, and
+/// the open is refused when the handle is a reparse point (security review N6), as `O_NOFOLLOW`
+/// does on Unix. The check is on the opened handle, so it holds for exactly the file that is
+/// read. The components above the last one are checked by `checked_path` before the open; a
+/// program that may write in the sync root can still swap one of them between that check and
+/// the open (ADR 0001, section 7, "Residual risk").
 fn open_read(full: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -624,7 +632,16 @@ fn open_read(full: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    options.open(full)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(full)?;
+    if is_reparse(&file.metadata()?) {
+        return Err(io::Error::other("the file is a reparse point"));
+    }
+    Ok(file)
 }
 
 fn stat_of(full: &Path, meta: &fs::Metadata) -> Stat {
@@ -1173,6 +1190,15 @@ impl FileSystem for LocalFs {
 
     fn exec_supported(&self) -> bool {
         cfg!(unix)
+    }
+    fn housekeeping(&self, now_ms: i64) {
+        let quarantine = self.reserved().join(QUARANTINE_DIR);
+        // Only a plain directory is touched, as when the root is opened.
+        let plain = fs::symlink_metadata(&quarantine)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink() && !is_reparse(&m));
+        if plain {
+            crate::trash::clean_quarantine(&quarantine, system_time(now_ms));
+        }
     }
 }
 

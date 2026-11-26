@@ -13,6 +13,8 @@
 //!   `Url::join`, which drops a base path (security review N6).
 //! - **Retries:** transient failures (no connection, `429`, `5xx`) are retried with exponential
 //!   backoff, honouring `Retry-After`; redirects are never followed.
+//! - **Proxies:** never for the plain HTTP of a loopback server; for https the environment's
+//!   proxy only tunnels the end-to-end checked TLS connection (security review N5).
 //! - **Limits:** every response body is read with a size limit, so a server cannot make the
 //!   app hold an unbounded answer in memory.
 //! - **SSE:** [`HttpServer::listen_events`] reads the account's event stream and reports each
@@ -302,6 +304,8 @@ pub struct HttpServer {
     mismatch: Arc<Mismatch>,
     identity: Option<SessionIdentity>,
     token: Option<SessionToken>,
+    /// The device log length this device verified, sent with the proof (security review H2).
+    log_length: Option<u64>,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -338,8 +342,18 @@ impl HttpServer {
                 Some(t) => builder.timeout(t),
                 None => builder.timeout(None),
             };
+            // Proxies (security review N5). Plain HTTP is allowed only to the loopback address
+            // (`parse_server_url`), and a proxy from the environment would see such a request,
+            // the proof and the session token in the clear, so it never goes through one. For
+            // https the client keeps the proxy of the environment (`HTTPS_PROXY`, `ALL_PROXY`):
+            // a proxy then only tunnels the TLS connection (`CONNECT`) and learns the host name,
+            // while the certificate or the SPKI pin is checked end to end with the server, so it
+            // can neither read nor change a request. Networks that allow https only through a
+            // proxy keep working that way.
             if config.url.scheme() == "https" {
                 builder = builder.https_only(true);
+            } else {
+                builder = builder.no_proxy();
             }
             builder.build().map_err(|e| NetError::Tls(e.to_string()))
         };
@@ -350,6 +364,7 @@ impl HttpServer {
             mismatch,
             identity,
             token: None,
+            log_length: None,
         })
     }
 
@@ -368,17 +383,17 @@ impl HttpServer {
     }
 
     fn send_error(&self, e: &reqwest::Error) -> NetError {
+        // The mismatch flag stays set until a request succeeds, so the server key number can
+        // still be shown after a later failure; it explains only a failure of the TLS handshake
+        // itself (security review, info). A timeout or a refused connection after a mismatch is
+        // "unreachable", not another "the server identifies itself differently".
+        if !is_tls_failure(e) {
+            return NetError::Unreachable;
+        }
         if self.mismatch.seen().is_some() {
             return NetError::PinMismatch;
         }
-        let text = format!("{e:?}").to_ascii_lowercase();
-        if text.contains("certificate")
-            || text.contains("invalidcertificate")
-            || text.contains("tls")
-        {
-            return NetError::Tls(e.to_string());
-        }
-        NetError::Unreachable
+        NetError::Tls(e.to_string())
     }
 
     fn request(&self, method: &Method, url: Url, body: &Body, auth: bool) -> RequestBuilder {
@@ -435,7 +450,7 @@ impl HttpServer {
                 }
                 Ok(resp) => {
                     let wait = retry_after(&resp);
-                    let error = error_of(resp);
+                    let error = removed_only_on_proof(path, error_of(resp));
                     if !error.is_transient() || attempt >= retry.attempts.max(1) {
                         return Err(error);
                     }
@@ -529,6 +544,7 @@ impl HttpServer {
                 challenge: challenge.challenge,
                 server_url,
                 signature,
+                log_length: self.log_length,
             })?,
             false,
         )?;
@@ -559,7 +575,7 @@ impl HttpServer {
             if resp.status() == StatusCode::UNAUTHORIZED {
                 self.token = None;
             }
-            return Err(error_of(resp));
+            return Err(removed_only_on_proof(api::EVENTS_PATH, error_of(resp)));
         }
         self.mismatch.set(None);
         parse_sse(BufReader::new(resp), &mut on_sequence)
@@ -603,6 +619,36 @@ impl HttpServer {
     }
 }
 
+/// Whether a failed request failed in TLS: a `rustls` error in its source chain (also inside
+/// nested I/O errors), or a message that names a certificate or TLS. A timeout never is one.
+fn is_tls_failure(e: &reqwest::Error) -> bool {
+    if e.is_timeout() {
+        return false;
+    }
+    if std::error::Error::source(e).is_some_and(holds_rustls_error) {
+        return true;
+    }
+    let text = format!("{e:?}").to_ascii_lowercase();
+    text.contains("certificate") || text.contains("tls") || text.contains("rustls")
+}
+
+/// Whether `error` or anything below it is a `rustls` error. An I/O error's `source` skips the
+/// error it wraps, so that one is reached through `get_ref`.
+fn holds_rustls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.downcast_ref::<rustls::Error>().is_some() {
+        return true;
+    }
+    if let Some(inner) = error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+    {
+        if holds_rustls_error(inner) {
+            return true;
+        }
+    }
+    error.source().is_some_and(holds_rustls_error)
+}
+
 fn json<T: Serialize>(value: &T) -> Result<Body, NetError> {
     serde_json::to_vec(value)
         .map(Body::Json)
@@ -620,9 +666,30 @@ fn retry_after(resp: &Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// `device_removed` counts only as the answer to this device's own proof (security review H2):
+/// [`NetError::DeviceRemoved`] on [`api::PROOF_PATH`], a protocol error on every other route.
+/// A token says nothing about which key made it, so "removed" on a call with a token, or on a
+/// call without any, is no statement about this device's key and must not make it forget.
+fn removed_only_on_proof(path: &str, error: NetError) -> NetError {
+    match error {
+        NetError::Server(body) if body.code == api::ErrorCode::DeviceRemoved => {
+            if path == api::PROOF_PATH {
+                NetError::DeviceRemoved(body.removal_log)
+            } else {
+                NetError::Protocol(format!("device_removed is no answer of {path}"))
+            }
+        }
+        other => other,
+    }
+}
+
+/// The largest error body read: a `device_removed` answer carries up to `MAX_LOG_PAGE` device
+/// log entries (a few hundred bytes each, in base64url), far more than any other error body.
+const MAX_ERROR_BODY: u64 = 1024 * 1024;
+
 fn error_of(resp: Response) -> NetError {
     let status = resp.status();
-    match read_limited(resp, 64 * 1024)
+    match read_limited(resp, MAX_ERROR_BODY)
         .ok()
         .and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok())
     {
@@ -751,6 +818,7 @@ impl ServerApi for HttpServer {
                 challenge: *challenge,
                 server_url: hangar_drive_crypto::session::base_url(&self.config.url),
                 signature: *signature,
+                log_length: None,
             })?,
             false,
         )
@@ -885,6 +953,10 @@ impl ServerApi for HttpServer {
 
     fn seen_pin(&self) -> Option<[u8; 32]> {
         self.mismatch.seen()
+    }
+
+    fn set_known_log_length(&mut self, length: u64) {
+        self.log_length = Some(length);
     }
 }
 

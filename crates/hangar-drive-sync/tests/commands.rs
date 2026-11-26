@@ -13,8 +13,8 @@ use hangar_drive_crypto::identity::server_key_number;
 use hangar_drive_protocol::api::ErrorCode;
 use hangar_drive_protocol::ids::{base64url, DeviceId, ServerId};
 use hangar_drive_sync::api::{
-    ActivityEntry, ApiResult, BackendEvent, FixServerError, FolderStatus, NumberRows, PairResult,
-    RestoreOutcome, SetupState, StopReasonApi, Warning,
+    ActivityEntry, ApiResult, BackendEvent, DeviceNameError, FixServerError, FolderStatus,
+    NumberRows, PairResult, RestoreOutcome, SetupState, StopReasonApi, Warning,
 };
 use hangar_drive_sync::engine::{
     EngineCore, EnginePorts, EngineSettings, RESTORE_RETRY_MS, SERVER_NUMBER_COMMAND,
@@ -513,7 +513,10 @@ fn the_server_number_confirmed_becomes_the_pin() {
     set_up(&mut a, true);
     a.add_folder("mem:/a/Docs", "Docs").unwrap();
     a.tick();
-    assert!(a.confirm_server_number().is_err(), "no number was shown");
+    assert!(
+        a.confirm_server_number(&NEW_KEY).is_err(),
+        "no number was shown"
+    );
     world.shared.borrow_mut().presented_pin = Some(NEW_KEY);
     world.clock.advance(20_000);
     a.tick();
@@ -529,7 +532,9 @@ fn the_server_number_confirmed_becomes_the_pin() {
         shown.number,
         NumberRows::of(&server_key_number(&ServerId::from_bytes(SERVER), &NEW_KEY))
     );
-    a.confirm_server_number().unwrap();
+    // Security review N7: only the key whose number was shown, never another one.
+    assert!(a.confirm_server_number(&[0x42; 32]).is_err());
+    a.confirm_server_number(&shown.pin).unwrap();
     world.clock.advance(20_000);
     a.tick();
     assert!(
@@ -541,7 +546,7 @@ fn the_server_number_confirmed_becomes_the_pin() {
         a.snapshot().warnings
     );
     // Taken once: a second confirmation needs a number shown again.
-    assert!(a.confirm_server_number().is_err());
+    assert!(a.confirm_server_number(&shown.pin).is_err());
     // A server that presents no other key has no number to compare.
     assert!(a.server_number().is_err());
 }
@@ -565,8 +570,8 @@ fn an_offer_of_a_trusted_device_brings_the_new_server_key() {
             .any(|w| matches!(w, Warning::ServerIdentity { .. })));
     }
     // A compares the number; then it connects and offers the new key to B.
-    a.server_number().unwrap();
-    a.confirm_server_number().unwrap();
+    let shown = a.server_number().unwrap();
+    a.confirm_server_number(&shown.pin).unwrap();
     a.tick();
     let offer = a.create_pairing_offer().unwrap();
 
@@ -662,4 +667,134 @@ fn files_another_device_deleted_come_back_from_the_activity() {
     // A second time brings nothing: both are back already.
     assert_eq!(b.restore_remote_deleted(&entry.0).unwrap(), 0);
     assert!(b.restore_remote_deleted("a-unknown").is_err());
+}
+
+// Follow-up check N-3: a warning is hidden only while the engine shows it; an ID the window
+// makes up is refused and hides nothing that appears later. Only "suspect device" is on the
+// allowlist, so a shown "folder missing" is refused as well and stays.
+#[test]
+fn only_a_shown_warning_can_be_hidden() {
+    let world = World::new();
+    let (mut a, mut b, folder) = two_devices(&world);
+    let id = format!("missing-{folder}");
+    assert!(b.dismiss_warning(&id).is_err(), "not shown yet");
+    assert!(b.dismiss_warning("made-up").is_err());
+    let disk = world.disk("mem:/b/Docs");
+    assert!(disk.user_delete(&hangar_drive_sync::folder::marker_path()));
+    world.settle(&mut [&mut a, &mut b]);
+    let shown = |b: &EngineCore| {
+        b.snapshot()
+            .warnings
+            .iter()
+            .any(|w| matches!(w, Warning::MissingFolder { .. }))
+    };
+    assert!(shown(&b), "the early attempt hid nothing");
+    assert!(b.dismiss_warning(&id).is_err(), "not on the allowlist");
+    assert!(shown(&b), "the refused attempt hid nothing");
+}
+
+// Skeleton check of device names: a new device whose name looks like one of the account's is
+// named in the request, so the window and the native question can say so.
+#[test]
+fn a_pairing_request_names_a_device_that_looks_the_same() {
+    let world = World::new();
+    let mut a = world.device(1, SharedKeychain::default());
+    let mut b = world.device(2, SharedKeychain::default());
+    set_up(&mut a, false);
+    let offer = a.create_pairing_offer().unwrap();
+    // Cyrillic small a in "Laptop", the name of the device that invites.
+    assert!(matches!(
+        b.start_pairing(&offer.link, "L\u{0430}ptop").unwrap(),
+        ApiResult::Ok(_)
+    ));
+    let request = a
+        .tick()
+        .into_iter()
+        .find_map(|e| match e {
+            BackendEvent::PairRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("pair request");
+    assert_eq!(request.similar_to.as_deref(), Some("Laptop"));
+    assert_eq!(
+        a.pair_request(&request.offer_id)
+            .unwrap()
+            .similar_to
+            .as_deref(),
+        Some("Laptop")
+    );
+    // A name that does not look like any is not flagged.
+    assert_eq!(a.similar_device_name("Desktop", None), None);
+}
+
+// A rename to a name that looks like another device's needs the confirmation the app gets in
+// the native question; the device's own name in another case is no look-alike of itself.
+#[test]
+fn a_rename_to_a_look_alike_needs_the_confirmation() {
+    let world = World::new();
+    let (mut a, _b, _folder) = two_devices(&world);
+    let devices = a.list_devices().unwrap().devices;
+    let me = devices.iter().find(|d| d.is_this).unwrap().id.clone();
+    let other = devices.iter().find(|d| !d.is_this).unwrap().id.clone();
+    assert_eq!(
+        a.rename_device(&other, "LAPT0P", false).unwrap(),
+        ApiResult::Err(DeviceNameError::LooksLike)
+    );
+    let names = |a: &EngineCore| {
+        a.list_devices()
+            .unwrap()
+            .devices
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>()
+    };
+    assert!(!names(&a).contains(&"LAPT0P".to_owned()));
+    assert_eq!(
+        a.rename_device(&other, "LAPT0P", true).unwrap(),
+        ApiResult::Ok(())
+    );
+    assert!(names(&a).contains(&"LAPT0P".to_owned()));
+    assert_eq!(
+        a.rename_device(&me, "Mein Rechner", false).unwrap(),
+        ApiResult::Ok(())
+    );
+    assert_eq!(
+        a.rename_device(&me, "MEIN RECHNER", false).unwrap(),
+        ApiResult::Ok(())
+    );
+}
+
+// Follow-up check N-1: the engine counts the files a folder reset makes disappear before the
+// native question.
+#[test]
+fn a_reset_preview_counts_the_files_that_disappear() {
+    let world = World::new();
+    let (mut a, mut b, folder) = two_devices(&world);
+    let first = a
+        .get_timeline(&folder, 20)
+        .unwrap()
+        .entries
+        .last()
+        .unwrap()
+        .id
+        .clone();
+    world.disk("mem:/a/Docs").user_write(&p(&["new.txt"]), b"n");
+    world
+        .disk("mem:/a/Docs")
+        .user_write(&p(&["more.txt"]), b"m");
+    world
+        .disk("mem:/a/Docs")
+        .user_write(&p(&["plan.txt"]), b"v2");
+    world.settle(&mut [&mut a, &mut b]);
+    let preview = a.reset_folder_preview(&folder, &first).unwrap();
+    assert_eq!(preview.folder_name, "Docs");
+    assert_eq!(preview.vanishing, 2, "plan.txt changes but stays");
+    // Nothing changed by the preview.
+    assert_eq!(
+        world
+            .disk("mem:/b/Docs")
+            .read_all(&p(&["new.txt"]))
+            .unwrap(),
+        b"n"
+    );
 }

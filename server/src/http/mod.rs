@@ -135,16 +135,26 @@ async fn authorize_inner(
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0);
+    if let Some(proxy) =
+        client_ip::untrusted_forwarder(request.headers(), peer, &app.trusted_proxies)
+    {
+        if app.forwarder_warnings.first(proxy) {
+            tracing::warn!(
+                %proxy,
+                "operator warning: a local address sends X-Forwarded-For but is not in \
+                 HANGAR_DRIVE_TRUSTED_PROXIES; every client behind it shares its rate limits. \
+                 Add the proxy's exact address there if it is your reverse proxy"
+            );
+        }
+    }
     let ip = client_ip::client_ip(request.headers(), peer, &app.trusted_proxies);
     let (ip_key, net_key) = (client_ip::rate_key(ip), client_ip::net_key(ip));
-    let limited = |handler: access::Handler, account: Option<&[u8]>| {
-        let keys = ratelimit::RateKeys {
-            ip: &ip_key,
-            net: &net_key,
-            account,
-        };
-        !ratelimit::check_route(&app.limiter, handler, &keys, app.now_ms() / 1000)
+    let keys = ratelimit::RateKeys {
+        ip: &ip_key,
+        net: &net_key,
+        account: None,
     };
+    let now_s = app.now_ms() / 1000;
     match access {
         // A known path with a method the table does not name has no handler but the 405
         // fallback; everything else outside the table is refused.
@@ -155,12 +165,16 @@ async fn authorize_inner(
         .into_response(),
         None => ApiError::new(ErrorCode::Forbidden).into_response(),
         Some((Access::Public, handler)) => {
-            if limited(handler, None) {
+            if !ratelimit::check_route(&app.limiter, handler, &keys, now_s) {
                 return ApiError::new(ErrorCode::RateLimited).into_response();
             }
             next.run(request).await
         }
         Some((Access::Call(call), handler)) => {
+            // The address limits come before the token is looked up (overall review, info).
+            if !ratelimit::check_address(&app.limiter, handler, &keys, true, now_s) {
+                return ApiError::new(ErrorCode::RateLimited).into_response();
+            }
             let Some(token) = extract::bearer(request.headers()) else {
                 return ApiError::new(ErrorCode::Unauthorized).into_response();
             };
@@ -171,7 +185,12 @@ async fn authorize_inner(
             if session.scope.require(call).is_err() {
                 return ApiError::new(ErrorCode::Forbidden).into_response();
             }
-            if limited(handler, Some(session.account.as_bytes().as_slice())) {
+            if !ratelimit::check_account(
+                &app.limiter,
+                handler,
+                session.account.as_bytes().as_slice(),
+                now_s,
+            ) {
                 return ApiError::new(ErrorCode::RateLimited).into_response();
             }
             request.extensions_mut().insert(session);
@@ -213,6 +232,20 @@ async fn guard(request: Request, next: Next) -> Response {
     }
     set_headers(response.headers_mut());
     response
+}
+
+/// `Strict-Transport-Security` on every reply of a server that terminates TLS itself: a year,
+/// without `includeSubDomains` or `preload`, which would bind hosts this server does not serve.
+pub fn with_hsts(router: Router) -> Router {
+    router.layer(middleware::map_response(
+        |mut response: Response| async move {
+            response.headers_mut().insert(
+                "strict-transport-security",
+                HeaderValue::from_static("max-age=31536000"),
+            );
+            response
+        },
+    ))
 }
 
 fn set_headers(headers: &mut HeaderMap) {

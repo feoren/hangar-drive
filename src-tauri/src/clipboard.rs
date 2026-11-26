@@ -71,9 +71,10 @@ pub fn copy_and_clear<C: Clipboard>(
     Ok(())
 }
 
-/// The clipboard text the window may see: a `hangar-drive://` link, an `http(s)://` invite or
-/// join link, or a code of Crockford base32 groups (recovery and pairing codes); `""` for
-/// anything else, so the window never reads unrelated clipboard contents.
+/// The clipboard text the window may see: a `hangar-drive://join#`, `pair#` or `recover#` link,
+/// an `http(s)://<host>/join#` invite, or a recovery or pairing code in its exact printed form;
+/// `""` for anything else, so the window never reads unrelated clipboard contents (security
+/// review L2, N10).
 pub fn readable(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_READ_CHARS {
@@ -86,43 +87,62 @@ pub fn readable(text: &str) -> String {
     }
 }
 
-fn looks_like_link(text: &str) -> bool {
-    // White space inside a pasted link is removed by the window; a line break or a control
-    // character is not part of one.
-    if text.chars().any(char::is_control) {
-        return false;
-    }
-    let lower = text.to_ascii_lowercase();
-    if [
-        "hangar-drive://join#",
-        "hangar-drive://pair#",
-        "hangar-drive://recover#",
-    ]
-    .iter()
-    .any(|p| lower.starts_with(p))
-    {
-        return true;
-    }
-    // An invite as the server prints it: `https://host/join#...` (http only for localhost,
-    // which the engine's parser decides).
-    (lower.starts_with("https://") || lower.starts_with("http://"))
-        && lower.contains("/join#")
-        && !lower.contains(char::is_whitespace)
+/// The app's own link prefixes.
+const APP_LINKS: [&str; 3] = [
+    "hangar-drive://join#",
+    "hangar-drive://pair#",
+    "hangar-drive://recover#",
+];
+
+/// A link's fragment: base64url and the `.` an invite uses between its parts.
+fn fragment_ok(fragment: &str) -> bool {
+    !fragment.is_empty()
+        && fragment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// A recovery or pairing code: groups of two to eight Crockford base32 characters (the letters
-/// I, L and O the window maps to digits included, U never), separated by `-` or spaces, 8 to 80
-/// characters in all and at least one digit, so a line of ordinary words is not one.
+fn looks_like_link(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if let Some(prefix) = APP_LINKS.iter().find(|p| lower.starts_with(*p)) {
+        return fragment_ok(&text[prefix.len()..]);
+    }
+    // An invite as the server prints it: `https://host/join#...`, the path exactly `/join`
+    // (http only for localhost, which the engine's parser decides).
+    let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let Some((authority, fragment)) = rest.split_once("/join#") else {
+        return false;
+    };
+    let authority_ok = !authority.is_empty()
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']'));
+    // The fragment from the original text, its case kept.
+    authority_ok && fragment_ok(&text[text.len() - fragment.len()..])
+}
+
+/// Crockford's base32 alphabet, as the codes are printed (no I, L, O or U).
+const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/// A recovery or pairing code: eight groups of four characters.
+const CODE_GROUPS: usize = 8;
+const GROUP_LEN: usize = 4;
+
+/// A recovery or pairing code exactly as the app prints it: eight groups of four Crockford
+/// base32 characters, in any case, separated by `-` or by single spaces.
 fn looks_like_code(text: &str) -> bool {
-    let groups: Vec<&str> = text.split(['-', ' ']).filter(|g| !g.is_empty()).collect();
-    let crockford = |c: char| c.is_ascii_alphanumeric() && !c.eq_ignore_ascii_case(&'u');
-    let letters: usize = groups.iter().map(|g| g.len()).sum();
-    !groups.is_empty()
-        && groups
-            .iter()
-            .all(|g| (2..=8).contains(&g.len()) && g.chars().all(crockford))
-        && (8..=80).contains(&letters)
-        && text.chars().any(|c| c.is_ascii_digit())
+    let separator = if text.contains('-') { '-' } else { ' ' };
+    let groups: Vec<&str> = text.split(separator).collect();
+    groups.len() == CODE_GROUPS
+        && groups.iter().all(|g| {
+            g.len() == GROUP_LEN
+                && g.bytes()
+                    .all(|b| CROCKFORD.contains(&b.to_ascii_uppercase()))
+        })
 }
 
 #[cfg(test)]
@@ -202,9 +222,11 @@ mod tests {
         for good in [
             "hangar-drive://pair#AQIDBA",
             "  HANGAR-DRIVE://recover#AQID  ",
+            "hangar-drive://join#AQ_d-x",
             "https://drive.example/join#abc.def",
+            "http://localhost:8080/join#CQkJ",
             "D7KQ-M2XP-9H4T-RW8C-ZB3N-F6JA-Q1VE-K5SY",
-            "d7kq m2xp 9h4t rw8c",
+            "d7kq m2xp 9h4t rw8c zb3n f6ja q1ve k5sy",
             "07GE-3RQ3-WKJY-DSZ8-X7NE-QV7D-XVQJ-SKJC",
         ] {
             assert_eq!(readable(good), good.trim(), "{good:?}");
@@ -220,6 +242,39 @@ mod tests {
             "short",
             "äöü-äöü-äöü",
             &"A".repeat(MAX_READ_CHARS + 1),
+        ] {
+            assert_eq!(readable(bad), "", "{bad:?}");
+        }
+    }
+
+    // Security review N10: only the exact code format and the link prefixes pass; text that
+    // merely contains a link part or looks a bit like a code stays on the clipboard.
+    #[test]
+    fn near_misses_are_not_read() {
+        for bad in [
+            // Codes of the wrong shape: too few or too many groups, a wrong group length, a
+            // letter outside Crockford's alphabet, mixed or doubled separators.
+            "d7kq m2xp 9h4t rw8c",
+            "PIN 1234-5678",
+            "4711-0815-2342-1337",
+            "D7KQ-M2XP-9H4T-RW8C-ZB3N-F6JA-Q1VE-K5SY-ABCD",
+            "D7KQM-2XP-9H4T-RW8C-ZB3N-F6JA-Q1VE-K5SY",
+            "D7KQ-M2XP-9H4T-RW8C-ZB3N-F6JA-Q1VE-K5SU",
+            "D7KQ-M2XP-9H4T-RW8C ZB3N-F6JA-Q1VE-K5SY",
+            "D7KQ  M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY",
+            "ab12 cd34 ef56 gh78 jk90 mn12 pq34 rs5o",
+            // Links that only contain a prefix or a path part.
+            "see https://drive.example/join#abc",
+            "https://evil.example/x?/join#abc",
+            "https://user@drive.example/join#abc",
+            "https://drive.example/join#abc def",
+            "https://drive.example/join#",
+            "https://drive.example/join#abc!x",
+            "hangar-drive://pair#",
+            "hangar-drive://pair#AQ ID",
+            "hangar-drive://pair#AQID?x=1",
+            "hangar-drive://other#AQID",
+            "ftp://drive.example/join#abc",
         ] {
             assert_eq!(readable(bad), "", "{bad:?}");
         }

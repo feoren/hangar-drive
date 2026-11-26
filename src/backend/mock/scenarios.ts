@@ -80,6 +80,8 @@ export const SCENARIOS = [
   { id: "olderState", label: "Server shows older state" },
   { id: "removed", label: "This device was removed" },
   { id: "removedUnknown", label: "Removed, by an unknown device" },
+  { id: "removalReported", label: "Server reports a removal" },
+  { id: "treeLimit", label: "Server version too large" },
   { id: "updateRequired", label: "Update required" },
   { id: "updateOff", label: "Update required, updates off" },
   { id: "refused", label: "Server refuses this device" },
@@ -317,6 +319,18 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
     case "removedUnknown":
       // The server answered `deviceRemoved` at sign-in; who removed it is not known.
       state.warnings = [{ kind: "removed", id: "w-removed", by: "" }];
+      break;
+    case "removalReported":
+      // The server answered this device's sign-in with "removed" (security review H2).
+      state.warnings = [{ kind: "removalReported", id: "w-removal", since: now - 2 * fx.HOUR }];
+      break;
+    case "treeLimit":
+      // The server's newest version of a folder is too large to be one (security review M3).
+      state.warnings = [
+        { kind: "treeLimit", id: "w-tree", folderId: "f-main", folderName: "Hangar Drive" },
+      ];
+      setFolderStatus(state, "f-main", { kind: "stopped", reason: "treeLimit" });
+      state.notices = [{ kind: "olderAccountState" }];
       break;
     case "updateRequired":
       state.warnings = [{ kind: "updateRequired", id: "w-update" }];

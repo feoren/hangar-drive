@@ -83,6 +83,18 @@ pub async fn find_or_create(
     if let Some(row) = find(conn, account_pk, folder).await? {
         return Ok(row);
     }
+    // The garbage collection deleted this folder and is still removing its files (overall
+    // review N2): a new row now would put new files into the directory being removed.
+    let removing: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM folder_tombstones WHERE account_pk = ? AND folder_id = ?",
+    )
+    .bind(account_pk)
+    .bind(folder.as_bytes().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    if removing.is_some() {
+        return Err(ErrorCode::RateLimited.into());
+    }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE account_pk = ?")
         .bind(account_pk)
         .fetch_one(&mut *conn)
@@ -191,7 +203,8 @@ pub async fn retire(app: &App, session: &Session, folder: FolderId) -> ApiResult
 /// retained bytes made live again. If a standing pin holds the retired head (a retirement that
 /// set off the burst signal, finding M3), its tree goes through the pin restore allowance first,
 /// as every restore of a pinned tree does: undoing a harmful retirement does not wait for the
-/// budget the harmful device may have used up.
+/// budget the harmful device may have used up. That happens once per pinned head (overall
+/// review N1); a later bring-back of the same head pays the budgets.
 pub async fn bring_back(app: &App, session: &Session, folder: FolderId) -> ApiResult<()> {
     let now = app.now_ms();
     let mut tx = begin_write(&app.db).await?;
@@ -211,17 +224,30 @@ pub async fn bring_back(app: &App, session: &Session, folder: FolderId) -> ApiRe
         return Err(ErrorCode::QuotaExceeded.into());
     }
     let head_seq = head(&mut tx, head_pk).await?.seq;
-    let pinned: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM pins WHERE folder_pk = ? AND seq = ? AND lapsed_ms IS NULL AND until_ms > ? LIMIT 1",
+    // The allowance covers a pinned head once (overall review N1): a pin on this head that
+    // was brought back with it before, even a pin that ended since or one made by a later
+    // retirement of the same head, leaves the next bring-back to the budgets. Otherwise a
+    // device could retire and bring back the same pinned folder over and over for free.
+    let (pinned, used): (i64, i64) = sqlx::query_as(
+        "SELECT \
+         COALESCE(SUM(lapsed_ms IS NULL AND until_ms > ?), 0), \
+         COALESCE(SUM(brought_back_ms IS NOT NULL), 0) \
+         FROM pins WHERE folder_pk = ? AND seq = ?",
     )
+    .bind(i64_of(now))
     .bind(row.pk)
     .bind(i64_of(head_seq))
-    .bind(i64_of(now))
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     let mut paid = row.live.all();
-    if pinned.is_some() {
+    if pinned > 0 && used == 0 {
         paid -= usage::take_allowance(&mut tx, &app.limits, session.account_pk, paid, now).await?;
+        sqlx::query("UPDATE pins SET brought_back_ms = ? WHERE folder_pk = ? AND seq = ?")
+            .bind(i64_of(now))
+            .bind(row.pk)
+            .bind(i64_of(head_seq))
+            .execute(&mut *tx)
+            .await?;
     }
     let hit = usage::charge_budget(
         &mut tx,

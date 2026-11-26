@@ -8,7 +8,6 @@ import type { FolderId, RestoreOutcome, Timeline, TimelineEntry, TreeNode } from
 import { formatRelative, formatTime } from "../format";
 import { useLanguage, useT } from "../i18n";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
-import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Dialog } from "../ui/Dialog";
 import { FileIcon, FolderIcon, SearchIcon } from "../ui/icons";
 import { RowMenu } from "../ui/Menu";
@@ -461,7 +460,6 @@ function VersionTreeView({
     [backend, folderId, entry.id],
   );
   const [onlyDiff, setOnlyDiff] = useState(true);
-  const [confirmReset, setConfirmReset] = useState(false);
   const reset = useOutcome();
   const when = whenText(language, t, entry.at, now);
   const checkId = useId();
@@ -499,30 +497,26 @@ function VersionTreeView({
               disabled={reset.action.pending}
               onClick={() => {
                 reset.clear();
-                setConfirmReset(true);
+                // The shell asks natively, with the folder and the files that disappear on
+                // every device (follow-up check N-1); "no" there changes nothing and says nothing.
+                void reset.action.run(async () => {
+                  const outcome = await backend.resetFolder(folderId, entry.id);
+                  if (outcome !== null) {
+                    reset.show(outcome, () =>
+                      t("restore.folder.done", { folder: folderName, when }),
+                    );
+                  }
+                });
               }}
             >
               {t("restore.folder")}
             </button>
             {reset.line}
           </div>
+          {reset.action.error !== null && (
+            <Feedback tone="error">{errorText(reset.action.error, t)}</Feedback>
+          )}
         </>
-      )}
-      {confirmReset && (
-        <ConfirmDialog
-          title={t("restore.folder.title")}
-          confirmLabel={t("restore.folder.confirm")}
-          focus="confirm"
-          onConfirm={async () => {
-            const outcome = await backend.resetFolder(folderId, entry.id);
-            reset.show(outcome, () => t("restore.folder.done", { folder: folderName, when }));
-          }}
-          onClose={() => {
-            setConfirmReset(false);
-          }}
-        >
-          <p>{t("restore.folder.body", { folder: folderName, when })}</p>
-        </ConfirmDialog>
       )}
     </div>
   );

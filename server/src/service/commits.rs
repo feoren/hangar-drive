@@ -76,21 +76,46 @@ async fn load_ids(tx: &mut Tx, request: &CommitRequest) -> ApiResult<()> {
         lists.push((Part::SideAdded, &side.delta.added));
         lists.push((Part::SideDropped, &side.delta.dropped));
     }
-    // One static statement per list: the IDs travel as one JSON array of hex strings, which
-    // SQLite unpacks itself, so no SQL text depends on the request.
+    // One static statement: the IDs travel as JSON arrays of hex strings, which SQLite
+    // unpacks itself, so no SQL text depends on the request. They go in pages written straight
+    // into one reused text (overall review N4): a list of a million IDs as one `Vec<String>`
+    // plus its JSON held about 160 MiB on top of the parsed request, per commit call.
+    let mut json = String::with_capacity(ID_PAGE * (ObjectId::LEN * 2 + 3) + 2);
     for (part, ids) in lists {
-        if ids.is_empty() {
-            continue;
-        }
-        let hex: Vec<String> = ids.iter().map(ObjectId::to_hex).collect();
-        let json = serde_json::to_string(&hex).map_err(|e| ApiError::internal(&e))?;
-        sqlx::query("INSERT INTO commit_ids (id, part) SELECT unhex(value), ? FROM json_each(?)")
+        for page in ids.chunks(ID_PAGE) {
+            json.clear();
+            json.push('[');
+            for (i, id) in page.iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                json.push('"');
+                push_hex(&mut json, id.as_bytes());
+                json.push('"');
+            }
+            json.push(']');
+            sqlx::query(
+                "INSERT INTO commit_ids (id, part) SELECT unhex(value), ? FROM json_each(?)",
+            )
             .bind(part.code())
-            .bind(json)
+            .bind(json.as_str())
             .execute(&mut **tx)
             .await?;
+        }
     }
     Ok(())
+}
+
+/// IDs per statement of [`load_ids`]: about 270 KiB of JSON each.
+const ID_PAGE: usize = 4096;
+
+/// Appends `bytes` as lowercase hex.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
 }
 
 /// IDs of `part` the folder does not hold, at most as many as an error lists.
@@ -827,4 +852,17 @@ pub async fn delta(
         sequence: row.seq,
         more: after.saturating_add(limit) < row.seq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_id_pages_spell_ids_as_their_hex() {
+        let id = ObjectId::from_bytes([0x0f, 0xa0, 0x5c, 0xff].repeat(8).try_into().unwrap());
+        let mut out = String::new();
+        push_hex(&mut out, id.as_bytes());
+        assert_eq!(out, id.to_hex());
+    }
 }

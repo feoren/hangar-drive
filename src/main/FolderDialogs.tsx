@@ -1,6 +1,7 @@
 // Dialogs of the folder rows: stop syncing, folder number, entries that are never synced, and
-// "Add folder" with the merge question for a folder that is not empty (6.5). "Delete everywhere"
-// has no dialog of its own: the shell asks natively (security review L2), see FolderList.
+// "Add folder". Neither "Delete everywhere" nor joining a folder that is not empty (6.5) has a
+// dialog of its own: the shell asks natively (security review L2, H1), see FolderList and
+// `bring` below.
 
 import { useId, useState } from "react";
 
@@ -12,7 +13,6 @@ import { Dialog } from "../ui/Dialog";
 import { FolderIcon, PlusIcon } from "../ui/icons";
 import { Feedback, Loading, NumberRows } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
-import { MergeDialog } from "../setup/MergeDialog";
 import { folderRefusalText } from "./BannerArea";
 
 export function StopFolderDialog({
@@ -113,8 +113,6 @@ export function NotSyncedDialog({
   );
 }
 
-type Pending = { readonly folderId: FolderId; readonly name: string; readonly place: FolderPlace };
-
 /** "Add folder" (UX 6.3): folders of the other devices first, then any folder here. */
 export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
   const t = useT();
@@ -123,7 +121,6 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
   const titleId = useId();
   const action = useAction();
   const [message, setMessage] = useState<string | null>(null);
-  const [merge, setMerge] = useState<Pending | null>(null);
 
   /**
    * The backend proposes the place (and its token) right when the person asks, so a folder that
@@ -138,18 +135,26 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
     return picked.kind === "picked" ? picked : null;
   };
 
-  const bring = (folderId: FolderId, name: string) => {
+  /**
+   * Joins the folder at `token`. A place that holds files is asked about natively by the shell
+   * (6.5, security review H1); "Choose another folder" there opens the picker and tries again.
+   */
+  const join = async (folderId: FolderId, token: string): Promise<void> => {
+    const outcome = await backend.addAccountFolder(folderId, token);
+    if (outcome === "joined") {
+      onClose();
+      return;
+    }
+    const picked = await backend.pickFolder({ kind: "account", folderId });
+    if (picked.kind === "refused") setMessage(folderRefusalText(picked.reason, picked.folder, t));
+    if (picked.kind === "picked") await join(folderId, picked.token);
+  };
+
+  const bring = (folderId: FolderId) => {
     setMessage(null);
     void action.run(async () => {
       const place = await placeFor(folderId);
-      if (!place) return;
-      const count = await backend.countLocalFiles(place.token);
-      if (count > 0) {
-        setMerge({ folderId, name, place });
-        return;
-      }
-      await backend.addAccountFolder(folderId, place.token);
-      onClose();
+      if (place) await join(folderId, place.token);
     });
   };
 
@@ -166,23 +171,6 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
       onClose();
     });
   };
-
-  if (merge) {
-    return (
-      <MergeDialog
-        folderId={merge.folderId}
-        folderName={merge.name}
-        place={merge.place}
-        onMerge={async (place) => {
-          await backend.addAccountFolder(merge.folderId, place.token);
-          onClose();
-        }}
-        onClose={() => {
-          setMerge(null);
-        }}
-      />
-    );
-  }
 
   const remote = snapshot.remoteFolders;
   const deleted = snapshot.deletedFolders;
@@ -204,7 +192,7 @@ export function AddFolderDialog({ onClose }: { readonly onClose: () => void }) {
                   className="button secondary small"
                   disabled={action.pending}
                   onClick={() => {
-                    bring(folder.id, folder.name);
+                    bring(folder.id);
                   }}
                 >
                   {t("main.addFolder.bring")}
