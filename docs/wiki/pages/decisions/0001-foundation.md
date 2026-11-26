@@ -2,7 +2,7 @@
 title: "ADR 0001: Foundation: scope, sync model, server and encryption"
 type: decision
 tags: [scope, sync, server, backup, e2e, crypto, architecture, merge, restore, quota]
-sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[unix-inode-reuse-measurement]]"]
+sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[unix-inode-reuse-measurement]]", "[[tauri-nsis-uninstall-code-reading]]", "[[merge-collision-benchmark]]"]
 status: accepted
 superseded_by:
 created: 2026-11-26
@@ -171,7 +171,8 @@ publishes a merge commit.
   - Version 1 writes and accepts at most two parents. The format's limit of 8
     ([[threat-model-and-crypto-design]], section 8.4) stays reserved.
   - Reference deltas are always relative to the first parent ([[threat-model-and-crypto-design]],
-    section 4.1).
+    section 4.1), or full; every commit signs a digest of its delta (amendment "reference deltas
+    bound to the tree").
 - **Publishing (client):**
   1. The device builds commit C on its base B from its local tree, uploads the missing objects
      and calls commit with expected head B.
@@ -256,7 +257,9 @@ conflict copy.**
   `YYYY-MM-DD` at the merge. `<ext>` is everything after the last dot, unless that dot is the
   first character; without an extension the suffix goes at the end. If the name is taken, ` 2`,
   ` 3` and so on are appended inside the parentheses. The date is only a label; it decides
-  nothing.
+  nothing. A name longer than 255 UTF-16 units is shortened: the stem first, down to its first
+  character, then the extension, and the label last (amendment "collisions in linear time and
+  copy names within the limit").
 - The word `conflict` is written in the merging device's UI language (for example `Konflikt` in
   German), with English as the fallback; the same holds for `restored` in section 5. The whole
   name is only a label for people: no device parses it, and no rule of this ADR depends on it
@@ -560,11 +563,12 @@ primitives the sister app already uses:
     (`RecoveryCode::identity`, `RecoveryCode::device_id`, label
     `hangar-drive/v1/recovery-device-id`, vector `recovery.device_id`), so nothing else is
     needed. The sheet's public part is also the link `hangar-drive://recover#<payload>`
-    (base64url of the sheet bytes, version 2 since the second engine review: account ID, server
-    ID, the genesis anchor, the optional SPKI pin and the server URL; see the amendment "App
-    shell and the second engine review"); the link never carries the code, which is always
-    typed. The server ID is learnt before the code is shown, through the
-    session challenge, which the server answers for any account and which writes nothing.
+    (base64url of the sheet bytes, version 3: account ID, server ID, the genesis anchor, the
+    code's anchor tag over account and anchor, the optional SPKI pin and the server URL; see the
+    amendments "App shell and the second engine review" and "Recovery link bound to the code");
+    the link never carries the code, which is always typed. The server ID is learnt before the
+    code is shown, through the session challenge, which the server answers for any account and
+    which writes nothing.
   - **Flow** (conclusion): the new installation signs in as the recovery device at the
     sheet's server (server ID checked at the sign-in), checks that the verified log lists that
     recovery device as current with the derived keys (otherwise the code is unknown or used
@@ -688,7 +692,9 @@ primitives the sister app already uses:
   - **Burst threshold** (conclusion, server security review L4): within the rolling hour, at
     least `min(500, 30 % of the folder's file objects)` file objects, but never fewer than 20,
     that make up at least 30 % of the folder's file data. A fixed 500 alone meant a folder with
-    fewer files could never set off a pin. An operator count below 20 is taken as set.
+    fewer files could never set off a pin. An operator count below 20 is taken as set. The share
+    also counts against the file data at the start of the window (amendment "reference deltas
+    bound to the tree", LOW 1).
   - **Retirement** (conclusion, server security review M3): retiring a folder counts as
     dropping every live object of it and goes through the same burst signal: a retired folder
     with at least 20 file objects pins its last head and every device is told. A retired
@@ -828,8 +834,11 @@ primitives the sister app already uses:
     Otherwise a compromised device could upload garbage, drop it in its next commit and lock
     every honest device out until the window ends.
   - **Checked at upload and at commit:**
-    - `PUT /objects/{id}` is refused when the live bytes plus uncommitted uploads plus the new
-      object would exceed the quota. A commit only references objects the server already holds,
+    - `PUT /objects/{id}` is refused when the live bytes plus the uploading device's own
+      uncommitted uploads plus the new object would exceed the quota. Only the device's own
+      uploads count (amendment "One device cannot lock out the others"): counting every
+      device's uploads let one compromised device block all the others with uploads it never
+      commits. A commit only references objects the server already holds,
       but a delete or a partial restore still uploads the new directory nodes on the path to the
       root. Directory nodes (type 3, visible in the object header) may therefore use a headroom
       above the quota, operator-set, default 1% of the quota and at least 64 MiB (conclusion).
@@ -846,7 +855,9 @@ primitives the sister app already uses:
     cost nothing, so moves, renames and dedup hits on live objects are free. Otherwise a device
     could keep any amount of dropped data stored, by making it live again and dropping it, one
     quota at a time, before each window ends. Both budgets are separate from the account quota.
-    - **Per device:** stops only the device that exceeds it. Default: the account budget.
+    - **Per device:** stops only the device that exceeds it. Default: half the account budget
+      (amendment "One device cannot lock out the others"), so one device never uses up the
+      budget of the others.
     - **Per account:** the sum over all its devices. Default: the account quota, so a first full
       upload fits in one day. It is needed because a compromised device can add devices to the
       account log, each with its own device budget, so device budgets alone bound nothing
@@ -890,8 +901,10 @@ primitives the sister app already uses:
     `notice` to every device of the account. Remedies: remove the device (its tokens end at
     once) and, if needed, an operator purge through the server CLI.
   - **Disk reserve:** below a configured free disk reserve the server refuses all new uploads
-    and warns the operator. This is the only case in which honest devices are blocked, and it
-    means the disk is too small for the configured quotas. Bytes that uploads in flight have
+    and warns the operator. It is the only limit that blocks honest devices because of
+    something outside their account, and it means the disk is too small for the configured
+    quotas. Within an account, see the amendment "One device cannot lock out the others" for
+    what a compromised device can still block and for how long. Bytes that uploads in flight have
     announced but not written count as used, the reserve is checked again before an upload is
     stored, and each account has at most a few uploads in flight (server security review M5).
   - **Records** (conclusion, server security review L3): the sealed account records of an
@@ -1074,6 +1087,13 @@ primitives the sister app already uses:
   under it would land in the reserved directory past the ignore list. Which short names exist
   depends on the volume and the order of creation, so every name of that shape is refused, not
   only the reserved one; elsewhere such names sync as usual.
+- **Shell junction names** (conclusion, follow-up review of the Windows handles, M1): a name
+  that ends in a dot and a GUID in braces (`Bilder.{0AFACED1-E828-11D1-9187-B532F1E9575D}`) is
+  marked "cannot sync on this device" on Windows (`WindowsNameProblem::ShellJunction`). The
+  Explorer shell takes such a folder for the namespace extension the GUID names; with
+  `CLSID_FolderShortcut` and a `target.lnk` inside, a shell path through it resolves to the
+  link's target, which another device could otherwise sync into a root. Files of that form are
+  refused too; elsewhere such names sync as usual.
 - **Code points HFS+ ignores** (conclusion, overall security review N15): the case keys drop
   U+200C to U+200F, U+202A to U+202E, U+206A to U+206F and U+FEFF before they are computed, the
   code points HFS+ ignores when it compares names (Apple TN1150, not measured on a volume), so
@@ -1082,15 +1102,15 @@ primitives the sister app already uses:
 - Long paths: the app manifest declares `longPathAware`, and file system calls use `\\?\`
   paths, because the manifest alone works only when the `LongPathsEnabled` registry value is set.
 - 8.3 short names from watcher events are resolved to long names before matching.
-- **Reading a file** (overall security review N6): the open uses `FILE_FLAG_OPEN_REPARSE_POINT`
-  on Windows and `O_NOFOLLOW` on Unix and refuses a handle that is a reparse point, so a link put
-  in place of the file is never read through. **Residual risk:** the directories above the file
-  are checked by path before the open (their file IDs against the index, L1), not through
-  handles; a program that may write in the sync root can swap one of them for a junction or a
-  link between that check and the open, and the engine then reads, and uploads, a file from
-  outside the root. Roots that other users or untrusted programs may write to are not protected
-  against that race; closing it needs a walk by handles (`NtCreateFile` relative to a directory
-  handle, `openat` on Unix), an open point.
+- **Reading a file** (overall security review N6): the open uses `FILE_OPEN_REPARSE_POINT` on
+  Windows and `O_NOFOLLOW` on Unix and refuses a handle that is a reparse point, so a link put
+  in place of the file is never read through. The directories above the file are opened by
+  handles as well, each relative to the one above it (amendments "Directory handles on Unix" and
+  "Directory handles on Windows", L1), so a directory swapped for a link or junction between the
+  check and the open changes nothing: the engine reads the file in the directory it checked.
+  Before the Windows amendment the directories were checked by path on Windows, and a program
+  that may write in the sync root could swap one of them for a junction in between and make the
+  engine read, and upload, a file from outside the root.
 - Locked files (sharing violations from Office, antivirus, the indexer) are retried with backoff
   and never block the whole run.
 - Downloads go to a temporary file and are renamed atomically.
@@ -1103,10 +1123,12 @@ primitives the sister app already uses:
   survives writes, renames, time and mode changes, so a move keeps its ID. `st_ctime` is not a
   fallback: it changes with every rename and every time or mode change (same measurement), so
   moves would lose their ID, a directory would get a new ID with every entry added to it, and
-  the engine's own `set_meta` would read as a replace. Code: `crates/hangar-drive-sync/src/localfs.rs`
-  (`unix_id`).
+  the engine's own `set_meta` would read as a replace. Code:
+  `crates/hangar-drive-sync/src/localfs/unix.rs` (`unix_id`, read through `statx` relative to a
+  directory handle since the amendment "Directory handles on Unix", with the same values std's
+  metadata gave on glibc and macOS).
   - **Residual risk:** where the file system reports no birth time (ext4 with 128 byte inodes,
-    ext3, 9p, NFSv3, many FUSE file systems, and musl builds, whose std does not call `statx`),
+    ext3, 9p, NFSv3, many FUSE file systems, and kernels before 4.11 without `statx`),
     the ID stays device and inode. There, a file another program deleted and created again
     with the same size and mtime (to the tolerance) on the same inode is taken for the expected
     one: an incoming replace overwrites the other program's file instead of keeping it as a
@@ -1415,6 +1437,8 @@ second sync engine review. Formats of version 1 that were never shipped change i
   - **Pin:** a sheet printed for a self-signed server carries the pin this device trusts, so the
     recovery's first connection is pinned like a pairing's; a sheet for a public CA carries none.
   - Version 1 sheets (without anchor) are refused.
+  - Superseded by version 3 (amendment "Recovery link bound to the code"): the anchor alone does
+    not stop a forged account that lists the recovery device.
 - **Log length (N4):** reading a device log refuses a server's page that claims more than
   `MAX_LOG_ENTRIES`, before any entry is read, and stops after at most that many pages
   (`recovery::fetch_log`, `Account::sync_log`).
@@ -1466,7 +1490,8 @@ Fixes of the app shell's security review (M1 to M3, L1 to L7, I1 to I4), each wi
   is set up again; `resetDevice` does the same without the warning; a join that fails after the
   identity was stored, or joins another account, leaves nothing behind. The NSIS uninstaller
   starts the app with `--uninstall-cleanup` (not on an update), which forgets the secrets and
-  removes the index folder.
+  removes the index folder. Narrowed later to an uninstall with the "delete app data" box
+  ticked, see the amendment "Installer upgrade keeps the device keys".
 - **Defense in depth (L2):** accepting a pairing request and deleting a folder everywhere ask
   again in a native dialog that names the device and its safety number, or the folder. Folder
   places reach the backend only as tokens of `pickFolder`, `defaultFolderPlace` and
@@ -1863,3 +1888,855 @@ that fails without the fix.
 | --- | --- | --- |
 | `ProofRequest.log_length: Option<u64>` | request of `POST /session/proof` | optional and left out when empty; a server of an older build refuses it as an unknown field (no build is released yet) |
 | `ErrorBody.removal_log: Option<LogPage>` | `device_removed` answer of the proof | optional; replies ignore unknown fields |
+
+## Amendment 2026-11-26: installer upgrade keeps the device keys
+
+Finding HIGH of an independent security review: a manual upgrade or downgrade on Windows forgot
+the device's account. The pre-uninstall hook (`src-tauri/windows/hooks.nsh`) started
+`--uninstall-cleanup` whenever `$UpdateMode` was not 1, but the Tauri NSIS template of tauri-cli
+2.12.6 sets that only when the installer itself runs with `/UPDATE`, which only the updater does.
+An interactive installer of a newer or older version preselects "uninstall before installing" and
+runs the installed version's uninstaller without `/UPDATE`, so the cleanup removed
+`device-identity`, every epoch secret, the index and `settings.json` on each manual upgrade
+([[tauri-nsis-uninstall-code-reading]]). With the updater off until the owner adds its key (see
+[[0002-version-scheme]]), that is the only way to update. No build had been released, so no
+installed copy carries the old hook.
+
+- **Decision:** the cleanup runs only after the person's explicit choice:
+  `${If} $UpdateMode <> 1` `${AndIf} $DeleteAppDataCheckboxState = 1`. The template's "delete app
+  data" box on the uninstaller's confirmation page is always shown, unchecked, and read in
+  `un.ConfirmLeave` before the uninstall section runs; silent and passive uninstalls leave it
+  empty ([[tauri-nsis-uninstall-code-reading]]). The box is reliable in the reinstall path too,
+  because that path runs the same uninstaller with its pages, so no extra message box is needed.
+  Keeping the keys is the safe default on an upgrade: a lost identity means setting the device up
+  again, a kept one costs nothing there.
+- **Wording:** custom language files (`src-tauri/windows/German.nsh`, `English.nsh`, entered in
+  `bundle.windows.nsis.customLanguageFiles`) replace the CLI's built-in ones, identical except for
+  `deleteAppData` ("App-Daten und Geräteschlüssel dieses PCs löschen" / "Delete app data and this
+  PC's device keys") and `${PRODUCTNAME}` instead of the placeholder the bundler leaves unfilled.
+  They have to be compared with the built-in files after every CLI update.
+- **Trade-off against L1** (amendment "Security review of the app shell"): L1 made every
+  uninstall forget the device's secrets so that the next user of the PC finds nothing to open.
+  That stays available, but as a choice: an uninstall without the tick, and every upgrade or
+  downgrade, now leaves the device identity and the epoch secrets in the user's Credential Manager
+  and the index in `%LOCALAPPDATA%\Hangar Drive`. Both belong to the same Windows user, who could
+  read them while the app was installed anyway (SECURITY.md, "Installation per user"); a person
+  who gives the PC away ticks the box or uses "Dieses Gerät zurücksetzen" first. The device stays
+  in the account's log either way until another device removes it.
+- **Tests:** `cleanup::tests::the_uninstall_hook_runs_the_cleanup_only_when_the_person_ticked_it`
+  interprets the hook's conditions for every combination of the two variables (it fails with the
+  old hook), and `the_delete_box_names_the_device_keys_in_every_installer_language` checks the
+  language files and their entries in `tauri.conf.json`. The hook and both language files were
+  compiled and run with makensis 3.13 in a harness ([[tauri-nsis-uninstall-code-reading]]). The
+  real installer flow is a manual check before every release ([[0002-version-scheme]]).
+
+## Amendment 2026-11-26: recovery link bound to the code
+
+Finding LOW of an independent security review, "recovery link as phishing into a foreign
+account". The recovery sheet's link carries server URL, pin and genesis anchor, and a link can
+come from anyone. Whoever knows an account's device log (the server's operator, a copy of its
+database) can build an account of their own: the same account ID, their own entry 1 and device,
+the code's recovery device listed in it (its public keys and its proof of possession are public in
+the real log, and the proof binds only account ID, device ID and the recovery flag), an epoch
+secret they hold wrapped to its KEM key, and a link to their server with their own genesis
+anchor. The real code then passed every check there (the log starts with the link's anchor and
+lists the recovery device, current, with exactly the derived keys), and the new device joined an
+account whose epoch secret the attacker knows: what the person then put into it was readable by
+the attacker.
+
+**Decision: recovery sheet, version 3, with an anchor tag.**
+
+```text
+sheet      = 0x03 || account ID (16) || server ID (16) || genesis (32) || anchor tag (16)
+             || pin flag (0x00 or 0x01) || SPKI pin (32, with flag 0x01) || server URL
+anchor tag = HKDF-SHA256(salt none, ikm = the code's 128 bit entropy,
+                         info = field("hangar-drive/v1/recovery-anchor") || field(account ID)
+                                || field(genesis), 16 bytes)
+```
+
+- `RecoveryCode::anchor_tag`, `RecoverySheet::new` and `RecoverySheet::is_for` in
+  `crates/hangar-drive-crypto/src/recovery.rs`. The recovering installation checks the tag right
+  after the code is typed and before it connects anywhere (`EngineCore::recover_account`), and
+  `recovery::add_device_with_code` checks it again before it reads the log, so every caller of the
+  recovery step does. A sheet that fails answers the new window code `wrongSheet`
+  (`RecoverError::WrongSheet`, `RecoveryError::WrongSheet`), with the text
+  `error.recovery.wrongSheet` in all twelve languages: the link does not belong to the code, take
+  the link or QR code from the same sheet as the code, and do not use a link somebody sent.
+- **Why it holds against the attack:** the attacker knows the complete log, every public key and
+  the server database, but not the code. HKDF-Expand is HMAC-SHA256 under a key extracted from
+  the code's 128 bits, a PRF, so without the code nobody can make the tag for any (account,
+  genesis) pair, and a tag seen on a real sheet covers only the real genesis. The attacker's
+  account cannot reuse the real genesis either: entry 1 is signed by the creating device and
+  every later entry by a device the log lists, so a log that starts with the real anchor continues
+  only with entries real devices signed, and an epoch secret is accepted only against the
+  commitment such an entry carries. Forging a tag by guessing succeeds with probability 2^-128 per
+  link the person opens. The check also keeps the recovery device's sign-in away from a server the
+  code was not made for.
+- **Why not the key derivation:** feeding the genesis anchor into the recovery device's keys would
+  bind as well, but entry 1 lists the first recovery device, so the anchor (the hash of entry 1)
+  depends on that device's keys: circular. Moving the recovery device out of entry 1, or a signed
+  commitment in a later log entry, would change the log, the account creation and the server's
+  admission rules; the tag changes only the sheet, which was never shipped.
+- **Bound and not bound:** account ID and genesis anchor are bound. Server URL, server ID and pin
+  are not: a server may move, and a wrong server cannot produce a log that starts with the real
+  anchor (N1), so they need no binding of their own.
+- **Code renewal:** every new code (setup, `renewRecoveryCode`, the new code after a recovery in
+  `finish_recovery_cleanup`) makes its own sheet with its own tag over the same account and
+  anchor, so a renewed code's link differs from the old one in the tag only. An old sheet's link
+  with a new code is refused as `wrongSheet`, which tells the person to keep code and link of one
+  sheet together.
+- **Printed sheet:** the tag is part of the link and its QR code only; the sheet prints no field
+  for it, since the person pastes or scans the link and never types its parts. No safety number
+  was added: the cryptographic binding needs no comparison by the person.
+- Versions 1 and 2 are refused (`SheetError::Version`); no build with either was released.
+- Vectors: `recovery.anchor_tag` is new, `recovery.sheet` and `recovery.sheet_unpinned` are
+  version 3, recomputed independently by `crates/hangar-drive-crypto/test_vectors.py`.
+- Tests: `a_sheet_is_only_for_the_code_it_was_made_with` (crypto: another genesis or account with
+  the real tag fails, another code fails, server URL, server ID and pin are free);
+  `a_forged_account_that_lists_the_recovery_device_cannot_take_the_code`
+  (`crates/hangar-drive-sync/tests/engine.rs`: the attack built from public data only on a second
+  in-memory server, refused as `wrongSheet` before a single call reaches that server, refused by
+  `add_device_with_code` on its own, then the control that the same forged account with a tag only
+  the code holder can make would pass every other check, and the good case with the real sheet);
+  `a_sheet_with_another_genesis_is_refused` (another anchor with the real tag is `wrongSheet`,
+  another anchor with a valid tag is still refused by the log check as `unknown`);
+  `a_renewed_code_replaces_the_old_one_after_the_group_check` (same fields, new link, old link with
+  the new code is `wrongSheet`); window tests for the text and the mock.
+
+## Amendment 2026-11-26: directory handles on Unix (security review L1)
+
+Finding L1 of the independent security review (low): on Unix the directories between the sync
+root and a target were checked by path (`symlink_metadata`, file IDs against the index) and the
+operation then resolved the path again. A local program with write access in the sync root could
+swap a checked directory for a symbolic link in between, and a write, delete, rename, directory
+creation, metadata change or read landed outside the root.
+
+- **Decision:** on Linux and macOS every operation of `LocalFs` goes through directory handles
+  (`crates/hangar-drive-sync/src/localfs/unix.rs`). The root is opened with `O_DIRECTORY |
+  O_NOFOLLOW`, each directory on the way with `openat` relative to the one above it and `O_RDONLY
+  | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`; a link or a file on the way fails that open (`ELOOP`,
+  `ENOTDIR`, `EMLINK` on FreeBSD) and is `FsError::Changed`, and where the index knows a
+  directory's file ID the ID of the open handle (`fstat`) must match. The operation is relative to
+  the handle of the directory that holds the target: `openat` with `O_NOFOLLOW` (reads also with
+  `O_NONBLOCK` and a regular file check, so a FIFO cannot block), `statx` or `fstatat` with
+  `AT_SYMLINK_NOFOLLOW`, `mkdirat`, `unlinkat`, `linkat`, `renameat2` with `RENAME_NOREPLACE` and
+  `RENAME_EXCHANGE` on Linux, `renameatx_np` with `RENAME_EXCL` and `RENAME_SWAP` on macOS (the
+  fallbacks of L2 and L3 unchanged, now handle-relative), and listings through `fdopendir` on the
+  handle. A path is never resolved twice: a directory swapped after the walk changes only what the
+  path means, and the operation stays in the directory that was checked, inside the root.
+- **Reserved directory and cleaning:** `.hangar-drive/` and its levels are created with `mkdirat`
+  and opened with `O_NOFOLLOW` (N5 unchanged in effect); emptying `tmp` at start enters only plain
+  directories through their handles, at most 16 levels deep.
+- **Stats:** `std::fs::Metadata` has no handle-relative form, so the module reads stats itself
+  (`statx` with `STATX_BTIME` on Linux, falling back to `fstatat` where `statx` is missing, and
+  `fstatat` with `st_birthtime` on macOS). Device (`makedev` of the `statx` halves), inode, birth
+  time and modification time are the values std read before, so the file IDs in existing indexes
+  stay valid (test `handle_stats_match_std_metadata`). musl builds now get the birth time too.
+- **Dependency:** `rustix` 1.1 (features `fs`, `std`) for the Unix target, section 8 policy:
+  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT, Bytecode Alliance, already in the lock file
+  through tempfile and polling, so no crate was added; safe wrappers, so the module has no unsafe
+  code. Alternatives: `libc` directly (about fifteen unsafe blocks and an own directory reader),
+  `nix` (no wrapper of `renameatx_np`). `libc` stays for `statfs` and `getuid`. `cargo deny`
+  green.
+- **Windows unchanged:** the IDs of the directories on the way come from handles opened with
+  `FILE_FLAG_OPEN_REPARSE_POINT`, then the operation uses the path. Between that check and the
+  operation a directory can still be swapped for a junction there (section 7, "Reading a file",
+  residual risk); closing it needs `NtCreateFile` relative to a directory handle and a
+  handle-based rename (`SetFileInformationByHandle` with `FileRenameInfoEx`), an open point.
+  Closed by the amendment "Directory handles on Windows".
+- **Open point, platform trash:** an incoming delete first checks the file through the handles,
+  then hands the path to the platform trash (`NSFileManager trashItemAtURL` on macOS, the
+  freedesktop trash in `crates/hangar-drive-sync/src/trash.rs` on Linux), which resolve it again.
+  A swap in that window moves a file of the same name from outside the root into the person's own
+  trash (recoverable, not deleted). The quarantine fallback is handle-based. The quarantine
+  cleaning (`trash::clean_quarantine`, `housekeeping`) still walks by path below a checked plain
+  directory; same class of race, open point. The quarantine cleaning goes through handles since
+  the amendment "Directory handles on Windows", on both platforms; the trash hand-over stays open
+  on Linux and macOS.
+- **Network and WSL drives** (measured on WSL 2 drvfs, 9p): an operation on a handle whose
+  directory was renamed after the walk fails with `ENXIO` instead of landing in the moved
+  directory. Nothing outside the root changes there either; the engine retries on the next run.
+- **Tests** (`crates/hangar-drive-sync/src/localfs.rs`, `link_swap_tests`, `cfg(unix)`): a sync
+  root with `a/f` and `a/sub/` next to a directory outside it. With the link already in place,
+  every operation (new file, replace, delete, trash, rename out of and into `a`, create and remove
+  directory, metadata, read, stat, list) is `Changed` and nothing outside changes. With the swap
+  made by a test hook exactly between the check and the operation (`race::arm`, per thread), each
+  operation changes nothing outside and acts on the checked directory (now `a.moved`). Also: a
+  directory replaced by another directory with a different file ID is refused, and a link at
+  `.hangar-drive` is never followed, neither by a write nor by the cleaning at start. Run on
+  Linux (WSL 2, ext4, kernel 6.18): all pass; the ten race tests fail against the code before this
+  change with the same hook, so they reproduce the finding. CI runs them on `ubuntu-latest` and
+  `macos-latest` (`cargo test --workspace`).
+
+## Amendment 2026-11-26: one device cannot lock out the others
+
+Security review findings MEDIUM 3 (one device locks every other device of the account out for
+24 hours) and LOW 2 (event stream slots can be used up). Section 5 ("Checked at upload and at
+commit", "Per device", "Disk reserve") is updated in place.
+
+**The attack (MEDIUM 3).** With the old defaults (device budget = account budget = quota) a
+compromised device uploaded a quota of garbage it never committed. The upload check counted
+every uncommitted upload of the account, so every honest device got `quota_exceeded`, and the
+account budget was gone as well (`budget_exceeded`). Removing the device freed nothing: the
+`objects` rows did not say who had uploaded them, and the collection deleted them only 24 hours
+after their upload. The attack could be repeated every day. Section 5 claimed the disk reserve
+was the only case in which honest devices are blocked; that was wrong.
+
+**Decision.**
+
+- **Uploader per object:** migration `0004_device_uploads.sql` adds `objects.uploader`, the
+  session device of the upload. Rows from before the migration keep NULL: a declared object no
+  longer needs it, and an uncommitted one counts against no device and goes with the
+  collection within 24 hours, as before.
+- **Upload check per device:** `PUT /objects/{id}` counts live bytes plus the uploading device's
+  own uncommitted bytes (instead of the account's) against Q and Q + H. One device's uploads
+  therefore never take quota from another device. The running counter per device is the table
+  `device_pending`, kept by triggers on `objects` (insert, `declared` 0 to 1, delete), so the
+  commit call needs no change, and rebuilt by `usage::recount_pending` at every collection step.
+  Measured: a commit that declares 200,000 uploads took 5.38 s with the triggers against 5.01 s
+  without them (release build, Windows 11, the `m4_measure_a_large_delta` setup with and without
+  an uploader; about 7 %).
+- **What still bounds the uncommitted bytes:** every upload pays the budgets, so all devices
+  together leave at most about one account budget uncommitted, which "Disk sizing" already
+  counts as the day of uploads before the window. The commit check still holds live bytes to Q +
+  H: two devices may each upload close to the quota, but only commits that fit go through
+  (test `another_devices_uncommitted_uploads_do_not_count_against_the_quota`).
+- **Removal deletes the uploads:** the log append that removes a device deletes its uncommitted
+  objects in the same transaction (`objects::drop_uploads_of`) and recounts the counters; the
+  files follow after the commit in the background under each object's stripe lock, as in the
+  collection's sweep, and a crash in between leaves files without rows for the orphan sweep.
+  Uncommitted objects have no references, so no tree changes. Each deleted byte is also taken off
+  the removed device's budget minute in which it was paid, so the account budget it spent on
+  garbage is free again at once. Only deleted bytes are given back; what the device made live
+  stays paid, so adding and removing devices never keeps anything stored beyond the budgets.
+- **Device budget default: half the account budget** (`config::default_device_budget`). A single
+  device leaves the others at least as much budget as it can take. Rejected: an account budget
+  of 2 Q with the device budget at Q, which keeps a full first upload within one day but doubles
+  the `B × (W + 1)` term of "Disk sizing". The cost of the choice: one device uploads at most half
+  a quota per day by default, so a first upload of a full quota from one device takes two days;
+  the operator can raise the account budget or set the device budget to the account budget
+  (`docs/self-hosting.md`).
+- **What remains (conclusion):** a compromised device can still add devices to the account log,
+  each with its own device budget, and spend the whole account budget through them. Adding a
+  device is visible in the device log and on every device, and removing the added devices deletes
+  their uncommitted uploads and gives that budget back. A device can also commit garbage and so
+  fill the quota with live bytes; that is the person's data as far as the server can tell,
+  visible in the history, and deleting it (directory nodes use the headroom) frees the quota.
+  Only the disk reserve blocks honest devices for reasons outside their account.
+
+**Event streams (LOW 2).** `GET /account/events` was limited to 32 streams per account and
+2048 on the server, so one device could take all 32 slots of its account, and 64 accounts all
+slots of the server. Now a device holds at most two streams (`events::MAX_STREAMS_PER_DEVICE`);
+a third stream of the same device closes the device's oldest one instead of being refused. The
+newest connection is the one most likely alive, so a half-open connection the server has not yet
+noticed never keeps an honest device from reconnecting, and a device can only close its own
+streams. A closed slot stops counting at once. The limits per account (32, still needed because a
+device can add devices) and per server (2048) stay. The endpoint stays as well: the client does
+not use it yet and polls the feed every 5 seconds; connecting the client to the stream is an open
+point.
+
+**Tests.** `server/tests/device_uploads.rs`:
+`removing_a_device_deletes_its_uncommitted_uploads_and_frees_the_budget_at_once` (device A uses
+up the account budget with uploads and commits one of them, B is refused, B removes A, the four
+uncommitted rows and their files are gone, the counters are zero, the committed object stays,
+and B uploads exactly the four refunded chunks at once),
+`with_the_default_budgets_one_device_cannot_lock_the_others_out` (with the defaults A stops at
+half the account budget and B still uploads and commits its half),
+`another_devices_uncommitted_uploads_do_not_count_against_the_quota` (A's uploads fill the
+quota, B uploads and commits all the same, A's commit of its garbage is refused, the collection's
+recount agrees with the triggers), `a_third_event_stream_of_a_device_closes_its_oldest` (over
+HTTP). Unit tests: `a_device_holds_at_most_two_streams_and_a_third_closes_its_oldest`
+(`events.rs`), `device_budget_defaults_to_half_the_account_budget` (`config.rs`). The migration
+was also applied to a database at 0003 with old rows (NULL uploader, triggers checked by hand
+with Python's SQLite 3.50.4).
+
+## Amendment 2026-11-26: collisions in linear time and copy names within the limit
+
+Security review findings HIGH 2 (collision handling of the merge and the executor quadratic to
+cubic) and LOW 3 (a conflict copy name longer than 255 UTF-16 units). Section 3, "Conflict copy
+name", is updated in place.
+
+**The attack (HIGH 2).** The merge fixed one collision per round and then started again from the
+root; each round compared every pair of names of a directory, each comparison computing NFC and
+six case keys, and `record_rekey` walked all rekeys. The executor compared every target name with
+every sibling. Measured before the fix (release build, Windows 11, the machine shared with other
+builds): an unchanged folder of 1,000 files in one directory 2.8 s (the review measured 112 s for
+8,000), 256 case variants of one name 46 s, a join of 400 identical files 175 s, writing 2,000
+new files 5.7 s. A compromised device could stop every device of the account with a directory of
+20,000 files or a few thousand case variants, well inside `MAX_DIRECTORY_ENTRIES` (2^18) and
+`MAX_TREE_ITEMS` (2^20).
+
+**Decision.** The rule itself is unchanged, and every device still reaches the same merge:
+
+- **Merge** (`merge.rs`, module docs): `fix_collisions` takes the fixes the round by round search
+  would take, in the same order, in one walk per directory. The case keys of an entry are
+  computed once per walk and looked up in hash maps (key to the first kept entry); a walk goes on
+  where the last fix left it, because a fix never changes the entries ahead of it or their order
+  (a renamed loser collides with nothing any more, a removed one is gone). Only a merge of two
+  directories adds entries to another directory; that directory is walked again from its start,
+  before the current one goes on if it comes first in the order (root, then item ID), as the
+  restart did. Rounds in which orphans or cycles still change fix one collision each, as before;
+  once they are settled, all remaining collisions are fixed in one go, bounded by the same round
+  limit. Fixing a collision never makes an orphan or a cycle. `record_rekey` keeps a backward map,
+  and `fix_cycles` first checks with one walk from the root whether any item has no path.
+- **Copy names** (`names::DirNames`): whether a candidate collides is a hash lookup in the
+  directory's key counts. Searching ` 2`, ` 3` and so on stays the rule, but the index learns
+  which numbered names are taken: every number with as many digits shares stem, label and
+  extension, so the name with number n is `P + n + Q`, and each case key of it is
+  `key(P) + n + key(Q)` (space, digits and `)` are stable in NFC, map to themselves under every
+  case mapping and end the context of a final sigma; the index checks the split on every name it
+  tries, and a property test checks it on random names with combining marks, sigma, long s, the
+  Kelvin sign, dotted and dotless i and ignorable code points). Losers that share `key(P)` and
+  `key(Q)` skip the numbers known to be taken; when such a key leaves the directory the number
+  is forgotten, so the result is always the first free name.
+- **Executor** (`apply.rs`): an index of the working tree by case key per directory, built when a
+  directory is first asked about and kept in step with every change of the working tree during a
+  run, answers what `Tree::colliding_children` answered.
+- **Keys of ASCII names** (`names::case_keys`): NFC, the HFS+ ignorables and the three case
+  mappings are the identity or the ASCII mappings for ASCII, so the keys are computed directly;
+  a test checks them against `CaseKeys::of`.
+
+Measured after the fix (same machine and benchmark): 1,000 unchanged files 1.3 ms, 8,000 10 ms,
+50,000 88 ms, 262,144 (one full directory) 0.67 s; 256 case variants 1.7 ms, 1,024 7 ms, 4,096
+33 ms, 262,144 3.4 s; a join of 400 identical files 1.3 ms, 5,000 27 ms, 50,000 0.34 s, 262,144
+2.5 s; writing 2,000 new files 5 ms, 20,000 54 ms, 262,144 0.98 s. The copy name search costs a
+few key computations per copy and digit of its number, so the work is about n log n.
+
+**Copy names within the limit (LOW 3).** `labelled` shortened only the stem, and an extension of
+more than about 225 units still made a name longer than 255 units. The stem is now shortened
+first, down to its first character, then the extension, and the label only when it alone would
+not fit; an extension cut short loses trailing dots and spaces. Cuts fall between characters, so
+no surrogate pair is split. A copy of a name Windows can hold is one Windows can hold: the label
+`(...)` keeps the part before the first dot from being a reserved name or an 8.3 alias. Names
+that fit with at least one character of the stem stay exactly as before. The measurements are
+filed in [[merge-collision-benchmark]].
+
+**Tests.** `merge.rs`: `linear_collision_fixing_equals_the_reference` (4,000 random merges with
+case, NFC, long s, sigma and Kelvin collisions, numbered copy names, joins, orphans and cycles,
+compared field by field with the old round by round implementation, kept as a test module),
+`nested_directory_merges_equal_the_reference` (joins with nested directories merging into remote
+ones in both ID orders), `record_rekey_equals_the_reference`, and
+`collisions_take_linear_work`, which counts key computations in a debug build without a clock:
+an unchanged folder of 50,000 files, a join of 5,000 identical files and 2,048 case variants.
+`names.rs`: `indexed_copy_names_equal_the_plain_search` (entries come and go, also ones that look
+like numbered copies), `copy_names_for_many_variants_take_linear_work` (3,000 losers in case and
+long s variants), `keys_split_at_the_number`, `fast_keys_equal_the_protocol_keys`,
+`long_extensions_fit_windows` (a 250 unit extension, an extension cut at spaces, surrogate
+pairs, a 400 character device name). `apply.rs`: `sibling_index_equals_the_pass_over_the_directory`,
+`many_new_files_take_linear_work` (20,000 new files).
+
+## Amendment 2026-11-26: server notices reach the window, downloads respect the disk
+
+Follow-up to a security review of the engine (MEDIUM 1, MEDIUM 2, LOW 4).
+
+**Anomaly pins reach every device (MEDIUM 1).** The engine dropped every feed notice except three,
+so section 5's "all devices are told through a feed notice" did not hold. Now
+(`crates/hangar-drive-sync/src/engine.rs`):
+
+- `Notice::AnomalyPin` is stored per folder and commit in the engine's settings (`pins`, at most
+  32, kept across restarts because the feed tells each pin only once) and shown in every snapshot
+  as `Warning::Suspect` with the folder, the pinned commit as the timeline entry, the retention
+  days, the pin's end (`until`) and `lapsed`.
+- The suspect device is the writer of the first commit after the pinned one in this device's own
+  verified timeline (`burst_writer`), never a device the server names; the notice carries no
+  device. Narrowed by the amendment "Follow-up review of the delta binding" (MEDIUM 3): a device
+  is named only when its own verified heads after the pin drop enough to set off a burst. A device that does not sync the folder, or has not pulled the burst yet, leaves the
+  device empty and the window names the folder (UX 9.4).
+- A pin the pin cap lets go comes again with its end set to the server's now. A pin notice that
+  ends within an hour of the device's clock, or earlier than known, marks the pin as lapsed (the
+  margin covers clock skew; a fresh pin lasts 90 days). A pin leaves the device once its end plus
+  the retention window has passed. "Das war ich" stays per device ("No shared dismissal"); the
+  suspect warning is still the only one that can be hidden.
+- `QuotaWarning`, `AccountBudget` and `DiskReserve` become the quiet notices `quota` (with the
+  numbers on the storage line), `budgetAccount` and `serverDisk`; `MinimumCountCap` now names the
+  retention window instead of 0 days. Quiet notices appear once each instead of piling up while
+  the app runs. They have no "cleared" signal from the server and stay until the app restarts
+  (open point below).
+
+**Downloads respect the disk (MEDIUM 2).** A manifest may name the same chunk up to its limit
+(`MAX_FILE_SIZE` 4 TiB) while the quota counts only distinct objects, so one small upload could
+fill the disks of all devices, and `FsDisk::write_file` fetched every repeated chunk again. Now
+(`crates/hangar-drive-sync/src/folder.rs`):
+
+- Before anything is fetched, the free space of the sync root's volume
+  (`FileSystem::free_bytes`, `crates/hangar-drive-sync/src/space.rs`: `GetDiskFreeSpaceExW` or
+  `statvfs`; replaceable in tests through `MemFs::set_free_bytes`) must hold the file plus a
+  reserve of 256 MiB (`DISK_RESERVE_BYTES`; since the amendment "Follow-up review of the delta
+  binding", LOW 4, 5 % of the volume, at least 256 MiB and at most 10 GiB). Otherwise the write fails with `DiskFull`, nothing is
+  fetched or written, the item backs off from one minute doubling to 32 minutes, and the window
+  shows the existing `diskFull` banner with the bytes the waiting files need until they are
+  written or the folder is in sync.
+- Within one write, a chunk ID that comes again is kept as plaintext until its last use, up to
+  64 MiB (`CHUNK_CACHE_BYTES`); beyond that it is fetched again, so memory stays bounded.
+- One apply run fetches at most 1 GiB (`ROUND_DOWNLOAD_BYTES`); the first file of a run always
+  goes, the rest waits for the next round, which checks the free space again.
+
+**Incoming mass deletion has no threshold (LOW 4, open point).** `planner.rs` holds only local
+deletions above the threshold for a decision. A mass deletion another device commits is applied
+here without a question. The threat model treats this as inherent: a device of the account may
+delete, and every deleted file goes to the recycle bin or the quarantine and stays in the server's
+history for the retention window, so it can be brought back. Whether incoming deletions should
+also wait above a threshold is an open product decision (it would let a compromised device's
+deletions sit undecided on every other device, and hold up honest reorganisations).
+
+**Open points.**
+- Quiet notices end only with a restart; a "condition cleared" feed notice would let them go when
+  the server clears the condition.
+- The disk reserve is a constant; a setting may follow if it proves too much for small disks
+  (now 5 % of the volume within 256 MiB and 10 GiB, see LOW 4 of the follow-up review).
+
+**Tests.** `crates/hangar-drive-sync/tests/server_warnings.rs`:
+`a_burst_by_one_device_warns_every_device` (A replaces every file, the memory server sends the
+pin, B and A show "suspect" naming "Laptop" with the pinned commit as a timeline entry, "Das war
+ich" on B hides it only there, a lapse marks it on A),
+`quota_budget_and_disk_notices_reach_the_window_once`,
+`a_download_waits_for_space_and_fetches_a_repeated_chunk_once` (a file of three identical chunks
+is not written with too little space, the banner names its size, and after space returns every
+object is fetched at most once). Unit tests in `engine.rs`
+(`pin_notices_are_kept_once_and_a_lapse_is_noticed`, `the_burst_writer_comes_from_the_timeline`),
+`space.rs`, `src-tauri/src/notifications.rs`, the decoder shapes in `src-tauri/src/commands.rs`,
+and the window (`src/problems/problems.test.tsx`, `src/main/MainWindow.test.tsx`).
+
+## Amendment 2026-11-26: reference deltas bound to the tree
+
+Security review finding HIGH: no one checked a reference delta against the tree. The server
+checked a delta only against its own view of the deltas before it (`check_delta` in
+`server/src/service/commits.rs`), never that the new root stayed live; the signed body held no
+delta; the delta pull did not deliver it; honest devices computed their delta from their tree.
+A compromised device that was not removed yet could (1) keep the tree and drop every object of
+it, so devices saw no change while the collection deleted the folder after the window; (2) lock
+the folder for every honest device for good, because each later honest diff then dropped an
+object the server no longer held live and was refused as `commit_refused`, which the client did
+not handle, and the re-anchor (all objects as added) was refused because they were live; (3)
+declare garbage as added with the tree unchanged, live for ever against the quota. LOW 1 of the
+same file: the burst share could be diluted by adding garbage first.
+
+**Format** (no release yet, so the format changes in place; labels stay `hangar-drive/v1/`):
+
+```text
+body = ... || field(counter, u64) || field(flags, u32) || field(delta digest, 32) || field(seen)
+flags bit 2 = full delta (never on a side commit)
+delta digest = SHA-256( field("hangar-drive/v1/commit-delta") || field(mode, u8: 0 diff, 1 full)
+               || field(added ids, ascending) || field(dropped ids, ascending) )
+```
+
+`ReferenceDelta::validate` requires both lists strictly ascending, so a delta has one spelling.
+`crates/hangar-drive-crypto/src/commit.rs` (`DeltaDigest`, `SignedCommit::check_delta`); vector
+`commit.side_delta_digest` and the four commit vectors recomputed in Rust and by
+`test_vectors.py`.
+
+**Delta per commit kind** (`R(c)` is the set of objects reachable from commit c's tree):
+
+| Commit | Mode | Relative to |
+| --- | --- | --- |
+| First commit | diff | the empty set |
+| Normal commit, restore, conflict copies of a merge | diff (full when the diff does not fit and the set does) | the first parent, the head the device verified |
+| Merge commit | diff | its first parent, the current server head, never the side commit |
+| Side commit | always diff (a full side commit is malformed) | its base, the head it was built on |
+| Stage of a publish too large for one commit | diff | the previous stage |
+| Re-anchor | full | none |
+| Barrier | full when `R` fits one delta, else the empty diff | none |
+| Repair after `delta_mismatch` | full, without the side commit | none |
+
+A diff is exact: `added = R(c) \ R(parent)`, `dropped = R(parent) \ R(c)`. The client no longer
+truncates the dropped list (`fit_delta` is gone): every device recomputes it, so a missing ID
+would make an honest commit look forged. A commit whose diff and full set both exceed
+`MAX_REFERENCE_DELTA_IDS` is split by the stages as before; one that only drops that much with a
+tree that large stays refused (open point).
+
+**Server** (`server/src/service/commits.rs`):
+- The uploaded delta must match the signed digest and mode, else `commit_refused`.
+- A diff: every added object held (`missing_objects`), none live; every dropped one live; and the
+  new root live afterwards (added, or live and not dropped). A violation is the new code
+  `delta_mismatch` (409) with up to 64 of the IDs that do not fit in `missing`, never
+  `commit_refused`. The side commit's diff is checked against its base the same way.
+- A full delta: every object held (`missing_objects` otherwise, so a device can upload objects the
+  collection already deleted), the root in the list, and then the list replaces the live set:
+  objects in it that are not live are added, live objects outside it are dropped
+  (`split_full`). Quota, budgets, the burst signal and the retention intervals see exactly that
+  change, like a diff.
+
+**Devices** (`crates/hangar-drive-sync/src/folder.rs`, `verify_tree_deltas`): after a pull
+verified the chain, every new head and side commit is checked: the digest of `R(tree)` against
+`R(first parent)` (side commit: its base; full: `R(tree)` alone) must equal the signed digest.
+The server applied exactly the signed delta, so this proves that the server's live set matches
+the tree. A mismatch is refused like a bad signature
+(`ChainError::Commit(CommitError::DeltaMismatch)`): the folder takes nothing in, publishes
+nothing on top and shows the error until the person removes the device that wrote it.
+Exceptions:
+- A mismatching commit by a device the verified log has removed since passes, because it comes
+  in only behind a barrier the removing device or the person accepted; the barrier's full delta
+  already reset the live set.
+- A commit whose trees can no longer be read (the parent's objects collected after the window, a
+  tree beyond the limits) cannot be checked.
+
+In both cases the device sets `full_next`, and its next commit carries a full delta.
+
+**The delta pull does not deliver the delta** (deviation from the review's proposal, a
+conclusion): with the digest in the signed body, the device recomputes the delta from the two
+trees it decodes anyway and compares digests, and the server's check of the uploaded delta
+against the same digest ties its live set to that delta. Delivering the lists would add nothing
+to the proof and cost up to 32 MiB per commit, for every device on every pull, plus storing the
+lists for as long as the window. The IDs a device would want for diagnosis are in the server's
+`delta_mismatch` answer.
+
+**Repair path, so that honest devices are never locked out:**
+- A publish whose diff the server answers with `delta_mismatch` sets `full_next`, seals every
+  directory node and manifest of the same tree again (`codec::encode_fresh`), uploads every
+  object the server lacks, and sends the tree once more with a full delta and without the side
+  commit. That rebuilds the live set from what the honest device declares and uploads, also
+  after the collection deleted objects (state after attacks 1 and 2).
+- The re-anchor sends a full delta (before, its all-added delta could never pass) and seals its
+  tree fresh, since the server that showed an older state may lack objects the index lists as
+  uploaded.
+- The barrier after a removal sends a full delta when the tree fits; if the server lacks objects
+  of it, the barrier falls back to the empty diff and the device's next publish carries the full
+  delta with the objects uploaded again. Since the amendment "Follow-up review of the delta
+  binding" (HIGH 1) such a barrier is followed by a repair commit at once.
+
+**Burst signal (LOW 1):** every head commit records an event with the folder's file data before
+the change, also one that drops nothing (migration `0005_delta_binding.sql`, column
+`drop_events.live_before`). The share of dropped bytes counts against that data just before the
+change and also against the data before the window's first change, whichever share is larger.
+Adding garbage first and then dropping every real file within the hour now sets off the pin.
+
+**Open points.**
+- Garbage added more than an hour before the drop still dilutes the share; a longer lookback or
+  an absolute byte threshold would close it at the price of more false alarms.
+- Chunks hashed under an older generation and not yet uploaded when a rotation happens could not
+  be sealed for upload until the file changed; a full repair that needed such a chunk waited the
+  same way. Closed by the amendment "content hashed before a key rotation".
+- Objects a repair re-adds count as revived bytes against the repairing device's budget (or the
+  pin restore allowance), like any restore.
+- A commit that drops more than `MAX_REFERENCE_DELTA_IDS` objects of a tree that itself holds
+  more than that many cannot be published yet (no delete stages).
+
+**Tests.** `server/tests/delta_binding.rs`:
+`a_head_that_keeps_its_root_but_drops_it_is_refused` (attack 1 with the root: `delta_mismatch`
+naming the root; a never live root; a full delta without its root),
+`a_delta_the_commit_did_not_sign_is_refused` (garbage on top of the signed delta, another
+digest, a flipped mode, a hidden drop),
+`a_full_delta_rebuilds_a_broken_live_set_with_objects_uploaded_again` (attack 1 without the root,
+the collection deletes the files, a diff naming them gets `delta_mismatch`, the full delta asks
+for the deleted files, takes them, and diffs fit again),
+`garbage_added_first_does_not_dilute_the_burst_signal` (20 chunks for 20 GB of real data, 80 of
+garbage, then every real chunk dropped: the pin holds the head before the drop; the test fails
+without the fix). `crates/hangar-drive-sync/tests/delta_binding.rs` (memory server, which now
+keeps the live set like the real one):
+`a_head_whose_delta_does_not_fit_its_tree_is_refused_until_its_device_is_removed` (B refuses C's
+forged head and publishes nothing, A removes C, the barrier's full delta resets the live set, B
+goes on), `an_honest_device_heals_a_broken_server_view_and_commits_again` (empty live set and
+deleted objects: the device's diff gets `delta_mismatch`, the full delta uploads everything
+again, B verifies it, and the next commit is a diff again). Unit tests:
+`the_delta_digest_binds_mode_order_and_both_lists`, the flag rules, the protocol's order check.
+The end to end test against the real server passes unchanged.
+
+## Amendment 2026-11-26: content hashed before a key rotation
+
+**Problem.** Chunk IDs are keyed per generation. A file hashed under generation 1 whose round
+failed before the upload (at the pull, say) kept its generation 1 chunk IDs after a removal
+rotated the ring to generation 2. `seal_chunk` seals under the writable generation and refuses a
+chunk whose ID differs, and the scan does not hash a file again while its size and time are
+unchanged, so every publish ended in `LocalChanged` and the file never went up. A full repair
+after `delta_mismatch` that needed a generation 1 chunk the collection had deleted failed the
+same way.
+
+**Decision.** A chunk that does not seal to its ID marks its content for the next scan, which
+hashes the file again under the newest generation even when size and time are unchanged
+(`FolderSync::rehash`, in memory only). When the failing content's chunk list names an older
+generation, every other content with chunks the server lacks and an older generation is marked
+too, so a rotation costs one failed publish attempt, not one per pending file; a file that merely
+changed marks only itself. The new chunk IDs give the file a new content key, which publishes
+like any local change.
+
+- **Not chosen:** sealing such chunks with the older generation's keys. A removed device knows
+  them, so new data under them would be readable by it. Uploads use the writable generation only.
+- **Not chosen:** hashing every unpublished file of an older generation in each scan. That needs
+  the server's and the synced tree's contents as a set in every scan, while the failed upload
+  already names exactly the affected contents.
+- **Manifests and directory nodes** are not affected: `codec::encode` seals every object the
+  object cache does not know as on the server under the writable generation in each encode, and
+  the cache holds only uploaded or downloaded objects. An object the server lost after a rotation
+  is sealed again under the writable generation by `codec::encode_fresh`.
+
+**Tests.** `crates/hangar-drive-sync/tests/removal.rs`:
+`content_hashed_before_a_rotation_but_not_uploaded_still_goes_up` (eight files hashed in a round
+that fails at the pull, a removal rotates to generation 2, the next round publishes all of them;
+it fails without the fix, and also when only the failing content is marked),
+`a_repair_after_a_rotation_uploads_lost_old_chunks_under_the_new_generation` (the collection
+deleted every object of a generation 1 tree after the rotation, the full repair uploads the file
+again under generation 2; it fails without the fix).
+
+## Amendment 2026-11-26: directory handles on Windows (security review L1)
+
+The amendment "Directory handles on Unix" left the race of finding L1 open on Windows, the
+first target platform: the IDs of the directories on the way were read from handles opened with
+`FILE_FLAG_OPEN_REPARSE_POINT`, and the operation then resolved the path again. A local program
+with write access in the sync root could swap a checked directory for a junction (or a directory
+symbolic link) in between, and a write, delete, rename, directory creation, metadata change or
+read landed outside the root.
+
+- **Decision:** on Windows every operation of `LocalFs` goes through directory handles as well
+  (`crates/hangar-drive-sync/src/localfs/windows.rs`, the same `plat::Spot` and `plat::Folder`
+  interface as `localfs/unix.rs`). The root is opened with `CreateFileW` and
+  `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, each directory on the way with
+  `NtCreateFile` relative to the handle of the one above it (`OBJECT_ATTRIBUTES.RootDirectory`,
+  the bare name as `ObjectName`, `OBJ_CASE_INSENSITIVE` as `CreateFileW` uses) and
+  `FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`. A junction, a directory symbolic link or
+  another reparse point on the way opens as itself and is refused by `FILE_ATTRIBUTE_REPARSE_POINT`,
+  a file on the way fails with `STATUS_NOT_A_DIRECTORY`; both are `FsError::Changed`, and where
+  the index knows a directory's file ID the ID of the open handle must match. The operation is
+  relative to the handle of the directory that holds the target: opens, creates and stats with
+  `NtCreateFile` and `FILE_OPEN_REPARSE_POINT` (plus `FILE_NON_DIRECTORY_FILE` or
+  `FILE_DIRECTORY_FILE` where the kind is known), deletes with `SetFileInformationByHandle` and
+  `FileDispositionInfoEx` with `FILE_DISPOSITION_FLAG_POSIX_SEMANTICS` (the classic
+  `FileDispositionInfo` where the file system refuses the extended class, FAT and exFAT;
+  read-only files stay refused, as `DeleteFileW` refuses them), renames with
+  `NtSetInformationFile` and `FileRenameInformation`, `RootDirectory` set to the handle of the
+  target's directory and `ReplaceIfExists` false wherever the code expects "already exists"
+  (L2), and listings with `GetFileInformationByHandleEx` and `FileFullDirectoryInfo` on the
+  directory handle. The reserved directory and its levels are created or opened in one step
+  (`FILE_OPEN_IF | FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT`, N5 unchanged in effect).
+- **Names below the Win32 parser:** names reach `NtCreateFile` as they are, so the path as a
+  whole has no `MAX_PATH` limit (each name keeps its 255 unit limit) and no device name mapping
+  (`CON`, `NUL`; `name_problem` refuses them before any path is built, unchanged). The module
+  refuses, as a second line, every name that is empty, `.` or `..` or holds `\`, `/`, `:` or a
+  NUL, so no name can reach another directory or an alternate data stream.
+- **Stats and IDs:** attributes, size and write time from `GetFileInformationByHandle`, the reparse
+  tag from `FileAttributeTagInfo`, the file ID from `FileIdInfo` with the volume serial number,
+  else the 64-bit file index: the same values as before, so the IDs in existing indexes stay
+  valid (test `handle_stats_match_std_metadata` against std's metadata and a handle opened by
+  path). Kinds as std's `FileType` decides them: a name surrogate reparse point (junction,
+  symbolic link) is a link, any other reparse point `Reparse`.
+- **Replace (L3):** Windows has no swap of two names by handle (`ReplaceFileW` takes paths), so
+  the replace is two renames by handle, neither of which replaces: the old file moves into the
+  reserved `tmp` directory under a random name (`FILE_NON_DIRECTORY_FILE`, so a directory put in
+  its place is not moved), then the new file takes the freed name. Afterwards the old file is
+  checked against the expectation and removed or kept as a conflict copy, as before. If someone
+  takes the name in the moment between the two renames, the old file goes back, or, if that
+  fails as well, next to it as a conflict copy, and the replace reports `Changed`; nothing is lost.
+  The new file gets the old one's creation time and its hidden, archive and not content indexed
+  attributes, as `ReplaceFileW` gave them (read-only left out). **Trade-off:** for that moment the
+  name is free, so a program that opens it exactly then finds no file; `ReplaceFileW` swapped by
+  path and had that race of L1 instead. The new file keeps the ACL it got in `tmp` (inherited
+  from the root, as for every new file since L2), not the old file's explicit ACL.
+- **Recycle bin (open point of the Unix amendment, closed on Windows):** the shell's
+  `IFileOperation` takes a path and resolves it again. Before the hand-over the directories from
+  the root down to the file's directory are walked again with handles that do not share delete
+  (`windows::pin`), the pinned directory must have the file ID of the one checked before, and the
+  file is checked again in it. While these handles are open, nobody can rename, move or delete
+  any of these directories (an open for `DELETE` fails with a sharing violation; delete access
+  covers delete and rename, CreateFileW documentation of `FILE_SHARE_DELETE`), so what the path
+  means in the file system stays the one checked. That alone does not make the shell act on the
+  checked file: the shell resolves paths through its own namespace, see "Shell namespace" in the
+  amendment "Follow-up review of the Windows handles", which adds the check that closes it.
+  Files inside a pinned directory stay free to go (measured,
+  test `a_pinned_directory_cannot_be_renamed`), so the shell can still move the file into the
+  recycle bin. A directory someone holds open for deleting at that moment fails the pin with a
+  sharing violation (`Locked`, retried later). **Residual window:** the file itself is not pinned
+  (the shell needs to move it); a program that swaps the file for another file of the same name in
+  between makes the shell recycle that other file, which is inside the root and recoverable: the
+  L3 class of race, unchanged. On Linux and macOS the open point of the Unix amendment stays.
+- **Quarantine cleaning (both platforms):** `trash::clean_quarantine` walked by path below a
+  checked directory. The cleaning at start and in `housekeeping` now goes through handles on
+  both platforms (`clean_quarantine` in `localfs/windows.rs` and `localfs/unix.rs`): only plain
+  directories are entered, each through its own handle, at most 16 levels deep, and a link or
+  junction is removed as itself, never followed. The age rule stays in `trash::expired`.
+- **Platform behaviour met on the way** (measured on Windows 11 Pro 10.0.26300, NTFS):
+  `SetFileInformationByHandle` with `FileRenameInfo` refuses a `RootDirectory` with
+  `ERROR_INVALID_PARAMETER`, so the native `NtSetInformationFile` is used, whose documentation
+  defines `RootDirectory` as the target directory of a relative name; `FileRenameInformation`
+  refuses a buffer shorter than the structure with `STATUS_INFO_LENGTH_MISMATCH`; a directory with
+  an open handle below it cannot be renamed by others (documented in the remarks of
+  `FILE_RENAME_INFORMATION`), so a user's rename of a folder can fail while an operation of the
+  engine below it runs (milliseconds; the person retries, the engine never holds handles across
+  runs).
+- **Dependency:** none added. `windows-sys` 0.61 gains the features `Wdk_Foundation`,
+  `Wdk_Storage_FileSystem` and `Win32_System_IO` (`NtCreateFile`, `NtSetInformationFile`,
+  `OBJECT_ATTRIBUTES`, `IO_STATUS_BLOCK`); `ReplaceFileW`, `MoveFileExW` and the path-based Windows
+  code in `localfs.rs` are gone. The unsafe code is in the module `nt` of `localfs/windows.rs`,
+  each block with its `SAFETY` note. `cargo deny check` green.
+- **Microsoft documentation:** `NtCreateFile` (winternl.h, ntdll; "If this value is non-NULL, the
+  ObjectName member specifies a file name relative to this directory"; `FILE_OPEN_REPARSE_POINT`
+  "bypass normal reparse point processing"), `FILE_RENAME_INFORMATION` (ntifs.h; `RootDirectory`
+  "a handle for the root directory under which the file will reside after it is renamed",
+  `ReplaceIfExists` false fails if the target exists), `FILE_DISPOSITION_INFORMATION_EX` (ntddk.h;
+  POSIX semantics remove the name when the delete handle closes), `CreateFileW` (`FILE_SHARE_DELETE`:
+  "Otherwise, no process can open the file or device if it requests delete access", "Delete
+  access allows both delete and rename operations"). Retrieved 2026-11-26 from
+  learn.microsoft.com.
+- **Tests** (`crates/hangar-drive-sync/src/localfs.rs`, `link_swap_tests`, now on every
+  platform): each test runs with every link kind the machine can make, a junction (made with
+  `cmd /C mklink /J` as an argv array, no admin rights needed) and a directory symbolic link,
+  which needs developer mode or elevation and is skipped with a note otherwise (skipped on the
+  development machine). With the link already in place every operation is `Changed`; with the
+  swap made by `race::arm` exactly between the check and the operation, nothing outside the root
+  changes and the operation acts on the checked directory (now `a.moved`); the listing test now
+  also compares a size, since the outside twin has the same names. New on Windows:
+  `a_trash_after_the_swap_hands_the_shell_no_path_through_the_link` (the outside twin has the
+  same size and time and the expectation no file ID, so only the pin stops the shell), and in
+  `localfs/windows.rs` `handle_stats_match_std_metadata`,
+  `names_that_are_not_single_names_are_refused_by_the_open`,
+  `times_before_the_epoch_convert_like_std` and `a_pinned_directory_cannot_be_renamed`. In
+  `tests/localfs.rs`, `the_quarantine_cleaning_never_follows_a_link` replaces the test that
+  called the path-based cleaning. **Counter-check:** against the code before this change the ten
+  race tests fail on Windows with the same hook (they reproduce the finding), and the trash test
+  fails with the pin switched off (the shell recycled the outside file). Run on Windows 11 (NTFS):
+  every test of `hangar-drive-sync` passes; on Linux (WSL 2, ext4) the `localfs` unit and
+  integration tests pass with the new Unix quarantine cleaning.
+
+## Amendment 2026-11-26: follow-up review of the delta binding
+
+A read-only security review of the amendment "reference deltas bound to the tree" kept the
+format, the digest and the server check, and found four gaps.
+
+**HIGH 1: a check skipped behind an unreadable tree.** A device skipped the delta check of a
+commit whose tree or parent tree it could not read (`readable_set` gave up on a missing object or
+a tree beyond the limits) and only set `full_next`, which took effect at its next publish. A
+compromised device commits X1, whose root names a manifest it never uploads, and right after X2
+with the old tree and a forged delta; every device skipped both and took them in.
+- `DeltaCommit` carries the server's unsigned time of the call, `server_ms`, absent once the
+  commit expired. A missing object counts as "the collection took it" only for a commit older
+  than `UNREADABLE_AFTER_MS` (one day, the shortest retention an operator can set) or without a
+  time; for a younger commit of a current device it is a delta mismatch. A server decides
+  retention anyway, so its time gives it nothing new (conclusion).
+- A tree beyond the limits anywhere on the way stops the folder as `StopReason::TreeLimit` does,
+  not only for the last head.
+- A skipped check, a mismatch of a removed device behind a barrier, and a barrier that kept the
+  empty diff now write a repair commit at once (`FolderSync::repair`): the remote tree again on
+  the frontier with a full delta, nodes and manifests sealed again, missing objects uploaded,
+  with no local change needed.
+
+**MEDIUM 2: repair and barrier stuck on the upload budget.** Bytes a commit makes live again
+count against the device budget, so after a removed device dropped more than a budget slowly
+(below the burst signal), the full barrier was refused with `budget_exceeded` until the
+collection had deleted the data.
+- Server (`revived`): bytes whose last drop came from a head of a device the log has removed
+  since go through the pin restore allowance, like bytes of a pinned tree. Not free: a device
+  that can add and remove devices could otherwise keep garbage stored for nothing by dropping it
+  from a device it then removes. Reviving bytes this account already paid for keeps costing
+  budget in every other case, because that cost is what bounds keeping dropped data alive
+  through revive and drop cycles (section 5, "Upload budgets").
+- Client: the barrier also falls back to the empty diff on `budget_exceeded` and
+  `quota_exceeded`, so the removal finishes, and the repair follows once it fits.
+
+**MEDIUM 3: who is named suspect.** The window named the writer of the first commit after the
+pinned one. A malicious server could place a pin right before any device's commit, and after a
+removal the barrier that drops the removed device's garbage named the barrier's writer.
+- Each verified head's timeline record holds the file objects its delta drops and the parent's
+  file objects (`TimelineRec::dropped_files`, `files_before`), counted from the trees by the
+  delta check; a full delta counts chunks only, so a barrier or repair that keeps the tree drops
+  nothing.
+- `burst_writer` names a device only if its verified heads after the pin, within the hour after
+  the first of them, drop at least the server's default share (30 %) and count (20 to 500,
+  at most all file objects of a small folder). Otherwise the warning names no device and the
+  window offers the device list instead of "Gerät entfernen" (already in place). A pin on a
+  commit outside this device's history names no device either.
+- Open point: commits a device published itself have no counts, so on the device that wrote a
+  burst the warning names no device.
+
+**LOW 4: the disk reserve.** A download now leaves 5 % of the volume free, at least 256 MiB and
+at most 10 GiB (5 % of a 4 TB disk would hold back 200 GB; 10 GiB covers a system feature update
+and a swap file), checked per file against the free space read right before it
+(`folder::room_for`). Unknown free space is no room: every supported platform reports it, so
+`None` means the call failed, and the file waits as on a full disk. `ROUND_DOWNLOAD_BYTES` is
+documented as a bound on traffic per round, not on the disk. `FileSystem::volume_bytes` is new
+(`space::volume_bytes`: `GetDiskFreeSpaceExW` total, `statvfs` `f_blocks`).
+
+**Test double.** The memory server keeps the live set after every head and checks a side
+commit's diff against its base like the real server.
+
+**Tests.** `crates/hangar-drive-sync/tests/delta_binding.rs`:
+`a_forged_delta_behind_a_tree_nobody_can_read_is_refused` (X1 and X2 as above with a current
+server time: B refuses with the mismatch; it failed without the time rule),
+`an_unreadable_old_tree_is_skipped_and_repaired_at_once` (without a server time: B writes a full
+repair commit at once and the live set is the tree again). `server/tests/delta_binding.rs`:
+`bringing_back_what_a_removed_device_dropped_costs_no_budget` (device budget 20 kB, C drops
+12.4 kB with a diff that sets off no pin, C is removed, A's full delta is accepted; it failed
+with `budget_exceeded` before; A's own drop and revival still pays). `engine.rs`:
+`a_pin_before_a_commit_that_drops_nothing_names_no_device`,
+`a_barrier_after_a_pin_does_not_name_its_writer`, the burst writer test reworked.
+`crates/hangar-drive-sync/tests/disk_reserve.rs`:
+`twenty_files_of_one_gib_leave_five_percent_of_the_volume` (100 GiB volume, 10 GiB free, twenty
+files of 1 GiB: 5 GiB stay free, 1 GiB before), checked on the policy function, since `MemFs`
+would need the 20 GiB in memory.
+
+## Amendment 2026-11-26: follow-up review of the Windows handles
+
+A read-only security review of the amendment "Directory handles on Windows" found the handle
+walk itself sound (reparse points on every level, alternate data streams, 8.3 names, case, the
+FFI) and six points, all fixed with tests.
+
+- **M1, shell namespace (medium):** the recycle bin hands the shell a path, and the shell
+  resolves it through its own namespace, not the file system's. A folder named `x.{CLSID}`, or
+  a plain folder with the read-only attribute and a `desktop.ini` that names a CLSID
+  (`CLSID2=`, `Flags=2`), is a namespace junction there; with `CLSID_FolderShortcut`
+  (`{0AFACED1-E828-11D1-9187-B532F1E9575D}`) and a `target.lnk`, the shell item of
+  `root\x\victim.txt` is `outside\victim.txt`, and `DeleteItem` recycled the file outside the
+  root (reproduced by the review; measured here with `SIGDN_FILESYSPATH` on Windows 11, without
+  deleting anything). The pin of the directories does not help, since nothing in the file system
+  changes. A peer that syncs the first form into a root makes the attack remote. Three layers:
+  - `trash::to_recycle_bin` reads the file system path of the parsed item and of its parent
+    (`IShellItem::GetDisplayName(SIGDN_FILESYSPATH)`, freed with `CoTaskMemFree`) and compares
+    them with the checked path and its directory (`CompareStringOrdinal`, case ignored, as the
+    file system compares names); any difference is a failure, and the file goes to the
+    quarantine through the handles. The item's own path is the decisive one, since the copy engine
+    deletes what the item is; the parent is compared as well because the copy engine works in the
+    item's parent folder, so a namespace that reported the right item path under a foreign
+    parent would still be refused. Conclusion, not measured beyond the two forms above.
+  - `windows_problem` refuses names that end in `.{GUID}` (section 7, "Shell junction names"),
+    so the first form never reaches a root from another device. The engine reports it as
+    `NameReason::Reserved`, like `ShortNameAlias` (`engine::name_reason`), and the rename field
+    of the window says "reserved on Windows" (`src/domain/windowsNames.ts`).
+  - `trash_file`: when the platform reports success but the checked file is still in place and
+    still matches, it recycled something else; the checked file goes to the quarantine and the
+    result is `Quarantine`, never `RecycleBin`.
+  Tests: `a_shell_junction_name_never_reaches_the_shell` (first form: the shell resolves outside,
+  the engine refuses the name, nothing outside changes), `the_recycle_bin_refuses_a_path_the_shell_resolves_elsewhere`
+  (second form with a plain name: the shell resolves outside, the result is `Quarantine`, nothing
+  outside changes), `shell_junction_names_cannot_sync_on_windows` in the protocol crate. The
+  counter-check without the resolution check was not run, since it would put the outside file
+  into the person's real recycle bin; the shell's resolution to `outside\f`, asserted in both
+  tests, shows what `DeleteItem` would have acted on.
+- **L1, buffer length (soundness):** the length passed to `SetFileInformationByHandle` was
+  raised to the size of `FILE_RENAME_INFORMATION` for every class, so the 4 byte
+  `FILE_DISPOSITION_INFO_EX` and the 1 byte `FILE_DISPOSITION_INFO` were read past their end.
+  The length is now passed as given; only the rename raises its own buffer to the structure's
+  size, as `NtSetInformationFile` requires.
+- **L2, listing parser:** the parser of `FILE_FULL_DIR_INFO` records read a whole record (72
+  bytes) after checking only 68. It is now a safe function over a byte slice that reads each
+  field by its offset, ends the chain at a record whose fixed part or name does not fit or whose
+  `NextEntryOffset` points into the fixed part, and is tested with hand-built buffers
+  (`the_listing_parser_stays_inside_the_buffer`, the last record at `bytes - 68`); the offsets are
+  checked against windows-sys (`the_record_offsets_match_the_sdk`).
+- **L3, backups across a crash:** the old file a replace pushed out waits in `tmp` until it is
+  settled, and the cleaning at start deleted `tmp`, so a crash in between (or a failed
+  `keep_as_conflict`) lost an edit the person made at the last moment. The old file now always
+  waits under a name ending in `.bak` (on Linux and macOS the new file takes such a name before the
+  exchange), and the cleaning at start moves such files through the handles into
+  `.hangar-drive/trash/recovered/` instead of deleting them; that directory expires like every
+  quarantine entry, 30 days after the last file moved in. Other leftovers (half-written downloads)
+  are still removed. Tests: `a_backup_left_in_tmp_is_recovered_at_start` and
+  `a_crash_after_the_swap_of_a_replace_loses_no_old_file` (a hook right after the swap panics),
+  both failing before the fix (run on Windows) and passing after it on Windows and Linux.
+- **L4, one entry without a stat:** an entry whose own open was refused (an ACL, a filter
+  driver) failed the whole listing. It is now listed with the attributes, size and write time of
+  its directory record and without a file ID; a reparse point stays `Reparse`. Listing it as
+  `Other`, as the review proposed, would drop a known file from the next tree and send its delete
+  to every device; without a file ID the scan matches it by path. Test
+  `an_entry_without_a_stat_does_not_fail_the_listing` (`icacls` denies SYNCHRONIZE to everyone on
+  a file in `tests/.tmp/` and resets it afterwards), failing before the fix.
+- **L5, rename onto the same file:** a case-only rename (the target name holds the source
+  itself) used a replacing rename, so a file put under the target name after the file ID check
+  was replaced for good. On Windows the rename now never replaces: NTFS takes a case change of
+  the same entry without `ReplaceIfExists` (measured), and a file put there meanwhile is "already
+  exists". Test `a_rename_onto_the_same_file_never_replaces_another_one` (a second hard link of
+  the file passes the ID check and is then swapped for another file), failing before the fix.
+  Linux and macOS keep the plain rename: on a case-insensitive APFS volume `RENAME_EXCL` may refuse
+  the case change of the same entry (not measured), and two names of one inode make `rename` a
+  no-op; open point for macOS.
+- **Not done (info):** remembering the root's file ID in `LocalFs::new` and comparing it in every
+  open of the root would need the ID passed to every platform function; the root path itself is
+  outside the threat model (amendment "Directory handles on Unix").
+- **Dependency:** none added; `windows` 0.62 gains the feature `Win32_Globalization`
+  (`CompareStringOrdinal`). `cargo deny check` green.
