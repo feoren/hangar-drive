@@ -586,7 +586,6 @@ const de = {
   "settings.retention.other": "Versionen bleiben {days} Tage erhalten.",
   "settings.about": "Über {app}",
   "settings.version": "Version {version}",
-  "settings.versionBuild": "Version {version}, Build {build}",
   "settings.saveReport": "Fehlerbericht speichern",
   "settings.reportHelp":
     "Enthält Versionen, Zustände und Fehlercodes. Keine Dateinamen, keine Inhalte, keine Schlüssel.",
@@ -1193,7 +1192,6 @@ const en: Dictionary = {
   "settings.retention.other": "Versions are kept for {days} days.",
   "settings.about": "About {app}",
   "settings.version": "Version {version}",
-  "settings.versionBuild": "Version {version}, build {build}",
   "settings.saveReport": "Save error report",
   "settings.reportHelp":
     "Contains versions, states and error codes. No file names, no contents, no keys.",
@@ -1772,7 +1770,6 @@ const el: Dictionary = {
   "settings.retention.other": "Οι εκδόσεις διατηρούνται για {days} ημέρες.",
   "settings.about": "Σχετικά με το {app}",
   "settings.version": "Έκδοση {version}",
-  "settings.versionBuild": "Έκδοση {version}, build {build}",
   "settings.saveReport": "Αποθήκευση αναφοράς σφάλματος",
   "settings.reportHelp":
     "Περιέχει εκδόσεις, καταστάσεις και κωδικούς σφάλματος. Χωρίς ονόματα αρχείων, χωρίς περιεχόμενα, χωρίς κλειδιά.",
@@ -2402,7 +2399,6 @@ const es: Dictionary = {
   "settings.retention.other": "Las versiones se guardan durante {days} días.",
   "settings.about": "Acerca de {app}",
   "settings.version": "Versión {version}",
-  "settings.versionBuild": "Versión {version}, compilación {build}",
   "settings.saveReport": "Guardar informe de errores",
   "settings.reportHelp":
     "Contiene versiones, estados y códigos de error. Ningún nombre de archivo, ningún contenido, ninguna clave.",
@@ -3029,7 +3025,6 @@ const fr: Dictionary = {
   "settings.retention.other": "Les versions sont conservées {days} jours.",
   "settings.about": "À propos de {app}",
   "settings.version": "Version {version}",
-  "settings.versionBuild": "Version {version}, build {build}",
   "settings.saveReport": "Enregistrer le rapport d’erreur",
   "settings.reportHelp":
     "Contient les versions, les états et les codes d’erreur. Pas de noms de fichiers, pas de contenus, pas de clés.",
@@ -3665,7 +3660,6 @@ const it: Dictionary = {
   "settings.retention.other": "Le versioni vengono conservate per {days} giorni.",
   "settings.about": "Informazioni su {app}",
   "settings.version": "Versione {version}",
-  "settings.versionBuild": "Versione {version}, build {build}",
   "settings.saveReport": "Salva rapporto errori",
   "settings.reportHelp":
     "Contiene versioni, stati e codici di errore. Nessun nome di file, nessun contenuto, nessuna chiave.",
@@ -4204,7 +4198,6 @@ const ja: Dictionary = {
   "settings.retention.other": "版は {days} 日間保持されます。",
   "settings.about": "{app} について",
   "settings.version": "バージョン {version}",
-  "settings.versionBuild": "バージョン {version}、ビルド {build}",
   "settings.saveReport": "エラーレポートを保存",
   "settings.reportHelp":
     "バージョン、状態、エラーコードが含まれます。ファイル名、内容、鍵は含まれません。",
@@ -4885,7 +4878,6 @@ const pl: Dictionary = {
   "settings.retention.other": "Wersje są przechowywane przez {days} dnia.",
   "settings.about": "O aplikacji {app}",
   "settings.version": "Wersja {version}",
-  "settings.versionBuild": "Wersja {version}, kompilacja {build}",
   "settings.saveReport": "Zapisz raport o błędzie",
   "settings.reportHelp":
     "Zawiera wersje, stany i kody błędów. Bez nazw plików, bez zawartości, bez kluczy.",
@@ -5521,7 +5513,6 @@ const pt: Dictionary = {
   "settings.retention.other": "As versões ficam guardadas por {days} dias.",
   "settings.about": "Sobre o {app}",
   "settings.version": "Versão {version}",
-  "settings.versionBuild": "Versão {version}, build {build}",
   "settings.saveReport": "Salvar relatório de erro",
   "settings.reportHelp":
     "Contém versões, estados e códigos de erro. Nenhum nome de arquivo, nenhum conteúdo, nenhuma chave.",
@@ -6199,7 +6190,6 @@ const ru: Dictionary = {
   "settings.retention.other": "Версии хранятся {days} дня.",
   "settings.about": "О программе {app}",
   "settings.version": "Версия {version}",
-  "settings.versionBuild": "Версия {version}, сборка {build}",
   "settings.saveReport": "Сохранить отчёт об ошибке",
   "settings.reportHelp":
     "Содержит версии, состояния и коды ошибок. Никаких имён файлов, никакого содержимого, никаких ключей.",
@@ -6776,7 +6766,6 @@ const tr: Dictionary = {
   "settings.retention.other": "Sürümler {days} gün saklanır.",
   "settings.about": "{app} hakkında",
   "settings.version": "Sürüm {version}",
-  "settings.versionBuild": "Sürüm {version}, derleme {build}",
   "settings.saveReport": "Hata raporunu kaydet",
   "settings.reportHelp":
     "Sürümleri, durumları ve hata kodlarını içerir. Dosya adı yok, içerik yok, anahtar yok.",
@@ -7278,7 +7267,6 @@ const zh: Dictionary = {
   "settings.retention.other": "版本保留 {days} 天。",
   "settings.about": "关于 {app}",
   "settings.version": "版本 {version}",
-  "settings.versionBuild": "版本 {version}，构建 {build}",
   "settings.saveReport": "保存错误报告",
   "settings.reportHelp": "包含版本、状态和错误代码。不含文件名、内容或密钥。",
   "settings.reportPreview": "错误报告包含哪些内容",

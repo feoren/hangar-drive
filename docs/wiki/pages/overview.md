@@ -2,7 +2,7 @@
 title: Overview
 type: overview
 tags: []
-sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]"]
+sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]"]
 created: 2026-11-25
 updated: 2026-11-26
 ---
@@ -20,6 +20,8 @@ that only the operator sets, and an account quota that counts only live data.
   [[sync-prior-art-research]].
 - Threat model, key hierarchy, formats, backup rules and reuse of the sister app's crypto:
   [[threat-model-and-crypto-design]].
+- Version scheme X.Y.Z-B and how Tauri treats build metadata: [[0002-version-scheme]],
+  [[version-number-wikipedia]], [[tauri-version-handling-code-reading]].
 
 ## Open risks
 - The protocol is built by hand and not reviewed externally; the review blocks the first release.

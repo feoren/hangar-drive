@@ -30,4 +30,60 @@ mod tests {
             "package.json"
         );
     }
+
+    /// X.Y.Z of `X.Y.Z` or `X.Y.Z+B` (ADR 0002); `None` for anything else, such as `X.Y.Z-B`.
+    fn base_version(version: &str) -> Option<[u64; 3]> {
+        let (base, build) = match version.split_once('+') {
+            Some((base, build)) => (base, Some(build)),
+            None => (version, None),
+        };
+        if build.is_some_and(|build| build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        let mut parts = base.split('.').map(|part| {
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+        });
+        let parsed = [parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some(parsed)
+    }
+
+    #[test]
+    fn base_version_reads_only_the_internal_forms() {
+        assert_eq!(base_version("0.12.224+1548"), Some([0, 12, 224]));
+        assert_eq!(base_version("0.10.0"), Some([0, 10, 0]));
+        assert_eq!(base_version("0.1.0-12"), None);
+        assert_eq!(base_version("0.1.0+"), None);
+        assert_eq!(base_version("0.1"), None);
+        assert_eq!(base_version("0.1.0.4"), None);
+    }
+
+    // The internal form is X.Y.Z or X.Y.Z+B: NSIS takes the Windows file version X.Y.Z.B only from
+    // the build metadata after "+", and "-B" would make it a pre-release.
+    #[test]
+    fn the_crate_version_follows_the_scheme() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(base_version(version).is_some(), "{version}");
+    }
+
+    // The code carries the upcoming version, so its X.Y.Z is the highest entry in the changelog.
+    #[test]
+    fn the_crate_version_is_the_highest_changelog_entry() {
+        let changelog: Value =
+            serde_json::from_str(include_str!("../../src/changelog.json")).unwrap();
+        let highest = changelog
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| base_version(entry["version"].as_str().unwrap()).unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(
+            base_version(env!("CARGO_PKG_VERSION")).unwrap(),
+            highest,
+            "changelog.json"
+        );
+    }
 }

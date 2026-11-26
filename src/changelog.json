@@ -1,0 +1,22 @@
+[
+  {
+    "version": "0.1.0",
+    "date": null,
+    "items": [
+      {
+        "de": "Die erste Version von Hangar Drive: Deine Ordner bleiben auf allen deinen Geräten gleich und liegen Ende-zu-Ende-verschlüsselt auf deinem eigenen Server.",
+        "en": "The first version of Hangar Drive: your folders stay the same on all your devices and are stored end-to-end encrypted on your own server.",
+        "el": "Η πρώτη έκδοση του Hangar Drive: οι φάκελοί σου μένουν ίδιοι σε όλες τις συσκευές σου και αποθηκεύονται με κρυπτογράφηση από άκρο σε άκρο στον δικό σου διακομιστή.",
+        "es": "La primera versión de Hangar Drive: tus carpetas son iguales en todos tus dispositivos y se guardan cifradas de extremo a extremo en tu propio servidor.",
+        "fr": "La première version de Hangar Drive : tes dossiers restent identiques sur tous tes appareils et sont stockés chiffrés de bout en bout sur ton propre serveur.",
+        "it": "La prima versione di Hangar Drive: le tue cartelle restano uguali su tutti i tuoi dispositivi e sono salvate con crittografia end-to-end sul tuo server.",
+        "ja": "Hangar Drive の最初のバージョンです。フォルダーはすべてのデバイスで同じ内容に保たれ、自分のサーバーにエンドツーエンド暗号化で保存されます。",
+        "pl": "Pierwsza wersja Hangar Drive: twoje foldery są takie same na wszystkich twoich urządzeniach i są przechowywane z szyfrowaniem end-to-end na twoim własnym serwerze.",
+        "pt": "A primeira versão do Hangar Drive: suas pastas ficam iguais em todos os seus dispositivos e são guardadas com criptografia de ponta a ponta no seu próprio servidor.",
+        "ru": "Первая версия Hangar Drive: твои папки одинаковы на всех твоих устройствах и хранятся со сквозным шифрованием на твоём собственном сервере.",
+        "tr": "Hangar Drive'ın ilk sürümü: klasörlerin tüm cihazlarında aynı kalır ve kendi sunucunda uçtan uca şifreli olarak saklanır.",
+        "zh": "Hangar Drive 的第一个版本：你的文件夹在你的所有设备上保持一致，并以端到端加密的方式存放在你自己的服务器上。"
+      }
+    ]
+  }
+]

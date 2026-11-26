@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { all, cleanup, click, dialogTitle, field, renderApp, text } from "../test/harness";
 
@@ -63,5 +63,21 @@ describe("settings (UX 11)", () => {
       "Esc",
       "Umschalt+F10",
     ]);
+  });
+
+  // ADR 0002: internally X.Y.Z+B, shown as X.Y.Z-B, whether the build number comes with the version
+  // (release build) or separately (development build).
+  it.each([
+    { version: "0.1.0+12", build: null },
+    { version: "0.1.0", build: 12 },
+    { version: "0.1.0+12", build: 12 },
+  ])("shows $version with build $build as Version 0.1.0-12", async (about) => {
+    const { mock } = await renderApp();
+    vi.spyOn(mock, "getAbout").mockResolvedValue(about);
+    await click("Einstellungen");
+    const line = all('[role="dialog"] .info-line')
+      .map((element) => element.textContent)
+      .find((content) => content.startsWith("Version "));
+    expect(line).toBe("Version 0.1.0-12");
   });
 });

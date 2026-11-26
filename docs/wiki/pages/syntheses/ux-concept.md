@@ -1757,7 +1757,6 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `settings.reportHelp` | Enthält Versionen, Zustände und Fehlercodes. Keine Dateinamen, keine Inhalte, keine Schlüssel. | Contains versions, states and error codes. No file names, no contents, no keys. |
 | `settings.localNote` | Deine Dateien liegen auf diesem Computer unverschlüsselt. Schalte die Laufwerksverschlüsselung deines Systems ein. | Your files are stored unencrypted on this computer. Turn on your system’s drive encryption. |
 | `settings.serverNote` | Auf dem Server sind deine Dateien verschlüsselt. Der Betreiber sieht weder Namen noch Inhalte. | On the server your files are encrypted. The operator sees neither names nor contents. |
-| `settings.versionBuild` | Version {version}, Build {build} | Version {version}, build {build} |
 | `settings.reportPreview` | Das steht im Fehlerbericht | What the error report contains |
 | `help.title` | Hilfe | Help |
 | `help.body` | {app} hält deine Ordner auf allen deinen Geräten gleich. Wenn etwas deine Entscheidung braucht, steht es oben im Fenster. | {app} keeps your folders the same on all your devices. When something needs your decision, it shows at the top of the window. |

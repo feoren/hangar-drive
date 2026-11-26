@@ -3,6 +3,7 @@
 
 import { useId, useState } from "react";
 
+import { HANGAR_DRIVE_BUILD } from "../buildInfo";
 import { formatSize } from "../format";
 import { isLanguage, LANGUAGE_NAMES, LANGUAGES, useLanguage, useT } from "../i18n";
 import { formatCombo, FIXED_KEYS, SHORTCUTS } from "../shortcuts";
@@ -11,6 +12,7 @@ import { useBackend, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback, Loading } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
+import { formatVersion, withBuild } from "../version";
 
 export function SettingsDialog({ onClose }: { readonly onClose: () => void }) {
   const t = useT();
@@ -121,12 +123,13 @@ export function SettingsDialog({ onClose }: { readonly onClose: () => void }) {
           </h3>
           {about.status === "ready" && (
             <p className="info-line">
-              {about.data.build === null
-                ? t("settings.version", { version: about.data.version })
-                : t("settings.versionBuild", {
-                    version: about.data.version,
-                    build: about.data.build,
-                  })}
+              {t("settings.version", {
+                // A release build carries its build number in the version (X.Y.Z+B); a
+                // development build only gets it from vite.config.ts. Shown as X.Y.Z-B (ADR 0002).
+                version: formatVersion(
+                  withBuild(about.data.version, about.data.build ?? HANGAR_DRIVE_BUILD),
+                ),
+              })}
             </p>
           )}
           <p className="info-line">{t("settings.serverNote")}</p>
