@@ -137,7 +137,9 @@ Hangar Drive has no official installer yet. Until the first release you build th
    docker compose exec server hangar-drive-server invite
    ```
 
-   It prints a link that creates exactly one account and stays valid for 7 days.
+   It prints a link that creates exactly one account and stays valid for 7 days. No terminal on
+   the host? Until the first account exists, the server prints such a link in its log at every
+   start.
 
 3. **Set up your first computer.** Open the link, or start Hangar Drive, choose _Start with an
    invite link_ and paste it. Keep the recovery sheet somewhere safe and pick the folder to sync.

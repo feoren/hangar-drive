@@ -428,6 +428,32 @@ pub struct Account {
 impl Account {
     /// Creates the account on the server with `first` (and `others`) in the genesis entry.
     pub async fn create(server: &TestServer, first: &Device, others: &[&Device]) -> Self {
+        let invite = server.invite().await;
+        match Self::create_from(server, first, others, invite).await {
+            Ok(account) => account,
+            Err(reply) => panic!(
+                "creating the account failed: {} {}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            ),
+        }
+    }
+
+    /// Creates the account with `first` alone and the given invite; the refusal on error.
+    pub async fn create_with_invite(
+        server: &TestServer,
+        first: &Device,
+        invite: InviteToken,
+    ) -> Result<Self, Reply> {
+        Self::create_from(server, first, &[], invite).await
+    }
+
+    async fn create_from(
+        server: &TestServer,
+        first: &Device,
+        others: &[&Device],
+        invite: InviteToken,
+    ) -> Result<Self, Reply> {
         let id = AccountId::from_bytes(random());
         let mut state = AccountState::new(id);
         let mut devices = vec![first.log_device(&id)];
@@ -444,26 +470,23 @@ impl Account {
             .post(
                 ACCOUNTS_PATH,
                 &CreateAccountRequest {
-                    invite: server.invite().await,
+                    invite,
                     account: id,
                     genesis: Blob(genesis.clone()),
                 },
             )
             .await;
-        assert_eq!(
-            reply.status,
-            201,
-            "{}",
-            String::from_utf8_lossy(&reply.body)
-        );
+        if reply.status != 201 {
+            return Err(reply);
+        }
         let created: CreateAccountResponse = reply.json();
         state.apply(&genesis).unwrap();
-        Self {
+        Ok(Self {
             id,
             state,
             secret: None,
             server: Some(created.server),
-        }
+        })
     }
 
     /// Signs in `device` and returns a client with its token.

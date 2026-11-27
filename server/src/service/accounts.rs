@@ -62,6 +62,52 @@ pub async fn create_invite(
     Ok((token, expires_ms))
 }
 
+/// Where the hash of the last invite made by [`first_start_invite`] is kept.
+const FIRST_INVITE_KEY: &str = "first_start_invite";
+/// Lifetime of the invite a fresh server prints at start.
+pub const FIRST_INVITE_DAYS: u32 = 7;
+
+/// The invite a server without any account prints in its log at start, so an operator whose
+/// container host has no terminal (a NAS) can still create the first account. Each start
+/// replaces the previous one if it is still unused, so only the newest printed link works; once
+/// an account exists, nothing is created and the marker goes away.
+pub async fn first_start_invite(
+    db: &Db,
+    now_ms: u64,
+) -> Result<Option<(InviteToken, u64)>, sqlx::Error> {
+    let accounts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(db)
+        .await?;
+    let previous: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM server_meta WHERE key = ?")
+            .bind(FIRST_INVITE_KEY)
+            .fetch_optional(db)
+            .await?;
+    if let Some(hash) = &previous {
+        // An unused earlier link was only ever shown in an older log: retire it.
+        sqlx::query("DELETE FROM invites WHERE token_hash = ? AND used_ms IS NULL")
+            .bind(hash.as_slice())
+            .execute(db)
+            .await?;
+    }
+    if accounts > 0 {
+        if previous.is_some() {
+            sqlx::query("DELETE FROM server_meta WHERE key = ?")
+                .bind(FIRST_INVITE_KEY)
+                .execute(db)
+                .await?;
+        }
+        return Ok(None);
+    }
+    let (token, expires_ms) = create_invite(db, now_ms, FIRST_INVITE_DAYS).await?;
+    sqlx::query("INSERT OR REPLACE INTO server_meta (key, value) VALUES (?, ?)")
+        .bind(FIRST_INVITE_KEY)
+        .bind(sha256(token.expose()).as_slice())
+        .execute(db)
+        .await?;
+    Ok(Some((token, expires_ms)))
+}
+
 /// `POST /accounts`.
 /// Whether `request` repeats a creation that went through but whose answer the device never got
 /// (finding E2E-1: a retry from the same device must carry on): its invite is used and its

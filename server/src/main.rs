@@ -142,9 +142,28 @@ async fn serve(config: Config) -> Result<()> {
         public_url = config.public_url.as_deref().unwrap_or_default(),
         "server ready"
     );
+    first_start_invite(&config, &server.app).await;
     hangar_drive_server::serve(server, listener, shutdown_signal()).await?;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// While no account exists, prints a fresh invite link to the log, for hosts without a terminal
+/// to run `invite` in (accounts::first_start_invite). A failure only costs the convenience.
+async fn first_start_invite(config: &Config, app: &hangar_drive_server::app::AppState) {
+    let Some(public_url) = config.public_url.as_deref() else {
+        return;
+    };
+    match accounts::first_start_invite(&app.db, app.now_ms()).await {
+        Ok(Some((token, expires_ms))) => tracing::info!(
+            link = %hangar_drive_server::links::invite_link(public_url, &token, &app.server_id, None),
+            valid_until = %format!("{} UTC", format_ms(expires_ms)),
+            "no account yet: open this invite link on your first device to create the account; \
+             every start replaces it until the account exists"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "could not create the first-start invite"),
+    }
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {

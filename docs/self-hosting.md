@@ -56,6 +56,16 @@ backups, updates and the server key number.
    up in no access log. Send the whole link. With a self-signed certificate, add `--pin` (see
    [Invite links](#invite-links)).
 
+   No terminal on the host (a NAS whose container app only shows logs)? While no account exists,
+   the server prints an invite link in its log at every start, after `server ready`:
+   `no account yet: open this invite link ... link=https://drive.example.org/join#...`. Each
+   start replaces the previous one, so take the link from the newest start. Once the first
+   account exists (the log says `account created`), no further link is printed; invites for
+   other people come from the `invite` command. Until then, anyone who can read the server's
+   log can create the account with that link, so keep the log as private as the host. The link
+   needs the default log level (`RUST_LOG` at `info`) and carries no pin: with a self-signed
+   certificate, create the invite with `invite --pin` instead.
+
 5. Open the link on the new device. The page `/join` of your server explains that the link
    belongs to the Hangar Drive app and offers a button that opens it there; pasting the link
    into the app ("Start with an invite link") works as well. Further devices of the same
