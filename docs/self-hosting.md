@@ -141,7 +141,7 @@ Caddy obtains and renews a Let's Encrypt certificate on its own. The commented `
 		stream_timeout 24h
 	}
 	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}
 }
@@ -169,7 +169,7 @@ server {
     ssl_certificate     /etc/letsencrypt/live/drive.example.org/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/drive.example.org/privkey.pem;
     ssl_protocols       TLSv1.3;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
 
     # 5 MiB at least for chunks; 100 MiB for large directory nodes and commits.
     client_max_body_size 100m;
@@ -187,6 +187,18 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_request_buffering off;
+    }
+
+    location /api/v1/folders/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering off;
+        # A large commit is checked set by set before it answers, and a download of a large
+        # object waits on the disk: more than nginx's default of 60 s.
+        proxy_read_timeout 300s;
     }
 
     location /api/v1/account/events {
@@ -216,8 +228,21 @@ The server can terminate TLS 1.3 itself. Mount the certificate chain and key (PE
 container and set `HANGAR_DRIVE_TLS_CERT` and `HANGAR_DRIVE_TLS_KEY`. Then bind the port to the
 network instead of `127.0.0.1`. A reverse proxy remains the recommended setup: it renews
 certificates on its own. A server that terminates TLS itself sends
-`Strict-Transport-Security: max-age=31536000` on every reply; behind a proxy it sends none, so
-set it in the proxy as shown above.
+`Strict-Transport-Security: max-age=31536000` on every reply (without `includeSubDomains`,
+which would bind other hosts of the domain); behind a proxy it sends none, so set it in the
+proxy as shown above.
+
+- **No trusted proxies:** with TLS in the server, `HANGAR_DRIVE_TRUSTED_PROXIES` must be empty,
+  and the server refuses to start otherwise. Nothing sits in front of it then, so a client
+  that can reach the port directly could send its own `X-Forwarded-For` from an address that
+  was once your proxy's and choose its rate limit key. Remove the line when you move from a
+  proxy to this setup.
+- **Certificate renewal:** the server reads the certificate and key at start only. After
+  replacing the files, restart it (`docker compose restart server`).
+- **Connections:** without a proxy the server's own limits apply to every client: at most
+  `HANGAR_DRIVE_CONNECTIONS_PER_IP` connections per address (IPv6: per /64), and while fewer
+  than half of the server's 4096 connection slots are free, four times as many per network
+  (IPv4 /24, IPv6 /48, at most 1024); a TLS handshake must finish within 5 seconds.
 
 ### Forward proxies on the devices
 
@@ -237,6 +262,7 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HANGAR_DRIVE_PORT` | `8080` | Port to listen on |
+| `HANGAR_DRIVE_BIND` | `0.0.0.0` in the image, `127.0.0.1` otherwise | Address to listen on (IPv4 or IPv6, for example `::`); in the image the port mapping decides who reaches it |
 | `HANGAR_DRIVE_PUBLIC_URL` | none, required | The address devices reach the server under, for the links `invite` prints and the sign-in check ([Invite links](#invite-links)); the server does not start without it |
 | `HANGAR_DRIVE_DATA_DIR` | `/data` in the image | Database and objects |
 | `HANGAR_DRIVE_RETENTION_DAYS` | `30` | How long a version stays restorable after it was replaced (W) |
@@ -247,17 +273,22 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | `HANGAR_DRIVE_ACCOUNT_BUDGET` | Q | Bytes an account may make live per 24 hours (B) |
 | `HANGAR_DRIVE_DEVICE_BUDGET` | half the account budget | Bytes one device may make live per 24 hours; at most the account budget |
 | `HANGAR_DRIVE_DISK_RESERVE` | `1GiB` | Below this much free disk space, uploads are refused |
-| `HANGAR_DRIVE_TRUSTED_PROXIES` | empty | Comma-separated addresses of reverse proxies (CIDR ranges are accepted; prefer the exact address) |
+| `HANGAR_DRIVE_TRUSTED_PROXIES` | empty | Comma-separated addresses of reverse proxies (CIDR ranges are accepted; prefer the exact address); must be empty with TLS in the server |
 | `HANGAR_DRIVE_RECORD_CAP` | `64MiB` | Bytes of encrypted account records (folder keys, folder list, device names) per account (R) |
 | `HANGAR_DRIVE_HEAVY_REQUESTS` | `4` | Commits and record writes worked on at once; their bodies are held in memory |
 | `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` | `8` | Uploads one account may have in flight at once |
-| `HANGAR_DRIVE_CONNECTIONS_PER_IP` | `64` | Open connections per client address; trusted proxies are exempt |
+| `HANGAR_DRIVE_CONNECTIONS_PER_IP` | `64` | Open connections per client address; while the server's connection slots run short, a client network (IPv4 /24, IPv6 /48) gets four times as many, at most 1024; trusted proxies are exempt |
 | `HANGAR_DRIVE_TLS_CERT`, `HANGAR_DRIVE_TLS_KEY` | empty | PEM files for TLS in the server |
 | `HANGAR_DRIVE_GC_INTERVAL_MINUTES` | `60` | Minutes between two garbage collection steps |
 | `HANGAR_DRIVE_SHUTDOWN_GRACE_SECS` | `10` | How long a shutdown waits for open requests |
 | `HANGAR_DRIVE_ANOMALY_MIN_OBJECTS` | `500` | Replaced or dropped file objects within an hour that always count as a burst; a smaller folder needs `HANGAR_DRIVE_ANOMALY_PERCENT` of its file objects, at least 20 |
 | `HANGAR_DRIVE_ANOMALY_PERCENT` | `30` | Share of a folder's data (and of its file objects) a burst must replace or drop; retiring a folder counts as dropping all of it |
 | `RUST_LOG` | `info` | Log level |
+| `SQLITE_TMPDIR` | `/data/tmp` in the image | Where SQLite writes large temporary tables and sorts; the image's root file system is read-only, so it points into the data volume. The server creates `tmp` in the data folder and empties it at every start |
+
+At every start the server makes its data folder and the `tmp` folder in it private to its own
+user (mode `0700`). Outside the image this keeps the database and `server.secret` unreadable
+for other users of the host whatever the umask was.
 
 ### What the limits protect against
 
@@ -275,6 +306,19 @@ account budget, so one device never uses up the budget of the others. One device
 most half a quota per day; if a first upload of a full quota from a single device should fit in
 one day, raise `HANGAR_DRIVE_ACCOUNT_BUDGET` (which raises the disk bound below) or set
 `HANGAR_DRIVE_DEVICE_BUDGET` to the account budget (which gives up this protection).
+
+Such a device can also not fill the device log, the list of the account's devices, until it can
+no longer be removed: adding devices is limited to 30 per hour and account, and removing a
+device is never limited. Calls with a valid session count per device, never against the
+limits of its address, so a device in the same household (same public address) cannot lock the
+others out, also not with made-up session tokens, and cannot keep them from removing it.
+Commits are limited to 30 per minute and device and 120 per account; a device whose commits are
+refused 20 times within 10 minutes (other than because another device committed first) waits
+for the rest of those 10 minutes, and so does the whole account after 60, so no device can keep
+the database busy for the others with commits that never pass. While another commit or record
+write waits for one of the `HANGAR_DRIVE_HEAVY_REQUESTS` slots, a large body that arrives slower
+than 64 KiB/s on average is cut off and its device tries again; without such a wait a slow
+connection only has to finish within two minutes.
 
 ## Disk sizing
 
@@ -376,13 +420,21 @@ a short stop:
 
 ```sh
 docker compose stop server
-docker run --rm -v hangar-drive_drive-data:/data:ro -v "$PWD":/backup alpine \
-  tar czf /backup/drive-$(date +%F).tar.gz -C /data .
+docker run --rm --entrypoint sh \
+  -v hangar-drive_drive-data:/data:ro -v "$PWD":/backup \
+  caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+  -c "umask 077 && tar czf /backup/drive-$(date +%F).tar.gz -C /data . \
+      && chown $(id -u):$(id -g) /backup/drive-$(date +%F).tar.gz"
 docker compose start server
 ```
 
 (The volume name is `<project folder>_drive-data`; `docker volume ls` shows it.) Devices that
 are offline for those seconds catch up afterwards.
+
+The archive holds `server.secret`, so it is a secret itself: the command writes it with mode
+`0600` (`umask 077`) and gives it to your user. Store and move it only where the volume itself
+may go. The command runs `tar` from the Caddy image that `docker-compose.yml` already pins by
+digest; any image with a shell and `tar` works, ideally pinned by digest the same way.
 
 To restore, stop the server, replace the volume's contents with the copy and start it again.
 Devices then see an older state than they knew. They do not take it silently: each one pauses

@@ -39,3 +39,21 @@ In scope, for example:
 - bypassing the update signature check
 - another local user, or a page in the app's window, reaching the device keys or the files of a
   user who installed Hangar Drive
+
+The self-hosted sync server (`server/`) is in scope as well, for example:
+
+- signing in without a device key, or using a session beyond what its scope allows
+- reading, changing or deleting data of another account, or of a folder or device the session
+  does not own
+- making the server forget or delete versions a client cannot delete on its own
+- keeping a server from serving other accounts without signing in (resource exhaustion that a
+  single unauthenticated client or network can cause), or with one account's session beyond
+  the limits `docs/self-hosting.md` describes
+
+Out of scope:
+
+- a misconfiguration by the operator, such as trusting a whole address range in
+  `HANGAR_DRIVE_TRUSTED_PROXIES`, publishing the port without TLS, or leaving backups readable
+- denial of service that needs more traffic than the host's own network can take
+- what the operator of a server sees by design (object sizes, counts and times, never contents
+  or names), and an operator deleting data on their own server
