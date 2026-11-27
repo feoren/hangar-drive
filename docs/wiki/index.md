@@ -6,11 +6,11 @@ Catalog of all wiki pages. Updated on every ingest.
 - [[overview]]: state of knowledge, open risks and questions (sources: 6, updated: 2026-11-26)
 
 ## Decisions
-- [[0001-foundation]]: scope, non-goals, sync model (one head per folder, merge commits, conflict rules, change feed), server, end-to-end encryption, backup, restore and quota rules, name policy and synced file types of version 1 (sources: 5, updated: 2026-11-26)
-- [[0002-version-scheme]]: version scheme X.Y.Z-B of the Hangar family, internal X.Y.Z+B, build number from the commit count, the code carries the upcoming version, changelog and version tests, signed updates, the manual release checklist (sources: 3, updated: 2026-11-26)
+- [[0001-foundation]]: scope, non-goals, sync model (one head per folder, merge commits, conflict rules, change feed), server, end-to-end encryption, backup, restore and quota rules, name policy and synced file types of version 1 (sources: 5, updated: 2026-11-27)
+- [[0002-version-scheme]]: version scheme X.Y.Z-B of the Hangar family, internal X.Y.Z+B, build number from the commit count, the code carries the upcoming version, changelog and version tests, signed updates, the manual release checklist (sources: 3, updated: 2026-11-27)
 
 ## Syntheses
-- [[ux-concept]]: UX concept of the desktop app: setup in three steps, pairing, tray states, main window, problems, restore, devices, settings, accessibility and the full UI copy in German and English (sources: 3, updated: 2026-11-26)
+- [[ux-concept]]: UX concept of the desktop app: setup in three steps, pairing, tray states, main window, problems, restore, devices, settings, accessibility and the full UI copy in German and English (sources: 3, updated: 2026-11-27)
 
 ## Components
 _None yet._

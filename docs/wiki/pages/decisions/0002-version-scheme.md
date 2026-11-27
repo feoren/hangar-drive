@@ -6,7 +6,7 @@ superseded_by:
 tags: [release, version, updater, windows]
 sources: ["[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]", "[[tauri-nsis-uninstall-code-reading]]"]
 created: 2026-11-26
-updated: 2026-11-26
+updated: 2026-11-27
 ---
 
 # ADR 0002: Version scheme
@@ -137,7 +137,7 @@ Neither key nor certificate exists yet; both are the owner's step before the fir
 ## Release checklist: manual checks (amendment 2026-11-26)
 
 Checks no automated test can make, done by a person on a Windows test machine (or a throwaway
-Windows user) before every release; tick them in the release card. Never on a machine whose
+Windows user) before every release; record them in the release checklist. Never on a machine whose
 Credential Manager or `%LOCALAPPDATA%` holds an account that matters.
 
 **Installer upgrade, downgrade and uninstall** (amendment "Installer upgrade keeps the device keys"

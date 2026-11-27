@@ -4,7 +4,7 @@ type: synthesis
 tags: [ux, ui, onboarding, tray, conflicts, restore, devices, settings, accessibility, i18n, plurals, re-anchor]
 sources: ["[[threat-model-and-crypto-design]]", "[[sync-prior-art-research]]", "[[recycle-bin-measurement]]"]
 created: 2026-11-26
-updated: 2026-11-26
+updated: 2026-11-27
 ---
 
 # UX concept of the desktop app
@@ -293,6 +293,12 @@ exists on the server, and closing the window means starting step 1 again with th
 Chosen with "Ich nutze Hangar Drive schon auf einem anderen Gerät". There is no recovery code
 step, because the account already has one. [Design]
 
+The engine stores the joined account when the other device says yes, before the devices check
+(N2) and the folders, and the snapshot then says `"done"`. The setup holds itself on screen from
+the pairing request on (`onHold`), and lets go after a failed or cancelled pairing and after "Nein,
+abbrechen" in the devices check; without that, the window would switch to the main window and
+skip both steps. [Design, found 2026-11-27]
+
 **Step 1: pair.**
 
 ```text
@@ -390,15 +396,117 @@ Chosen with "Kein Gerät mehr da?". [ADR 4, threat model 2.3]
    the person can compare with the paper, and the device name appears, prefilled. Without a camera
    and with only the paper, the link is typed; white space is ignored, and the printed sheet sets
    the link in groups for that. [Backend: layout of the printed link] "Weiter" calls
-   `recoverAccount(sheet, code, name)`.
-2. **Clean up**, one screen: "Diese Geräte gehören noch zu deinem Konto. Entferne die, die du
-   nicht mehr hast." All old devices are listed and checked. [ADR 4: remove the lost devices and
-   the used recovery device]
+   `recoverAccount(sheet, code, name)`, which checks the sheet and the account's log and writes
+   nothing.
+2. **Clean up**, one screen: "Diese Geräte gehören noch zu deinem Konto. Entferne alle, die du
+   nicht mehr hast oder nicht kennst." All old devices are listed and checked; each can be
+   unchecked, and unchecking all of them is allowed. Below the list: "Erst mit
+   „Wiederherstellen“ kommt dieses Gerät in dein Konto. Dein alter Code gilt danach nicht mehr.
+   Brichst du vorher ab, bleibt alles, wie es war." The buttons are "Abbrechen" (back to the
+   welcome screen) and "Wiederherstellen", which calls `finishRecoveryCleanup` and does the
+   recovery in one step: this device joins, the chosen devices and the used recovery device are
+   removed. [ADR 0001, amendment "the engine on the recovery in one piece"; ADR 4]
 3. **New recovery code**, the same screen as setup step 2: the used code stops working. [ADR 4]
 4. **Choose folders**, as in 4.3 step 2.
 
 Four screens: the name moved onto the first one, where it appears only after the link is read,
 as in 4.2 step 1. Every screen is still one decision. [Design]
+
+**The clean-up screen in detail.** [ADR 0001, amendment "the engine on the recovery in one piece",
+Design]
+- **Devices without names.** Before this device joins, the recovery can read the account's log but
+  not the sealed device names, so a device is listed as "Gerät, hinzugefügt am {date}" (the long
+  date in the UI language; with the time as well when two were added on the same day). A blank name
+  is never shown as an empty line. The native question that follows (follow-up check N-2) names
+  the chosen devices the same way, with the date as `YYYY-MM-DD` in local time, because the backend
+  has no locale date format (`recover.cleanup.device`, `src-tauri/src/confirm.rs`).
+- **Everything checked at first.** Who recovers has usually lost the devices, and a device left in
+  the account keeps reading it; a device that turns up while the person chooses starts checked as
+  well. Keeping devices is one click per device; keeping all of them still renews the code, since
+  the used code always stops working.
+- **Nothing happens before "Wiederherstellen".** The account does not exist on this device until
+  then, and the snapshot says `setup: "needed"`, so the window stays in the setup and does not
+  start it over. Once the step succeeds, the snapshot says `"done"`; the setup holds itself on
+  screen (`onHold`, as the new account does for its "Fertig" screen) until the folders are chosen,
+  so the new code is never skipped.
+- **When the step does not go through** (`RecoveryCleanupError`):
+
+  | Reason | Screen |
+  | --- | --- |
+  | `listChanged`: the account's devices changed while the person chose; nothing was written | the list again, with "Die Geräte deines Kontos haben sich gerade geändert. Prüfe die Liste noch einmal." |
+  | `unreachable` | the same screen with the choice kept and the server text; the button now says "Erneut versuchen" and runs the same step |
+  | `used`, `unknown`, `insecure`: the code stopped working in between (another device removed its recovery device), it does not belong to the account, or the server is not the sheet's | "Die Wiederherstellung ist nicht abgeschlossen. Starte sie noch einmal." plus the reason from step 1, and "Abbrechen" / "Von vorn beginnen", which opens step 1 with the sheet's link filled in and the code empty |
+  | any other error | the general error text; the choice stays, and "Erneut versuchen" runs the same step again (before the append the engine kept the choice, after it the pending recovery is completed) |
+
+  The reasons come from the engine's typed errors only (`RecoveryListChanged`, `RecoveryCodeUsed`,
+  `RecoveryCodeUnknown`, and the network errors for `unreachable` and `insecure`), never from an
+  error text (`RecoveryCleanupError::of` in `src-tauri/src/commands.rs`). [ADR 0001, amendment "a
+  recovery survives every failure after its append"]
+
+**A pending recovery.** [ADR 0001, amendment "a recovery survives every failure after its append",
+Design] When the append went out but this device could not join yet (no connection, the app ended
+in between), the snapshot still says `setup: "needed"` and carries the warning `recoveryPending`.
+The engine tries again by itself about every minute; typing the code again finishes it as well.
+- The welcome screen is replaced by a calm notice: "Wiederherstellung wird abgeschlossen …" and
+  "Hangar Drive fügt dieses Gerät deinem Konto hinzu, sobald dein Server erreichbar ist. Das
+  geschieht von selbst, du musst nichts tun." (`role="status"`, the syncing mark). Its one action
+  is the quiet "Code erneut eingeben", which opens step 1 of the recovery; "Zurück" there comes
+  back to the notice.
+- The other doors (new account, pairing) are not offered while the recovery is pending, and a link
+  the OS hands over opens only when it is a recovery sheet's link.
+- **A way out, behind a warning.** [ADR 0001, amendment "follow-up review of the recovery after
+  its append", LOW 7] Below "Code erneut eingeben" a second quiet link, "Wiederherstellung
+  verwerfen …", opens an inline warning (`role="alert"`): "Die Wiederherstellung ist noch nicht
+  abgeschlossen" and "Setzt du dieses Gerät jetzt zurück, geht sein neuer Schlüssel verloren. Hast
+  du kein anderes Gerät mehr, kommst du dann vielleicht nie mehr an dein Konto." with "Abbrechen"
+  (focused) and the danger button "Trotzdem zurücksetzen". That button calls
+  `resetDeviceDiscardingRecovery`, which asks natively first ("Wiederherstellung verwerfen und
+  zurücksetzen?", the same text, "no" as the default button); "no" keeps everything. Without this
+  way out, a recovery whose server is gone for good would lock the device in this screen.
+- **Where a reset can start.** Only "Dieses Gerät zurücksetzen" in the settings of the main window
+  and the link above; the tray has no reset. The settings need an account, and the engine shows
+  `recoveryPending` only without one, so there the case is a safeguard: `resetDevice` answers
+  `ResetOutcome` (`confirmed`, `declined`, `recoveryPending`); with `recoveryPending` the shell
+  asked nothing and the engine refused the plain reset (`SyncError::RecoveryPending`), and the
+  settings show the same inline warning.
+- Typing the code again lets the pending device join inside `recoverAccount`, so the account can
+  come into being in step 1: the setup holds itself on screen from that call on (as it does at
+  "Wiederherstellen"), and the person goes on with the old devices, the new code and the folders.
+- When the engine finishes the join by itself, the window switches to the main window; if the app
+  ended before the new code was added, the banner below takes over.
+- Not a native notification and not "needs you" in the tray: nothing waits for the person.
+
+**No valid recovery code.** [ADR 0001, same amendment, L1; Design] An account without a current
+recovery device (the app ended between a recovery's join and its new code) shows the warning
+`noRecoveryCode` in the main window: title "Kein gültiger Wiederherstellungscode", body "Erstelle
+einen neuen. Ohne ihn kommst du nicht mehr an deine Dateien, wenn du alle Geräte verlierst.", one
+button "Neuen Wiederherstellungscode erstellen". It opens the dialog of 10.3 (`renewRecoveryCode`,
+then the group check with `confirmRecoveryGroup`) with the intro "Dein Konto hatte keinen gültigen
+Code. Dieser hier gilt, sobald du ihn bestätigt hast." The banner cannot be hidden (the engine
+answers `dismiss_warning` with `Invalid`); it goes once the new code is confirmed. Tone
+"attention", so the tray shows "needs you"; no native notification, because nothing is urgent.
+It ranks after the missing folder and before the storage banners.
+
+**Folders not readable after the recovery.** [ADR 0001, amendment "follow-up review of the
+recovery after its append", LOW 2; Design] After this device's own recovery, the key of some
+folders may not open yet, and the folder list may have had to start empty. The warning
+`foldersUnreadable` (`folders`: names, `folderList`: bool) is one calm banner (tone "info",
+`role="status"`, the tray stays calm, no native notification), ranked after `recoveryPending` and
+before the two-versions banner:
+- With folders: title "Noch nicht erreichbar: {folders}" (the names as one list in the UI language,
+  `Intl.ListFormat`, isolated like every name), body "Dieser Ordner ließ sich nach der
+  Wiederherstellung noch nicht öffnen. Sobald dein Server oder ein anderes Gerät ihn liefert, ist er
+  von selbst wieder da." or the plural sentence; no button, it goes when the keys open (the engine
+  refuses to hide it).
+- With the folder list: the sentence "Die Liste deiner Ordner ließ sich nach der Wiederherstellung
+  nicht lesen und wurde leer neu begonnen. Ordner, die dir fehlen, kannst du neu hinzufügen." is
+  added; alone it has the title "Ordnerliste neu begonnen" and the button "Ausblenden"
+  (`dismissSuspect`), since waiting brings nothing back.
+- A warning with neither is not shown.
+
+**Unknown warnings.** The window decodes warnings and server notices of a kind it does not know
+by leaving them out, so a newer engine never empties the window; a known kind with a wrong shape
+still fails the snapshot (`knownArray` in `src/backend/tauri/decode.ts`).
 
 **The sheet, version 3.** [ADR 4, Design] Print and "Als Datei speichern" lay out the same
 document, worded by the window in the UI language (`sheet.*`, `RecoverySheetDocument`): the
@@ -503,14 +611,14 @@ Devices > "Gerät hinzufügen":
 
 The tray shows one state for the whole app, the most urgent across all folders. [Design]
 
-| Priority | State | Icon shape (never color alone) | Tooltip (de) | Entered when | Left when |
-| --- | --- | --- | --- | --- | --- |
-| 1 | **Braucht dich** (problem) | cloud with exclamation mark, error color | Hangar Drive: Braucht deine Hilfe | a decision is pending (mass deletion), a folder is stopped for safety (missing folder, older state, suspected attack), this device was removed, the server refuses this device or needs an update, the disk or the server storage is full | the cause is gone or decided |
-| 2 | **Angehalten** (paused) | cloud with two bars | Hangar Drive: Angehalten bis {time} | the person paused | the pause ends or "Fortsetzen" |
-| 3 | **Offline** | cloud outline with a slash, muted | Hangar Drive: Offline. Änderungen werden später synchronisiert. | no network, or the server has not answered for 2 minutes | the server answers |
-| 4 | **Synchronisiert** (syncing) | cloud with two arrows | Hangar Drive: {count} Dateien werden synchronisiert (`tray.state.syncing`, one and other form) | there is work for more than 2 s | no work for 3 s |
-| 5 | **Aktuell** (up to date) | cloud with check mark | Hangar Drive: Alles aktuell, or "Alles andere ist aktuell" while files wait (below) | nothing else applies | |
-| | **Einrichtung offen** | cloud outline | Hangar Drive: Einrichtung noch nicht fertig | setup not finished | setup done |
+| Priority | State | Tray dot on the logo | Window mark shape (never color alone) | Tooltip (de) | Entered when | Left when |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | **Braucht dich** (problem) | red | cloud with exclamation mark, error color | Hangar Drive: Braucht deine Hilfe | a decision is pending (mass deletion), a folder is stopped for safety (missing folder, older state, suspected attack), this device was removed, the server refuses this device or needs an update, the disk or the server storage is full | the cause is gone or decided |
+| 2 | **Angehalten** (paused) | gray | cloud with two bars | Hangar Drive: Angehalten bis {time} | the person paused | the pause ends or "Fortsetzen" |
+| 3 | **Offline** | gray | cloud outline with a slash, muted | Hangar Drive: Offline. Änderungen werden später synchronisiert. | no network, or the server has not answered for 2 minutes | the server answers |
+| 4 | **Synchronisiert** (syncing) | none | cloud with two arrows | Hangar Drive: {count} Dateien werden synchronisiert (`tray.state.syncing`, one and other form) | there is work for more than 2 s | no work for 3 s |
+| 5 | **Aktuell** (up to date) | green | cloud with check mark | Hangar Drive: Alles aktuell, or "Alles andere ist aktuell" while files wait (below) | nothing else applies | |
+| | **Einrichtung offen** | none | cloud outline | Hangar Drive: Einrichtung noch nicht fertig | setup not finished | setup done |
 
 - **Waiting files are not work.** [Design] Files held back by a metered network or by the
   server's daily upload budget (8.4) do not count for state 4: the icon would otherwise show
@@ -527,8 +635,22 @@ The tray shows one state for the whole app, the most urgent across all folders. 
 - **No animation.** [Design] The syncing icon is static. A spinning tray icon is seen all day and
   flickers in screenshots and screen recordings; the arrows say enough.
 - **Hysteresis** (2 s in, 3 s out) keeps the icon from blinking when small files change. [Design]
-- **Icon set:** a light and a dark taskbar variant and a high contrast variant, each at 16, 20,
-  24 and 32 px. [Design]
+- **Tray icon: the logo with a state dot.** [Design] The tray shows the app logo (the folded D of
+  `src-tauri/app-icon.svg`) with a small filled dot in the bottom right corner, inside a ring of
+  the logo tile `#141a24` that cuts it free from the D and from light and dark taskbars. Green
+  `#3fb950` when up to date (deeper and more saturated than the logo's `#4fd1a5`, so the dot does
+  not read as a piece of the D), red `--error` `#ff9491` when something needs the person, gray
+  `--muted` `#8592a3` when paused or offline (nothing moves, nothing is wrong). Syncing has no
+  dot: it passes between two other states, and a dot that came and went with every saved file
+  would draw the eye all day. Setup has none either: it is also the icon at start, before
+  anything is known. The tooltip names the state, so the dot's color is never the only signal.
+  The window's status mark keeps the cloud shapes of the table (6.3).
+- **Icon set:** one variant for every taskbar (the logo brings its own dark tile), rasterized by
+  `src-tauri/build.rs` from `app-icon.svg` at 16, 20, 24 and 32 px, chosen by the display scale.
+  Below 24 px the logo's two cream squares are left out, because they blur into a gray smudge at
+  that size (judged by rendering every size on a light and a dark taskbar). macOS shows the icon
+  in color, not as a template image, which would flatten logo and dot into one silhouette.
+  High contrast has no variant of its own yet. [Design]
 
 ### 6.2 Tray menu
 
@@ -574,14 +696,31 @@ The tray shows one state for the whole app, the most urgent across all folders. 
 +------------------------------------------------------------------+
 ```
 
-- **Header.** [Design, owner 2026-11-26] Only three things: the main menu button ("≡", `main.menu`)
-  before the logo (the folded D of `src-tauri/app-icon.svg`, in its own colors in both themes)
-  and the app's name, and on the right the compact status. The menu (`role="menu"`, arrow keys,
-  Escape returns the focus to the button, no shortcut of its own) holds "Ordner hinzufügen",
-  "Letzte Aktivitäten", "Geräte", "Einstellungen" and "Hilfe"; F1, Ctrl+, and Ctrl+Shift+D still
-  open help, settings and devices. No version in the header: the window learns it only through
-  `getAbout`, and the settings show it.
-- **Status.** [Design] The tray's state mark (same shape as the tray icon, tinted green when up to
+- **Header.** [Design, owner 2026-11-27, as in Hangar] Only three things: the main menu button
+  ("≡", `main.menu`) before the logo (the folded D of `src-tauri/app-icon.svg`, in its own colors
+  in both themes, spanning two lines), the app's name in bold with the version below it in small
+  muted text, and on the right the compact status. The version comes from `getAbout` (with the
+  build number, as in the settings) and carries the outlined `version.beta` badge in the accent
+  color while the major version is 0, the same rule as Hangar (`versionParts`). Its line keeps its
+  height before the answer arrives or if it never does, so the name never moves.
+- **Main menu.** [Design, owner 2026-11-27] The same component and behaviour as Hangar's app
+  menu (`src/ui/AppMenu.tsx`, keyboard logic in `src/ui/menuNav.ts`): a panel below the button
+  with "Datei", "Ansicht" and "Hilfe" (`menu.file`, `menu.view`, `menu.help`), each opening a
+  submenu to its right ("›"). Datei: "Ordner hinzufügen", "Geräte", "Einstellungen", a separator
+  and "Hangar Drive beenden" (`menu.quit`, the tray's quit, no question). Ansicht: "Liste" and
+  "Kacheln" as `menuitemradio` (the current one bold with a check mark, the same stored view as
+  the switch above the folders), a separator and "Letzte Aktivitäten". Hilfe: "Hilfe". There is
+  nothing to edit, so no "Bearbeiten", and no "Über Hangar Drive" while "About" is only a section
+  of the settings. Keys follow the WAI-ARIA menu pattern: opening (click or Down arrow on the
+  button) focuses "Datei" without opening a submenu; Up and Down move, Right, Enter or Space opens
+  a submenu and focuses its first entry, Left or Escape closes it and returns to its entry, Home
+  and End jump, a first letter jumps, Escape at the top or Tab closes everything and returns the
+  focus to the button. With the mouse a submenu opens on click or once the pointer moves onto its
+  entry. Choosing an entry closes the menu and puts the focus back on the button first, so a
+  dialog opened from it returns there. Shortcuts are shown next to their entries
+  (`aria-keyshortcuts` as well); F1, Ctrl+, and Ctrl+Shift+D still open help, settings and
+  devices, and the menu has no shortcut of its own.
+- **Status.** [Design] The state mark (the cloud shapes of 6.1, tinted green when up to
   date, red when something needs the person) and the state in words, the same as the tray tooltip;
   offline shows the one word `main.status.offline`. The sentence is the button's name, the muted
   line (time of the last sync, bytes left, why files wait) its tooltip and description. Clicking
@@ -792,9 +931,47 @@ which action is the default (focused, primary style).
   brings the files back into the folder from the last synced state. "Ja, löschen" is the danger
   style. Escape closes the dialog without deciding; the banner stays.
 - **No "do not ask again".** [Design] The threshold is the whole point of the guard.
-- **Incoming deletions** from other devices do not ask. Files deleted locally because another
-  device deleted them go to the Windows recycle bin, not into nothing. The activity shows
-  "Fotos: 342 Dateien auf Laptop gelöscht" with "Wiederherstellen". [Design]
+- **Incoming deletions, few.** [Design] Deletions another device made below the threshold below
+  do not ask. Files deleted locally because another device deleted them go to the Windows recycle
+  bin, not into nothing. The activity shows "Fotos: 342 Dateien auf Laptop gelöscht" with
+  "Wiederherstellen".
+- **Incoming deletions, many.** [ADR 0001, amendment "incoming mass deletes"] Once the files
+  another device deleted in a folder since the last decision, within a day, reach 1,000, or 100
+  and a quarter of the folder (the fewest files it held that day), they stay here and the same
+  dialog asks in its incoming variant. A folder of fewer than 100 files never asks; moves,
+  directories and files that only arrived that day are not counted, so tidying up a few files a
+  day or removing part of a new project stays quiet.
+  Everything else of the folder keeps syncing, further deletions while the question is open wait
+  too, and a file changed here meanwhile simply stays (and goes back to the other devices). The
+  tray goes to "Braucht dich", a notification appears, the dialog opens once by itself and the
+  banner stays until the person decides.
+
+```text
++--------------------------------------------------------------+
+| Laptop hat 342 Dateien in „Fotos“ gelöscht                   |
+| Laptop ist seit 3. Okt. 2026 in deinem Konto.  (muted)       |
+| Hier liegen sie noch. Sollen sie auch hier gelöscht werden?  |
+|                                                              |
+|   Urlaub 001.jpg, Urlaub 002.jpg, Urlaub 003.jpg             |
+|   und 339 weitere   Liste ansehen (link)                     |
+|                                                              |
+|          [ Ja, hier löschen ]   [ Wiederherstellen ]         |
+|                 Die Dateien kommen auf allen Geräten zurück. |
++--------------------------------------------------------------+
+```
+
+  - Without a device the verified history names alone: "Ein anderes Gerät hat 342 Dateien in
+    „Fotos“ gelöscht", and no second line.
+  - The quiet second line names since when the device is in the account, from the verified
+    device log, the date the device list shows: a device can take another one's name, not this
+    date (security review L5).
+  - "Wiederherstellen" has the focus and is the safe default: the files come back on every
+    device as a new version, from the copies still here. The hint below it says so and is its
+    description for screen readers.
+  - "Ja, hier löschen" is the danger style and asks once more natively ("342 Dateien in „Fotos“
+    auch hier löschen?" / "Auf diesem Gerät kommen sie in den Papierkorb."). It deletes exactly
+    what the question showed; deletions that arrived since ask again.
+  - Escape closes without deciding; the banner stays.
 
 - **Where they go.** [Backend, measured on Windows, [[recycle-bin-measurement]]] Windows:
   `IFileOperation` with `FOFX_RECYCLEONDELETE`, the plain path (the shell refuses `\\?\` paths).
@@ -1293,6 +1470,11 @@ entry. They are one view with two tabs, so there is one place to learn. [Design]
   alte funktioniert danach nicht mehr. Wirf das alte Blatt weg." The old recovery device is removed
   only after the group check succeeds, so closing the dialog midway leaves the old code valid.
   [Design, Backend]
+- **The native question** after the group check: "Den neuen Wiederherstellungscode übernehmen?"
+  with the intro above. An account without a valid code (banner `noRecoveryCode`) has no old code
+  to replace, so the question says instead: "Für dein Konto gilt gerade kein
+  Wiederherstellungscode. Mit diesem kommst du wieder an deine Dateien, wenn kein Gerät mehr da
+  ist." (`confirm::renew_code`, decided from the snapshot).
 
 ## 11. Settings
 
@@ -1583,7 +1765,13 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `recover.body` | Füge den Link von deinem Blatt ein oder scanne den QR-Code darauf. Den Code tippst du ab. | Paste the link from your sheet or scan the QR code on it. Then type the code. |
 | `recover.codeLabel` | Wiederherstellungscode | Recovery code |
 | `recover.cleanup.title` | Alte Geräte entfernen | Remove old devices |
-| `recover.cleanup.body` | Diese Geräte gehören noch zu deinem Konto. Entferne die, die du nicht mehr hast. | These devices still belong to your account. Remove the ones you no longer have. |
+| `recover.cleanup.body` | Diese Geräte gehören noch zu deinem Konto. Entferne alle, die du nicht mehr hast oder nicht kennst. | These devices still belong to your account. Remove every one you no longer have or do not know. |
+| `recover.cleanup.device` (also backend) | Gerät, hinzugefügt am {date} | Device, added on {date} |
+| `recover.cleanup.note` | Erst mit „{button}“ kommt dieses Gerät in dein Konto. Dein alter Code gilt danach nicht mehr. Brichst du vorher ab, bleibt alles, wie es war. | This device joins your account only with “{button}”. Your old code stops working then. If you stop before, nothing changes. |
+| `recover.cleanup.confirm` | Wiederherstellen | Recover |
+| `recover.cleanup.changed` | Die Geräte deines Kontos haben sich gerade geändert. Prüfe die Liste noch einmal. | The devices of your account just changed. Check the list again. |
+| `recover.ended` | Die Wiederherstellung ist nicht abgeschlossen. Starte sie noch einmal. | The recovery did not finish. Start it again. |
+| `recover.restart` | Von vorn beginnen | Start again |
 | `recover.newCode` | Der alte Code ist jetzt verbraucht. Hier ist dein neuer. | The old code is used up now. Here is your new one. |
 | `recover.linkLabel` | Link vom Blatt | Link from the sheet |
 | `recover.linkOk` | Gefunden: {host} | Found: {host} |
@@ -1634,6 +1822,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `main.addFolder.remote` | Auf deinen anderen Geräten gibt es noch: | Your other devices also have: |
 | `main.activity` | Letzte Aktivitäten | Recent activity |
 | `main.menu` | Menü | Menu |
+| `menu.file` | Datei | File |
+| `menu.view` | Ansicht | View |
+| `menu.help` | Hilfe | Help |
+| `menu.quit` | {app} beenden | Quit {app} |
+| `version.beta` | beta | beta |
 | `main.status.offline` | Offline | Offline |
 | `main.view` | Ansicht | View |
 | `main.view.list` | Liste | List |
@@ -1765,6 +1958,21 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `deletes.confirm` | Ja, löschen | Yes, delete |
 | `deletes.restored.one` | {count} Datei ist wieder da. | {count} file is back. |
 | `deletes.restored.other` | {count} Dateien sind wieder da. | {count} files are back. |
+| `incoming.title.one` | {device} hat {count} Datei in „{folder}“ gelöscht | {device} deleted {count} file in “{folder}” |
+| `incoming.title.other` | {device} hat {count} Dateien in „{folder}“ gelöscht | {device} deleted {count} files in “{folder}” |
+| `incoming.titleUnknown.one` | Ein anderes Gerät hat {count} Datei in „{folder}“ gelöscht | Another device deleted {count} file in “{folder}” |
+| `incoming.titleUnknown.other` | Ein anderes Gerät hat {count} Dateien in „{folder}“ gelöscht | Another device deleted {count} files in “{folder}” |
+| `incoming.body` | Hier liegen sie noch. Sollen sie auch hier gelöscht werden? | They are still here. Delete them here too? |
+| `incoming.deviceSince` | {device} ist seit {date} in deinem Konto. | {device} has been in your account since {date}. |
+| `incoming.restoreHint` | Die Dateien kommen auf allen Geräten zurück. | The files come back on all devices. |
+| `incoming.confirm` | Ja, hier löschen | Yes, delete here |
+| `incoming.restored.one` | {count} Datei ist wieder da, auf allen Geräten. | {count} file is back on all devices. |
+| `incoming.restored.other` | {count} Dateien sind wieder da, auf allen Geräten. | {count} files are back on all devices. |
+| `incoming.done.one` | {count} Datei ist jetzt auch hier gelöscht. | {count} file is now deleted here too. |
+| `incoming.done.other` | {count} Dateien sind jetzt auch hier gelöscht. | {count} files are now deleted here too. |
+| `incoming.ask.one` | {count} Datei in „{folder}“ auch hier löschen? | Delete {count} file in “{folder}” here too? |
+| `incoming.ask.other` | {count} Dateien in „{folder}“ auch hier löschen? | Delete {count} files in “{folder}” here too? |
+| `incoming.askBody` | Auf diesem Gerät kommen sie in den Papierkorb. | On this device they go to the trash. |
 | `missing.title` | „{folder}“ ist nicht mehr da | “{folder}” is gone |
 | `missing.body` | {app} hat den Ordner angehalten. Auf dem Server und auf deinen anderen Geräten ist nichts gelöscht. | {app} has paused the folder. Nothing was deleted on the server or on your other devices. |
 | `missing.find` | Ordner suchen | Find folder |
@@ -2211,7 +2419,7 @@ the window's own, this section wins.
   the warning for the last device in the same question instead of a second one), "Dieses Gerät
   zurücksetzen" (11), taking a renewed recovery code once its group matched (10.3), continuing a
   folder with the server's older state (8.6), taking in the changes of a removed device (8.9),
-  "Ja, löschen" for many deletions (8.1), turning "Beim Anmelden starten" off (11), "Jetzt
+  "Ja, löschen" and "Ja, hier löschen" for many deletions (8.1), turning "Beim Anmelden starten" off (11), "Jetzt
   aktualisieren" once an update was found (8.8) and confirming a removal only the server reports
   (8.8) are asked by the operating system's dialog, with what the backend knows (device, folder,
   number of files, version). The window asks nothing of its own before these where its step
@@ -2220,7 +2428,21 @@ the window's own, this section wins.
   native question (the confirm screen is gone; the screen without a comparison stays, because
   it says what skipping the comparison costs). Dialogs that carry the decision itself (8.1, 8.9,
   the comparison of 8.6) stay. "Nein" in a native question is not an error: nothing changes and
-  nothing is shown.
+  nothing is shown. Every native question starts on "Nein", so Enter or Space never confirms
+  one (security review LOW 1): on Windows an own task dialog with "Nein" as its default button,
+  on macOS the buttons in reverse order so "Nein" takes Return, on Linux the dialog of the
+  desktop as it is.
+  > [!question] Unverified
+  > The macOS and Linux default button on a running system.
+- **Folder names from the account and "Im Explorer öffnen" (security review MEDIUM 1).** A
+  proposed place for an account folder never carries a name the Windows shell or the Finder
+  reads as more than a folder: a `.{GUID}` ending loses its dot, a reserved name gets a leading
+  `_`, an 8.3 short name shape loses its `~`, a bundle ending (`.app` and the like) loses its
+  dot (`root_dir_name` in `src-tauri/src/commands.rs`). A folder with a `.{GUID}` name on its
+  path is refused as a sync root ("Dieser Ordner gehört zum System."), also when the person picks
+  it; other names they pick stay allowed. The file manager only shows: on Windows after the
+  shell resolved the path to exactly the checked one, on macOS with `open -R` (the folder is
+  shown selected in its parent, also for "Ordner öffnen").
 - **6.5, a folder that is not empty (H1).** The window's merge dialog is gone. The shell asks
   natively with the number of files, the account folder, the place and the server the files go
   to, with "Zusammenführen" and "Anderen Ordner wählen"; the latter opens the folder picker for

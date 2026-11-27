@@ -6,7 +6,7 @@ sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "
 status: accepted
 superseded_by:
 created: 2026-11-26
-updated: 2026-11-26
+updated: 2026-11-27
 ---
 
 # ADR 0001: Foundation
@@ -2277,7 +2277,8 @@ here without a question. The threat model treats this as inherent: a device of t
 delete, and every deleted file goes to the recycle bin or the quarantine and stays in the server's
 history for the retention window, so it can be brought back. Whether incoming deletions should
 also wait above a threshold is an open product decision (it would let a compromised device's
-deletions sit undecided on every other device, and hold up honest reorganisations).
+deletions sit undecided on every other device, and hold up honest reorganisations). Decided in
+the amendment "incoming mass deletes" (2026-11-27): they wait above a threshold.
 
 **Open points.**
 - Quiet notices end only with a restart; a "condition cleared" feed notice would let them go when
@@ -2740,3 +2741,1152 @@ FFI) and six points, all fixed with tests.
   outside the threat model (amendment "Directory handles on Unix").
 - **Dependency:** none added; `windows` 0.62 gains the feature `Win32_Globalization`
   (`CompareStringOrdinal`). `cargo deny check` green.
+
+## Amendment 2026-11-27: security review of the crypto and protocol crates
+
+A read-only security review of `crates/hangar-drive-crypto` and `crates/hangar-drive-protocol`
+found one medium, one low and six informational points. All are fixed, with tests. The byte
+formats of entries, records, objects, offers and commits do not change, so the fixed vectors
+stay as they are (`test_vectors.py`: all 61 match). Two rules that server and clients share
+change (device log, replay guard), and the app's stored guard marks gain the epoch.
+
+**MEDIUM 1: the reserve of the device log could be used up.** The last 64 places of the log took
+removals and rotate epoch entries, and a rotate epoch entry was accepted at any time. A
+compromised current device could append about 8190 plain rotations, fill the log up to
+`LogFull` and never be removed; with many devices added before, 64 places did not hold a removal
+of each of them either.
+- **No plain rotations** (conclusion): a rotate epoch entry is accepted only while a rotation is
+  due after a removal, or for the account's first epoch (`LogError::NoRotationDue`). The app
+  makes no other rotation (`finish_setup` makes the first epoch, every later rotation comes from
+  `remove_devices`), and a rotation without a removal protects nothing a removal did not already
+  ask for. A plain rotation "once something else was appended since the last one" was not
+  chosen: it would keep an add and rotate cycle of two entries per call for nothing the app
+  uses. The epochs of a log are now at most its removals plus one.
+- **The reserve holds every device:** `RESERVED_LOG_ENTRIES = 2 * MAX_CURRENT_DEVICES + 2` (132;
+  first set to `2 * MAX_DEVICES + 2` and raised with the follow-up below). In the reserve the log
+  takes removals, the due rotation, and one regular device added by a recovery device per epoch;
+  the very last place takes only the due rotation. The recovery add keeps a log in the reserve
+  from getting stuck when the person has only the recovery device left. Bound (conclusion,
+  checked by the tests below): an attacker with regular devices only uses at most two places per
+  device it removes (it keeps itself and the recovery device), plus one for a rotation due when
+  the reserve began; the person then needs one place to add a device through the recovery
+  device, one per remaining device and one for the rotation. With `c` current devices at the
+  start of the reserve and `d` (0 or 1) for a due rotation that is at most `2c + d` places.
+  Corrected with the amendment "recovery in one piece": the person's part must fit in one piece
+  (it is one batch now), and after every complete batch an account has at most `MAX_DEVICES`
+  devices (the place above the limit is taken only inside a recovery batch), while a due rotation
+  follows a removal, so `c + d <= MAX_DEVICES` and at most 128 places are needed; the earlier
+  premise `c + d <= MAX_CURRENT_DEVICES` (130) was looser than needed.
+- The server's `admit_batch` is unchanged; a plain rotation batch after the first epoch is now
+  refused there by the same verifier (`NoRotationDue`). Throttling appends is the server's part.
+- Tests (`devicelog.rs`): `only_the_first_rotation_needs_no_removal`;
+  `the_last_places_are_reserved` (rewritten: a regular device adds nothing in the reserve, no
+  plain rotation, one recovery add per epoch, the last place only for the due rotation);
+  `after_the_worst_abuse_the_owner_still_removes_the_attacker` (64 devices, the attacker removes
+  every device but the owner's, each with its rotation, and tries plain rotations and adds in
+  between; the owner then removes it and rotates within the log);
+  `after_the_worst_abuse_the_recovery_device_still_gets_the_account_back` (the same with a
+  rotation due at the start of the reserve and only the recovery device left: it adds a device
+  that removes the attacker and the recovery device and rotates);
+  `the_reserve_holds_a_removal_of_every_device`. Both abuse tests fail with the old reserve of
+  64 places. They move the log to the reserve without thousands of signed entries
+  (`fast_forward`: the checks of the next entry read only the length and the newest hash).
+- **Recovery over the device limit** (follow-up, conclusion): the device cap also bound the
+  recovery device. A compromised regular device could remove the person's regular devices and
+  fill the account up to `MAX_DEVICES` with devices of its own; the recovery device then could
+  not add a device (`TooManyDevices`), so the recovery sheet never got back in.
+  - A regular device added by a recovery device may exceed `MAX_DEVICES` by exactly one, up to
+    `MAX_CURRENT_DEVICES = MAX_DEVICES + 1` (65). A regular device still adds nothing at 64 or
+    more, so only the person's recovery device reaches the extra place, and a recovery device
+    adds nothing at 65. The device it adds can then remove every other device.
+  - Every bound that counts current devices follows: a rotation wraps to at most 65 devices, so
+    `MAX_WRAPPED_KEYS` is 65; one append call removes every other device of a full account with
+    its rotation (64 removals and the rotation, which is what the app's removal and recovery do
+    in one call), so `MAX_APPEND_ENTRIES` rose from 16 to 65. The crypto crate checks both at
+    compile time against `MAX_CURRENT_DEVICES`. The server's wrap check
+    (`wraps_cover_current_devices`) compares with the log's current devices and needed no
+    change; no other list is bounded by the device limit (device names allow 1024, the create
+    entry 8). The reserve grew to `2 * MAX_CURRENT_DEVICES + 2` above.
+  - Not chosen: exempting the recovery add from the cap altogether (a recovery code holder could
+    then grow the account without bound and every rotation's recipients with it), and reserving
+    a place below the cap for the recovery device (it would lower what the person can use, and
+    an account with two recovery devices would need two).
+  - Tests: `a_full_account_still_lets_the_recovery_device_in` and
+    `the_reserve_holds_the_device_over_the_limit_too` (`devicelog.rs`: 65 devices before the
+    reserve, the attacker's worst use of it, then the recovery path within the log), and
+    `server/tests/recovery_cap.rs`, `a_full_account_still_lets_the_recovery_sheet_in_and_remove_everyone`
+    (over the socket: the attacker removes the owner and fills the account to 64, a regular add is
+    refused, the recovery session adds the new device as the 65th, and that device removes all 64
+    others with one append call and one wrap).
+
+**LOW 1: a huge record version blocked the re-seal.** The replay guard ordered records by version
+only, and the re-seal after a removal writes the version plus one. A malicious server together
+with a compromised current device could give a device a record at version `u64::MAX`; after that
+device's removal the guard refused every re-sealed record of the new epoch for good.
+- **Order `(epoch, version)`** (`RecordGuard::check`): a record under a newer epoch than the
+  mark's is newer whatever its version; one under an older epoch is refused
+  (`GuardError::StaleEpoch`); within one epoch the version rule stays (an older version is
+  refused, a different record under the same version is equivocation). The guard only sees
+  records that opened, whose sender is current in the verified log, so a record of a newer epoch
+  always comes from a current device.
+- **Marks hold the epoch:** `RecordMark { epoch: Option<Epoch>, version, digest }`. The app stores
+  them as `marks` in its account value. An account stored by an older version has `guard` tuples
+  without the epoch, read once (`resume_marks` in `crates/hangar-drive-sync`): a mark takes the
+  epoch of the record kept for its key when that record's SHA-256 is the mark's digest and its
+  version the mark's (`RecordMark::from_legacy`); otherwise the epoch stays unknown and the mark
+  keeps the version-only rule until the next accepted record. The next save writes only `marks`.
+- **Server rule:** unchanged. The server stores only the current epoch and only the stored
+  version plus one, so what it stores never goes back in either order.
+- Open point for the sync engine: `AccountRecords` documents its versions as the server's. A
+  device that was shown a forged high version still re-seals at that version plus one; an honest
+  server refuses that with `record_version`, and the record the device then fetches may be the
+  removed device's, which no longer opens. Other current devices re-seal, and the device accepts
+  their records under the new order; a device that is the only one left should re-seal at the
+  version the server holds.
+- Tests: `a_huge_version_of_a_removed_device_does_not_block_the_next_epoch` (the attack: b's
+  record at `u64::MAX`, b removed, a's re-sealed record at version 4 of epoch 2 is accepted; the
+  epoch 1 records are refused as stale, an older version or another record of epoch 2 as
+  before), `a_mark_without_epoch_keeps_the_version_rule` and
+  `a_legacy_mark_takes_the_epoch_of_its_own_record` (crypto), `old_guard_marks_are_migrated`
+  (sync).
+
+**Info.**
+- `object::padme` returns `Option<u64>`, `None` where the rounded length would pass `u64::MAX`
+  (lengths above `2^64 - 2^57`). The callers (objects, records, pairing names) add the length
+  prefix with `checked_add` and refuse such lengths. Test `padme_does_not_overflow_near_the_top`.
+- Pairing: the offer body is written into a buffer of its final size, signature included, so no
+  grown buffer leaves copies of the pairing secret in freed memory. Test
+  `offer_buffers_are_allocated_at_their_final_size`.
+- Pairing: typing P as a code without the offer is documented as not supported. The code carries
+  neither account ID nor log head hash, so a device that only typed it has no trust anchor. The
+  app pairs only through the scanned offer; no feature changed.
+- `FolderView::reanchor_base` finds the bases of side commits by map lookups (the kept chain
+  through the view's positions, the segment through its own map) instead of a linear search per
+  head, and the check for side commits without a head uses a set. Test
+  `reanchor_finds_side_bases_on_the_kept_chain_and_in_the_segment` (bases on the kept chain and in
+  the segment are found, one on the dropped part of the chain is refused, as before).
+- `RecordKey` is deserialized through `try_from` with the rule of `RecordKey::new` (a folder
+  exactly for per-folder kinds), so no JSON, feed entry or stored state yields a mismatched key.
+  Test `record_keys_are_checked_when_read`.
+- Fuzz target `verify_built_delta`: builds commits from the input's fields, signs them with the
+  fixture's keys (one device current, one removed with its rotation) and runs `verify_delta`,
+  `check_delta` and `reanchor_base`, so `step`, the removed signer rule and the re-anchor walk are
+  reached behind the signature. It compiles (`cargo check` of the fuzz package); it was not run,
+  since no nightly toolchain is installed here.
+
+## Amendment 2026-11-27: security review of the sync server
+
+A security review of `server/` found three medium and four low points and a few infos; each
+was checked in the code first and is fixed with tests (`server/tests/server_review.rs`,
+`server/tests/deploy_files.rs`, unit tests in the named modules). The device log throttle
+below is the server side of the crypto review's log reserve (amendment "security review of the
+crypto and protocol crates").
+
+- **M1, address tables flooded without a session:** the authorization layer counts every call
+  with a bearer token per address before the token lookup (`CallIp`, 3000/min, IPv6 per /64)
+  and per network (`CallNet`, 12000/min, IPv6 per /48). Each request of one /48 with a new /64
+  added a key, so a few networks filled the table of 100 000 keys within a minute, and from
+  then on every new honest key got `rate_limited`. Now every address scope keeps at most
+  `MAX_ADDRESSES_PER_NET` (256) keys of one network at a time; beyond that a new address is not
+  tracked and only the network limit, counted first, applies to it. Ended windows are evicted
+  on every new key, not only in a full table, so the per network counts hold only live keys.
+  `CallIp` also fails open in a full table (about 400 networks at once): it only bounds token
+  lookups, which `CallNet` still bounds. The sign-in scopes keep refusing new keys in a full
+  table, so an online search for proofs or invites never gains from a flood. Code:
+  `server/src/http/ratelimit.rs` (`hit_in`, `Table::groups`, `Scope::fails_open`).
+- **M2, one account holding the global write lock:** the commit call took `BEGIN IMMEDIATE`
+  first and then loaded up to 2^21 IDs into its temporary table and checked them, so commits
+  full of IDs the server does not hold (refused with `missing_objects` only at the end) held
+  the write lock of every account, and sign-ins, uploads and pairing of others ran into the
+  10 s busy timeout. The call now has two phases on one pooled connection
+  (`commits::commit_call`, `db::begin_write_on`). Without the lock it reads the account, the
+  folder and the head (refusing `head_moved` early), decodes and verifies both commits, loads
+  the IDs into `commit_ids` (writes to the temporary database only, which take no lock on the
+  main one) and checks that every added object is held. Under `BEGIN IMMEDIATE` it reads the
+  account again (and decodes again if the device log grew), then runs the unchanged checks:
+  compare and swap, parents, counters, every rule that depends on the head, and the held checks
+  once more. The collection deletes object rows in its own write transaction, so the second
+  check sees every deletion before it and none can come before the commit is durable; the
+  object locks order only file removal against uploads and are not involved. Option (a) was
+  taken because it removes the cost the attack needs; (b) is added on top: `CommitAccount` (30
+  commits per minute and account, before the body is read) and `CommitRefusedAccount` (20
+  refused commits per 10 minutes, `head_moved` and the server's own failures not counted; once
+  used up, every commit of the account is refused before its body is read for the rest of the
+  window). Measured on Windows 11, debug build, the largest delta (1 048 576 IDs, none held)
+  and an empty write transaction every 20 ms beside it
+  (`m2_measure_a_refused_commit_with_the_largest_delta`, the same test run against the previous
+  code in a temporary worktree): before, a write waited **1.64 s** for the lock (2 writes during
+  a call of 5.5 s); after, the longest wait was **14.6 ms** (54 writes during a call of 3.7 s).
+  Tests: a commit stopped by a test hook right before the lock (`Hooks::commit_prepared`) does
+  not delay another account's sign-in; an object deleted while it waits makes it fail with
+  `missing_objects` under the lock; a commit of phantom IDs never reaches the hook; refused
+  commits brake only their own account.
+- **M3, no writable temporary folder in the image:** confirmed in the code. The bundled SQLite
+  (libsqlite3-sys 0.40) is built without `SQLITE_TEMP_STORE`, so temporary tables and sorts
+  spill to files beyond the page cache; `unixTempFileDir` tries `SQLITE_TMPDIR`, `TMPDIR`,
+  `/var/tmp`, `/usr/tmp`, `/tmp` and `.`, all on the read-only root file system of the
+  container (`read_only: true`, no tmpfs), so a large commit could fail with an I/O error.
+  Fixed without RAM: the image sets `SQLITE_TMPDIR=/data/tmp`, and the server creates
+  `<data dir>/tmp` (0700 on Unix) at every start and empties it in `serve` under the data
+  folder lock (an admin command beside the server must not remove its files). No environment
+  variable is set at run time, which edition 2024 makes `unsafe`. Open: checked by reading the
+  code and by `deploy_files.rs`; a large commit in the real container was not run (Docker was
+  not available).
+- **L1, connection slots per network:** the server limited connections per address only, so
+  with TLS in the server 64 IPv4 addresses took all 4096 slots. `PeerConnections` now also
+  counts per network (the rate limiter's network key): four times the address limit and at
+  most a quarter of all slots (`Concurrency::connections_per_net`). The TLS handshake timeout
+  went from 10 s to 5 s.
+- **L2, trickling bodies in the heavy slots:** a commit or record body holds one of the four
+  heavy slots while it arrives (the slot bounds the memory of these bodies, finding M4), and
+  only an idle timeout of 30 s and a total of 120 s ended a slow one. Heavy bodies must now keep
+  64 KiB/s on average after a grace of 5 s (`extract::HEAVY_PACE`, `read_paced`); a body that
+  falls behind is answered 408 and frees its slot. Taking the slot after the body was rejected:
+  it would give up the memory bound.
+- **L3, trusted proxies with TLS in the server:** an operator who moved from a proxy to TLS in
+  the server kept trusting `X-Forwarded-For` from the old proxy's addresses, which clients could
+  then reach directly. The server now refuses to start when TLS in the server is configured and
+  `HANGAR_DRIVE_TRUSTED_PROXIES` is not empty (`ConfigError::TlsWithTrustedProxies`).
+- **L4, backup command:** the documented `tar` wrote the archive with `server.secret` world
+  readable and used an unpinned image. It now runs with `umask 077`, gives the archive to the
+  operator's user, and uses the Caddy image that `docker-compose.yml` already pins by digest;
+  the guide says the archive is a secret.
+- **Device log throttle (crypto follow-up):** a compromised current device could append
+  rotations at the call rate until the log was full and it could no longer be removed. The log
+  format now refuses rotations nothing made due; on the server, appends that add a device or
+  rotate without a removal count against `LogAppendAccount` (30 per hour and account), and
+  rotations without a removal also against `LogRotateAccount` (one per hour). A batch that
+  removes devices, the rotation the log has due and the one append of a recovery session are
+  never counted, so a stolen device always stays removable (`service::devicelog::Throttle`).
+- **Infos done:** `SECURITY.md` names the self-hosted server's scope (sign-in bypass, access
+  across accounts, denial of service without a session) and what is out of scope (operator
+  misconfiguration). `HANGAR_DRIVE_BIND` sets the listen address: loopback by default outside
+  the image, `0.0.0.0` in the image; the health check follows it. The proxy examples send HSTS
+  without `includeSubDomains`, like the server. The nginx example gives `/api/v1/folders/` a
+  read timeout of 300 s. The guide says a certificate change in the TLS mode needs a restart.
+  The data folder is made 0700 at start on Unix (a process umask would need `unsafe`, and a
+  private folder covers every file in it). An upload claims its staging bytes before the disk
+  check, so two uploads cannot both pass on the same free space.
+- **Not done:** a total time limit for `GET /objects` bodies. The body stream is polled only
+  when the socket takes data, so a timer inside it does not fire for a client that stops
+  reading; it needs a write timeout on the connection, which hyper's HTTP/1 server does not
+  offer. Open point. The health check in the TLS mode still only connects (info 5): a real
+  handshake needs a client configuration that accepts the server's own certificate.
+- **Breaking changes:** outside the image the server now listens on `127.0.0.1` unless
+  `HANGAR_DRIVE_BIND` is set; with TLS in the server and trusted proxies it does not start.
+- **Dependency:** none added.
+
+## Amendment 2026-11-27: security review of the sync engine
+
+A security review of `crates/hangar-drive-sync` (threat model of section 4: the server is not
+trusted, other devices of the account may be hostile) found work that grew with the square of a
+directory or with the history, unbounded memory and storage, and gaps in the local mass delete
+guard. Fixed with tests unless marked open; the complexity tests count operations, not time, so
+they hold in a debug build.
+
+**HIGH 1: the scan was quadratic in the size of a directory.** `Tree::lookup_exact` looked at
+every entry of each directory on the path and fell back to the comparison key of every entry;
+the scan asked once per entry found, in the walk of a partial scan and for the remote tree of a
+new file. Measured by the review: 64,000 entries in one directory took 117 s per round, at
+`MAX_DIRECTORY_ENTRIES` about 30 minutes, which a hostile device sets off with empty files and an
+honest large folder meets as well.
+- `tree::NameIndex`, built once per scan: the exact names per directory borrow from the tree, the
+  comparison keys are computed once per node and only when a lookup first needs them; where
+  several entries match, the smallest item ID wins, as before. The scan takes all its lookups
+  through it (`folder.rs`, local index for the walk, the identification and unreadable
+  directories, the remote index on first need).
+- Tests: `name_index_equals_the_walk_over_the_children` (random trees with names equal by key
+  but not by bytes, and duplicate names), `scan_lookups_take_linear_work` (50,000 entries in one
+  directory, half found only by key: at most 6 units of work per entry; the walk over the
+  children needs more than 10 per entry already for the first 200 lookups, 2.5 * 10^9 for all).
+
+**HIGH 2: the delta check held every tree of a pull in memory.** `verify_tree_deltas` read the
+reachable set of the tree and of the parent's tree of every commit and kept every set until the
+end (`readable_set` with a cache without eviction); 200 commits over a tree of a million files
+need an estimated 15 to 20 GB, and every device of the account fell into an out of memory loop.
+- `codec::ReachState` holds one reachable set as reference counts (references from reachable
+  directory nodes and manifests, repeats counted, the kind of each object). `goto(root)` first
+  counts the references of objects of the new root that were not reachable, then takes away
+  those of the old root's objects that lose their last one; a subtree both roots share is never
+  read. The objects form an acyclic graph (an ID is the keyed hash of a plaintext naming its
+  children), so `added` and `dropped` are exactly the set differences of the earlier walk
+  (`reachable_typed`). A head's first parent is the head before it, so a pull reads the first
+  tree once and then only what each commit changed, and holds one set.
+- The check (`DeltaWalk`) keeps the roots found unreadable (gone or beyond the limits), as the
+  cache did. A move also reads the dropped nodes of the old tree; when that fails, the target is
+  read alone, and the old tree then counts as unreadable, as a full read of it would have found.
+  A forged tree that names one ID as two kinds keeps the kind first reached; the counts stay
+  consistent, only such a tree's set can differ from the earlier walk's (conclusion).
+- Stricter in one case (conclusion): an object missing in a subtree both trees share no longer
+  makes the check unreadable, since it is never read; the diff is then computed exactly, and a
+  commit whose delta does not fit is refused, where before an old enough commit passed as
+  unchecked. An honest commit always fits its diff.
+- `take_outcome` (the removal job) uses the same check. `readable_set` stays only for the single
+  tree of a barrier.
+- Tests: `counted_transitions_equal_the_set_differences` (500 random graphs with chunks repeated
+  within and across manifests, one manifest in many places, one directory node under many
+  parents, roots that reuse subtrees of others; sequences of moves also back, to no root and to
+  a subtree: `added`, `dropped`, the dropped manifests and chunks and the set itself equal the
+  earlier walk's, kept as the test reference), `many_commits_over_a_large_tree_read_only_the_changes`
+  (200 commits over 20,000 files in 100 directories: at most 20,101 + 6 * 200 node reads, about
+  8 million before, and at most the tree plus four objects held). The integration tests of the
+  delta binding pass unchanged.
+
+**MEDIUM 1: the executor was quadratic for chains of renames.** Each pass tried every pending
+item, and a chain of renames onto the name the next item gives up freed one name per pass
+(measured by the review: 16,000 in 65 s).
+- `apply.rs` registers a waiting operation under what it waits for (`Reason`: its parent's
+  creation, a name of a directory by each of its case keys, the directory to empty, a move of a
+  directory between it and its target, the return of a parked item) and wakes it on the
+  matching `Event` of the working tree (an entry left a directory, an item arrived, an item
+  moved, a parked item came back). Passes keep the ID order: an operation woken before the
+  place the pass has reached runs in the next pass. A pass with nothing to run parks one item
+  as before.
+- One correction of the earlier passes: a move that leaves its content to the next pass counted
+  as no progress, so as the last pending operation it ended blocked until the next round; it now
+  finishes in the same run.
+- Tests: `event_scheduling_equals_the_passes` (3,000 random runs with chains, swaps, cycles,
+  moves below the item itself, late emptied directories and skipped items: working tree, synced
+  tree, disk and report equal the earlier passes, kept as the test reference with the
+  correction), `a_chain_of_renames_takes_linear_steps` (20,000 renames: at most 3 steps per
+  item; about 2 * 10^8 before).
+
+**MEDIUM 3: the local index grew without a bound.** The plaintexts, object IDs and chunk lists
+of every object ever seen stayed until the folder was removed.
+- `FolderSync::prune_cache`, with the hourly scan (`engine.rs`): kept are the object IDs of the
+  remote and the local tree (found by encoding them against the cache, nothing is uploaded, so
+  the next publish seals no unchanged node again), the plaintexts and IDs of everything
+  reachable in the cache from the remote root, the last fully synced head and every commit of
+  the timeline seen within `HISTORY_CACHE_MS` (30 days, the server's default retention), and the
+  chunk lists of every file of the three trees. Everything else is a cache: a restore of an older
+  commit fetches its nodes again, and its chunk lists come with its manifests. A tree that does
+  not encode leaves everything as it is. New `Store::retain_cache`.
+- Before a plaintext or a chunk list is written, the free space of the index volume is checked
+  (`SpaceGuard`, again after 8 MiB or 2 s): without the reserve a download leaves
+  (`folder::disk_reserve`), the write fails with `StoreError::DiskFull`, shown as "disk full"
+  (`ErrorKind::DiskFull`), and the system drive is never filled. Unknown free space does not stop
+  it.
+- Tests: `the_cache_keeps_only_what_is_named`, `a_full_index_volume_stops_the_cache_with_its_own_error`
+  (index), `the_cache_shrinks_and_syncing_and_restoring_go_on` (`tests/cache_prune.rs`: 30
+  versions of 20 files, the plaintexts and chunk lists fall to below a quarter, a download, a
+  publish and a restore of the first version work afterwards).
+
+**MEDIUM 2: open point, `MAX_DELTA_TOTAL`.** (Closed for the pull and the removal job by the amendments "delta pages" and "delta pages in the engine"; the re-anchor stays open there.) A pull, a re-anchor (from cursor 0) and the removal
+job read the whole delta after the cursor and refuse more than 200,000 commits as a protocol
+error. A new device, a re-anchor and a device that was offline long are then locked out for
+good, and a hostile device writes that many commits in about an hour. Not changed here: the
+check of the chain (`FolderView::check_delta` in the crypto crate) takes the delta as a whole,
+because heads of a removed device are let in only with a barrier later in the same delta, and a
+prefix that ends before the barrier is refused. A fix that is not half needs the crypto crate.
+Draft:
+- The crypto crate verifies page by page into a scratch view: each page continues the chain of
+  the one before; heads of a removed signer without a barrier yet are kept as compact pending
+  metadata (commit ID, device, sequence, first parent, root, delta digest; about 200 bytes),
+  settled by a later barrier or, after the last page, by the refusal and the takeover as now.
+- The engine runs the tree check per page with the counted set above (it already reads only the
+  changes), keeps the scratch view, the pending heads and the cursor in the store, so a pull
+  resumes after a restart, and adopts the view, the timeline and the remote tree only after the
+  last page. The barrier rule stays as it is; `MAX_DELTA_TOTAL` then bounds a page set in
+  memory, not the history.
+- The protocol does not change (the pages are the server's). Next step: a task for the crypto
+  crate (`check_delta_page` with the pending set) and the engine part with tests over more than
+  200,000 commits of the memory server.
+
+**LOW 1: the local mass delete guard.**
+- "Delete them" (`resolve_held(false)`) now approves exactly the held items
+  (`FolderMeta::approved`, which replaces `approve_deletes`); a delete that came later goes
+  through the guard again. Before, the flag let every local delete of the next round pass.
+- While a question is open (`held` not empty), every further local delete is held as well. A held
+  item that is back on the disk leaves the question.
+- The threshold counts this device's local deletes of the last `DELETE_WINDOW_MS` (10 minutes,
+  `FolderMeta::recent_deletes`, approved deletes not counted) together with those of the round,
+  so 50 files every 10 seconds are held from the second batch on.
+- Tests (`tests/mass_delete.rs`): `an_approval_lets_only_the_held_deletes_go`,
+  `an_open_question_holds_every_further_delete`,
+  `a_slow_delete_is_held_once_the_window_reaches_the_threshold`. The guard for incoming deletes
+  is a task of its own (window and texts).
+
+**LOW 2:** the activity list looked through the grouped deletes once per change
+(`engine.rs`); it takes one set now.
+
+**LOW 3:** `Merger::fix_cycles` asked `Tree::path` for every item, which walks up to n steps for
+an item on a cycle. The items that reach the root are found by one walk down and the set grows
+as fixes link items back (a fix moves only an item without a path, so no item loses its path).
+Test `many_cycles_take_linear_work` (10,000 two-item cycles from local moves: at most 20 units of
+work per pair, about 4 * 10^8 before); the random merge tests against the reference pass.
+
+**LOW 4: the Linux trash.** `$topdir/.Trash-$uid`, `$topdir/.Trash/$uid`, the home trash and
+their `files/` and `info/` were created with `create_dir_all` and used without a check, so a link
+or a directory of another user on a shared volume took the file elsewhere. Each is now looked at
+with lstat and used only as a plain directory of this user that nobody else may write to; a
+missing one is created with mode 0700 and checked again. Anything else sends the file to the
+quarantine. `$topdir/.Trash` must be a plain directory with the sticky bit, as before. The
+decision is a pure function (`trash::xdg`), tested on every platform
+(`trash_directories_must_be_plain_and_private`); the system calls compile and run only on Linux.
+A swap of a checked directory by its owner between the check and the rename stays possible (the
+owner is this user).
+
+**Crypto review LOW 1, the open point of the sync engine.** A device that a malicious server and
+a compromised device showed a forged high record version re-sealed after a removal at that
+version plus one; an honest server refuses it with `record_version`, and as the last current
+device it stayed in the old epoch for good. `Account::reseal_after_removal` now fetches the
+refused record and, when it is not under the current epoch, seals it again under the current
+epoch at the server's version plus one (`reseal_at_server_version`); the new epoch is newer than
+every mark of the old one. A version at `u64::MAX` is sealed one below, refused, and goes the
+same way. Test `the_last_device_reseals_at_the_server_version_after_a_forged_one`
+(`tests/removal.rs`; fails without the fix).
+
+**Info.**
+- The watcher keeps at most `MAX_CHANGED_PATHS` (10,000) paths per drain and asks for a full scan
+  beyond (`Changes::add_path`, test `many_changed_paths_become_a_full_scan`); so does
+  `FolderSync::note_changes` for paths that pile up.
+- A failing random generator gave every new item the ID `ff..ff`, so two new items could share
+  one ID (the comment said "a hash of a counter"). `EntropyIds` now gives distinct IDs for the
+  rest of the run and the run is refused with the generator's error (test
+  `a_failing_generator_gives_distinct_ids_and_an_error`). The executor's placeholder for "no
+  item" is the root's ID, which no item has.
+- The client index sets `secure_delete`, so paths of a removed folder or a reset device do not
+  stay in free pages of the file.
+- Open (LOW 5): the timeline and the chain are written as JSON with the folder metadata on every
+  save and grow with the history; a table of their own in the index is the follow-up.
+
+**Public API:** `FolderMeta::approve_deletes` is replaced by `approved` and `recent_deletes`;
+new `FolderSync::prune_cache`, `tree::NameIndex`, `codec::ReachState`, `codec::ObjectGraph`,
+`codec::StoreGraph`, `codec::cached_reachable`, `Store::retain_cache`, `StoreError::DiskFull`,
+`watch::MAX_CHANGED_PATHS`, `folder::DELETE_WINDOW_MS`, `folder::HISTORY_CACHE_MS`. Nothing of it
+is used by the app shell. **Dependency:** none added.
+
+## Amendment 2026-11-27: delta pages
+
+The crypto part of the open point MEDIUM 2 of the amendment "security review of the sync engine"
+(`MAX_DELTA_TOTAL`). The engine part (pulling, storing the state, adopting after the last page)
+follows in the sync crate.
+
+- **Page by page check without a format change** (conclusion): `FolderView::begin_check` (and
+  `begin_check_before_barrier` for the removing device's check without the removed signer rule)
+  returns a `DeltaVerifier`; `push_page(state, page)` checks the next page and returns a
+  `DeltaPart` (the heads and side commits that passed so far and, before a barrier, the removed
+  heads among them); `finish(state)` returns the verdict `check_delta` gives for the whole delta:
+  `DeltaVerdict::Accepted { view, rest }` or `DeltaVerdict::RemovedSigner(refusal)`, or the
+  error. `check_delta`, `verify_delta` and `verify_delta_before_barrier` are that check with the
+  delta as one page. Nothing passed by a page is accepted before `finish`.
+- **Why it needs no protocol change:** the removed signer rule asks of every head of a removed
+  device that a later head of a current device names a log head at or after the removal. Read
+  forward, that is one number: the highest removal index among the heads still waiting; a head of
+  a current device that names a log head at or after it settles every waiting head at once,
+  because a smaller index waiting is covered by the same head. The draft's pending metadata per
+  head (about 200 bytes each) is not needed for the verdict.
+- **Same refusals as the whole delta:** a commit that does not decode, verify or keep the order
+  of sequences refuses at once (the whole delta reads all of them first); a refusal of the chain
+  rules is kept and returned by `finish` only after the removed signer rule, as before. A head
+  waits until its call is complete, because its side commit may start the next page: the open
+  call holds at most a head and one side commit.
+- **Memory:** per verified head the scratch view's chain entry (60 bytes stored,
+  `VERIFIER_BYTES_PER_HEAD`) and its place in the view's index; besides that the open call, the
+  marks per device and fixed fields. The commits themselves stay with the page.
+- **Stored state:** `DeltaVerifier::encode` and `decode` (a strict local format of the crypto
+  crate, version byte 1), so the engine can resume after a restart. A stored state is trusted
+  like the rest of the local index; it resumes only with the device log the check began with
+  (`ChainError::LogChanged` otherwise, and on any page with another log: begin again).
+- **Not covered:** `FolderView::reanchor_base` still takes the server's commits after the base
+  as a whole, because it walks back from the last head; a re-anchor across more than
+  `MAX_DELTA_TOTAL` commits needs its own step (a first pass that keeps the first parent per
+  head, then this check from the base).
+- Tests (`commit.rs`): every delta any test of the crate verifies is also checked against the
+  former whole delta check (kept for the tests as `verify_whole`), cut at four sets of random
+  page boundaries with the state stored and resumed between pages, in both modes, and the removed
+  heads before a barrier are compared; `pages_check_exactly_what_the_whole_delta_check_does` (240
+  random deltas from an empty view and from a verified chain, with a removed signer and barriers,
+  merges with side commits and mistakes of every kind; acceptance and the refusals
+  `RemovedSigner`, `Counter`, `Sequence` and `SideUnexpected` are reached);
+  `the_page_by_page_check_holds_a_fixed_size_per_head` (3000 heads in pages of 512: at most two
+  commits held, the stored state grows by the chain entries only);
+  `a_stored_delta_check_resumes_only_with_its_own_log` (strict decoding, another log refused).
+  A deliberately wrong variant that closes the open call at the end of every page fails 8 of the
+  tests.
+- The formats on the wire and the fixed vectors do not change (`test_vectors.py`: all 61 match).
+
+## Amendment 2026-11-27: incoming mass deletes
+
+Decides the open point LOW 4 of the amendment "server notices reach the window, downloads
+respect the disk" ("incoming mass deletion has no threshold"). A single compromised device, or a
+slip on another device, removed the working copy of every device within seconds: incoming
+deletes went to the recycle bin at once (`FolderSync::apply_plan`), the server is not trusted
+(section 2), and the recycle bin is no reliable protection (it may be off, full or emptied, and a
+quarantined file is gone after 30 days).
+
+**Decision.** Deletes another device made wait on this device for the person's decision once
+the incoming *file* deletes of a folder since the last decision, within a day
+(`LONG_DELETE_WINDOW_MS`, 24 hours, which holds the local guard's 10 minute window), reach
+
+- at least 1,000 (`INCOMING_DELETE_ALWAYS`), or
+- at least 100 (`INCOMING_DELETE_MIN`) and at least 25 % (`INCOMING_DELETE_PERCENT`) of the
+  folder's size, which is the fewest files the folder held over that day plus the deletes
+  carried out within it (`FolderSync::files_before`).
+
+A folder of fewer than 100 files never asks. Moves keep their item and are no delete;
+directories are held with their files but not counted; files that came into the folder within
+the day are not counted either (see "Follow-up review" below). The decision is the pure function
+`planner::hold_deletes`; `FolderSync::guard_incoming` applies it after the plan. (The first
+version of this amendment counted over the 10 minute window only and took the share of the
+current file count; the follow-up review below changed both.)
+
+**Reasons for the numbers.** 100 is the local guard's threshold (Nextcloud's default), so both
+directions ask from the same size. The share keeps honest tidying up quiet: removing 100 old
+files from a folder of 5,000 is 2 %, removing a quarter of a folder is what an attack or a slip
+looks like. 1,000 asks regardless of the share, so a large folder cannot lose thousands of files
+without a question. Over a day, many small commits (one device deleting 50 files every few
+seconds, or 99 every 10 minutes) add up instead of slipping through one by one.
+
+**Behavior.**
+- An incoming delete is an item of the synced tree and of the disk that the server's tree and the
+  plan no longer have. Held items go into the executor's skip set: they stay on the disk and in
+  the synced tree, so the merge keeps seeing them as deleted remotely and everything else of the
+  folder keeps syncing. Deleted directories above a held item are skipped as well.
+- While a question is open, every further incoming delete is held too. A local change to a held
+  file wins by the existing merge rules (modify against delete keeps the file), so it leaves the
+  question and is published again.
+- The state lives in `FolderMeta` (`incoming_held`, `incoming_revision`, `incoming_devices`,
+  `incoming_approved`, `recent_incoming`, and since the follow-up review `file_minimums`,
+  `fresh_files`, `long_deletes`), all `#[serde(default)]`, so metadata stored before loads
+  unchanged and a question and the day's counts survive a restart.
+- "Ja, hier löschen" approves exactly the held set, bound to `incoming_revision`, which grows
+  whenever the set gains items; the app reads the revision before its native question and passes
+  it on, so deletes that arrived during the question ask again. Approved deletes are not counted
+  in the window, and either decision starts the day's count again.
+- "Wiederherstellen" (the default) pulls, grafts every held file (and every held empty
+  directory) from the synced tree onto the current server tree (`folder::graft`: old IDs, missing
+  parents, a "restored" name on a clash) and publishes it as a new commit; the content comes from
+  this disk. The files come back on every device.
+- The question names the writing device when the non-side commits that arrived with the held
+  deletes come from exactly one device of the verified timeline; otherwise "another device".
+  Below the title it says since when that device is in the account (follow-up review, L5).
+- What this device's own action removes (a restore, a folder reset, an undo, through
+  `publish_tree`) is approved on this device; other devices ask.
+
+**Interface.** `Warning::IncomingDelete { folder, device: Option<String>, device_added:
+Option<Millis>, count, sample }`,
+`EngineCore::list_incoming_delete`, `incoming_delete_revision`, `resolve_incoming_delete`; Tauri
+commands `list_incoming_delete` and `resolve_incoming_delete` (native question before "delete
+here", like `resolve_mass_delete`); a notification and the tray's "Braucht dich" like the local
+guard; the window shows the local guard's dialog in an incoming variant (UX 8.1, keys
+`incoming.*`).
+
+**Consequences.** A compromised device can still delete on the server, but every other device
+keeps its copy until a person decides there, and restoring from any device brings the files back
+everywhere. An honest large reorganisation by deleting (not moving) asks once on each other
+device. The re-anchor after an older server state is not approved automatically: a mass delete it
+brings asks as well, which is the safe side when the server is in doubt.
+
+**Tests.** `planner::tests::incoming_deletes_are_held_from_the_thresholds_on` (99/100, 24/25 %,
+999/1000); `tests/incoming_delete.rs` (thresholds at the edges, the window over several commits,
+moves not counted, holding, approval of only the shown state, restore back on the deleting
+device, local change wins, restart keeps the question, own restore does not ask);
+`folder::tests::metadata_without_the_incoming_guard_fields_loads`; engine commands in
+`tests/commands.rs`; notification, native question and command checks in `src-tauri`; dialog,
+banner and texts in the window's tests.
+
+### Follow-up review of the incoming guard
+
+An independent review of this amendment found two ways around the threshold, a gap next to it,
+a spoofable name in the question and two smaller points.
+
+**M3: diluted and paced deletes.** (a) A device added 3,500 empty files to a folder of 500, then
+deleted the 500 real ones in one commit: 500 is below 1,000 and below 25 % of 4,000. (b) 99
+deletes every 10 minutes never reached 100 in the window. Fixed:
+- The share is taken of the fewest files the folder held over the day, kept as the fewest per
+  hour (`file_minimums`), plus the deletes carried out within the day. Files added before a
+  delete raise the count only after that day's minimum, so they cannot dilute it. The hourly
+  minimum is kept only once the folder was fully synced (`sync_base`), so a first download or
+  "download again" is no baseline.
+- The deletes add up over the long window since the last decision (`recent_incoming` now keeps
+  a day), so the pace of a slow delete does not matter within a day.
+- Files that came into a fully synced folder within the day (`fresh_files`, at most
+  `FRESH_FILES_CAP` = 20,000; past it the oldest are forgotten and count like any other file,
+  which only asks sooner) are not counted as deletes: creating a project and removing part of
+  it again does not ask. An old file cannot be made fresh: a move or a content change keeps its
+  item ID, and a delete followed by a new file under the same name deletes the old ID (held) and
+  brings a new one, which waits for the name until the decision.
+- The **local** guard had the same pacing flank (100 per 10 minutes, so 99 per 10 minutes went
+  out). It keeps its rule and adds the same long window for the old files this device deleted
+  since the last decision (`long_deletes`), by the same share rule and never below the set
+  threshold. Dilution did not apply there (no share).
+- Bound: a device that waits a full day after adding the filler files dilutes the share again;
+  1,000 deletes ask regardless.
+- Tests: `tests/incoming_delete.rs` (`files_added_just_before_do_not_dilute_the_share`,
+  `deletes_paced_below_the_short_window_add_up_over_the_day`,
+  `deleting_part_of_a_new_project_does_not_ask`, `a_little_cleanup_every_day_does_not_ask`,
+  `deleting_and_writing_again_under_the_same_names_is_held`,
+  `the_long_window_survives_a_restart`); `tests/mass_delete.rs`
+  (`deletes_paced_past_the_window_add_up_over_the_day`,
+  `deleting_files_made_today_does_not_add_up`).
+
+**M4: mass overwrites (open point, not built).** Emptying or encrypting the content of every file
+is no delete: each device takes the new versions at once (the ransomware pattern), and the
+server's history is no reliable protection, since the server is not trusted. Today the executor
+replaces a file atomically (`LocalFs::write_atomic` with `replace`; on Windows two renames by
+handle through `tmp`, on Unix an exchange), and `LocalFs::settle_old` removes the old file
+afterwards, or keeps it as a conflict copy when it was not the expected one. Nothing keeps it.
+The existing pieces are the quarantine `.hangar-drive/trash/<item ID>/` (30 days,
+`trash::QUARANTINE_DAYS`, cleaned by age at start and hourly through handles,
+`plat::clean_quarantine`), `trash/recovered` for backups left by a crash, and the disk reserve
+of the download path (`folder::disk_reserve`, 5 % within 256 MiB and 10 GiB). The "suspect"
+banner (UX 9.4) comes from the server's anomaly pin and names a timeline entry to restore, so it
+cannot say that versions were kept on this disk. The design:
+1. Count incoming content changes of old files from other devices (same item, new content, not
+   fresh) in the same long window and by the same rule (`hold_deletes`); from the threshold on,
+   the folder marks every further incoming replace of the window as "keep".
+2. A new `FileSystem` method, defaulting to `write_atomic`, replaces with "keep": `settle_old`
+   moves the old file by handle into `.hangar-drive/trash/kept/<time>-<item ID>/<name>`
+   instead of removing it (the same rename as the quarantine of a delete).
+3. Before keeping, the free space after the copy must stay above `disk_reserve`; if not, the
+   oldest entries under `trash/kept` go first (never other quarantine entries), and if that is
+   not enough the version is not kept. This needs a listing of `trash/kept` with sizes and an
+   eviction through the same handle code as `clean_quarantine`, on Windows and Unix.
+4. The 30 day cleaning covers `trash/kept` as it is.
+5. Finding them again: the folder's `.hangar-drive/trash/kept/`, newest last; a later version of
+   the window could list them in the restore dialog.
+This touches the platform file code that the reviews L1 (handles on Unix and Windows) hardened,
+adds a port method with a space-bounded eviction and needs real-file-system tests per platform,
+so it is not a small change; built halfway it would promise a protection it does not give.
+Recorded here as the next step instead.
+
+**L5: a spoofable name in the question.** Any current device can rename any device in the
+sealed device names (`Account::set_device_name`), so a hostile device can call itself "Laptop".
+The question now has a quiet line below the title, "{device} ist seit {date} in deinem Konto."
+(`incoming.deviceSince`), with the date the verified device log added the writing device
+(`Account::device_added_ms`, the issuing device's clock), the date the device list shows next to
+it. The engine sends it as `device_added`; without a named device there is no line. Tests:
+`tests/commands.rs` (equal to the device list), the window's dialog and text tests.
+
+**L1: record versions at the top.** `put_device_names` and `put_folder_list` took the held version
+plus one unchecked, a panic with overflow checks once a version reached `u64::MAX`; both now
+refuse with an error (`next_record_version`). The re-seal at the server's version
+(`reseal_at_server_version`) took any number the server named: a malicious server naming
+`u64::MAX - 1` made the device seal at `u64::MAX`, freezing the record. It now takes the
+server's version only when it is below the version the server refused (this device holds a
+forged higher one, the case it was made for) or when it is the version of the record this device
+just opened and accepted. Starting low under a new epoch would avoid the problem, but the server
+demands exactly its version plus one under any epoch (`server/src/service/records.rs`), so that
+needs a server change: reported, not made. Tests: `account::tests::a_record_at_the_top_takes_no_further_version`,
+`tests/removal.rs::a_bare_high_version_from_the_server_is_not_taken`.
+
+**Info: the clipboard clearing.** A clearing thread that found its copy was the last one could
+drop the next copy's secret from the held slot right after that copy set it; ending the app in
+that minute left the new code on the clipboard. A copy and its clearing now each run under the
+lock of the held slot, and a clearing only acts while the slot still holds its own text
+(`src-tauri/src/clipboard.rs`, test `a_clearing_never_drops_the_next_copy`).
+
+## Amendment 2026-11-27: delta pages in the engine
+
+The engine part of the open point MEDIUM 2 of the amendment "security review of the sync
+engine" (`MAX_DELTA_TOTAL`), on the page by page check of the amendment "delta pages".
+
+- **Pull page by page** (`folder/pull.rs`, `FolderSync::pull_delta`): the pull of a round and the
+  removal job ask for one page after the cursor, check it (`paging::check_page`: the page size,
+  sequences above the cursor and rising, `more` only with an item, the server's sequence not
+  below its items, the frontier not above the server's sequence) and hand it to
+  `DeltaVerifier::push_page`. What a page lets through (`DeltaPart`) goes on at once: the
+  heads' roots into the map of first parents, the check of every commit's reference delta
+  against the trees (the counted set of the amendment "security review of the sync engine", now
+  part by part: `TreeChecker`) and its timeline record with the drop counts. No list of raw
+  commits is kept. A head the verifier holds back for its side commit comes out with the next
+  page; its sequence and server time come from the last page's (`carry`), kept for that.
+- **Nothing before `finish`:** the view, the remote tree, the timeline and `full_next` change
+  only after `DeltaVerifier::finish` accepted the whole delta, as before. A refusal of the chain
+  rules, of the tree check (a current device's delta that does not fit its tree), of paging or
+  of the bound drops the stored state, so a refused delta is checked again from its start.
+- **Stored state** (Check of the round only): after every page the index holds the verifier
+  (`DeltaVerifier::encode`), the cursor, the frontier it began after, the last page's sequences
+  and server times, the last head, the two flags of the tree check, and the page's timeline
+  records under a key of their own (`pull/<folder>` and `pull/<folder>/<n>` in the account
+  values; the records first, so a crash between the two writes only repeats a page). After a
+  lost connection or a restart the next round goes on from there when the frontier is the same
+  and the verifier decodes with the device log of this round; otherwise (another frontier,
+  `ChainError::LogChanged`) it begins again. The counted set of the tree check is not stored: the
+  first page after a restart reads the parent's tree once. Removing a folder removes its stored
+  pull (`Store::delete_folder`).
+- **Memory:** per head the verifier's chain entry (60 bytes), its timeline record and its root,
+  about 200 bytes in all; of the commits only one page (at most 1,024 items of the protocol) and
+  the open call. The timeline records are what the folder keeps afterwards anyway (LOW 5 of the
+  review stays open: the timeline lives in the folder metadata).
+- **Bound:** `MAX_PULL_COMMITS` (four million commits, `FolderSettings::max_pull_commits`)
+  replaces `MAX_DELTA_TOTAL` for the pull and the removal job. Reason (conclusion): the server
+  takes at most 30 commits per minute and account (amendment "security review of the sync
+  server", M2), so a device that commits without a pause needs about 92 days to reach it, which
+  the person and the operator see long before; the memory at the bound is below a gigabyte.
+  Progress against endless pages stays: every page that announces more must hold an item and
+  move the cursor, and only commits the devices really signed pass the check, so a server can
+  only page forward over commits that exist.
+- **Before the barrier:** the device that is refused by the removed signer rule reads the delta a
+  second time page by page with `begin_check_before_barrier` and collects the removed heads; the
+  removal job does the same for its permit, and its normal checks (another device wrote the
+  barrier, the delta is already safe) use the same pull. These passes store no state; a removal
+  job that stops is resumed by its own record and reads its delta again.
+- **Incoming deletes:** the records are added to the timeline in one step after `finish`, as
+  before, so the writers the incoming guard names (timeline records since the last apply) are
+  the same. Within one page a part's side commits come before its heads, as for a whole delta
+  before; over pages the records keep the server's order.
+- **Re-anchor, open point:** `FolderView::reanchor_base` still takes the server's commits from
+  cursor 0 as one list (bound `MAX_DELTA_TOTAL`, 200,000), because it walks back from the
+  server's last head by first parents to the verified chain and checks that segment forward;
+  it needs the whole delta and cannot be fed page by page without a change of the crypto crate.
+  Draft of that change (not made here): a first page by page pass keeps per head only its ID
+  and first parent (40 bytes, the map the walk back uses today) and the last head; the walk back
+  gives the base and the segment's first sequence; a second page by page pass from the base
+  checks the segment with the normal rules (a `DeltaVerifier` that starts from the base entry
+  and the marks up to it, which `begin` does not offer yet) and collects the side commits.
+  The engine part would then use the same stored state as the pull. Until then a re-anchor
+  across more than 200,000 commits is refused as before, and only after the person confirmed
+  "the server shows an older state".
+- **Tests** (`tests/delta_pages.rs`, pages of four calls and a bound of 60 for the real sizes):
+  `a_device_without_a_frontier_takes_a_long_delta_in_pages` (120 commits: beyond the bound
+  refused with nothing taken in and nothing stored, within it every page, the folder equals the
+  server's and the timeline A's), `a_pull_cut_off_midway_goes_on_from_its_stored_state` (cut after
+  ten pages: nothing taken in, the stored state below 12 kB, the next round reads at most the
+  remaining pages plus one, every commit once in the timeline),
+  `a_changed_device_log_begins_the_pull_again` (a device added between the cut and the next
+  round: the pull reads every page again and ends at the server's head),
+  `a_rewound_server_after_a_cut_off_pull_stops_the_folder_and_keeps_nothing` (older state after a
+  cut: the folder stops as `OlderState`, its frontier unchanged, the stored state gone),
+  `a_device_joins_a_folder_with_more_commits_than_the_former_bound` (200,001 commits, ignored, run
+  with `--ignored`). Every other test of the crate (delta binding, removal with removed signers
+  and barriers, older states, the simulation, incoming deletes) passes unchanged on the paged
+  pull. The memory server counts and cuts delta pages (`ServerState::delta_pages`,
+  `delta_pages_left`).
+- **Interface:** `FolderSync::fetch_delta` is gone; `take_outcome` takes the pulled delta and is
+  crate internal; `write_barrier` takes the covered timeline records; new
+  `FolderSettings::max_pull_commits`, `folder::MAX_PULL_COMMITS`, `paging::check_page`. Nothing
+  of it is used by the app shell.
+
+## Amendment 2026-11-27: follow-up check of the sync server fixes
+
+An independent check of the amendment "security review of the sync server" found four points;
+all are fixed with tests.
+
+- **M2, address limits shared by every session behind one address (medium):** the token
+  lookup limits (`CallIp`, `CallNet`) counted every call with a bearer token, so a compromised
+  device in the same household (same public address) used them up, with made-up tokens or its
+  own session, and the honest device got `rate_limited` for everything, also for removing it.
+  A session token is now 16 random bytes and a 16 byte HMAC-SHA-256 tag over them under the
+  server secret (`sessions::new_token`, label `hangar-drive/v1/session-token`). The
+  authorization layer checks the tag in constant time (`sessions::issued_here`): a token with
+  a valid tag counts against `CallToken` (per token, before the lookup) and, once
+  `authenticate` admitted it, against `CallDevice` (per account and device); any other token
+  counts against the address limits as before. The tag only picks the limit: whether the
+  session exists, has not expired and belongs to a current device is still decided by
+  `authenticate` alone, so a revoked token stays refused (test
+  `a_token_the_server_issued_is_not_admitted_by_its_tag_alone`). It is no oracle: a valid tag
+  needs the server secret, and it tells nothing a holder of the token does not know. Chosen over
+  a cache of valid sessions, which would be empty after a restart, exactly when a flood would
+  keep honest devices from being looked up once. Tokens issued before the change (at most one
+  hour old) and after a lost `server.secret` carry no valid tag and only count as unknown.
+  128 random bits stay out of reach of guessing. The upload address limit (`UploadIp`) is gone
+  for the same reason; uploads count per account (`UploadAccount`) as before. Tests:
+  `made_up_tokens_from_the_same_address_do_not_lock_out_a_session`,
+  `a_flooding_device_does_not_keep_another_device_from_removing_it` (both from 127.0.0.1 with
+  every limit divided by 30), `issued_tokens_and_sessions_never_touch_the_address_limits`.
+- **L2, commit limits per account:** one device used up `CommitAccount` or set off the brake of
+  `CommitRefusedAccount` for the whole account. Both count per device now (`CommitDevice` 30
+  per minute, `CommitRefusedDevice` 20 per 10 minutes), with higher caps per account
+  (`CommitAccount` 120 per minute, `CommitRefusedAccount` 60 per 10 minutes), so one device
+  alone never reaches the account's caps, while the account as a whole still cannot keep the
+  write lock busy. Tests: `one_device_uses_up_only_its_own_commits`,
+  `refused_commits_brake_the_device_and_then_the_account`.
+- **L3, the least pace cut off slow honest uplinks:** the 64 KiB/s pace of heavy bodies now
+  applies only while another call waits for a heavy slot (`App::heavy_waiting`); without
+  contention only the idle timeout (30 s) and the total timeout (120 s) apply, and the read
+  looks again every 500 ms whether someone started to wait. A trickling body thus still frees
+  its slot as soon as it holds someone up. Tests:
+  `a_slow_body_passes_while_nobody_waits_and_is_cut_off_once_someone_does`,
+  `a_heavy_body_below_the_pace_is_cut_off_after_the_grace`.
+- **L4, connection cap per IPv4 /16:** one client of a provider or carrier NAT held the cap of
+  its /16, and every other customer of it was locked out in the TLS mode. Connections now count
+  per IPv4 /24 (IPv6 /48, `client_ip::connection_net_key`), and the network cap applies only
+  while fewer than half of the 4096 slots are free; the counts are kept all the time, so the cap
+  holds at once when the slots run short. Test
+  `a_providers_network_is_capped_only_per_24_and_only_when_slots_run_short`.
+- **Dependency:** none added (`hmac` was already used for the challenges).
+
+## Amendment 2026-11-27: recovery in one piece, adds per day, delta check on a growing log
+
+An independent follow-up check of the amendments "security review of the crypto and protocol
+crates" and "delta pages" found three points; all are fixed with tests.
+
+**H1 (high): a race in the recovery.** The recovery device added the person's new device F in
+one call, and F removed the lost devices and rotated in a second call after signing in. A hostile
+device that stayed online removed F with its rotation in between, as often as it liked; in the
+reserve each round cost three places, so after about 44 rounds the log was full and the hostile
+device stayed for good. And at the second-to-last place a recovery device could still add F,
+which then could remove nobody.
+- **One batch** (conclusion): a third batch shape, `BatchShape::Recovery`, in the recovery
+  session's one append call: `[add device F (signed by the recovery device), remove device*
+  (signed by F), rotate (signed by F)]`, the only batch with two signers, admitted only when the
+  sender is a current recovery device. Rotation wraps go to every device current after the
+  batch; `device_wrap` carries F's wrap of the epoch before it (so F opens the records it
+  re-seals and can fetch that epoch later); the server stores both. `LogAppendRequest::validate`
+  no longer refuses both kinds of wraps in one request; `append_wraps_fit` checks which kind
+  fits which shape. `MAX_APPEND_ENTRIES` is 66 (the add, up to 64 removals, the rotation).
+- **A log rule as well** (conclusion): after a recovery device's add, only F may write, and only
+  removals and its rotation, until that rotation (`LogError::RecoveryOpen`), so every verifier
+  sees that nothing came in between, not only the server. A recovery device adds only where the
+  log still has room after the add: two places (a removal and the rotation), one when a rotation
+  is already due; otherwise `Reserved`.
+- **The two-step way is gone:** the add of a recovery device alone is no batch the server
+  admits (`RecoveryOpen`), and the recovery session's scope check asks for at least two entries
+  and the rotation's wraps. Keeping it would keep the race; the stuck-log exception (finding M5,
+  section 4) needs nothing else, since F makes the due rotation in the same batch. Which devices
+  the recovery removes is the app's choice; `epoch::recover` takes the list.
+- **Reserve:** after every complete batch an account has at most `MAX_DEVICES` devices, and the
+  person's part is one recovery batch of `1 + c' + 1` places; the bound of the amendment above
+  is corrected there (at most 128 of the 132 places).
+- Tests: `nobody_writes_between_a_recovery_and_its_rotation` (the attacker's removal of F, its
+  other entries and a second add are refused while the recovery is open; the batch in parts or
+  without its rotation is refused), `the_recovery_batch_cannot_be_used_by_a_regular_device` (a
+  regular device's add with removals and rotation by the added device, a removal signed by
+  another device, another sender), `a_recovery_fits_at_the_end_of_the_log` (no add at the
+  second-to-last place, the batch at the last three places, with a due rotation at the last two,
+  and after the worst use of the reserve), the reworked
+  `a_recovery_device_may_add_one_device_while_a_rotation_is_due` and
+  `a_full_account_still_lets_the_recovery_device_in` (`devicelog.rs`);
+  `server/tests/recovery_cap.rs`: the full account recovered in one call over the socket, the
+  attacker's session ends in the same call, the recovery session cannot add on its own, a
+  regular session cannot send the recovery shape; `flows.rs`, the recovery session test.
+
+**M1 (medium): add and remove cycles filled the log before the reserve.** Removals are free and
+adds were limited to 30 an hour: a device that adds a throwaway device, removes it and rotates
+appends three entries per add, about 90 an hour, and the reserve was reached in about four days.
+- **Adds per day** (conclusion): every added device of a regular device also counts against
+  `ADDS_PER_DAY` = 20 per account and day (`server/src/service/devicelog.rs`). Each cycle needs
+  an add, so the log grows by at most 60 entries a day that way: about 134 days from an empty log
+  to the reserve, and the reserve still keeps every device removable. Twenty new devices a day is
+  far above any household's pairing; removals, the due rotation and the recovery are never
+  counted.
+- Not chosen: counting removals of devices the remover added "recently". The log has no time
+  of its own, and every recency the log can express (same epoch, a few entries) the attacker
+  controls, since its own removals advance it; a format rule cannot bound a rate. Counting
+  removals at all would let an attacker use up the count that the person needs to remove it.
+- The count lives in memory in the device log service until the rate limiter has a day scope of
+  its own (a scope `LogAddDayAccount`, 20 per 86,400 s, is the clean place).
+- Tests: `adds_are_bounded_per_day` and the reworked
+  `one_plain_rotation_an_hour_and_removals_after_every_limit` (unit tests), the reworked
+  `device_log_appends_are_throttled_and_removals_never` (`server_review.rs`: 20 adds, then
+  refused, also an hour later; the removal of the thief passes; a day later adds pass again).
+
+**M5 (medium): the delta check began again on every log change.** A hostile device changes the
+log about once a minute, so a slow device with a long history never reached `finish`.
+- **Pinned to the log it began with** (conclusion): `DeltaVerifier` applies every rule to the log
+  as it was at `begin_check`; pages, `finish` and `decode` take a newer log that extends it
+  (`ChainError::LogChanged` only for a log that does not hold the pinned head). The check stops
+  instead (`DeltaVerifier::cut`) at the first call with a commit that names a log head beyond the
+  pinned one, or whose signer the newer log has removed since; that call and everything after
+  it is the next delta, checked from the accepted view against the newer log. `finish` refuses
+  with `LogChanged` only when the newer log removed a device whose heads were already checked.
+- **Why it is never weaker:** every accepted commit names a head of the pinned log, where the
+  newer log vouches for the same signers and keys; no accepted head comes from a device the newer
+  log removed after the pinned head, and so no head that would cover a removed signer under the
+  pinned log is one the newer log would not count. The removed signer rule therefore reads the
+  same under both logs, and the accepted part is exactly what `check_delta` against the newer log
+  accepts for it, with the same view. A delta whose commits need the newer log is left to the
+  next pull, never let through on the older one; with an unchanged log nothing changes.
+- **Progress:** the commits written after the pin are at the end of the history, so the cut
+  falls there and the long part before it is accepted; a restart is needed only when a device
+  with heads already checked is removed during the check, which the removal itself bounds (and
+  adds per day bound for throwaway devices).
+- Tests: `a_growing_log_does_not_restart_the_check` (the newer log between pages: the check stops
+  at the first commit naming it; the rest as the next delta gives the result of the whole delta
+  against the newer log), `a_removal_in_the_newer_log_is_never_missed` (b removed during the
+  check and the barrier left out: known from the first page, b's heads are left to the next
+  delta, which the rule refuses; known only at the end or after a resume from storage,
+  `LogChanged`), `a_stored_delta_check_resumes_with_its_own_log_or_a_longer_one`. Every delta of
+  every test still runs against the whole delta check at random page boundaries.
+- API changes for the engine: `DeltaVerifier::cut()` is new; `push_page`, `finish` and `decode`
+  take a newer log; the stored state's format byte is 2 (states of format 1 are refused as
+  `InvalidView`: begin again). `AccountState::last_removal_index_at` is new.
+
+The formats on the wire and the fixed vectors do not change (`test_vectors.py`: all 61 match);
+the shared rules change (recovery batch, the open recovery, the add's room at the end of the
+log).
+
+## Amendment 2026-11-27: the engine on the recovery in one piece and the growing log
+
+The engine part of the amendment "recovery in one piece, adds per day, delta check on a growing
+log" (H1 and M5).
+
+**Recovery in one append** (`crates/hangar-drive-sync/src/recovery.rs`, `engine.rs`).
+- `recovery::prepare` (steps 0 to 3): the sheet is checked against the code, the recovery
+  session reads the verified log, checks the genesis anchor and the code's recovery device
+  (current, a recovery device, the code's keys), and lists the current regular devices with
+  the time their add entry was issued. It writes nothing.
+- `recovery::recover_with_code` (step 4): reads the log again, unwraps the current epoch's
+  secret, and sends one `LogAppendRequest` built by `epoch::recover`: the add of the new device
+  (signed by the recovery device), the removal of the chosen devices that are still current
+  regular devices and of every current recovery device, the used one included, and the
+  rotation (signed by the new device), with the rotation's wraps and the new device's wrap of
+  the epoch before (`device_wrap`). The log head after the batch is computed here and must be
+  the server's answer (security review I1). The former `add_device_with_code` (the add alone) is
+  gone, as the server no longer admits it.
+- The engine keeps its three calls in their order. `recover_account` signs in as the recovery
+  device and runs `prepare`; the session, the sheet, the code and the new device's keys wait in
+  memory (`Recovering::before_join`). `recovery_devices` lists the devices from the verified log.
+  `finish_recovery_cleanup` makes the one append with the chosen devices, signs in as the new
+  device, joins at the head after the batch, and runs the removal job, whose append step finds
+  the removals in the log already (`removal::resume`), so it re-seals and writes the barriers with
+  the new device's own removal (`BarrierPermit::of_own_removal`); then the device name and the
+  new code as before.
+- **Records sealed before the batch:** the batch removes the devices that sealed the account's
+  records, and a record opens only when its sender is current, so the new device could not open
+  them against the whole log. At its join, and only for a device a recovery device added, a
+  record that does not open is opened once more against the log right before the batch
+  (`Account::recovery_base_of`), the state every current device held then; the guard checks it
+  as always. Nothing a removed device seals after the batch is stored (the server takes records
+  of the newest epoch only), and the new device seals everything again under the new epoch right
+  after the join. Conclusion: the new device trusts the records the account held right before the
+  recovery, as a device joining before the removal did in the two-step way.
+- **Before the choice nothing is in the account:** an end of the app or a cancel between
+  `recover_account` and `finish_recovery_cleanup` leaves the log as it was and the code unused
+  (a code is "used" exactly when its recovery device is removed, which only the batch does). A
+  failed append leaves the same; the person starts again.
+- **Keeping every old device stays possible:** `epoch::recover` needs a removal unless a rotation
+  is due, and the batch always removes the used recovery device (as the cleanup did before), so
+  the list of chosen devices may be empty. No behavior change for the person there.
+- **What changes for the person:** before the choice the recovery session cannot read the sealed
+  device names (its scope is the log, its own wrapped keys and one append), so the devices come
+  without names, with their ID and the date they were added. And a "code used" or "unknown code"
+  now ends `finish_recovery_cleanup` as well, when another device removed the recovery device
+  between the two calls.
+- The memory server keeps a recovery's `device_wrap` under the epoch before the batch and
+  announces the batch's epoch in the feed, as the server does.
+
+**Delta check on a growing log** (`folder/pull.rs`).
+- A stored check resumes with a longer log (`DeltaVerifier::decode` takes it). When it stops at the
+  first call that needs the newer log (`DeltaVerifier::cut`), the pull finishes the part before
+  it and, in the same round, checks the rest as the next delta from the accepted view against
+  this round's log, with the cursor back at the accepted frontier. A check begun in this round
+  is pinned to this round's log and is not cut.
+- A page that names a log head beyond this round's log (`AheadOfLog`) or an unknown generation
+  keeps the stored state: the round reads the log and goes on from the state stored before that
+  page. `LogChanged` (a log without the pinned head, or a removal of a device whose heads were
+  checked) and a stored state of format 1 (`InvalidView`) begin again.
+- The stored state is written after a page only when an eighth more pages were read since the
+  last write (at least one page), so writing stays linear in the delta, since each write holds
+  every chain entry checked so far; the timeline records of every page are stored at once, and
+  records after the last state are written again on the resume. Removing the stored pull also
+  removes such records.
+- Tests (`tests/delta_pages.rs`): `a_growing_log_goes_on_with_the_pull` (a device added between
+  the cut and the next round, A's later commits naming the newer log head: the next round reads
+  at most the remaining pages, the page of the cut again and one more, and ends at the server's
+  head with the whole timeline) replaces `a_changed_device_log_begins_the_pull_again`;
+  `a_stored_pull_without_its_pinned_log_head_begins_again` (the stored pinned head changed: every
+  page again).
+
+**Changes the app needs** (not made here; `src-tauri` and `src` build unchanged):
+- Recovery dialog, device list (`recoveryDevices`): `Device.name` is empty before the join; show
+  "Gerät, hinzugefügt am {date}" from `added` instead of a name, in every language.
+- The step text: the new device is not in the account until "Fertig"; closing the dialog before
+  ends the recovery without changes, and the code stays valid.
+- `finishRecoveryCleanup` can now fail with the reasons `recoverAccount` had ("code used", "code
+  unknown", "not reachable"); it reports them as `SyncError::Invalid` or `Net`. The app maps them
+  to the recovery texts and lets the person start again.
+- Keeping all old devices is allowed (an empty list); the used code always stops working.
+
+## Amendment 2026-11-27: a recovery survives every failure after its append
+
+A security review of the recovery in one piece found that every failure after the append made
+the account unusable for good, and two smaller gaps. Fixed in `crates/hangar-drive-sync`; tests
+in `tests/recovery_resume.rs`.
+
+**HIGH 1: a failure after the append threw the only key away.** Once the batch is sent, the code
+is spent and the chosen devices are gone, yet every later failure ran into "nothing happened,
+start again": a head the server answered wrongly, an answer lost after the commit, the end of the
+app before the join, a failed sign-in of the new device, or a failed join. The join deleted the
+new identity, the engine dropped it, and a person who had removed every old device lost the
+account. Without any hostile server, two cases led there as well: a record under an epoch older
+than the current one (the new device only gets the wraps of the current epoch and the one after
+the batch), and a record a hostile but current device left signed but unreadable (the server only
+checks header and signature); the join's refresh stopped at either.
+- **Pending recovery.** Right before the append goes out, the engine stores the new device's
+  identity in the keychain (`recovery-identity`) and a marker in the local index
+  (`recovery-pending`: account, device, name, server address, pin, server ID, genesis anchor, the
+  head after the batch computed by this device, the removed devices). The marker holds nothing
+  secret. It goes once the new device joined and wrote the barriers, or once the recovery
+  device's own verified log shows that the batch is not in.
+- **Resolution by the new device's own log.** Whatever the server answers to the append, the new
+  device signs in and joins at the head this device computed (with the genesis anchor). A join
+  that works proves the batch is in; a head the server made up is no reason to stop any more,
+  since the join checks the computed head against its own verified log (I1 holds: the anchor is
+  never the server's value). When the join fails while the recovery session is still open, the
+  recovery device reads its log: while it still lists the recovery device (which the batch
+  removes) and not the new device, the batch is not in, and the marker and the key go, the choice
+  stays, and the same code works again (a server that hides a batch it took from the recovery
+  device can make this device drop the key; such a server can withhold the whole account
+  anyway, and the next attempt works on the log it shows). Otherwise everything stays: the engine tries again in its
+  loop (every `POLL_INTERVAL_MS`), at a repeated `finishRecoveryCleanup`, after a restart, and
+  when the person types the code again (`recoverAccount` first lets the pending device join; only
+  a log that still lists the recovery device drops the earlier attempt). A marker of another
+  account makes `recoverAccount` refuse; "reset this device" removes marker and key as every
+  other secret.
+- **A join cut short is completed.** The join stores the account before it writes the records it
+  could not read anew; a restart in between finds the stored account with the marker and runs
+  `Account::complete_recovery_join` (every record read again from cursor 0, the same leniency,
+  then the writes), then the barriers.
+- **Lenient join, only after the own recovery** (`Account::join_recovered`). A record that opens
+  neither against the log nor against the log before the batch, or whose epoch secret the server
+  does not hold for the new device (`not_found`), counts as missing; failures of the connection,
+  the keychain or the local index still stop the join, so it is tried again. The leniency holds
+  only for a device whose add a recovery device signed (`recovery_base_of`) and only during that
+  join; `Account::join` for pairing is unchanged, and the replay guard checks every record the
+  join does take. When the new device is the only regular device left, it writes the missing
+  records anew under the new epoch at the server's version plus one: a folder list it could not
+  open becomes an empty one, the device names list only itself, and a folder whose key ring it
+  could not open leaves the folder list (no device holds that key any more; the folder's files
+  are out of reach either way; replaced by LOW 2 of the "follow-up review of the recovery after
+  its append" below: the folder stays and the `foldersUnreadable` warning names it). With other regular devices left it writes nothing; they re-seal
+  under the new epoch (N1). A later device names or folder list write after a skipped record
+  takes the server's version plus one as well.
+- **What the person loses in the worst case:** with a hostile device that overwrote the folder
+  list, the list of folders (their rings stay on the server, unnamed); never the account.
+- Tests: `a_lost_answer_after_the_append_still_joins`,
+  `a_recovery_cut_off_before_the_join_finishes_after_a_restart`,
+  `typing_the_code_again_finishes_a_pending_recovery`,
+  `a_record_under_an_older_epoch_does_not_stop_the_join`,
+  `an_unreadable_record_of_another_device_does_not_stop_the_join`,
+  `an_unreadable_folder_list_becomes_an_empty_one`,
+  `a_join_cut_off_midway_is_tried_again` (an identity the cut off join left under the device
+  identity's entry, with no stored account, is removed exactly when it is the pending one:
+  `Account::drop_unfinished_join`),
+  `an_append_that_did_not_go_through_starts_over_with_the_same_code`. The former test
+  `a_recovery_refuses_a_head_the_server_made_up` becomes
+  `a_recovery_joins_at_its_own_head_when_the_server_makes_one_up`. The memory server can lose an
+  append's answer, drop an append, and go offline right after one.
+
+**MEDIUM 1: a device added while the person chose survived.** The append read the log again and
+removed only the chosen devices, so a device added between the list and the append stayed in the
+account unseen. The list now keeps the head of the log it was read from (`RecoveryChoice::shown`);
+`recovery::build_recovery` refuses with `RecoveryError::ListChanged` before anything is written
+when the log moved on, the engine reads the list again and answers
+`SyncError::RecoveryListChanged` (`ErrorKind::RecoveryListChanged`, `"recoveryListChanged"`), and
+`recoveryDevices` returns the new list. Test:
+`a_device_added_while_the_person_chooses_is_offered_too`.
+
+**Typed refusals of the append.** "Code used" and "code unknown" at `finishRecoveryCleanup`
+were `SyncError::Invalid` with a fixed text, which the app had to compare. They are
+`SyncError::RecoveryCodeUsed` (`ErrorKind::RecoveryCodeUsed`, `"recoveryCodeUsed"`) and
+`SyncError::RecoveryCodeUnknown` (`ErrorKind::RecoveryCodeUnknown`, `"recoveryCodeUnknown"`, also
+for a sheet the code was not made for) now, both before anything is written. Test:
+`a_code_used_in_between_is_its_own_error`.
+
+**LOW 1: an account left without a recovery device went unnoticed.** The app could end after the
+join and before the new code was added. The snapshot now carries the warning
+`{"kind": "noRecoveryCode", "id": "noRecoveryCode"}` while the account is set up and its log has
+no current recovery device; it cannot be hidden and goes once a new code is confirmed
+(`renewRecoveryCode`, which also ends a recovery that joined but stopped before its code). While
+a recovery is pending and this device has no account yet, the snapshot carries
+`{"kind": "recoveryPending", "id": "recoveryPending"}`.
+
+**Changes the app needs** (not made here):
+- Decode and show the warnings `noRecoveryCode` (banner with "Neuen Wiederherstellungscode
+  erstellen", calling `renewRecoveryCode`) and `recoveryPending` (the recovery is being completed;
+  typing the code again also works), in every language.
+- Map `ErrorKind::RecoveryCodeUsed` and `ErrorKind::RecoveryCodeUnknown` from
+  `finishRecoveryCleanup` instead of comparing error texts.
+- Map `ErrorKind::RecoveryListChanged` from `finishRecoveryCleanup`: tell the person that the
+  account's devices changed, reload `recoveryDevices` and let them choose again.
+- After a failed `finishRecoveryCleanup` keep the dialog: the call can be repeated (before the
+  append the choice stays; after it the pending recovery is completed).
+
+## Amendment 2026-11-27: follow-up review of the recovery after its append
+
+A second security review of the previous amendment found one medium and several low points.
+Fixed in `crates/hangar-drive-sync`; regression tests in `tests/recovery_resume.rs` (among them
+the review's two probes with the expectation turned around) and one test against the real
+server.
+
+**M1: a retry after a refused append could keep a device unseen.** When the recovery's reads
+missed a device added right before its append, the batch built on the shorter log was refused
+(the real server refuses an append whose first entry does not chain to the log's head:
+`a_recovery_built_on_a_stale_log_is_refused_by_the_real_server` in `tests/e2e_server.rs`).
+`settle_unsent` then took the new log as the shown one and returned the send error, so a retry
+with the same choice went through and left the added device in the account. Now `settle_unsent`
+compares the recovery device's log with the one the person chose from: when it ends elsewhere,
+the choice takes the new list and `finish_recovery_cleanup` answers
+`SyncError::RecoveryListChanged`; only on the same log is the send error returned. Test:
+`a_device_added_between_read_and_append_is_offered_before_the_retry`.
+
+**LOW 2: too much counted as unreadable, and a folder left the list silently.**
+- `unreadable` takes only failures to open: `not_found` for the epoch wrap, a wrap that does not
+  open, a missing secret, the record header, and the opening errors of a record (malformed,
+  format, sender, signature, decryption, padding). The replay guard, a version the server named
+  wrongly, a record ahead of the log, an unknown epoch, the checks on what an opened record holds,
+  the connection, the keychain and the local index stop the join as before (unit test
+  `only_records_that_do_not_open_are_unreadable`).
+- A folder whose key ring the join could not open stays in the folder list. Its ring is kept as
+  unreadable in the stored account (`Account::unreadable_records`) and read again, leniently and
+  against the log before the batch as well, at every refresh that fetches it, until it opens (the
+  server shows it intact, or a remaining device re-seals it). Then the barriers of the recovery's
+  removals are written for that folder (`Account::take_recovered_rings`,
+  `Account::removed_by_own_recovery`), which it could not get while its ring was unreadable;
+  without them it would stop at the removed devices' heads. That they are due is stored with the
+  account (`rings_recovered`) and cleared only once they are written, so an end of the app in
+  between writes them at the next start (test
+  `barriers_for_a_ring_that_came_back_survive_a_restart`). The same holds for the folder list
+  and the device names while another regular device is left to re-seal them. This is the only
+  leniency after the join, and only for these keys.
+- The window is told with one warning, `foldersUnreadable`, which names the folders whose key
+  could not be read and says whether the folder list itself could not be read (the empty list the
+  only device left had to start with). One warning is enough for the person: both cases mean
+  "some folders are not reachable right now", and the folder names are what they can act on. It
+  cannot be dismissed while it names a folder; with only the folder list it can, since nothing
+  comes back by waiting. Test: `a_ring_the_server_damages_during_the_join_comes_back` (the
+  review's probe `a_ring_the_server_damages_during_the_join_drops_the_folder_for_good` turned
+  around).
+- This replaces the rule of the previous amendment that dropped such a folder from the list.
+
+**LOW 3: the marker was not protected.** The keychain entry of the pending recovery now holds a
+format byte, the SHA-256 of the marker and the identity; a marker that does not match it, or one
+without its key, is refused and nothing is acted on (the key and the warning `recoveryPending`
+stay). A key without a marker (the app ended between the two writes, before the append) is
+removed at the next start. Test: `a_changed_marker_is_refused`.
+
+**LOW 4: the leniency could outlive the join.** The recovery counts as pending until its marker
+is gone; a failure to remove it is returned. The stored account notes whether its join after the
+recovery is still open (`recovery_join_open`), and `complete_recovery_join` does nothing once it
+finished, so a marker left behind brings no leniency back. Test:
+`a_marker_left_after_the_join_brings_no_leniency_back`.
+
+**LOW 5: the device names of the new device alone.** While the new device could not read the
+names and another regular device is left, it does not write a list of itself alone (that would
+drop every other name); the remaining device re-seals the names under the new epoch, and the
+loop adds the new device's name once the names are readable. Test:
+`unreadable_names_wait_for_the_device_that_is_left`.
+
+**LOW 7: a reset could destroy the only key.** `reset_device` refuses with
+`SyncError::RecoveryPending` (`ErrorKind::RecoveryPending`, `"recoveryPending"`) while a recovery
+is pending and this device has no account yet. `reset_device_discarding_recovery` resets anyway;
+the app calls it only after the person confirmed that the account may then be lost. Test:
+`a_reset_during_a_pending_recovery_needs_the_forced_reset`.
+
+**LOW 6 (a server that forks), not changed:** `settle_unsent` drops the earlier attempt's key
+when the recovery device's log still lists the recovery device. Keeping it as "superseded" until
+a new join succeeds was considered and not done: the key helps only if the server later shows a
+log with the first batch after all, and then the new attempt's device lives in the other fork,
+so neither key gives one consistent account; keeping keys of abandoned forks with no way to use
+them leaves secrets behind (security review L1). A server that forks controls what every device
+sees and can withhold the account in any case. With M1 above, a log that moved on is shown to
+the person instead of being acted on.
+
+**Precision on the leniency:** `Account::join` (pairing) runs the strict refresh. The leniency
+needs the log before a recovery batch (`recovery_base_of`), which exists only for a device whose
+add a recovery device signed, and the writes in place of unreadable records need
+`Account::join_recovered`; the engine joins a paired device through `Account::join` only, so
+none of this applies to it.
+
+**Changes the app needs** (not made here):
+- Decode `{"kind": "foldersUnreadable", "id": "foldersUnreadable", "folders": [names],
+  "folderList": bool}`: a banner naming the folders (they could not be opened after the
+  recovery and come back by themselves once the server or another device provides them), and
+  with `folderList` that the list of folders had to start empty. Dismissible only without
+  folders.
+- Map `ErrorKind::RecoveryPending` from `resetDevice`: explain that a recovery is not finished
+  and that resetting may lose the account for good; offer "Reset anyway", which calls
+  `resetDeviceDiscardingRecovery` after a native confirmation.
