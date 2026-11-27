@@ -51,6 +51,7 @@ pub const SESSION_SECS: u32 = 3600;
 const CHALLENGE_LABEL: &[u8] = b"hangar-drive/v1/server-challenge";
 /// Bytes of the truncated tag in a challenge.
 const TAG_LEN: usize = 16;
+const TOKEN_LABEL: &[u8] = b"hangar-drive/v1/session-token";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -140,6 +141,37 @@ fn check_challenge(app: &App, request: &ProofRequest) -> Option<u64> {
     (expires > now && expires <= now + u64::from(CHALLENGE_SECS) * 1000).then_some(expires)
 }
 
+/// A new session token: 16 random bytes and a 16 byte tag over them under the server secret
+/// (server security review, follow-up M2). The tag lets the authorization layer tell a token this
+/// server issued from a made-up one without a database read ([`issued_here`]), so a flood of
+/// made-up tokens from an address uses up only the limits for unknown tokens, never the calls of
+/// the sessions behind that address. Whether the session still exists is decided by
+/// [`authenticate`] alone, as before; 128 random bits stay out of reach of guessing.
+fn new_token(app: &App) -> ApiResult<SessionToken> {
+    let mut bytes = [0u8; 32];
+    OsEntropy
+        .fill(&mut bytes[..16])
+        .map_err(|_| ApiError::internal(&"no randomness for a token"))?;
+    let mac = mac_over(app.server_secret.expose(), &[TOKEN_LABEL, &bytes[..16]])
+        .ok_or_else(|| ApiError::internal(&"token MAC"))?
+        .finalize()
+        .into_bytes();
+    bytes[16..].copy_from_slice(&mac[..TAG_LEN]);
+    Ok(SessionToken::from_bytes(bytes))
+}
+
+/// Whether `token` carries the tag of [`new_token`] under this server's secret, compared in
+/// constant time. It says nothing about whether the session exists: an expired, revoked or
+/// removed device's token passes too, and only [`authenticate`] admits a call. A token from
+/// before this format, or from before a lost `server.secret`, does not pass and is treated as
+/// unknown, which only means the address limits apply to it.
+pub fn issued_here(app: &App, token: &SessionToken) -> bool {
+    let bytes = token.expose();
+    let (random, tag) = bytes.split_at(16);
+    mac_over(app.server_secret.expose(), &[TOKEN_LABEL, random])
+        .is_some_and(|mac| mac.verify_truncated_left(tag).is_ok())
+}
+
 fn failure_key(account: &AccountId, device: &DeviceId) -> Vec<u8> {
     [account.as_bytes().as_slice(), device.as_bytes().as_slice()].concat()
 }
@@ -205,11 +237,7 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         }
         Err(_) => return Err(failed()),
     };
-    let mut token = [0u8; 32];
-    OsEntropy
-        .fill(&mut token)
-        .map_err(|_| ApiError::internal(&"no randomness for a token"))?;
-    let token = SessionToken::from_bytes(token);
+    let token = new_token(app)?;
     let expires = now + u64::from(SESSION_SECS) * 1000;
     let mut tx = begin_write(&app.db).await?;
     sqlx::query("DELETE FROM used_challenges WHERE expires_ms <= ?")

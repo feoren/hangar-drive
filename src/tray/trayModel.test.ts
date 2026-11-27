@@ -58,6 +58,7 @@ describe("tray state", () => {
   it("shows one state for the whole app, the most urgent", () => {
     expect(trayState(snap("setup"), NOW, false).kind).toBe("setup");
     expect(trayState(snap("massDelete"), NOW, false).kind).toBe("attention");
+    expect(trayState(snap("incomingDelete"), NOW, false).kind).toBe("attention");
     expect(trayState(snap("paused"), NOW, false).kind).toBe("paused");
     expect(trayState(snap("offline"), NOW, false)).toEqual({
       kind: "offline",

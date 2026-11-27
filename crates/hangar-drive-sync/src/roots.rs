@@ -24,6 +24,14 @@
 //!   iCloud Drive on Windows (`%USERPROFILE%\iCloudDrive`), and on macOS everything below
 //!   `~/Library/CloudStorage` (every File Provider client: OneDrive, Google Drive, Dropbox,
 //!   Box) and `~/Library/Mobile Documents` (iCloud). Other clients are not recognised.
+//! - **No shell junction on the way:** a folder whose name ends in `.{GUID}` is a namespace
+//!   junction for the Windows Explorer shell, which then shows another place or a system object
+//!   for it (security review MEDIUM 1). A root with such a name anywhere in its path is refused
+//!   on every platform: the account's folder name comes from the root's name, and on Windows
+//!   "Open folder" would show the junction's target. Names the person may well have on their
+//!   own (a reserved Windows name, an 8.3 shape, a macOS bundle ending) stay allowed for a
+//!   folder they pick themselves; the app proposes none of them (`root_dir_name` of the app)
+//!   and its file manager never runs one.
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +56,9 @@ pub enum RootError {
     /// Another sync client's folder.
     #[error("the folder belongs to {0}")]
     OtherCloud(&'static str),
+    /// A name on the way ends in `.{GUID}`, a Windows shell junction (module docs).
+    #[error("the folder's path holds a Windows shell junction name")]
+    ShellJunction,
 }
 
 /// The comparison key of a canonical path (module docs).
@@ -385,6 +396,9 @@ pub fn check_planned_root(candidate: &Path, existing: &[PathBuf]) -> Result<Path
 
 /// The rules of [`check_root`] for a resolved path.
 fn check_resolved(resolved: &Path, existing: &[PathBuf]) -> Result<(), RootError> {
+    if has_shell_junction(resolved) {
+        return Err(RootError::ShellJunction);
+    }
     let existing: Vec<String> = existing
         .iter()
         .map(|p| key(&std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
@@ -407,6 +421,16 @@ fn check_resolved(resolved: &Path, existing: &[PathBuf]) -> Result<(), RootError
         &system,
         &clouds,
     )
+}
+
+/// Whether a name of `path` ends in `.{GUID}` (module docs).
+fn has_shell_junction(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(name) => {
+            hangar_drive_protocol::name::is_shell_junction(&name.to_string_lossy())
+        }
+        _ => false,
+    })
 }
 
 /// The files at `path` a new sync root would upload (ux-concept 6.5): regular files below it,
@@ -490,6 +514,32 @@ mod tests {
         ));
         // An existing folder is checked as before.
         assert!(check_planned_root(&dir.join("taken"), &[]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Security review MEDIUM 1: a shell junction name anywhere on the way is refused, planned
+    // or existing; a bundle ending or a reserved-looking name the person chose is not.
+    #[test]
+    fn a_shell_junction_name_never_becomes_a_root() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("junction-root");
+        let _ = std::fs::remove_dir_all(&dir);
+        let junction = dir.join("Photos.{0AFACED1-E828-11D1-9187-B532F1E9575D}");
+        std::fs::create_dir_all(&junction).unwrap();
+        std::fs::create_dir_all(dir.join("Photos.app")).unwrap();
+        assert_eq!(check_root(&junction, &[]), Err(RootError::ShellJunction));
+        assert_eq!(
+            check_planned_root(&junction.join("Inner"), &[]),
+            Err(RootError::ShellJunction)
+        );
+        assert_eq!(
+            check_planned_root(&dir.join("New.{0AFACED1-E828-11D1-9187-B532F1E9575D}"), &[]),
+            Err(RootError::ShellJunction)
+        );
+        assert!(check_root(&dir.join("Photos.app"), &[]).is_ok());
+        assert!(check_planned_root(&dir.join("Photos_{0AFACED1}"), &[]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

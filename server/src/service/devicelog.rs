@@ -2,8 +2,27 @@
 //! `AccountState::admit_batch` and `append_wraps_fit` check, and each device's wrapped epoch
 //! secrets. A removal ends the removed devices' sessions and deletes their uncommitted uploads in
 //! the same transaction.
+//!
+//! **Throttle** (server security review, follow-up of the crypto review): the log has a fixed
+//! length limit, so a compromised current device that appended rotations as fast as the call
+//! limits allowed (about 8000 calls in three minutes) filled it, and the device could no longer
+//! be removed. Appends that add a device or rotate without a removal count against
+//! [`Scope::LogAppendAccount`], rotations without a removal also against
+//! [`Scope::LogRotateAccount`] (one an hour). A batch that removes devices, the rotation the log
+//! has due and the one append of a recovery session (the recovery batch, which adds the new
+//! device and lets it remove and rotate in the same call) are never limited.
+//!
+//! **Added devices per day** (security review follow-up, M1): a device that adds a throwaway
+//! device, removes it and rotates appends three entries per added device, and removals are
+//! free, so thirty adds an hour filled the log up to its reserve in about four days. Adds also
+//! count against [`ADDS_PER_DAY`] per account and day, which bounds that to 60 entries a day:
+//! about 134 days from an empty log to the reserve, which still keeps every device removable.
+//! Twenty new devices in one day is far above any household's pairing. The log has no time of
+//! its own, so this is a server rule, not a format rule. The count lives in memory like the
+//! other limits; until the limiter has a day scope of its own it is kept here. The log format reserves the room for removals as a first line; this is the second.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hangar_drive_crypto::devicelog::BatchShape;
 use hangar_drive_crypto::epoch::append_wraps_fit;
@@ -11,11 +30,12 @@ use hangar_drive_protocol::api::{
     ErrorCode, FeedChange, LogAppendRequest, LogAppendResponse, LogPage, WrappedKeyResponse,
     MAX_LOG_PAGE,
 };
-use hangar_drive_protocol::ids::{Blob, Epoch};
+use hangar_drive_protocol::ids::{AccountId, Blob, Epoch};
 
 use crate::app::{account_by_pk, App, AppState};
 use crate::db::{begin_write, i64_of, u64_of};
 use crate::error::{ApiError, ApiResult};
+use crate::http::ratelimit::{RateLimiter, Scope};
 use crate::service::sessions::Session;
 use crate::service::{feed, objects, retention};
 
@@ -78,10 +98,15 @@ pub async fn append(
     if !wraps_fit {
         return Err(ErrorCode::LogEntryRefused.into());
     }
-    if matches!(
+    let recovery = matches!(
         session.scope,
         hangar_drive_protocol::api::SessionScope::Recovery { .. }
-    ) {
+    );
+    let throttled = Throttle::of(&batch.shape, state.rotation_due(), recovery);
+    if !throttled.admit(&app.limiter, &account.id, app.now_ms() / 1000) {
+        return Err(ErrorCode::RateLimited.into());
+    }
+    if recovery {
         // The one append of a recovery session, recorded in the same transaction.
         let marked =
             sqlx::query("UPDATE sessions SET appended = 1 WHERE token_hash = ? AND appended = 0")
@@ -109,8 +134,21 @@ pub async fn append(
         .await?;
     let mut pushed = Vec::new();
     let mut dropped_files = Vec::new();
+    // A recovery stores the new device's wrap of the epoch before the batch, then is a rotation.
+    if let (BatchShape::Recovery { epoch, .. }, Some(wrap)) = (&batch.shape, &request.device_wrap) {
+        if let Some(before) = epoch.0.checked_sub(1).filter(|e| *e > 0) {
+            store_wrap(
+                &mut tx,
+                account.pk,
+                Epoch(before),
+                wrap.device.as_bytes(),
+                wrap.data.as_bytes(),
+            )
+            .await?;
+        }
+    }
     match &batch.shape {
-        BatchShape::Rotation { removed, epoch } => {
+        BatchShape::Rotation { removed, epoch } | BatchShape::Recovery { removed, epoch, .. } => {
             for wrap in &request.wraps {
                 store_wrap(
                     &mut tx,
@@ -166,6 +204,114 @@ pub async fn append(
     Ok(LogAppendResponse { head })
 }
 
+/// Which account limits an admitted append counts against (module docs, "Throttle").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Throttle {
+    /// Removals with their rotation, the rotation the log has due, and the one append of a
+    /// recovery session: never limited, so a stolen device always stays removable.
+    Free,
+    /// A new device.
+    Append,
+    /// A rotation without a removal that nothing made due.
+    Rotation,
+}
+
+impl Throttle {
+    fn of(shape: &BatchShape, rotation_due: bool, recovery: bool) -> Self {
+        match shape {
+            _ if recovery => Throttle::Free,
+            BatchShape::Recovery { .. } => Throttle::Free,
+            BatchShape::Rotation { removed, .. } if !removed.is_empty() || rotation_due => {
+                Throttle::Free
+            }
+            BatchShape::Rotation { .. } => Throttle::Rotation,
+            BatchShape::AddDevice { .. } => Throttle::Append,
+        }
+    }
+
+    /// Counts the append; `false` when a limit is used up. Nothing is counted then, so a
+    /// refused rotation does not use up the account's appends.
+    fn admit(self, limiter: &RateLimiter, account: &AccountId, now_s: u64) -> bool {
+        let key = account.as_bytes().as_slice();
+        match self {
+            Throttle::Free => true,
+            Throttle::Append => {
+                let mut days = day_adds();
+                if days.exceeded(account, now_s)
+                    || !limiter.hit(Scope::LogAppendAccount, key, now_s)
+                {
+                    return false;
+                }
+                days.record(*account, now_s);
+                true
+            }
+            Throttle::Rotation => {
+                if limiter.exceeded(Scope::LogAppendAccount, key, now_s)
+                    || limiter.exceeded(Scope::LogRotateAccount, key, now_s)
+                {
+                    return false;
+                }
+                limiter.hit(Scope::LogRotateAccount, key, now_s)
+                    && limiter.hit(Scope::LogAppendAccount, key, now_s)
+            }
+        }
+    }
+}
+
+/// Devices one account may add per day (module docs, "Added devices per day").
+pub const ADDS_PER_DAY: usize = 20;
+const DAY_S: u64 = 86_400;
+/// Accounts whose adds of the last day are kept; above it, accounts without an add in the
+/// last day are forgotten first.
+const MAX_TRACKED_ACCOUNTS: usize = 100_000;
+
+/// The times of each account's adds in the last day.
+#[derive(Debug, Default)]
+struct DayAdds(HashMap<AccountId, VecDeque<u64>>);
+
+impl DayAdds {
+    fn recent(&mut self, account: &AccountId, now_s: u64) -> usize {
+        let Some(times) = self.0.get_mut(account) else {
+            return 0;
+        };
+        while times
+            .front()
+            .is_some_and(|t| now_s.saturating_sub(*t) >= DAY_S)
+        {
+            times.pop_front();
+        }
+        times.len()
+    }
+
+    fn exceeded(&mut self, account: &AccountId, now_s: u64) -> bool {
+        self.recent(account, now_s) >= ADDS_PER_DAY
+    }
+
+    fn record(&mut self, account: AccountId, now_s: u64) {
+        if self.0.len() >= MAX_TRACKED_ACCOUNTS && !self.0.contains_key(&account) {
+            self.0.retain(|_, times| {
+                times
+                    .back()
+                    .is_some_and(|t| now_s.saturating_sub(*t) < DAY_S)
+            });
+            if self.0.len() >= MAX_TRACKED_ACCOUNTS {
+                // Only reachable with more busy accounts than any server holds; forgetting
+                // makes the limit looser, never refuses an honest add.
+                self.0.clear();
+            }
+        }
+        self.0.entry(account).or_default().push_back(now_s);
+    }
+}
+
+fn day_adds() -> std::sync::MutexGuard<'static, DayAdds> {
+    static DAY_ADDS: OnceLock<Mutex<DayAdds>> = OnceLock::new();
+    DAY_ADDS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 async fn store_wrap(
     conn: &mut sqlx::SqliteConnection,
     account_pk: i64,
@@ -209,4 +355,82 @@ pub async fn length(app: &App, account_pk: i64) -> ApiResult<u64> {
         .fetch_one(&app.db)
         .await?;
     Ok(u64_of(len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hangar_drive_protocol::ids::DeviceId;
+
+    fn rotation(removed: usize) -> BatchShape {
+        BatchShape::Rotation {
+            removed: (0..removed)
+                .map(|i| DeviceId::from_bytes([i as u8; 16]))
+                .collect(),
+            epoch: Epoch(2),
+        }
+    }
+
+    #[test]
+    fn removals_due_rotations_and_recovery_are_never_throttled() {
+        let add = BatchShape::AddDevice {
+            device: DeviceId::from_bytes([9; 16]),
+        };
+        let recovery = BatchShape::Recovery {
+            by: DeviceId::from_bytes([8; 16]),
+            device: DeviceId::from_bytes([9; 16]),
+            removed: vec![DeviceId::from_bytes([7; 16])],
+            epoch: Epoch(3),
+        };
+        assert_eq!(Throttle::of(&rotation(1), false, false), Throttle::Free);
+        assert_eq!(Throttle::of(&rotation(0), true, false), Throttle::Free);
+        assert_eq!(Throttle::of(&add, true, true), Throttle::Free);
+        assert_eq!(Throttle::of(&rotation(0), false, true), Throttle::Free);
+        assert_eq!(Throttle::of(&recovery, false, true), Throttle::Free);
+        assert_eq!(Throttle::of(&recovery, false, false), Throttle::Free);
+        assert_eq!(Throttle::of(&rotation(0), false, false), Throttle::Rotation);
+        assert_eq!(Throttle::of(&add, false, false), Throttle::Append);
+    }
+
+    #[test]
+    fn one_plain_rotation_an_hour_and_removals_after_every_limit() {
+        let limiter = RateLimiter::new();
+        let account = AccountId::from_bytes([0x71; 16]);
+        assert!(Throttle::Rotation.admit(&limiter, &account, 0));
+        assert!(!Throttle::Rotation.admit(&limiter, &account, 1));
+        let other = AccountId::from_bytes([0x72; 16]);
+        assert!(Throttle::Rotation.admit(&limiter, &other, 1), "per account");
+        // Adds: the day budget binds before the hourly appends do.
+        for _ in 0..ADDS_PER_DAY {
+            assert!(Throttle::Append.admit(&limiter, &account, 2));
+        }
+        assert!(!Throttle::Append.admit(&limiter, &account, 2));
+        for _ in 0..1000 {
+            assert!(Throttle::Free.admit(&limiter, &account, 2), "removals pass");
+        }
+        assert!(Throttle::Rotation.admit(&limiter, &account, 3600));
+    }
+
+    // Security review follow-up, M1: added devices count per account and day, a refused add
+    // counts nothing, and a day later the budget is back.
+    #[test]
+    fn adds_are_bounded_per_day() {
+        let limiter = RateLimiter::new();
+        let account = AccountId::from_bytes([0x73; 16]);
+        let hourly = Scope::LogAppendAccount.rule().limit as usize;
+        assert!(ADDS_PER_DAY < hourly, "the day budget is the tighter one");
+        // Spread over the day, so the hourly limit never binds.
+        for k in 0..ADDS_PER_DAY {
+            assert!(Throttle::Append.admit(&limiter, &account, k as u64 * 3600));
+        }
+        let late = (ADDS_PER_DAY as u64) * 3600;
+        assert!(!Throttle::Append.admit(&limiter, &account, late));
+        assert!(!Throttle::Append.admit(&limiter, &account, late + 1));
+        // The first add of the day leaves the window a day after it.
+        assert!(Throttle::Append.admit(&limiter, &account, DAY_S));
+        assert!(!Throttle::Append.admit(&limiter, &account, DAY_S + 1));
+        // Another account has its own budget.
+        let other = AccountId::from_bytes([0x74; 16]);
+        assert!(Throttle::Append.admit(&limiter, &other, late));
+    }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-incoming-delete"
+description = "Enables the list_incoming_delete command without any pre-configured scope."
+commands.allow = ["list_incoming_delete"]
+
+[[permission]]
+identifier = "deny-list-incoming-delete"
+description = "Denies the list_incoming_delete command without any pre-configured scope."
+commands.deny = ["list_incoming_delete"]

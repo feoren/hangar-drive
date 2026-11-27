@@ -14,6 +14,7 @@ import { Dialog } from "../ui/Dialog";
 import { Feedback, Loading } from "../ui/parts";
 import { errorText, useAction, useLoad } from "../ui/useAsync";
 import { formatVersion, withBuild } from "../version";
+import { PendingResetWarning } from "../setup/PendingReset";
 
 export function SettingsDialog({ onClose }: { readonly onClose: () => void }) {
   const t = useT();
@@ -248,6 +249,19 @@ function ResetDevice() {
   const backend = useBackend();
   const action = useAction();
   const app = t("app.name");
+  // A recovery that is not finished: the shell asked nothing; the window explains first.
+  const [pending, setPending] = useState(false);
+  if (pending) {
+    return (
+      <div className="report">
+        <PendingResetWarning
+          onCancel={() => {
+            setPending(false);
+          }}
+        />
+      </div>
+    );
+  }
   return (
     <div className="report">
       <p className="setting-help">{t("reset.help", { app })}</p>
@@ -257,7 +271,8 @@ function ResetDevice() {
         disabled={action.pending}
         onClick={() => {
           void action.run(async () => {
-            await backend.resetDevice();
+            const outcome = await backend.resetDevice();
+            if (outcome === "recoveryPending") setPending(true);
           });
         }}
       >

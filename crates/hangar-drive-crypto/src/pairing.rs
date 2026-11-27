@@ -13,10 +13,17 @@
 //!
 //! The offer is the new device's trust anchor: the log head comes out of band, so a server
 //! cannot show the new device an invented log ([`check_joined`]). It is single use and expires
-//! after 10 minutes (the server enforces single use, the app the expiry). Without a camera the
-//! person types P as a 32-character code ([`PairingSecret::reveal`], Crockford base32 with a
-//! checksum, like the recovery code) or compares safety numbers. Short codes are never used as P
-//! without a PAKE: the server sees the tag and could brute force a short code offline.
+//! after 10 minutes (the server enforces single use, the app the expiry).
+//!
+//! **Typed pairing is not supported** (security review, info). [`PairingSecret::reveal`] and
+//! [`PairingSecret::parse`] turn P into a 32-character code (Crockford base32 with a checksum,
+//! like the recovery code), but that code carries P alone: no account ID and no log head hash.
+//! A new device that only typed it has no trust anchor, so the server could show it an invented
+//! log with devices of the server's own, and [`check_joined`] needs the offer's head. The app
+//! therefore pairs only through the scanned offer; a typed form must carry account ID and head
+//! hash (or the person must compare the log safety number before anything is trusted) before
+//! it can be offered. Short codes are never used as P without a PAKE: the server sees the tag
+//! and could brute force a short code offline.
 //!
 //! **Signature:** the inviting device signs the offer. A device of the same account that scans
 //! an offer takes the server URL and the SPKI pin from it (pin rotation, ADR 0001, section 6)
@@ -179,12 +186,14 @@ impl PairingSecret {
         Ok(Self(bytes))
     }
 
-    /// The secret as a typed code (8 groups of 4 characters), for pairing without a camera.
+    /// The secret as a code of 8 groups of 4 characters. Not a pairing method on its own: the
+    /// code carries no trust anchor (module docs, "Typed pairing is not supported").
     pub fn reveal(&self) -> Zeroizing<String> {
         encode_code(LABEL_CODE, CODE_VERSION, &self.0)
     }
 
-    /// Reads a typed code.
+    /// Reads a code made by [`PairingSecret::reveal`]. A device that has only this has no
+    /// trust anchor (module docs).
     pub fn parse(text: &str) -> Result<Self, PairingError> {
         Ok(Self(decode_code(text, LABEL_CODE, CODE_VERSION)?))
     }
@@ -213,7 +222,11 @@ impl PairingSecret {
         entropy.fill(&mut nonce)?;
         let aad = framed(&[LABEL_NAME, account.as_bytes(), device.as_bytes()]);
         let len = u64::try_from(name.len()).map_err(|_| PairingError::Name)?;
-        let padded_len = usize::try_from(padme(len + 8)).map_err(|_| PairingError::Name)?;
+        let padded_len = len
+            .checked_add(8)
+            .and_then(padme)
+            .and_then(|padded| usize::try_from(padded).ok())
+            .ok_or(PairingError::Name)?;
         let mut padded = Zeroizing::new(Vec::with_capacity(padded_len));
         padded.extend_from_slice(&len.to_be_bytes());
         padded.extend_from_slice(name.as_bytes());
@@ -269,7 +282,7 @@ impl PairingSecret {
         let len_usize = usize::try_from(len).map_err(|_| PairingError::Name)?;
         if len_usize > rest.len()
             || len_usize > MAX_DEVICE_NAME_LEN
-            || u64::try_from(plain.len()).ok() != Some(padme(len + 8))
+            || u64::try_from(plain.len()).ok() != len.checked_add(8).and_then(padme)
         {
             return Err(PairingError::Name);
         }
@@ -461,10 +474,18 @@ impl fmt::Debug for OfferContent {
     }
 }
 
+/// Bytes of an offer body besides the URL and the pin: the version byte, nine length prefixes
+/// and the fixed fields (server, account, inviter, head index, head hash, P, expiry).
+const OFFER_FIXED_LEN: usize = 1 + 9 * 4 + 16 + 16 + 16 + 8 + 32 + ENTROPY_LEN + 8;
+
 impl OfferContent {
-    fn body(&self) -> Result<Zeroizing<Vec<u8>>, PairingError> {
+    /// The offer body, in a buffer with room for `extra` more bytes. The body holds the pairing
+    /// secret, so it is written into a buffer of its final size: a buffer that grew would leave
+    /// copies of P in the freed memory, which `Zeroizing` never sees (security review, info).
+    fn body(&self, extra: usize) -> Result<Zeroizing<Vec<u8>>, PairingError> {
         let url = parse_server_url(self.server_url.as_str())?;
-        let mut w = Writer::new();
+        let pin_len = self.spki_pin.map_or(0, |p| p.len());
+        let mut w = Writer::with_capacity(OFFER_FIXED_LEN + url.as_str().len() + pin_len + extra);
         w.u8(OFFER_VERSION)
             .field(url.as_str().as_bytes())
             .field(self.spki_pin.as_ref().map_or(&[][..], |p| p.as_slice()))
@@ -484,7 +505,7 @@ impl OfferContent {
         if self.head.index == 0 {
             return Err(PairingError::Malformed);
         }
-        let body = self.body()?;
+        let body = self.body(0)?;
         let signature = Signature::from_bytes(identity.sign(&offer_message(&body)));
         Ok(PairingOffer {
             content: self,
@@ -521,7 +542,7 @@ impl PairingOffer {
     /// The offer's wire bytes (module docs), wiped on drop. The app shows them as base64url in
     /// a QR code.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, PairingError> {
-        let mut bytes = self.content.body()?;
+        let mut bytes = self.content.body(SIGNATURE_LEN)?;
         bytes.extend_from_slice(self.signature.as_bytes());
         Ok(bytes)
     }
@@ -590,7 +611,7 @@ impl PairingOffer {
             .device(&self.content.inviter)
             .filter(|d| d.is_current() && !d.recovery)
             .ok_or(PairingError::Signature)?;
-        let body = self.content.body()?;
+        let body = self.content.body(0)?;
         if !verify(
             &inviter.keys.sign,
             &offer_message(&body),
@@ -702,9 +723,9 @@ mod tests {
     #[test]
     fn sealed_names_are_padded_with_padme() {
         use hangar_drive_protocol::api::{SEALED_NAME_MAX_PADDED, SEALED_NAME_MIN_PADDED};
-        assert_eq!(SEALED_NAME_MIN_PADDED as u64, padme(8 + 1));
+        assert_eq!(Some(SEALED_NAME_MIN_PADDED as u64), padme(8 + 1));
         assert_eq!(
-            SEALED_NAME_MAX_PADDED as u64,
+            Some(SEALED_NAME_MAX_PADDED as u64),
             padme(8 + MAX_DEVICE_NAME_LEN as u64)
         );
         let secret = PairingSecret::generate(&mut OsEntropy).unwrap();
@@ -717,7 +738,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 request.sealed_name.as_bytes().len(),
-                SEALED_NAME_OVERHEAD + padme(8 + len as u64) as usize
+                SEALED_NAME_OVERHEAD + padme(8 + len as u64).unwrap() as usize
             );
             assert_eq!(request.validate(), Ok(()));
             assert_eq!(
@@ -881,6 +902,28 @@ mod tests {
             crate::recovery::RecoveryCode::generate(&mut FixedEntropy::counting(0xd0, 16)).unwrap();
         assert!(PairingSecret::parse(&recovery.reveal()).is_err());
         assert_eq!(format!("{secret:?}"), "PairingSecret(..)");
+    }
+
+    // Security review, info: the offer bytes hold P, so they are written into a buffer of their
+    // final size, signature included; a buffer that grew would leave copies of P behind.
+    #[test]
+    fn offer_buffers_are_allocated_at_their_final_size() {
+        let a = dev(1);
+        let state = created(&a);
+        for pin in [None, Some([7; 32])] {
+            let mut content = content(
+                PairingSecret::generate(&mut OsEntropy).unwrap(),
+                a.id,
+                state.head().unwrap(),
+            );
+            content.spki_pin = pin;
+            let body = content.body(0).unwrap();
+            assert_eq!(body.capacity(), body.len(), "pin {pin:?}");
+            let offer = content.sign(&a.identity).unwrap();
+            let wire = offer.encode().unwrap();
+            assert_eq!(wire.len(), body.len() + SIGNATURE_LEN);
+            assert_eq!(wire.capacity(), wire.len(), "pin {pin:?}");
+        }
     }
 
     #[test]

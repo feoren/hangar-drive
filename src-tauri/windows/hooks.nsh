@@ -15,7 +15,16 @@
 ; uninstall section runs; a silent (/S) or passive (/P) uninstall never shows that page, so the
 ; state stays empty and the keys stay. A running Hangar Drive is closed first, so it does not
 ; hold the index open or write its secrets back.
+;
+; Autostart: the Tauri template already deletes the Run value "${PRODUCTNAME}" in
+; HKCU\...\CurrentVersion\Run outside update mode (tauri-cli 2.12.6, read in its embedded
+; installer.nsi). The autostart plugin (auto-launch) also writes a value of that name under
+; Explorer\StartupApproved\Run, the Task Manager's on/off switch; it is removed here the same way,
+; so an uninstall leaves no autostart trace. An update keeps both.
 !macro NSIS_HOOK_PREUNINSTALL
+  ${If} $UpdateMode <> 1
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
+  ${EndIf}
   ${If} $UpdateMode <> 1
   ${AndIf} $DeleteAppDataCheckboxState = 1
     !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"

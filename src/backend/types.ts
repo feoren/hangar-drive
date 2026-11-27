@@ -147,6 +147,25 @@ export type Warning =
       /** The first few names, for the sentence "a, b, c and 339 more". */
       readonly sample: readonly string[];
     }
+  /**
+   * Many files another device deleted wait here for the person's decision (ADR 0001, amendment
+   * "incoming mass deletes"); they are still on this disk. `device` names the device that
+   * deleted them when the verified history names exactly one, otherwise null.
+   */
+  | {
+      readonly kind: "incomingDelete";
+      readonly id: string;
+      readonly folderId: FolderId;
+      readonly folderName: string;
+      readonly device: string | null;
+      /**
+       * When `device` was added to the account, from the verified device log: a device can
+       * take another one's name, not this date (security review L5). Null without a device.
+       */
+      readonly deviceAdded: Millis | null;
+      readonly count: number;
+      readonly sample: readonly string[];
+    }
   | {
       readonly kind: "missingFolder";
       readonly id: string;
@@ -203,6 +222,30 @@ export type Warning =
     }
   | { readonly kind: "updateRequired"; readonly id: string }
   | { readonly kind: "refused"; readonly id: string }
+  /**
+   * The account has no valid recovery code (the app ended between a recovery's join and its new
+   * code). Cannot be dismissed; it goes once a new code is confirmed (`renewRecoveryCode`, then
+   * `confirmRecoveryGroup`).
+   */
+  | { readonly kind: "noRecoveryCode"; readonly id: string }
+  /**
+   * A recovery sent its one change, but this device could not join the account yet (setup is
+   * still "needed"). The engine tries again about every minute; typing the code again finishes
+   * it too. Resetting the device now would throw away this device's new key.
+   */
+  | { readonly kind: "recoveryPending"; readonly id: string }
+  /**
+   * After this device's own recovery the key of each folder in `folders` (by name) could not be
+   * read yet; they come back by themselves once the server or a remaining device provides them.
+   * `folderList`: the list of folders itself could not be read and was started empty. Can be
+   * dismissed (`dismissSuspect`) only while `folders` is empty.
+   */
+  | {
+      readonly kind: "foldersUnreadable";
+      readonly id: string;
+      readonly folders: readonly string[];
+      readonly folderList: boolean;
+    }
   | {
       readonly kind: "suspect";
       readonly id: string;
@@ -462,6 +505,20 @@ export interface FolderChoice {
 export type RecoverError =
   "typo" | "unknown" | "used" | "otherApp" | "wrongSheet" | "unreachable" | "insecure";
 
+/**
+ * Why the last step of a recovery did not add this device. `listChanged`: the account's devices
+ * changed since they were shown and nothing was written; the person chooses again from the new
+ * list. `unreachable`: the same step is tried again. `RecoveryEnded`: the step cannot succeed
+ * with this sheet; the person starts again.
+ */
+export type RecoveryCleanupError = "listChanged" | "unreachable" | RecoveryEnded;
+
+/**
+ * The reasons of `RecoveryCleanupError` that end the recovery: the code stopped working between
+ * the steps, it does not belong to the account, or the server is not the one of the sheet.
+ */
+export type RecoveryEnded = "used" | "unknown" | "insecure";
+
 // ---------------------------------------------------------------------------------------------
 // Conflicts and names
 
@@ -682,6 +739,13 @@ export type ServerConfirm = Confirmation;
 export type Confirmation = "confirmed" | "declined";
 
 /**
+ * How "Reset this device" ended. `recoveryPending`: a recovery sent its change and this device
+ * has not joined yet; nothing was asked and nothing changed. Its key may be the account's only
+ * one, so the window explains first and offers `resetDeviceDiscardingRecovery`.
+ */
+export type ResetOutcome = Confirmation | "recoveryPending";
+
+/**
  * How the group check ended: "wrong" for a group that does not match, "declined" when the
  * person said no to taking a renewed code in the native dialog (the old code stays valid).
  */
@@ -812,18 +876,31 @@ export interface Backend {
   ): Promise<Result<null, RecoverError | NameError>>;
   /** No longer called by the window (the name goes with `recoverAccount`); kept for the shell. */
   setDeviceName(name: string): Promise<Result<null, DeviceNameError>>;
+  /**
+   * The devices of the account during a recovery. Before this device joined, `name` is empty
+   * (the recovery cannot open the sealed names); `added` tells them apart.
+   */
   recoveryDevices(): Promise<readonly Device[]>;
   /**
-   * Removes the chosen old devices and the used recovery device, returns the new code. Removing
-   * devices asks natively first with their names; null when the person said no there (nothing
-   * was removed). The window asks nothing before it.
+   * Adds this device to the account, removes the chosen old devices and the used recovery
+   * device in one step, and returns the new code. Before this call nothing changed in the
+   * account. Removing devices asks natively first and names them; null when the person said no
+   * there (nothing changed). The window asks nothing before it. `RecoveryCleanupError`: this
+   * device was not added; a thrown error after the join means the same call may be tried again.
    */
-  finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode | null>;
+  finishRecoveryCleanup(
+    remove: readonly DeviceId[],
+  ): Promise<Result<RecoveryCode | null, RecoveryCleanupError>>;
   /**
    * Forgets the account on this device: secrets, stored account and the folders' sync state; the
    * files stay. The next snapshot says `setup: "needed"`, so the window shows the welcome again.
    */
-  resetDevice(): Promise<Confirmation>;
+  resetDevice(): Promise<ResetOutcome>;
+  /**
+   * Resets this device although a recovery is pending: its new key is thrown away, so the account
+   * may be lost for good. The shell asks natively first ("no" as the default).
+   */
+  resetDeviceDiscardingRecovery(): Promise<Confirmation>;
 
   // Everyday (6)
   openFolder(folderId: FolderId | null, path?: string): Promise<void>;
@@ -853,6 +930,15 @@ export interface Backend {
   listMassDelete(warningId: string): Promise<readonly string[]>;
   /** "delete" asks once more natively with the folder and the number of files. */
   resolveMassDelete(warningId: string, decision: "restore" | "delete"): Promise<MassDeleteOutcome>;
+  listIncomingDelete(warningId: string): Promise<readonly string[]>;
+  /**
+   * "restore" brings the files back on all devices; "delete" asks once more natively with the
+   * folder and the number of files and deletes them here.
+   */
+  resolveIncomingDelete(
+    warningId: string,
+    decision: "restore" | "delete",
+  ): Promise<MassDeleteOutcome>;
   findMissingFolder(folderId: FolderId): Promise<PickResult>;
   redownloadFolder(folderId: FolderId): Promise<void>;
   getServerNumber(): Promise<{ readonly number: NumberRows; readonly command: string }>;

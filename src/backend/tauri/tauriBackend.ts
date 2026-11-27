@@ -232,10 +232,18 @@ export class TauriBackend implements Backend {
     return this.call("recoveryDevices", {}, d.array(d.device));
   }
   finishRecoveryCleanup(remove: readonly DeviceId[]) {
-    return this.call("finishRecoveryCleanup", { remove }, d.nullableRecoveryCode);
+    return this.call(
+      "finishRecoveryCleanup",
+      { remove },
+      d.result(d.nullableRecoveryCode, "listChanged", "unreachable", "used", "unknown", "insecure"),
+    );
   }
   resetDevice() {
-    return this.call("resetDevice", {}, d.confirmation);
+    return this.call("resetDevice", {}, d.resetOutcome);
+  }
+
+  resetDeviceDiscardingRecovery() {
+    return this.call("resetDeviceDiscardingRecovery", {}, d.confirmation);
   }
 
   async openFolder(folderId: FolderId | null, path?: string) {
@@ -290,6 +298,12 @@ export class TauriBackend implements Backend {
   }
   resolveMassDelete(warningId: string, decision: "restore" | "delete") {
     return this.call("resolveMassDelete", { warningId, decision }, d.massDeleteOutcome);
+  }
+  listIncomingDelete(warningId: string) {
+    return this.call("listIncomingDelete", { warningId }, d.array(d.str));
+  }
+  resolveIncomingDelete(warningId: string, decision: "restore" | "delete") {
+    return this.call("resolveIncomingDelete", { warningId, decision }, d.massDeleteOutcome);
   }
   findMissingFolder(folderId: FolderId) {
     return this.call("findMissingFolder", { folderId }, d.pickResult);

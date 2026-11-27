@@ -55,6 +55,76 @@ describe("format", () => {
     expect(plain(formatSince("de", NOW - DAY, NOW))).toBe("gestern");
   });
 
+  describe("across midnight, month and year boundaries", () => {
+    const justAfterMidnight = new Date(2026, 10, 27, 0, 7).getTime();
+
+    it("keeps minutes under an hour even when the event was before midnight", () => {
+      expect(plain(formatRelative("de", justAfterMidnight - 20 * MINUTE, justAfterMidnight))).toBe(
+        "vor 20 Min.",
+      );
+      expect(plain(formatRelative("de", justAfterMidnight - 7 * MINUTE, justAfterMidnight))).toBe(
+        "vor 7 Min.",
+      );
+      const midnight = new Date(2026, 10, 27, 0, 0).getTime();
+      expect(plain(formatRelative("de", midnight - 1, midnight))).toBe("vor 1 Min.");
+    });
+
+    it("says yesterday, not hours, once an hour old event lies on the previous day", () => {
+      expect(plain(formatRelative("de", justAfterMidnight - 62 * MINUTE, justAfterMidnight))).toBe(
+        "gestern",
+      );
+      expect(plain(formatRelative("en", justAfterMidnight - 62 * MINUTE, justAfterMidnight))).toBe(
+        "yesterday",
+      );
+      expect(plain(formatRelative("de", justAfterMidnight - 3 * HOUR, justAfterMidnight))).toBe(
+        "gestern",
+      );
+    });
+
+    it("counts hours up to the end of the same day", () => {
+      const lateEvening = new Date(2026, 10, 26, 23, 59).getTime();
+      const earlyMorning = new Date(2026, 10, 26, 0, 30).getTime();
+      expect(plain(formatRelative("de", earlyMorning, lateEvening))).toBe("vor 23 Std.");
+      expect(plain(formatRelative("de", lateEvening - HOUR, lateEvening))).toBe("vor 1 Std.");
+    });
+
+    it("says yesterday across a month and a year boundary", () => {
+      const firstOfDecember = new Date(2026, 11, 1, 0, 7).getTime();
+      expect(
+        plain(formatRelative("de", new Date(2026, 10, 30, 22, 0).getTime(), firstOfDecember)),
+      ).toBe("gestern");
+      const newYear = new Date(2027, 0, 1, 0, 7).getTime();
+      expect(plain(formatRelative("de", new Date(2026, 11, 31, 22, 0).getTime(), newYear))).toBe(
+        "gestern",
+      );
+      expect(plain(formatRelative("de", new Date(2026, 11, 29, 12, 0).getTime(), newYear))).toBe(
+        "vor 3 Tagen",
+      );
+      expect(plain(formatRelative("de", new Date(2026, 11, 10, 12, 0).getTime(), newYear))).toBe(
+        "10. Dez. 2026",
+      );
+    });
+
+    it("shows a time since today, but yesterday for a moment just before midnight", () => {
+      expect(plain(formatSince("de", justAfterMidnight - 5 * MINUTE, justAfterMidnight))).toBe(
+        "00:02",
+      );
+      expect(plain(formatSince("de", justAfterMidnight - 20 * MINUTE, justAfterMidnight))).toBe(
+        "gestern",
+      );
+    });
+
+    it("adds the weekday to a future time that falls after midnight", () => {
+      const beforeMidnight = new Date(2026, 10, 26, 23, 50).getTime();
+      expect(plain(formatFutureTime("de", beforeMidnight + 5 * MINUTE, beforeMidnight))).toBe(
+        "23:55",
+      );
+      expect(plain(formatFutureTime("de", beforeMidnight + 20 * MINUTE, beforeMidnight))).toMatch(
+        /^Fr\.?, 00:10$/,
+      );
+    });
+  });
+
   it("formats sizes with decimal units", () => {
     expect(plain(formatSize("de", 12_400_000_000))).toBe("12,4 GB");
     expect(plain(formatSize("en", 48_200))).toBe("48.2 kB");

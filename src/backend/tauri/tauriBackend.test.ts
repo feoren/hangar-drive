@@ -82,6 +82,89 @@ describe("tauri backend", () => {
     }
   });
 
+  // Security review "recovery" H1 and L1: both recovery banners come through exactly as the
+  // engine writes them (serde tag "kind", camelCase).
+  it("decodes the two recovery warnings", async () => {
+    for (const scenario of [
+      "noRecoveryCode",
+      "recoveryPending",
+      "foldersUnreadable",
+      "folderListUnreadable",
+    ] as const) {
+      const state = await new MockBackend({ scenario }).getSnapshot();
+      const bridge = backendWith({ get_snapshot: JSON.parse(JSON.stringify(state)) });
+      await expect(bridge.backend.getSnapshot()).resolves.toEqual(state);
+    }
+    const snapshot = await new MockBackend({ scenario: "upToDate" }).getSnapshot();
+    const wire = {
+      ...snapshot,
+      warnings: [
+        { kind: "noRecoveryCode", id: "noRecoveryCode" },
+        { kind: "recoveryPending", id: "recoveryPending" },
+      ],
+    };
+    const decoded = await backendWith({ get_snapshot: wire }).backend.getSnapshot();
+    expect(decoded.warnings).toEqual(wire.warnings);
+  });
+
+  // Follow-up review LOW 2 and LOW 7: the unreadable folders as the engine writes them, a wrong
+  // shape refused; the reset's outcome, with the pending recovery as one of them.
+  it("decodes the unreadable folders and the reset outcomes", async () => {
+    const snapshot = await new MockBackend({ scenario: "upToDate" }).getSnapshot();
+    const warning = {
+      kind: "foldersUnreadable",
+      id: "foldersUnreadable",
+      folders: ["Docs"],
+      folderList: false,
+    };
+    const decoded = await backendWith({
+      get_snapshot: { ...snapshot, warnings: [warning] },
+    }).backend.getSnapshot();
+    expect(decoded.warnings).toEqual([warning]);
+    await expect(
+      backendWith({
+        get_snapshot: { ...snapshot, warnings: [{ ...warning, folders: "Docs" }] },
+      }).backend.getSnapshot(),
+    ).rejects.toMatchObject({ code: "badResponse" });
+    for (const outcome of ["confirmed", "declined", "recoveryPending"]) {
+      await expect(backendWith({ reset_device: outcome }).backend.resetDevice()).resolves.toBe(
+        outcome,
+      );
+    }
+    await expect(
+      backendWith({ reset_device: "pending" }).backend.resetDevice(),
+    ).rejects.toMatchObject({ code: "badResponse" });
+    const forced = backendWith({ reset_device_discarding_recovery: "declined" });
+    await expect(forced.backend.resetDeviceDiscardingRecovery()).resolves.toBe("declined");
+    expect(forced.calls[0]?.command).toBe("reset_device_discarding_recovery");
+  });
+
+  // A newer engine may add a banner this window does not know: the snapshot still arrives
+  // (instead of an empty window), without that banner. A known kind of the wrong shape, an item
+  // without a kind and a wrong list still fail.
+  it("leaves out warnings and notices of an unknown kind, and nothing else", async () => {
+    const snapshot = await new MockBackend({ scenario: "conflicts" }).getSnapshot();
+    const future = {
+      ...snapshot,
+      warnings: [{ kind: "fromTheFuture", id: "x", extra: 1 }, ...snapshot.warnings],
+      notices: [{ kind: "newNotice" }, { kind: "quota" }],
+    };
+    const decoded = await backendWith({ get_snapshot: future }).backend.getSnapshot();
+    expect(decoded.warnings).toEqual(snapshot.warnings);
+    expect(decoded.notices).toEqual([{ kind: "quota" }]);
+    for (const warnings of [
+      [{ kind: "conflicts", id: "conflicts", count: "two" }],
+      [{ id: "no-kind" }],
+      [{ kind: 3, id: "number-kind" }],
+      ["noRecoveryCode"],
+      { kind: "noRecoveryCode", id: "noRecoveryCode" },
+    ]) {
+      await expect(
+        backendWith({ get_snapshot: { ...snapshot, warnings } }).backend.getSnapshot(),
+      ).rejects.toMatchObject({ code: "badResponse" });
+    }
+  });
+
   it("decodes a folder's size, null before the first scan, and refuses a wrong one", async () => {
     const snapshot = await new MockBackend({ scenario: "upToDate" }).getSnapshot();
     const unscanned = {
@@ -182,6 +265,50 @@ describe("the sync engine's shapes", () => {
       code: "C",
       deviceName: " N",
     });
+  });
+
+  // The last step of a recovery: the new code, a "no" in the native question, or the end of
+  // the recovery with its reason.
+  it("decodes how the recovery cleanup ended", async () => {
+    const mock = new MockBackend();
+    const code = await mock.beginAccount("https://drive.example.org/join#k7Qm2xR9", "Laptop");
+    const value = code.ok ? code.value : null;
+    for (const [answer, expected] of [
+      [
+        { ok: true, value },
+        { ok: true, value },
+      ],
+      [
+        { ok: true, value: null },
+        { ok: true, value: null },
+      ],
+      [
+        { ok: false, error: "used" },
+        { ok: false, error: "used" },
+      ],
+      [
+        { ok: false, error: "unreachable" },
+        { ok: false, error: "unreachable" },
+      ],
+      [
+        { ok: false, error: "listChanged" },
+        { ok: false, error: "listChanged" },
+      ],
+    ] as const) {
+      const { backend, calls } = backendWith({ finish_recovery_cleanup: answer });
+      await expect(backend.finishRecoveryCleanup(["d1"])).resolves.toEqual(expected);
+      expect(calls.at(-1)).toEqual({
+        command: "finish_recovery_cleanup",
+        args: { remove: ["d1"] },
+      });
+    }
+    // The old answer (a bare code) and an unknown reason are refused.
+    for (const answer of [value, { ok: false, error: "typo" }]) {
+      const { backend } = backendWith({ finish_recovery_cleanup: answer });
+      await expect(backend.finishRecoveryCleanup([])).rejects.toMatchObject({
+        code: "badResponse",
+      });
+    }
   });
 
   it("decodes invite checks, read links and taken-in heads", async () => {

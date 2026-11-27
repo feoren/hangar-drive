@@ -6,7 +6,7 @@ import { useId, useState } from "react";
 
 import type { ConflictGroup } from "../backend/types";
 import { formatRelative, formatSize } from "../format";
-import { useLanguage, useT } from "../i18n";
+import { displayName, useLanguage, useT } from "../i18n";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback, Loading } from "../ui/parts";
@@ -101,15 +101,15 @@ function ConflictCard({
   return (
     <section className="group-card" aria-labelledby={headingId}>
       <h3 id={headingId} className="group-title">
-        <span className="bidi-name">{original?.name}</span>
-        {group.path && <span className="group-path"> {group.path}</span>}
+        <span className="bidi-name">{displayName(original?.name ?? "")}</span>
+        {group.path && <span className="group-path"> {displayName(group.path)}</span>}
       </h3>
       {group.kind === "caseOnly" && <p className="muted">{t("conflict.caseOnly")}</p>}
       <ul className="version-list">
         {group.versions.map((version) => (
           <li key={version.id} className="version-row">
             <span className="version-text">
-              <span className="version-name">{version.name}</span>
+              <span className="version-name">{displayName(version.name)}</span>
               <span className="version-sub">
                 {t("conflict.versionSize", {
                   version: t("conflict.version", {

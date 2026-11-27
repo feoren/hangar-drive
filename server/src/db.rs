@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 pub type Db = SqlitePool;
 pub type Tx = Transaction<'static, Sqlite>;
@@ -50,6 +50,15 @@ pub async fn connect(path: &Path) -> Result<Db, DbError> {
 /// each other (busy timeout). Every compare and swap of the server relies on it.
 pub async fn begin_write(db: &Db) -> Result<Tx, sqlx::Error> {
     db.begin_with("BEGIN IMMEDIATE").await
+}
+
+/// [`begin_write`] on a connection the caller already holds, for a call that prepares its
+/// temporary tables on that connection before it takes the write lock (the commit call, server
+/// security review MEDIUM 2). Temporary tables belong to one connection.
+pub async fn begin_write_on(
+    conn: &mut SqliteConnection,
+) -> Result<Transaction<'_, Sqlite>, sqlx::Error> {
+    conn.begin_with("BEGIN IMMEDIATE").await
 }
 
 /// A `u64` as SQLite's `INTEGER`, saturating (no stored value comes near `i64::MAX`).

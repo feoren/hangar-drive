@@ -520,7 +520,7 @@ fn a_forged_account_that_lists_the_recovery_device_cannot_take_the_code() {
     use hangar_drive_sync::account::{Account, Genesis};
     use hangar_drive_sync::api::RecoverError;
     use hangar_drive_sync::links::{parse_recovery_link, recovery_link};
-    use hangar_drive_sync::recovery::{add_device_with_code, RecoveryError};
+    use hangar_drive_sync::recovery::{prepare, RecoveryError};
 
     let real = MemServer::new_shared();
     let disks: Disks = Rc::default();
@@ -597,25 +597,8 @@ fn a_forged_account_that_lists_the_recovery_device_cannot_take_the_code() {
     // The engine's recovery step refuses it on its own as well.
     let typed = RecoveryCode::parse(&text).unwrap();
     let mut session = MemServer::connect(&evil, typed.device_id().unwrap());
-    let joiner = hangar_drive_crypto::identity::DeviceIdentity::generate(
-        &mut hangar_drive_crypto::entropy::OsEntropy,
-    )
-    .unwrap();
-    let joiner = hangar_drive_crypto::devicelog::LogDevice::of(
-        &joiner,
-        &real_sheet.account,
-        DeviceId::from_bytes([0xe2; 16]),
-        false,
-    );
     assert_eq!(
-        add_device_with_code(
-            &mut session,
-            &phishing,
-            &typed,
-            joiner,
-            4,
-            &mut hangar_drive_crypto::entropy::OsEntropy,
-        ),
+        prepare(&mut session, &phishing, &typed).map(|_| ()),
         Err(RecoveryError::WrongSheet)
     );
     assert_eq!(evil.borrow().calls, calls);
@@ -820,25 +803,32 @@ fn an_aborted_join_leaves_no_secret() {
     assert!(Account::load(&store, &keychain).unwrap().is_none());
 }
 
-// Security review I1: the recovery computes the head after its append itself and refuses a
-// server that reports another one, before the new device joins at it.
+// Security review I1: the recovery computes the head after its append itself and never joins at
+// a head the server reports. A made up head in the answer is no reason to give up the new device
+// (security review "recovery" H1): the new device joins at the computed head, which its own
+// verified log must contain, so the server's value is never used.
 #[test]
-fn a_recovery_refuses_a_head_the_server_made_up() {
-    use hangar_drive_sync::api::RecoverError;
+fn a_recovery_joins_at_its_own_head_when_the_server_makes_one_up() {
     let shared = MemServer::new_shared();
     let disks: Disks = Rc::default();
     let clock = ManualClock::at(1_795_651_200_000);
     let mut a = core(&shared, &disks, &clock, 36);
     let code = set_up(&mut a);
+    let lost = a.list_devices().unwrap().devices[0].id.clone();
     let keys = SharedKeychain::default();
     let mut c = core_with(&shared, &disks, &clock, 37, Box::new(keys.clone()), true);
     assert_eq!(
         c.recover_account(&code.sheet.link, &code.groups.join("-"), "Neu")
             .unwrap(),
-        ApiResult::Err(RecoverError::Unknown)
+        ApiResult::Ok(())
     );
-    assert_eq!(c.snapshot().setup, SetupState::Needed);
-    assert_eq!(keys.keys(), Vec::<String>::new());
+    c.finish_recovery_cleanup(std::slice::from_ref(&lost))
+        .unwrap();
+    assert_eq!(c.snapshot().setup, SetupState::Done);
+    let devices = c.list_devices().unwrap().devices;
+    assert_eq!(devices.len(), 1);
+    assert!(devices[0].is_this);
+    assert!(!keys.keys().contains(&"recovery-identity".to_owned()));
 }
 
 #[test]

@@ -77,3 +77,13 @@ export function formatCombo(combo: KeyCombo, t: Translate): string {
   );
   return parts.join("+");
 }
+
+/** The `aria-keyshortcuts` form, "Control+Shift+D": fixed English names, not the UI language. */
+export function ariaCombo(combo: KeyCombo): string {
+  const parts: string[] = [];
+  if (combo.ctrl) parts.push("Control");
+  if (combo.shift) parts.push("Shift");
+  if (combo.alt) parts.push("Alt");
+  parts.push(combo.key.length === 1 ? combo.key.toUpperCase() : combo.key);
+  return parts.join("+");
+}

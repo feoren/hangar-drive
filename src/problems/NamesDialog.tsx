@@ -5,7 +5,7 @@ import { useId, useState } from "react";
 
 import type { NameIssue, NameReason } from "../backend/types";
 import { suggestWindowsName, windowsNameProblem } from "../domain/windowsNames";
-import { useT, type Translate } from "../i18n";
+import { displayName, useT, type Translate } from "../i18n";
 import { useBackend } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback, Loading } from "../ui/parts";
@@ -92,10 +92,10 @@ function NameCard({
   const where = [issue.folderName, issue.dir].filter(Boolean).join(" \\ ");
 
   return (
-    <section className="group-card" aria-label={issue.name}>
+    <section className="group-card" aria-label={displayName(issue.name)}>
       <h3 className="group-title">
-        <span className="bidi-name">{issue.name}</span>
-        <span className="group-path"> {where}</span>
+        <span className="bidi-name">{displayName(issue.name)}</span>
+        <span className="group-path"> {displayName(where)}</span>
       </h3>
       <p className="group-text">{reasonText(issue.reason, t)}</p>
       <p className="muted">{t("names.from", { device: issue.device })}</p>

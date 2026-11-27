@@ -26,10 +26,32 @@ pub struct Changes {
     pub rescan: bool,
 }
 
+/// Changed paths one drain keeps at most; beyond, a full scan is cheaper than a partial scan of
+/// that many paths, and the list would otherwise grow with every event of a mass change
+/// (security review, info).
+pub const MAX_CHANGED_PATHS: usize = 10_000;
+
 impl Changes {
     /// Whether nothing happened.
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty() && !self.rescan
+    }
+
+    /// Notes a changed path; past [`MAX_CHANGED_PATHS`] the list goes and a full scan is due.
+    pub fn add_path(&mut self, path: Vec<String>) {
+        if self.rescan {
+            return;
+        }
+        self.paths.insert(path);
+        if self.paths.len() > MAX_CHANGED_PATHS {
+            self.set_rescan();
+        }
+    }
+
+    /// A full scan is due; the paths are not needed any more.
+    pub fn set_rescan(&mut self) {
+        self.rescan = true;
+        self.paths.clear();
     }
 }
 
@@ -119,13 +141,13 @@ impl FolderWatcher {
             Ok(raw) => Some(raw),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
-                changes.rescan = true;
+                changes.set_rescan();
                 None
             }
         };
         for raw in first.into_iter().chain(self.events.try_iter()) {
             match raw {
-                Raw::Rescan => changes.rescan = true,
+                Raw::Rescan => changes.set_rescan(),
                 Raw::Paths(paths) => {
                     for path in paths {
                         self.add(&path, &mut changes);
@@ -143,11 +165,29 @@ impl FolderWatcher {
                 if rel.first().is_some_and(|n| {
                     n.eq_ignore_ascii_case(hangar_drive_protocol::name::RESERVED_ROOT_DIR)
                 }) => {}
-            Some(rel) => {
-                changes.paths.insert(rel);
-            }
+            Some(rel) => changes.add_path(rel),
             // A path the watcher reports outside the root or not as UTF-8: scan everything.
-            None => changes.rescan = true,
+            None => changes.set_rescan(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_changed_paths_become_a_full_scan() {
+        let mut changes = Changes::default();
+        for n in 0..MAX_CHANGED_PATHS {
+            changes.add_path(vec![format!("f{n}")]);
+        }
+        assert!(!changes.rescan);
+        assert_eq!(changes.paths.len(), MAX_CHANGED_PATHS);
+        changes.add_path(vec!["one more".into()]);
+        assert!(changes.rescan && changes.paths.is_empty());
+        // Later paths are not kept again.
+        changes.add_path(vec!["later".into()]);
+        assert!(changes.paths.is_empty() && !changes.is_empty());
     }
 }

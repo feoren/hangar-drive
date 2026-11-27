@@ -93,6 +93,31 @@ fn notice_of(warning: &Warning) -> Option<Notice> {
             count: Some(*count),
             ..notice("deletes.title", id, &[("folder", folder_name)])
         },
+        // The device only when the engine could name exactly one, as in the window's question.
+        Warning::IncomingDelete {
+            id,
+            count,
+            folder_name,
+            device: Some(device),
+            ..
+        } => Notice {
+            count: Some(*count),
+            ..notice(
+                "incoming.title",
+                id,
+                &[("folder", folder_name), ("device", device)],
+            )
+        },
+        Warning::IncomingDelete {
+            id,
+            count,
+            folder_name,
+            device: None,
+            ..
+        } => Notice {
+            count: Some(*count),
+            ..notice("incoming.titleUnknown", id, &[("folder", folder_name)])
+        },
         Warning::MissingFolder {
             id, folder_name, ..
         } => notice("missing.title", id, &[("folder", folder_name)]),
@@ -231,6 +256,28 @@ mod tests {
             .is_empty());
     }
 
+    // A missing recovery code is not urgent (the tray shows "needs you" and the window's banner
+    // offers a new code), and a pending recovery and folders unreadable after a recovery resolve
+    // by themselves: none of them interrupts.
+    #[test]
+    fn the_recovery_warnings_raise_no_notice() {
+        let mut policy = Policy::default();
+        let warnings = vec![
+            Warning::NoRecoveryCode {
+                id: "noRecoveryCode".into(),
+            },
+            Warning::RecoveryPending {
+                id: "recoveryPending".into(),
+            },
+            Warning::FoldersUnreadable {
+                id: "foldersUnreadable".into(),
+                folders: vec!["Docs".into()],
+                folder_list: true,
+            },
+        ];
+        assert!(policy.on_snapshot(&snapshot(warnings), 0).is_empty());
+    }
+
     #[test]
     fn conflicts_are_batched_to_one_notice_per_ten_minutes() {
         let mut policy = Policy::default();
@@ -306,6 +353,45 @@ mod tests {
         assert_eq!(told[1].key, "suspect.title");
         let (_, body) = render("en", &told[1]).unwrap();
         assert!(body.contains("Old Laptop"), "{body}");
+    }
+
+    // ADR 0001, amendment "incoming mass deletes": the person is told once, with the device
+    // when the engine knows exactly one, else without a name.
+    #[test]
+    fn held_incoming_deletes_are_told_with_or_without_the_device() {
+        let incoming = |device: Option<&str>| Warning::IncomingDelete {
+            id: "incomingDelete-1".into(),
+            folder_id: "1".into(),
+            folder_name: "Fotos".into(),
+            device: device.map(str::to_owned),
+            device_added: device.map(|_| 0),
+            count: 342,
+            sample: Vec::new(),
+        };
+        let mut policy = Policy::default();
+        let told = policy.on_snapshot(&snapshot(vec![incoming(Some("Laptop"))]), 0);
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].key, "incoming.title");
+        let (_, body) = render("de", &told[0]).unwrap();
+        assert_eq!(body, "Laptop hat 342 Dateien in „Fotos“ gelöscht");
+        assert!(policy
+            .on_snapshot(&snapshot(vec![incoming(Some("Laptop"))]), 1)
+            .is_empty());
+        let mut policy = Policy::default();
+        let told = policy.on_snapshot(&snapshot(vec![incoming(None)]), 0);
+        assert_eq!(told[0].key, "incoming.titleUnknown");
+        let (_, body) = render("de", &told[0]).unwrap();
+        assert_eq!(
+            body,
+            "Ein anderes Gerät hat 342 Dateien in „Fotos“ gelöscht"
+        );
+        for lang in crate::texts::LANGUAGES {
+            let (_, body) = render(lang, &told[0]).unwrap();
+            assert!(
+                !body.contains('{') && body.contains("342"),
+                "{lang}: {body}"
+            );
+        }
     }
 
     #[test]

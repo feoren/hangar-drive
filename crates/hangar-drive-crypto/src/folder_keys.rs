@@ -592,7 +592,10 @@ pub struct ResealedRecord {
     pub data: Vec<u8>,
 }
 
-/// The account records the removing device holds, each with the version it accepted last.
+/// The account records the removing device holds, each with the version the server holds for
+/// it, the one the device last read or wrote; the re-seal stores that version plus one (compare
+/// and swap). Under the new epoch the replay guard orders by epoch first
+/// ([`crate::record::RecordGuard`]), so the version need not exceed a mark of an older epoch.
 #[derive(Debug)]
 pub struct AccountRecords<'a> {
     /// Every folder key ring; each gets a new generation.

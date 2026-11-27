@@ -17,6 +17,10 @@ import {
   renderWith,
   text,
 } from "./test/harness";
+import { pinClock } from "./test/clock";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();

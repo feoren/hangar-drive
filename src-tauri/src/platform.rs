@@ -1,9 +1,10 @@
 //! What the shell asks the operating system: the computer's name, free disk space, the local
-//! time zone and language, the taskbar's theme, whether a place lies in another sync client's
-//! folder, and showing a folder or file in the file manager. Programs are always started with an
-//! argument list, never through a shell; on Windows the file manager is driven through the shell
-//! API, never through `explorer.exe` and its own command line parser (security review L5).
+//! time zone and language, whether a place lies in another sync client's folder, and showing a
+//! folder or file in the file manager. Programs are always started with an argument list, never
+//! through a shell; on Windows the file manager is driven through the shell API, never through
+//! `explorer.exe` and its own command line parser (security review L5).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -159,37 +160,6 @@ pub fn os_language() -> Option<String> {
         .find(|v| !v.is_empty() && v != "C" && v != "POSIX")
 }
 
-/// Whether the taskbar is dark (Windows: `SystemUsesLightTheme` is 0). Elsewhere a dark panel
-/// is assumed, the default of GNOME and KDE.
-#[cfg(windows)]
-pub fn taskbar_is_dark() -> bool {
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-    let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-    let value = wide("SystemUsesLightTheme");
-    let mut data = 0u32;
-    let mut size = 4u32;
-    // SAFETY: both names are NUL-terminated; `data` holds the four bytes `size` names.
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            key.as_ptr(),
-            value.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            (&mut data as *mut u32).cast(),
-            &mut size,
-        )
-    };
-    // Without the value (Windows 10 before 1903) the taskbar is dark.
-    rc != 0 || data == 0
-}
-
-#[cfg(not(windows))]
-pub fn taskbar_is_dark() -> bool {
-    true
-}
-
 /// `path` without the `\\?\` prefix `canonicalize` puts on Windows paths, which the shell API
 /// does not read; other paths unchanged.
 pub fn plain(path: &Path) -> PathBuf {
@@ -204,21 +174,48 @@ pub fn plain(path: &Path) -> PathBuf {
 }
 
 /// Opens a folder in the file manager, or shows a file selected in its folder. `path` is a
-/// canonical path the caller checked to lie inside a synced folder.
+/// canonical path the caller checked to lie inside a synced folder; [`check_reveal`] makes sure
+/// the file manager shows that very path and runs nothing.
 #[cfg(windows)]
 pub fn reveal(path: &Path, select: bool) -> std::io::Result<()> {
-    if !select && !path.is_dir() {
-        // "open" of a file would run it.
-        return Err(std::io::Error::other("not a folder"));
-    }
-    let path = plain(path);
+    let path = path.to_path_buf();
     // COM wants its own single-threaded apartment; a short-lived thread keeps it off the
     // command threads.
     std::thread::Builder::new()
         .name("hangar-drive-reveal".into())
-        .spawn(move || shell_reveal(&path, select))?
+        .spawn(move || {
+            check_reveal(&path, select)?;
+            shell_reveal(&plain(&path), select)
+        })?
         .join()
         .map_err(|_| std::io::Error::other("the file manager thread failed"))?
+}
+
+/// What [`reveal`] checks before the file manager sees `path` (security review L5, MEDIUM 1):
+/// only a folder is opened, since "open" of a file would run it; and on Windows the shell must
+/// resolve `path`, and its parent, to exactly these file system paths. The shell reads a path
+/// through its own namespace, where a folder named `x.{CLSID}`, or one whose `desktop.ini` names
+/// a CLSID, is a junction (a folder shortcut shows another place, other CLSIDs system objects),
+/// so the check the recycle bin makes
+/// ([`hangar_drive_sync::trash::check_shell_resolution`]) runs here too, after a plain refusal of
+/// any `.{GUID}` name on the way, which no synced name and no accepted root carries.
+pub fn check_reveal(path: &Path, select: bool) -> std::io::Result<()> {
+    if !select && !path.is_dir() {
+        return Err(std::io::Error::other("not a folder"));
+    }
+    let junction = path.components().any(|c| match c {
+        std::path::Component::Normal(name) => {
+            hangar_drive_protocol::name::is_shell_junction(&name.to_string_lossy())
+        }
+        _ => false,
+    });
+    if junction {
+        return Err(std::io::Error::other("a shell junction on the way"));
+    }
+    #[cfg(windows)]
+    hangar_drive_sync::trash::check_shell_resolution(path)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -283,28 +280,55 @@ fn shell_reveal(path: &Path, select: bool) -> std::io::Result<()> {
     result
 }
 
-/// Opens a folder in the file manager, or shows a file selected in its folder.
+/// Opens a folder in the file manager, or shows a file selected in its folder (see the Windows
+/// variant); the program and its arguments come from [`reveal_argv`].
 #[cfg(not(windows))]
 pub fn reveal(path: &Path, select: bool) -> std::io::Result<()> {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        if select {
-            c.arg("-R");
-        }
-        c.arg(path);
-        c
+    check_reveal(path, select)?;
+    let (program, args) = reveal_argv(path, select, cfg!(target_os = "macos"));
+    Command::new(program).args(args).spawn().map(drop)
+}
+
+/// The file manager's command line for [`reveal`] outside Windows, always an argument list.
+/// macOS: `open -R`, which only shows the item selected in the Finder, for a folder too, since
+/// plain `open` of a folder that Launch Services takes for a package (`.app`, or any ending an
+/// installed program registers) starts a program instead (security review MEDIUM 1). Linux:
+/// `xdg-open` of the folder (of the file's folder, since it cannot select a file), which hands a
+/// directory to the file manager.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn reveal_argv(path: &Path, select: bool, macos: bool) -> (&'static str, Vec<OsString>) {
+    if macos {
+        return ("open", vec!["-R".into(), path.as_os_str().to_owned()]);
+    }
+    let target = if select {
+        path.parent().unwrap_or(path)
     } else {
-        // xdg-open cannot select a file; it opens the folder that holds it.
-        let target = if select {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        };
-        let mut c = Command::new("xdg-open");
-        c.arg(target);
-        c
+        path
     };
-    command.spawn().map(drop)
+    ("xdg-open", vec![target.as_os_str().to_owned()])
+}
+
+/// Endings the macOS Finder shows as a package and `open` runs or hands to a program instead of
+/// opening as a folder (security review MEDIUM 1).
+const BUNDLE_ENDINGS: [&str; 9] = [
+    "app",
+    "bundle",
+    "plugin",
+    "prefpane",
+    "saver",
+    "workflow",
+    "framework",
+    "kext",
+    "appex",
+];
+
+/// Whether `name` ends in one of the [`BUNDLE_ENDINGS`], without regard to ASCII case.
+pub fn is_bundle_name(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ending)| {
+        BUNDLE_ENDINGS
+            .iter()
+            .any(|bundle| ending.eq_ignore_ascii_case(bundle))
+    })
 }
 
 /// The roots of other sync clients and cloud folders: [`hangar_drive_sync::roots::other_clouds`]
@@ -431,6 +455,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // Security review MEDIUM 1: the file manager only ever shows; macOS gets `open -R` for a
+    // folder too, so a package is never started.
+    #[test]
+    fn the_file_manager_only_shows() {
+        let root = Path::new("/Users/a/Hangar Drive/Photos.app");
+        let file = Path::new("/Users/a/Hangar Drive/Docs/plan.txt");
+        for select in [false, true] {
+            assert_eq!(
+                reveal_argv(root, select, true),
+                (
+                    "open",
+                    vec![OsString::from("-R"), root.as_os_str().to_owned()]
+                )
+            );
+        }
+        assert_eq!(
+            reveal_argv(root, false, false),
+            ("xdg-open", vec![root.as_os_str().to_owned()])
+        );
+        assert_eq!(
+            reveal_argv(file, true, false),
+            (
+                "xdg-open",
+                vec![OsString::from("/Users/a/Hangar Drive/Docs")]
+            )
+        );
+        // A file is never "opened", only shown selected.
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(check_reveal(&here, false).is_err());
+    }
+
+    #[test]
+    fn bundle_endings_are_known_in_any_case() {
+        for bundle in [
+            "Photos.app",
+            "x.APP",
+            "a.b.bundle",
+            "p.Plugin",
+            "s.prefPane",
+            "s.saver",
+            "w.workflow",
+            "f.framework",
+            "k.kext",
+            "e.appex",
+        ] {
+            assert!(is_bundle_name(bundle), "{bundle}");
+        }
+        for plain in ["app", "Photos", "x.apps", "x.app.txt", "Photos_app"] {
+            assert!(!is_bundle_name(plain), "{plain}");
+        }
+    }
+
+    /// Security review MEDIUM 1: a folder named `x.{CLSID}` with a `target.lnk` is a folder
+    /// shortcut for the Windows shell, so the shell would show the link's target instead of the
+    /// folder. `check_reveal` (the step before the shell call) refuses it, a plain folder passes;
+    /// nothing is shown on screen.
+    #[cfg(windows)]
+    #[test]
+    fn a_shell_junction_never_reaches_the_file_manager() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(".tmp")
+            .join("reveal-junction");
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        let junction = base.join("Photos.{0AFACED1-E828-11D1-9187-B532F1E9575D}");
+        let normal = base.join("Photos");
+        for dir in [&outside, &junction, &normal] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(junction.join("f"), b"inside").unwrap();
+        std::fs::write(outside.join("f"), b"outside").unwrap();
+        let shell_link = |dir: &Path| {
+            let made = Command::new("powershell")
+                .env("HD_LNK", plain(&dir.join("target.lnk")))
+                .env("HD_TARGET", plain(&outside))
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HD_LNK); \
+                     $s.TargetPath = $env:HD_TARGET; $s.Save()",
+                ])
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        };
+        shell_link(&junction);
+        // The second form: a plain name, made a folder shortcut by its `desktop.ini` and the
+        // read-only attribute. Only the shell's own resolution can tell.
+        let shortcut = base.join("Shortcut");
+        std::fs::create_dir_all(&shortcut).unwrap();
+        std::fs::write(shortcut.join("f"), b"inside").unwrap();
+        std::fs::write(
+            shortcut.join("desktop.ini"),
+            "[.ShellClassInfo]\r\nCLSID2={0AFACED1-E828-11D1-9187-B532F1E9575D}\r\nFlags=2\r\n",
+        )
+        .unwrap();
+        shell_link(&shortcut);
+        let mut perms = std::fs::metadata(&shortcut).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&shortcut, perms.clone()).unwrap();
+        let junction = std::fs::canonicalize(&junction).unwrap();
+        let normal = std::fs::canonicalize(&normal).unwrap();
+        let shortcut_f = std::fs::canonicalize(shortcut.join("f")).unwrap();
+        assert!(check_reveal(&junction, false).is_err());
+        assert!(check_reveal(&junction.join("f"), true).is_err());
+        let refused = check_reveal(&shortcut_f, true);
+        assert!(normal.is_dir() && check_reveal(&normal, false).is_ok());
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&shortcut, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            refused.is_err(),
+            "the shell resolves the shortcut elsewhere"
+        );
+    }
+
     #[test]
     fn verbatim_prefixes_are_dropped_for_the_shell() {
         assert_eq!(
@@ -471,7 +614,6 @@ mod tests {
         let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         assert!(free_bytes(&here).is_some_and(|b| b > 0));
         let _ = os_language();
-        let _ = taskbar_is_dark();
         assert!(default_folder().is_some_and(|p| p.ends_with("Hangar Drive")));
     }
 }

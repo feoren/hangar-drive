@@ -431,3 +431,77 @@ fn a_repair_after_a_rotation_uploads_lost_old_chunks_under_the_new_generation() 
     );
     assert_eq!(devs[1].fs.read_all(&p(&["b.txt"])).unwrap(), b"b");
 }
+
+/// Crypto review LOW 1, the open point of the sync engine: a server showed A a version of the
+/// device names that it does not keep (a compromised C bumped it, the server went back to the
+/// older record). A removes B and C and is the last current device; its re-seal at its own
+/// version plus one is refused, so it re-seals at the server's version plus one under the new
+/// epoch, and nothing is left due. Before, the record stayed in the old epoch for good.
+#[test]
+fn the_last_device_reseals_at_the_server_version_after_a_forged_one() {
+    let (mut devs, clock, settings) = world();
+    for d in devs.iter_mut() {
+        round(d, &clock, &settings).unwrap();
+    }
+    let key = hangar_drive_crypto::device_names::device_names_key();
+    let earlier = devs[0].server.state().stored_record(&key).unwrap();
+    {
+        let c = &mut devs[2];
+        c.account
+            .refresh(&mut c.server, &mut c.keys, &mut c.store)
+            .unwrap();
+        for n in 0..5 {
+            let me = c.id;
+            c.account
+                .set_device_name(
+                    &mut c.server,
+                    &mut c.store,
+                    &me,
+                    &format!("C{n}"),
+                    &mut c.rng,
+                )
+                .unwrap();
+        }
+    }
+    let a = &mut devs[0];
+    a.account
+        .refresh(&mut a.server, &mut a.keys, &mut a.store)
+        .unwrap();
+    // The server keeps the earlier record again.
+    a.server
+        .state()
+        .set_stored_record(key, earlier.0, earlier.1.clone());
+    let targets = [devs[1].id, devs[2].id];
+    let (mut jx, folder, fs) = job(&mut devs[0], &clock, &settings);
+    let outcome = remove_devices(&mut jx, &mut [(folder, fs)], &targets).unwrap();
+    assert!(outcome.resealed);
+    assert!(
+        !devs[0].account.reseal_due(),
+        "nothing is left in the old epoch"
+    );
+    let (version, _) = devs[0].server.state().stored_record(&key).unwrap();
+    assert_eq!(version, earlier.0 + 1);
+}
+
+/// Security review L1: a server that names a version near the top for a record it cannot show
+/// does not get it: the last device re-seals nothing at that version (which would have frozen
+/// the record for good, or panicked one version later), and the step stays due.
+#[test]
+fn a_bare_high_version_from_the_server_is_not_taken() {
+    let (mut devs, clock, settings) = world();
+    for d in devs.iter_mut() {
+        round(d, &clock, &settings).unwrap();
+    }
+    let key = hangar_drive_crypto::device_names::device_names_key();
+    let earlier = devs[0].server.state().stored_record(&key).unwrap();
+    devs[0]
+        .server
+        .state()
+        .set_stored_record(key, u64::MAX - 1, earlier.1.clone());
+    let targets = [devs[1].id, devs[2].id];
+    let (mut jx, folder, fs) = job(&mut devs[0], &clock, &settings);
+    remove_devices(&mut jx, &mut [(folder, fs)], &targets).unwrap();
+    let (version, _) = devs[0].server.state().stored_record(&key).unwrap();
+    assert_eq!(version, u64::MAX - 1, "nothing sealed at the top");
+    assert!(devs[0].account.reseal_due(), "the step stays due");
+}

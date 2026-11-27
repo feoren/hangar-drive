@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from "react";
 
 import type { Folder, FolderView, StopReason } from "../backend/types";
 import { formatSize } from "../format";
-import { useLanguage, useT, type MessageKey, type Translate } from "../i18n";
+import { displayName, useLanguage, useT, type MessageKey, type Translate } from "../i18n";
 import { useBackend } from "../ui/backendContext";
 import { FolderIcon, GridIcon, ListIcon, PlusIcon } from "../ui/icons";
 import { RowMenu, type MenuItem } from "../ui/Menu";
@@ -277,8 +277,10 @@ function FolderRow({
           className="row-main"
           data-roving
           tabIndex={tabIndex}
-          aria-label={[folder.name, folder.path, status, size].filter(Boolean).join(", ")}
-          title={folder.path}
+          aria-label={[folder.name, displayName(folder.path), status, size]
+            .filter(Boolean)
+            .join(", ")}
+          title={displayName(folder.path)}
           onFocus={onFocus}
           onDoubleClick={openInExplorer}
           onClick={(event) => {

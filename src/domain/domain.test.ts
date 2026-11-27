@@ -130,6 +130,44 @@ describe("warnings", () => {
     expect(tone(conflicts)).toBe("info");
   });
 
+  // A missing recovery code needs the person (tray "needs you"); a pending recovery finishes by
+  // itself and stays calm.
+  it("ranks the recovery warnings: no code needs you, a pending recovery is calm", () => {
+    const noCode: Warning = { kind: "noRecoveryCode", id: "noRecoveryCode" };
+    const pending: Warning = { kind: "recoveryPending", id: "recoveryPending" };
+    expect(needsAttention(noCode)).toBe(true);
+    expect(tone(noCode)).toBe("attention");
+    expect(needsAttention(pending)).toBe(false);
+    expect(tone(pending)).toBe("info");
+    const list = shownWarnings(snapshot([conflicts, pending, noCode, missing]), NOW);
+    expect(list.map((warning) => warning.kind)).toEqual([
+      "missingFolder",
+      "noRecoveryCode",
+      "recoveryPending",
+      "conflicts",
+    ]);
+  });
+
+  it("keeps folders unreadable after a recovery calm, and drops an empty one", () => {
+    const folders: Warning = {
+      kind: "foldersUnreadable",
+      id: "foldersUnreadable",
+      folders: ["Docs"],
+      folderList: false,
+    };
+    expect(needsAttention(folders)).toBe(false);
+    expect(tone(folders)).toBe("info");
+    expect(anyAttention(snapshot([folders]), NOW)).toBe(false);
+    expect(shownWarnings(snapshot([conflicts, folders]), NOW).map((w) => w.kind)).toEqual([
+      "foldersUnreadable",
+      "conflicts",
+    ]);
+    const listOnly: Warning = { ...folders, folders: [], folderList: true };
+    expect(shownWarnings(snapshot([listOnly]), NOW)).toHaveLength(1);
+    const nothing: Warning = { ...folders, folders: [], folderList: false };
+    expect(shownWarnings(snapshot([nothing]), NOW)).toEqual([]);
+  });
+
   it("drops banners whose count fell to zero", () => {
     expect(shownWarnings(snapshot([{ kind: "names", id: "n", count: 0 }]), NOW)).toEqual([]);
   });

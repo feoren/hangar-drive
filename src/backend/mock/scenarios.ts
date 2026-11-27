@@ -70,6 +70,8 @@ export const SCENARIOS = [
   { id: "names", label: "Names Windows refuses" },
   { id: "freeze", label: "No news from other devices" },
   { id: "massDelete", label: "342 files deleted" },
+  { id: "incomingDelete", label: "Another device deleted 342 files" },
+  { id: "incomingDeleteUnknown", label: "Unknown device deleted 342 files" },
   { id: "missingFolder", label: "Folder missing" },
   { id: "serverIdentity", label: "Server identity changed" },
   { id: "serverIdentityAlone", label: "Server identity, no other device" },
@@ -85,6 +87,10 @@ export const SCENARIOS = [
   { id: "updateRequired", label: "Update required" },
   { id: "updateOff", label: "Update required, updates off" },
   { id: "refused", label: "Server refuses this device" },
+  { id: "noRecoveryCode", label: "No valid recovery code" },
+  { id: "recoveryPending", label: "Recovery being finished (setup)" },
+  { id: "foldersUnreadable", label: "Folders not readable after a recovery" },
+  { id: "folderListUnreadable", label: "Folder list started anew after a recovery" },
   { id: "suspect", label: "Suspected ransomware" },
   { id: "suspectElsewhere", label: "Suspected ransomware, folder not here" },
   { id: "removedHeads", label: "Changes from a removed device" },
@@ -180,6 +186,16 @@ const warn = {
     id: "w-delete",
     folderId: "f-photos",
     folderName: "Fotos",
+    count: 342,
+    sample: ["Urlaub 001.jpg", "Urlaub 002.jpg", "Urlaub 003.jpg"],
+  }),
+  incoming: (device: string | null, added: Millis | null): Warning => ({
+    kind: "incomingDelete",
+    id: "w-incoming",
+    folderId: "f-photos",
+    folderName: "Fotos",
+    device,
+    deviceAdded: added,
     count: 342,
     sample: ["Urlaub 001.jpg", "Urlaub 002.jpg", "Urlaub 003.jpg"],
   }),
@@ -290,6 +306,12 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
     case "massDelete":
       state.warnings = [warn.massDelete()];
       break;
+    case "incomingDelete":
+      state.warnings = [warn.incoming(fx.OTHER_DEVICE, now - 54 * fx.DAY)];
+      break;
+    case "incomingDeleteUnknown":
+      state.warnings = [warn.incoming(null, null)];
+      break;
     case "missingFolder":
       state.warnings = [warn.missing()];
       setFolderStatus(state, "f-photos", { kind: "stopped", reason: "missing" });
@@ -347,6 +369,33 @@ export function scenarioState(id: ScenarioId, now: Millis): MockState {
       break;
     case "refused":
       state.warnings = [{ kind: "refused", id: "w-refused" }];
+      break;
+    case "noRecoveryCode":
+      // The app ended between a recovery's join and its new code (security review "recovery" L1).
+      state.warnings = [{ kind: "noRecoveryCode", id: "noRecoveryCode" }];
+      break;
+    case "foldersUnreadable":
+      // After this device's recovery two folder keys could not be read yet (follow-up review
+      // LOW 2); they come back by themselves.
+      state.warnings = [
+        {
+          kind: "foldersUnreadable",
+          id: "foldersUnreadable",
+          folders: ["Fotos", "Musik"],
+          folderList: false,
+        },
+      ];
+      break;
+    case "folderListUnreadable":
+      // The folder list itself could not be read and was started empty; this one can be hidden.
+      state.warnings = [
+        { kind: "foldersUnreadable", id: "foldersUnreadable", folders: [], folderList: true },
+      ];
+      break;
+    case "recoveryPending":
+      // A recovery sent its change, but this device has not joined yet (review "recovery" H1).
+      setupState(state);
+      state.warnings = [{ kind: "recoveryPending", id: "recoveryPending" }];
       break;
     case "suspect":
       state.warnings = [warn.suspect(now)];

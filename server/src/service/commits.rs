@@ -3,7 +3,10 @@
 //! The call is one write transaction: compare and swap on the head, every server check of the
 //! ADR, the reference deltas against the trees they are relative to, the quota and the budgets,
 //! then the side commit, the new head, the reference intervals, the folder sequence and the feed
-//! entry. A refused call writes nothing.
+//! entry. A refused call writes nothing. The IDs of the deltas are loaded and checked for
+//! existence before that transaction starts, on the same connection ([`commit_call`], server
+//! security review MEDIUM 2), so a call full of IDs the server does not hold never takes the
+//! write lock.
 //!
 //! Reference deltas are checked against the server's own view of the trees: an added object
 //! must be held and not already in the parent's tree, a dropped one must be in it, and the new
@@ -38,10 +41,12 @@ use hangar_drive_protocol::api::{
     Notice, MAX_DELTA_PAGE,
 };
 use hangar_drive_protocol::ids::{Blob, DeviceId, FolderId, ObjectId};
+use sqlx::SqliteConnection;
 
 use crate::app::{account_by_pk, App};
-use crate::db::{begin_write, i64_of, u64_of, Tx};
+use crate::db::{begin_write_on, i64_of, u64_of};
 use crate::error::{ApiError, ApiResult, MAX_MISSING_LISTED};
+use crate::http::ratelimit;
 use crate::service::feed::{self, Pushed};
 use crate::service::folders::{self, FolderRow, HeadRow};
 use crate::service::notices;
@@ -72,14 +77,18 @@ impl Part {
 
 /// Fills the temporary table `commit_ids` with the call's IDs; a full head delta goes to
 /// [`Part::HeadFull`].
-async fn load_ids(tx: &mut Tx, request: &CommitRequest, head_full: bool) -> ApiResult<()> {
+async fn load_ids(
+    tx: &mut SqliteConnection,
+    request: &CommitRequest,
+    head_full: bool,
+) -> ApiResult<()> {
     for sql in [
         "CREATE TEMP TABLE IF NOT EXISTS commit_ids (id BLOB NOT NULL, part INTEGER NOT NULL, PRIMARY KEY (part, id)) WITHOUT ROWID",
         "CREATE TEMP TABLE IF NOT EXISTS commit_revived (object_pk INTEGER PRIMARY KEY, size INTEGER NOT NULL)",
         "DELETE FROM commit_ids",
         "DELETE FROM commit_revived",
     ] {
-        sqlx::query(sql).execute(&mut **tx).await?;
+        sqlx::query(sql).execute(&mut *tx).await?;
     }
     let head_added = if head_full {
         Part::HeadFull
@@ -117,7 +126,7 @@ async fn load_ids(tx: &mut Tx, request: &CommitRequest, head_full: bool) -> ApiR
             )
             .bind(part.code())
             .bind(json.as_str())
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
     }
@@ -137,7 +146,11 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
 }
 
 /// IDs of `part` the folder does not hold, at most as many as an error lists.
-async fn not_held(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<Vec<ObjectId>> {
+async fn not_held(
+    tx: &mut SqliteConnection,
+    folder_pk: i64,
+    part: Part,
+) -> ApiResult<Vec<ObjectId>> {
     let rows: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT c.id FROM commit_ids c LEFT JOIN objects o ON o.folder_pk = ? AND o.object_id = c.id \
          WHERE c.part = ? AND o.pk IS NULL LIMIT ?",
@@ -145,7 +158,7 @@ async fn not_held(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<Vec<Obje
     .bind(folder_pk)
     .bind(part.code())
     .bind(i64_of(MAX_MISSING_LISTED as u64))
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut *tx)
     .await?;
     Ok(rows
         .iter()
@@ -156,7 +169,7 @@ async fn not_held(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<Vec<Obje
 /// IDs of `part` that are in the tree of the head at `seq` (`in_tree`), or that are not (held
 /// or not), at most as many as an error lists.
 async fn tree_ids(
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     folder_pk: i64,
     part: Part,
     seq: u64,
@@ -177,7 +190,7 @@ async fn tree_ids(
         .bind(i64_of(seq))
         .bind(i64_of(seq))
         .bind(i64_of(MAX_MISSING_LISTED as u64))
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut *tx)
         .await?;
     Ok(rows
         .iter()
@@ -186,14 +199,14 @@ async fn tree_ids(
 }
 
 /// Whether `id` is live, that is in the tree of the current head.
-async fn is_live(tx: &mut Tx, folder_pk: i64, id: &ObjectId) -> ApiResult<bool> {
+async fn is_live(tx: &mut SqliteConnection, folder_pk: i64, id: &ObjectId) -> ApiResult<bool> {
     let row: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM objects o JOIN refs r ON r.object_pk = o.pk \
          WHERE o.folder_pk = ? AND o.object_id = ? AND r.dropped_seq IS NULL LIMIT 1",
     )
     .bind(folder_pk)
     .bind(id.as_bytes().as_slice())
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     Ok(row.is_some())
 }
@@ -201,7 +214,7 @@ async fn is_live(tx: &mut Tx, folder_pk: i64, id: &ObjectId) -> ApiResult<bool> 
 /// Splits a full head delta ([`Part::HeadFull`]) into what it changes in the live set: its
 /// objects that are not live become [`Part::HeadAdded`], live objects outside it become
 /// [`Part::HeadDropped`]. Everything after this treats the call like a diff.
-async fn split_full(tx: &mut Tx, folder_pk: i64) -> ApiResult<()> {
+async fn split_full(tx: &mut SqliteConnection, folder_pk: i64) -> ApiResult<()> {
     sqlx::query(
         "INSERT INTO commit_ids (id, part) SELECT c.id, ? FROM commit_ids c WHERE c.part = ? \
          AND NOT EXISTS (SELECT 1 FROM objects o JOIN refs r ON r.object_pk = o.pk \
@@ -210,7 +223,7 @@ async fn split_full(tx: &mut Tx, folder_pk: i64) -> ApiResult<()> {
     .bind(Part::HeadAdded.code())
     .bind(Part::HeadFull.code())
     .bind(folder_pk)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
         "INSERT OR IGNORE INTO commit_ids (id, part) SELECT o.object_id, ? FROM refs r \
@@ -220,13 +233,17 @@ async fn split_full(tx: &mut Tx, folder_pk: i64) -> ApiResult<()> {
     .bind(Part::HeadDropped.code())
     .bind(folder_pk)
     .bind(Part::HeadFull.code())
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
 
 /// Bytes and file object count of `part` (held objects only).
-async fn part_bytes(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<(Bytes, u64)> {
+async fn part_bytes(
+    tx: &mut SqliteConnection,
+    folder_pk: i64,
+    part: Part,
+) -> ApiResult<(Bytes, u64)> {
     let (data, dir, files): (i64, i64, i64) = sqlx::query_as(
         "SELECT COALESCE(SUM(CASE WHEN o.kind <> 3 THEN o.size ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN o.kind = 3 THEN o.size ELSE 0 END), 0), \
@@ -235,7 +252,7 @@ async fn part_bytes(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<(Bytes
     )
     .bind(folder_pk)
     .bind(part.code())
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     Ok((
         Bytes {
@@ -250,7 +267,7 @@ async fn part_bytes(tx: &mut Tx, folder_pk: i64, part: Part) -> ApiResult<(Bytes
 /// the empty tree): every added object held (`missing_objects` otherwise) and not in that tree,
 /// every dropped one in it (`delta_mismatch` with the IDs that do not fit otherwise).
 async fn check_delta(
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     folder_pk: i64,
     added: Part,
     dropped: &[ObjectId],
@@ -280,7 +297,7 @@ async fn check_delta(
 /// this a head could keep its tree and drop the root with everything below it, and the
 /// collection would delete the tree every device still shows.
 async fn check_root(
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     folder_pk: i64,
     root: &ObjectId,
     added: &[ObjectId],
@@ -319,25 +336,29 @@ fn decode(
     Ok(commit)
 }
 
-async fn mark(tx: &mut Tx, folder_pk: i64, device: &[u8]) -> ApiResult<u64> {
+async fn mark(tx: &mut SqliteConnection, folder_pk: i64, device: &[u8]) -> ApiResult<u64> {
     let counter: Option<i64> =
         sqlx::query_scalar("SELECT counter FROM device_marks WHERE folder_pk = ? AND device = ?")
             .bind(folder_pk)
             .bind(device)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut *tx)
             .await?;
     Ok(counter.map_or(0, u64_of))
 }
 
 /// The side commit's base: a head of this folder (every head is on the first-parent chain of
 /// the current head, since the server keeps one linear chain).
-async fn side_base(tx: &mut Tx, folder_pk: i64, id: &[u8]) -> ApiResult<Option<(HeadRow, bool)>> {
+async fn side_base(
+    tx: &mut SqliteConnection,
+    folder_pk: i64,
+    id: &[u8],
+) -> ApiResult<Option<(HeadRow, bool)>> {
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT pk, expired FROM commits WHERE folder_pk = ? AND commit_id = ? AND role = 'head'",
     )
     .bind(folder_pk)
     .bind(id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     match row {
         None => Ok(None),
@@ -363,7 +384,7 @@ pub struct Drops {
 /// allowance, not around every bound: a device that could add and remove devices at will would
 /// otherwise keep garbage stored for free by dropping it from a device it then removes.
 async fn revived(
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     folder_pk: i64,
     current_seq: Option<u64>,
     now: u64,
@@ -375,7 +396,7 @@ async fn revived(
     )
     .bind(folder_pk)
     .bind(Part::HeadAdded.code())
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     // A side commit keeps what it adds for the window, so an object it adds that is not live
     // is held again from now on: a revival like any other (finding H1). Without this, a device
@@ -390,7 +411,7 @@ async fn revived(
     .bind(folder_pk)
     .bind(Part::SideAdded.code())
     .bind(i64_of(current_seq.unwrap_or(0)))
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     // Per device that dropped the objects last (NULL: unknown, for example after the dropping
     // commit expired): all bytes, and those in the tree of an admitted pin.
@@ -409,7 +430,7 @@ async fn revived(
     )
     .bind(folder_pk)
     .bind(i64_of(now))
-    .fetch_all(&mut **tx)
+    .fetch_all(&mut *tx)
     .await?;
     let (mut all, mut eligible) = (0u64, 0u64);
     for (dropper, bytes, pinned) in rows {
@@ -426,7 +447,11 @@ async fn revived(
 
 /// Marks every object of the head's and the side commit's added lists as declared, and takes
 /// the ones that were not out of the account's uncommitted bytes.
-async fn declare_added(tx: &mut Tx, account_pk: i64, folder_pk: i64) -> ApiResult<()> {
+async fn declare_added(
+    tx: &mut SqliteConnection,
+    account_pk: i64,
+    folder_pk: i64,
+) -> ApiResult<()> {
     let (data, dir): (i64, i64) = sqlx::query_as(
         "SELECT COALESCE(SUM(CASE WHEN o.kind <> 3 THEN o.size ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN o.kind = 3 THEN o.size ELSE 0 END), 0) FROM objects o \
@@ -436,7 +461,7 @@ async fn declare_added(tx: &mut Tx, account_pk: i64, folder_pk: i64) -> ApiResul
     .bind(folder_pk)
     .bind(Part::HeadAdded.code())
     .bind(Part::SideAdded.code())
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     usage::shift_pending(
         tx,
@@ -455,13 +480,57 @@ async fn declare_added(tx: &mut Tx, account_pk: i64, folder_pk: i64) -> ApiResul
     .bind(folder_pk)
     .bind(Part::HeadAdded.code())
     .bind(Part::SideAdded.code())
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
 
-/// `POST /folders/{folder}/commit`.
+/// `POST /folders/{folder}/commit`. A refused call counts against the device's
+/// [`ratelimit::Scope::CommitRefusedDevice`] and the account's
+/// [`ratelimit::Scope::CommitRefusedAccount`] (server security review, MEDIUM 2, follow-up L2),
+/// except `head_moved`, the honest race between devices, and the server's own failures.
 pub async fn commit(
+    app: &App,
+    session: &Session,
+    folder: FolderId,
+    request: CommitRequest,
+) -> ApiResult<CommitResponse> {
+    let result = commit_call(app, session, folder, request).await;
+    if let Err(error) = &result {
+        if !matches!(
+            error.code,
+            ErrorCode::HeadMoved
+                | ErrorCode::Internal
+                | ErrorCode::RateLimited
+                | ErrorCode::DiskReserve
+        ) {
+            ratelimit::commit_refused(
+                &app.limiter,
+                session.account.as_bytes().as_slice(),
+                session.device.as_bytes().as_slice(),
+                app.now_ms() / 1000,
+            );
+        }
+    }
+    result
+}
+
+/// The commit call in two phases (server security review, MEDIUM 2).
+///
+/// **Before the write lock**, on the connection the call keeps for both phases (temporary
+/// tables belong to one connection): the cheap checks that refuse early, decoding and
+/// signature checks, the IDs into `commit_ids` and the check that every object the call adds is
+/// held. A call full of IDs the server does not hold ends here, and while it loads its IDs no
+/// other account's sign-in, upload or pairing waits for it. These statements write only to the
+/// temporary database, which takes no lock on the main one.
+///
+/// **Under `BEGIN IMMEDIATE`** runs everything the meantime can change: the compare and swap,
+/// every rule that depends on the head or the device log, and the held check again, since the
+/// collection may have deleted an object since. The collection deletes rows in its own write
+/// transaction, so the check under the lock sees every deletion before it and none can follow
+/// before the commit is durable; the object locks order only file removal against uploads and
+/// are not involved.
+async fn commit_call(
     app: &App,
     session: &Session,
     folder: FolderId,
@@ -470,8 +539,59 @@ pub async fn commit(
     request
         .validate()
         .map_err(|_| ApiError::new(ErrorCode::BadRequest))?;
+    let mut conn = app.db.acquire().await?;
+
+    // Phase 1, without the write lock.
+    let account = account_by_pk(&mut conn, session.account_pk)
+        .await?
+        .ok_or(ErrorCode::NotFound)?;
+    let checked_len = account.log_length;
+    let state = app
+        .states
+        .get(&mut conn, account.pk, account.id, account.log_length)
+        .await?;
+    let early = folders::find(&mut conn, account.pk, &folder).await?;
+    if early.is_some_and(|f| f.retired_ms.is_some()) {
+        return Err(ErrorCode::FolderRetired.into());
+    }
+    let early_head = match early.and_then(|f| f.head_pk) {
+        Some(pk) => Some(folders::head(&mut conn, pk).await?.id),
+        None => None,
+    };
+    if request.expected_head != early_head {
+        return Err(ApiError::head_moved(early_head));
+    }
+    let mut head = decode(&request.head, &state, &folder)?;
+    let mut side = request
+        .side
+        .as_ref()
+        .map(|s| decode(s, &state, &folder))
+        .transpose()?;
+    if head.commit.side || head.commit.device != session.device {
+        return Err(ErrorCode::CommitRefused.into());
+    }
+    load_ids(&mut conn, &request, head.commit.delta.full).await?;
+    // Rowids start at 1, so 0 is no folder's: a folder that does not exist yet holds nothing.
+    let early_pk = early.map_or(0, |f| f.pk);
+    let head_added = if head.commit.delta.full {
+        Part::HeadFull
+    } else {
+        Part::HeadAdded
+    };
+    let side_added = side.is_some().then_some(Part::SideAdded);
+    for part in std::iter::once(head_added).chain(side_added) {
+        let missing = not_held(&mut conn, early_pk, part).await?;
+        if !missing.is_empty() {
+            return Err(ApiError::missing(missing));
+        }
+    }
+    if let Some(hook) = &app.hooks.commit_prepared {
+        hook().await;
+    }
+
+    // Phase 2, under the write lock.
     let now = app.now_ms();
-    let mut tx = begin_write(&app.db).await?;
+    let mut tx = begin_write_on(&mut conn).await?;
     let account = account_by_pk(&mut tx, session.account_pk)
         .await?
         .ok_or(ErrorCode::NotFound)?;
@@ -479,6 +599,15 @@ pub async fn commit(
         .states
         .get(&mut tx, account.pk, account.id, account.log_length)
         .await?;
+    if account.log_length != checked_len {
+        // The device log grew meanwhile (a removal, a new generation): check against it.
+        head = decode(&request.head, &state, &folder)?;
+        side = request
+            .side
+            .as_ref()
+            .map(|s| decode(s, &state, &folder))
+            .transpose()?;
+    }
 
     let existing = folders::find(&mut tx, account.pk, &folder).await?;
     if existing.is_some_and(|f| f.retired_ms.is_some()) {
@@ -493,12 +622,6 @@ pub async fn commit(
         return Err(ApiError::head_moved(current.map(|h| h.id)));
     }
 
-    let head = decode(&request.head, &state, &folder)?;
-    let side = request
-        .side
-        .as_ref()
-        .map(|s| decode(s, &state, &folder))
-        .transpose()?;
     let h = &head.commit;
     // A device publishes only commits it signed itself: no device can replay another device's
     // signed commit under its own session.
@@ -568,8 +691,8 @@ pub async fn commit(
     }
 
     // Reference deltas: the head's against the live set (the tree of the current head), the
-    // side commit's against its base; a full head delta replaces the live set.
-    load_ids(&mut tx, &request, h.delta.full).await?;
+    // side commit's against its base; a full head delta replaces the live set. The IDs are in
+    // `commit_ids` since phase 1; the held checks below run again under the lock.
     if h.delta.full {
         let missing = not_held(&mut tx, row.pk, Part::HeadFull).await?;
         if !missing.is_empty() {
@@ -872,7 +995,7 @@ pub struct Burst {
 /// garbage kept the share below the threshold.
 pub async fn detect_burst(
     app: &App,
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     burst: &Burst,
     drops: &Drops,
     now: u64,
@@ -885,7 +1008,7 @@ pub async fn detect_burst(
 /// change is recorded, also one that drops nothing, so the window knows its starting size.
 async fn detect_burst_from(
     app: &App,
-    tx: &mut Tx,
+    tx: &mut SqliteConnection,
     burst: &Burst,
     drops: &Drops,
     live_before: u64,
@@ -898,7 +1021,7 @@ async fn detect_burst_from(
         .bind(i64_of(drops.objects))
         .bind(i64_of(drops.bytes))
         .bind(i64_of(live_before))
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     if drops.objects == 0 {
         return Ok(None);
@@ -910,7 +1033,7 @@ async fn detect_burst_from(
     )
     .bind(burst.folder_pk)
     .bind(since)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     // The live file data before the window's first change (0 for rows from before migration
     // 0005, which then add nothing).
@@ -919,7 +1042,7 @@ async fn detect_burst_from(
     )
     .bind(burst.folder_pk)
     .bind(since)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
     let (objects, bytes) = (u64_of(objects), u64_of(bytes));
     let limits = &app.limits;
@@ -939,7 +1062,7 @@ async fn detect_burst_from(
         sqlx::query_scalar("SELECT 1 FROM pins WHERE folder_pk = ? AND created_ms > ? LIMIT 1")
             .bind(burst.folder_pk)
             .bind(i64_of(now.saturating_sub(PIN_COOLDOWN_MS)))
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&mut *tx)
             .await?;
     if recent.is_some() {
         return Ok(None);
@@ -950,7 +1073,7 @@ async fn detect_burst_from(
     )
     .bind(burst.folder_pk)
     .bind(i64_of(pin_seq))
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some((commit_id,)) = pinned else {
         return Ok(None);
@@ -967,7 +1090,7 @@ async fn detect_burst_from(
     .bind(i64_of(pin_seq))
     .bind(i64_of(now))
     .bind(i64_of(until))
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     if let Some(account) = account_by_pk(tx, burst.account_pk).await? {
         tracing::warn!(account = %account.id, %commit, "operator warning: a burst of replaced or dropped objects pinned a commit");

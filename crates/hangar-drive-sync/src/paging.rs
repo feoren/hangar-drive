@@ -39,9 +39,10 @@ pub struct Limits {
     pub total: usize,
 }
 
-/// Most commits of one folder delta a device reads in one pull: a device that was offline for
-/// a long time reads at most this many and is otherwise refused as a protocol error (about
-/// 1 KiB per commit, so the list stays far below the memory of a desktop).
+/// Most commits of one folder delta read as a whole list ([`collect_delta`]), about 1 KiB each
+/// in memory. Only the re-anchor still reads its delta so (ADR 0001, amendment "delta pages
+/// in the engine"); a pull and the removal job check the delta page by page and are bounded by
+/// `folder::MAX_PULL_COMMITS` instead.
 pub const MAX_DELTA_TOTAL: usize = 200_000;
 /// Most feed entries one refresh reads.
 pub const MAX_FEED_TOTAL: usize = 200_000;
@@ -108,43 +109,58 @@ pub fn collect_pages<T>(
     let mut cursor = after;
     loop {
         let page = fetch(cursor)?;
-        if page.items.len() > limits.per_page {
-            return Err(protocol("a page is larger than the protocol allows"));
-        }
         if out.len().saturating_add(page.items.len()) > limits.total {
             return Err(protocol("the list is longer than this device reads"));
         }
-        let mut last = cursor;
-        for (index, item) in page.items.iter().enumerate() {
-            let s = sequence(item);
-            let fine = if index == 0 {
-                s > cursor
-            } else {
-                match order {
-                    Order::Strict => s > last,
-                    Order::CallPairs => s >= last,
-                }
-            };
-            if !fine {
-                return Err(protocol("sequences do not rise above the cursor"));
-            }
-            last = s;
-        }
-        // Only the items bind the server's sequence: a server below the cursor is an older
-        // state, which the caller detects (`FolderView::check_server_sequence`).
-        if !page.items.is_empty() && page.sequence < last {
-            return Err(protocol("the server sequence is below its own items"));
-        }
-        let empty = page.items.is_empty();
+        let last = check_page(cursor, &page, limits.per_page, order, &sequence)?;
         out.extend(page.items);
         if !page.more {
             return Ok((out, page.sequence));
         }
-        if empty {
-            return Err(protocol("more pages announced without an item"));
-        }
         cursor = last;
     }
+}
+
+/// Checks one page asked for after `cursor` by the rules of the module docs (all but the total,
+/// which a caller that keeps no list bounds itself) and returns the cursor for the next page:
+/// the last item's sequence. A page that says `more` holds at least one item, so every further
+/// request moves the cursor, and the items rise above it: a server can only page forward, over
+/// items it really has.
+pub fn check_page<T>(
+    cursor: u64,
+    page: &Page<T>,
+    per_page: usize,
+    order: Order,
+    sequence: impl Fn(&T) -> u64,
+) -> Result<u64, NetError> {
+    if page.items.len() > per_page {
+        return Err(protocol("a page is larger than the protocol allows"));
+    }
+    let mut last = cursor;
+    for (index, item) in page.items.iter().enumerate() {
+        let s = sequence(item);
+        let fine = if index == 0 {
+            s > cursor
+        } else {
+            match order {
+                Order::Strict => s > last,
+                Order::CallPairs => s >= last,
+            }
+        };
+        if !fine {
+            return Err(protocol("sequences do not rise above the cursor"));
+        }
+        last = s;
+    }
+    // Only the items bind the server's sequence: a server below the cursor is an older state,
+    // which the caller detects (`FolderView::check_server_sequence`).
+    if !page.items.is_empty() && page.sequence < last {
+        return Err(protocol("the server sequence is below its own items"));
+    }
+    if page.more && page.items.is_empty() {
+        return Err(protocol("more pages announced without an item"));
+    }
+    Ok(last)
 }
 
 /// Every page of a folder delta after `after`.

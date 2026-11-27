@@ -46,6 +46,9 @@
 //! - An added device ([`add_device`]) gets exactly one wrap, of the current epoch, and no
 //!   rotation happens. Records are sealed under the newest epoch and folder key rings hold every
 //!   generation, so the current epoch is all a new device needs.
+//! - A recovery ([`recover`]) carries both: the new device's wrap of the epoch before the batch
+//!   (so it can open the records it re-seals) and the rotation's wraps to every device that is
+//!   current after the batch.
 //!
 //! The server checks both with [`append_wraps_fit`] after the device log verifier admitted the
 //! batch.
@@ -647,7 +650,100 @@ pub fn append_wraps_fit<'a>(
                 _ => false,
             }
         }
+        BatchShape::Recovery { device, epoch, .. } => {
+            if !wraps_cover_current_devices(&batch.state, wraps) {
+                return false;
+            }
+            // The new device's wrap of the epoch before the batch, if the account had one.
+            let before = epoch.0.checked_sub(1).filter(|e| *e > 0);
+            match (before, device_wrap) {
+                (None, None) => true,
+                (Some(_), Some((recipient, data))) => {
+                    recipient == device && wrap_covers_added_device(&batch.state, device, data)
+                }
+                _ => false,
+            }
+        }
     }
+}
+
+/// The recovery in one append call (module docs; [`crate::devicelog::BatchShape::Recovery`]):
+/// the recovery device adds the person's new device, which removes `targets` and rotates. The
+/// new device's keys are made on the new installation before; its entries are signed with them.
+#[derive(Debug)]
+pub struct Recovery {
+    /// The add device entry (signed by the recovery device), the remove device entries and the
+    /// rotate entry (signed by the new device), in order.
+    pub entries: Vec<Vec<u8>>,
+    /// The new device's wrap of the epoch before the batch, which the recovery device holds;
+    /// `None` while the account has no epoch.
+    pub device_wrap: Option<Vec<u8>>,
+    /// The rotation; its wraps go to every device current after the batch.
+    pub rotation: Rotation,
+    /// The verified state after the batch, to apply once the server accepted it.
+    pub state: AccountState,
+    /// The new device's permit for the barrier commits after the removal.
+    pub permit: BarrierPermit,
+}
+
+/// Builds the recovery batch. `recovery` signs as the current recovery device `recovery_id`,
+/// `device` is the new device with the keys of `identity`, `current` the secret of the log's
+/// current epoch (which the recovery device unwrapped). `targets` must not be empty unless a
+/// rotation is due: the new device always rotates, and a rotation needs a removal before it.
+#[allow(clippy::too_many_arguments)]
+pub fn recover(
+    state: &AccountState,
+    recovery: &DeviceIdentity,
+    recovery_id: DeviceId,
+    identity: &DeviceIdentity,
+    device: LogDevice,
+    targets: &[DeviceId],
+    current: Option<&AccountSecret>,
+    issued_at_ms: u64,
+    entropy: &mut impl Entropy,
+) -> Result<Recovery, RotateError> {
+    if device.keys != identity.public_keys() || device.recovery {
+        return Err(LogError::InvalidKey.into());
+    }
+    let addition = add_device(
+        state,
+        recovery,
+        recovery_id,
+        issued_at_ms,
+        device,
+        current,
+        entropy,
+    )?;
+    let mut after = state.clone();
+    after.apply(&addition.entry)?;
+    let mut entries = Vec::with_capacity(targets.len() + 2);
+    entries.push(addition.entry);
+    for target in targets {
+        let entry = after.next_entry(
+            identity,
+            device.id,
+            issued_at_ms,
+            EntryKind::RemoveDevice(*target),
+        )?;
+        after.apply(&entry)?;
+        entries.push(entry);
+    }
+    let rotation = rotate(&after, identity, device.id, issued_at_ms, entropy)?;
+    after.apply(&rotation.entry)?;
+    entries.push(rotation.entry.clone());
+    let permit = BarrierPermit {
+        account: *after.account(),
+        removal_index: after.last_removal_index(),
+        holder: device.id,
+        folder: None,
+    };
+    Ok(Recovery {
+        entries,
+        device_wrap: addition.wrap,
+        rotation,
+        state: after,
+        permit,
+    })
 }
 
 /// Server side: whether a rotation's wraps go to exactly the current devices of the log, one

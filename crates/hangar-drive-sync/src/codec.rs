@@ -536,6 +536,322 @@ pub fn reachable_typed(
     Ok(out)
 }
 
+/// What a walk over a tree's objects reads of one object: the entries of a directory node, the
+/// chunks of a manifest. [`StoreGraph`] reads them through the store's plaintext cache and the
+/// server; tests use a graph in memory.
+pub trait ObjectGraph {
+    /// The entries of directory node `id`: each child with its kind, in order, repeats kept.
+    fn dir_entries(&mut self, id: &ObjectId) -> Result<Vec<(ObjectId, EntryKind)>, CodecError>;
+    /// The chunks of manifest `id`, in order, repeats kept.
+    fn manifest_chunks(&mut self, id: &ObjectId) -> Result<Vec<ObjectId>, CodecError>;
+}
+
+/// The objects of a folder, opened and checked as [`decode`] does (store cache first).
+pub struct StoreGraph<'a> {
+    /// The folder's keys.
+    pub crypto: &'a FolderCrypto,
+    /// The local index.
+    pub store: &'a mut dyn Store,
+    /// The server.
+    pub server: &'a mut dyn ServerApi,
+}
+
+impl ObjectGraph for StoreGraph<'_> {
+    fn dir_entries(&mut self, id: &ObjectId) -> Result<Vec<(ObjectId, EntryKind)>, CodecError> {
+        let (plain, _) = fetch_plaintext(
+            id,
+            ObjectType::DirectoryNode,
+            self.crypto,
+            self.store,
+            self.server,
+        )?;
+        Ok(DirectoryNode::decode(&plain)?
+            .entries()
+            .iter()
+            .map(|e| (e.child, e.kind))
+            .collect())
+    }
+
+    fn manifest_chunks(&mut self, id: &ObjectId) -> Result<Vec<ObjectId>, CodecError> {
+        let (plain, _) = fetch_plaintext(
+            id,
+            ObjectType::FileManifest,
+            self.crypto,
+            self.store,
+            self.server,
+        )?;
+        Ok(FileManifest::decode(&plain)?.chunks().to_vec())
+    }
+}
+
+/// The kind of an object in a [`ReachState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A directory node.
+    Dir,
+    /// A file manifest.
+    Manifest,
+    /// A chunk.
+    Chunk,
+}
+
+impl ObjectKind {
+    fn of_entry(kind: EntryKind) -> Self {
+        match kind {
+            EntryKind::Directory => ObjectKind::Dir,
+            EntryKind::File => ObjectKind::Manifest,
+        }
+    }
+
+    fn slot(self) -> usize {
+        match self {
+            ObjectKind::Dir => 0,
+            ObjectKind::Manifest => 1,
+            ObjectKind::Chunk => 2,
+        }
+    }
+}
+
+/// What one [`ReachState::goto`] changed: the objects reachable from the new root but not from
+/// the old one, and those reachable from the old root but not from the new one, both in
+/// ascending order, and the kinds of the dropped ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Transition {
+    /// Newly reachable objects, ascending.
+    pub added: Vec<ObjectId>,
+    /// No longer reachable objects, ascending.
+    pub dropped: Vec<ObjectId>,
+    /// Dropped manifests.
+    pub dropped_manifests: u64,
+    /// Dropped chunks.
+    pub dropped_chunks: u64,
+}
+
+/// The reachable set of one root as reference counts (security review of the delta check,
+/// HIGH 2): every object reachable from the root, with the number of references to it from
+/// reachable directory nodes and manifests (repeats counted), and its kind.
+///
+/// Moving to another root ([`ReachState::goto`]) first counts the references of the new root's
+/// objects that were not reachable yet, then takes away those of the old root's objects that
+/// lose their last reference. A subtree both roots share is never read: its root's count stays
+/// above zero. The work is that of the change, not of the tree, and only one set is held, so a
+/// delta of many commits over a large tree no longer reads and keeps every tree (the earlier
+/// check held one set per root, 15 to 20 GB for 200 commits over a million files).
+///
+/// The objects form a graph without cycles (an ID is the keyed hash of a plaintext that names
+/// its children's IDs), so an object loses its last reference exactly when no object of the new
+/// root reaches it: [`Transition::added`] and [`Transition::dropped`] are the set differences of
+/// the two reachable sets, as [`reachable_typed`] gives them. An object keeps the kind it was
+/// first reached as; only a forged tree names one ID as two kinds, and the counts stay
+/// consistent for it as well (they are expanded by the kept kind both ways).
+#[derive(Debug, Clone, Default)]
+pub struct ReachState {
+    root: Option<ObjectId>,
+    counts: BTreeMap<ObjectId, (u64, ObjectKind)>,
+    kinds: [u64; 3],
+}
+
+impl ReachState {
+    /// The empty set (no root).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The root the set is of.
+    pub fn root(&self) -> Option<ObjectId> {
+        self.root
+    }
+
+    /// Objects in the set.
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// Manifests in the set.
+    pub fn manifests(&self) -> u64 {
+        self.kinds[ObjectKind::Manifest.slot()]
+    }
+
+    /// Chunks in the set.
+    pub fn chunks(&self) -> u64 {
+        self.kinds[ObjectKind::Chunk.slot()]
+    }
+
+    /// Every object of the set, ascending.
+    pub fn ids(&self) -> impl Iterator<Item = &ObjectId> {
+        self.counts.keys()
+    }
+
+    /// Moves the set to the objects reachable from `target` (none for `None`) and returns what
+    /// changed. A set beyond [`MAX_REACHABLE_OBJECTS`] is [`CodecError::Limit`]. On any error
+    /// the set is cleared (to no root), since it may be half moved.
+    pub fn goto(
+        &mut self,
+        target: Option<ObjectId>,
+        graph: &mut dyn ObjectGraph,
+    ) -> Result<Transition, CodecError> {
+        if target == self.root {
+            return Ok(Transition::default());
+        }
+        match self.walk(target, graph) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                self.root = None;
+                self.counts.clear();
+                self.kinds = [0; 3];
+                Err(e)
+            }
+        }
+    }
+
+    fn walk(
+        &mut self,
+        target: Option<ObjectId>,
+        graph: &mut dyn ObjectGraph,
+    ) -> Result<Transition, CodecError> {
+        let start = self.counts.len();
+        let mut added = Vec::new();
+        let mut stack: Vec<ObjectId> = Vec::new();
+        if let Some(root) = target {
+            self.inc(root, ObjectKind::Dir, &mut added, &mut stack);
+        }
+        while let Some(id) = stack.pop() {
+            // Above the old set plus the limit, the new set alone is beyond the limit: stop
+            // before more is read.
+            if self.counts.len() > start.saturating_add(MAX_REACHABLE_OBJECTS) {
+                return Err(CodecError::Limit);
+            }
+            for (child, kind) in self.children(&id, graph)? {
+                self.inc(child, kind, &mut added, &mut stack);
+            }
+        }
+        let mut t = Transition::default();
+        if let Some(old) = self.root {
+            self.dec(old, &mut t, &mut stack);
+        }
+        while let Some(id) = stack.pop() {
+            for (child, _) in self.children(&id, graph)? {
+                self.dec(child, &mut t, &mut stack);
+            }
+            // Its references are taken away; the node goes.
+            self.counts.remove(&id);
+        }
+        if self.counts.len() > MAX_REACHABLE_OBJECTS {
+            return Err(CodecError::Limit);
+        }
+        added.sort_unstable();
+        t.dropped.sort_unstable();
+        t.added = added;
+        self.root = target;
+        Ok(t)
+    }
+
+    /// The references an object holds, by the kind it is kept as.
+    fn children(
+        &self,
+        id: &ObjectId,
+        graph: &mut dyn ObjectGraph,
+    ) -> Result<Vec<(ObjectId, ObjectKind)>, CodecError> {
+        match self.counts.get(id).map(|(_, kind)| *kind) {
+            Some(ObjectKind::Dir) => Ok(graph
+                .dir_entries(id)?
+                .into_iter()
+                .map(|(child, kind)| (child, ObjectKind::of_entry(kind)))
+                .collect()),
+            Some(ObjectKind::Manifest) => Ok(graph
+                .manifest_chunks(id)?
+                .into_iter()
+                .map(|c| (c, ObjectKind::Chunk))
+                .collect()),
+            // Only objects of the set are expanded.
+            None => Err(CodecError::Inconsistent),
+            Some(ObjectKind::Chunk) => Ok(Vec::new()),
+        }
+    }
+
+    fn inc(
+        &mut self,
+        id: ObjectId,
+        kind: ObjectKind,
+        added: &mut Vec<ObjectId>,
+        stack: &mut Vec<ObjectId>,
+    ) {
+        let entry = self.counts.entry(id).or_insert((0, kind));
+        entry.0 += 1;
+        if entry.0 == 1 {
+            self.kinds[entry.1.slot()] += 1;
+            added.push(id);
+            if entry.1 != ObjectKind::Chunk {
+                stack.push(id);
+            }
+        }
+    }
+
+    fn dec(&mut self, id: ObjectId, t: &mut Transition, stack: &mut Vec<ObjectId>) {
+        let Some(entry) = self.counts.get_mut(&id) else {
+            return;
+        };
+        // Zero: dropped already in this walk; never true for consistent counts.
+        if entry.0 == 0 {
+            return;
+        }
+        entry.0 -= 1;
+        if entry.0 > 0 {
+            return;
+        }
+        let kind = entry.1;
+        self.kinds[kind.slot()] = self.kinds[kind.slot()].saturating_sub(1);
+        t.dropped.push(id);
+        match kind {
+            ObjectKind::Manifest => t.dropped_manifests += 1,
+            ObjectKind::Chunk => t.dropped_chunks += 1,
+            ObjectKind::Dir => {}
+        }
+        if kind == ObjectKind::Chunk {
+            self.counts.remove(&id);
+        } else {
+            // A node keeps its entry with count zero until its own references are taken away
+            // ([`Self::children`] reads its kind from it).
+            stack.push(id);
+        }
+    }
+}
+
+/// The directory nodes and manifests reachable from `roots` whose plaintexts the store holds,
+/// without the server: a node the cache lacks is not entered (the cleanup of the cache, which
+/// must not download anything).
+pub fn cached_reachable(
+    roots: &[ObjectId],
+    folder: &FolderId,
+    store: &dyn Store,
+) -> Result<BTreeSet<ObjectId>, StoreError> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<(ObjectId, bool)> = roots.iter().map(|r| (*r, true)).collect();
+    while let Some((id, dir)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(plain) = store.plaintext(folder, &id)? else {
+            continue;
+        };
+        if !dir {
+            continue;
+        }
+        // A plaintext that does not decode was checked when it was stored; skip it here.
+        if let Ok(node) = DirectoryNode::decode(&plain) {
+            for entry in node.entries() {
+                stack.push((entry.child, entry.kind == EntryKind::Directory));
+            }
+        }
+    }
+    Ok(seen)
+}
+
 /// Remembers that the server now holds the sealed objects of `encoded`.
 pub fn remember_uploaded(
     encoded: &Encoded,
@@ -546,4 +862,232 @@ pub fn remember_uploaded(
         store.put_object_for(folder, digest, id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::names::tests::Rng;
+    use std::collections::HashMap;
+
+    /// Objects in memory, with a count of every read.
+    #[derive(Default)]
+    struct MemGraph {
+        dirs: HashMap<ObjectId, Vec<(ObjectId, EntryKind)>>,
+        manifests: HashMap<ObjectId, Vec<ObjectId>>,
+        reads: u64,
+    }
+
+    impl ObjectGraph for MemGraph {
+        fn dir_entries(&mut self, id: &ObjectId) -> Result<Vec<(ObjectId, EntryKind)>, CodecError> {
+            self.reads += 1;
+            self.dirs.get(id).cloned().ok_or(CodecError::Inconsistent)
+        }
+        fn manifest_chunks(&mut self, id: &ObjectId) -> Result<Vec<ObjectId>, CodecError> {
+            self.reads += 1;
+            self.manifests
+                .get(id)
+                .cloned()
+                .ok_or(CodecError::Inconsistent)
+        }
+    }
+
+    impl MemGraph {
+        /// A content addressed ID, so equal contents share one object as they do on a server.
+        fn id_of(tag: u8, parts: &[(ObjectId, u8)]) -> ObjectId {
+            let mut h = Sha256::new();
+            h.update([tag]);
+            for (id, k) in parts {
+                h.update(id.as_bytes());
+                h.update([*k]);
+            }
+            ObjectId::from_bytes(h.finalize().into())
+        }
+
+        fn manifest(&mut self, chunks: Vec<ObjectId>) -> ObjectId {
+            let parts: Vec<(ObjectId, u8)> = chunks.iter().map(|c| (*c, 0)).collect();
+            let id = Self::id_of(1, &parts);
+            self.manifests.insert(id, chunks);
+            id
+        }
+
+        fn dir(&mut self, entries: Vec<(ObjectId, EntryKind)>) -> ObjectId {
+            let parts: Vec<(ObjectId, u8)> = entries
+                .iter()
+                .map(|(c, k)| (*c, u8::from(*k == EntryKind::Directory)))
+                .collect();
+            let id = Self::id_of(2, &parts);
+            self.dirs.insert(id, entries);
+            id
+        }
+    }
+
+    type Sets = (BTreeSet<ObjectId>, BTreeSet<ObjectId>, BTreeSet<ObjectId>);
+
+    /// The earlier walk ([`reachable_typed`] over a graph), kept as the reference: every object
+    /// reachable from `root`, the manifests and the chunks among them.
+    fn reference(root: Option<ObjectId>, graph: &mut MemGraph) -> Sets {
+        let (mut all, mut dirs, mut manifests) =
+            (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        let Some(root) = root else {
+            return (all, manifests, BTreeSet::new());
+        };
+        let mut stack = vec![root];
+        all.insert(root);
+        dirs.insert(root);
+        while let Some(node) = stack.pop() {
+            for (child, kind) in graph.dir_entries(&node).unwrap() {
+                if !all.insert(child) {
+                    continue;
+                }
+                match kind {
+                    EntryKind::Directory => {
+                        dirs.insert(child);
+                        stack.push(child);
+                    }
+                    EntryKind::File => {
+                        manifests.insert(child);
+                        all.extend(graph.manifest_chunks(&child).unwrap());
+                    }
+                }
+            }
+        }
+        let chunks = all
+            .iter()
+            .filter(|id| !dirs.contains(id) && !manifests.contains(id))
+            .copied()
+            .collect();
+        (all, manifests, chunks)
+    }
+
+    /// Random trees over shared objects: few chunk IDs (repeated within and across manifests),
+    /// few manifests (one file content in many places), empty and equal directories (one node
+    /// referenced from many parents), and roots that reuse whole subtrees of others.
+    fn random_graph(rng: &mut Rng) -> (MemGraph, Vec<ObjectId>) {
+        let mut g = MemGraph::default();
+        let chunks: Vec<ObjectId> = (0..6u8)
+            .map(|i| ObjectId::from_bytes([i + 1; 32]))
+            .collect();
+        let mut manifests = Vec::new();
+        for _ in 0..8 {
+            let list: Vec<ObjectId> = (0..rng.below(4)).map(|_| *rng.pick(&chunks)).collect();
+            manifests.push(g.manifest(list));
+        }
+        let mut dirs: Vec<ObjectId> = Vec::new();
+        for _ in 0..30 {
+            let mut entries = Vec::new();
+            for _ in 0..rng.below(5) {
+                if !dirs.is_empty() && rng.below(3) == 0 {
+                    entries.push((*rng.pick(&dirs), EntryKind::Directory));
+                } else {
+                    entries.push((*rng.pick(&manifests), EntryKind::File));
+                }
+            }
+            dirs.push(g.dir(entries));
+        }
+        (g, dirs)
+    }
+
+    /// Security review of the delta check, HIGH 2: moving the counted set from root to root
+    /// gives exactly the set differences of the earlier walk, its manifest and chunk counts and
+    /// the dropped ones among them, for random sequences of roots (also back and forth, to no
+    /// root and to a subtree of the previous root).
+    #[test]
+    fn counted_transitions_equal_the_set_differences() {
+        let mut rng = Rng(0xde17a);
+        for case in 0..500 {
+            let (mut g, dirs) = random_graph(&mut rng);
+            let mut state = ReachState::new();
+            let mut at: Option<ObjectId> = None;
+            for step in 0..12 {
+                let next = if rng.below(6) == 0 {
+                    None
+                } else {
+                    Some(*rng.pick(&dirs))
+                };
+                let (before, before_manifests, before_chunks) = reference(at, &mut g);
+                let (after, after_manifests, after_chunks) = reference(next, &mut g);
+                let t = state.goto(next, &mut g).unwrap();
+                let added: Vec<ObjectId> = after.difference(&before).copied().collect();
+                let dropped: Vec<ObjectId> = before.difference(&after).copied().collect();
+                let what = format!("case {case} step {step}");
+                assert_eq!(t.added, added, "{what}");
+                assert_eq!(t.dropped, dropped, "{what}");
+                assert_eq!(
+                    t.dropped_chunks,
+                    before_chunks.difference(&after_chunks).count() as u64,
+                    "{what}"
+                );
+                assert_eq!(
+                    t.dropped_manifests,
+                    before_manifests.difference(&after_manifests).count() as u64,
+                    "{what}"
+                );
+                assert_eq!(state.len(), after.len(), "{what}");
+                assert!(state.ids().copied().eq(after.iter().copied()), "{what}");
+                assert_eq!(state.manifests(), after_manifests.len() as u64, "{what}");
+                assert_eq!(state.chunks(), after_chunks.len() as u64, "{what}");
+                at = next;
+            }
+        }
+    }
+
+    /// 200 commits over a tree of 20,000 files in 100 directories, each changing one file:
+    /// the counted set reads the tree once and then only the changed nodes, and holds one set.
+    /// The earlier check read both trees of every commit (about 8 million node reads here) and
+    /// kept every set until the end of the pull.
+    #[test]
+    fn many_commits_over_a_large_tree_read_only_the_changes() {
+        let (dirs_n, files_n) = (100usize, 200usize);
+        let mut g = MemGraph::default();
+        let mut content = 0u32;
+        let mut new_manifest = |g: &mut MemGraph| {
+            content += 1;
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&content.to_be_bytes());
+            g.manifest(vec![ObjectId::from_bytes(bytes)])
+        };
+        let mut files: Vec<Vec<ObjectId>> = (0..dirs_n)
+            .map(|_| (0..files_n).map(|_| new_manifest(&mut g)).collect())
+            .collect();
+        let build = |g: &mut MemGraph, files: &[Vec<ObjectId>]| {
+            let subdirs: Vec<(ObjectId, EntryKind)> = files
+                .iter()
+                .map(|f| {
+                    let entries = f.iter().map(|m| (*m, EntryKind::File)).collect();
+                    (g.dir(entries), EntryKind::Directory)
+                })
+                .collect();
+            g.dir(subdirs)
+        };
+        let first = build(&mut g, &files);
+        let mut roots = vec![first];
+        let mut rng = Rng(9);
+        for _ in 0..200 {
+            let (d, f) = (rng.below(dirs_n), rng.below(files_n));
+            files[d][f] = new_manifest(&mut g);
+            roots.push(build(&mut g, &files));
+        }
+        g.reads = 0;
+        let mut state = ReachState::new();
+        let mut largest = 0;
+        let mut changed = 0usize;
+        for root in &roots {
+            let t = state.goto(Some(*root), &mut g).unwrap();
+            changed += t.added.len() + t.dropped.len();
+            largest = largest.max(state.len());
+        }
+        let tree = 1 + dirs_n + 2 * dirs_n * files_n;
+        assert_eq!(state.len(), tree);
+        // One read of the first tree, then six per commit: the new root, directory and
+        // manifest, and the old ones when they go.
+        assert!(
+            g.reads <= (1 + dirs_n + dirs_n * files_n) as u64 + 6 * 200,
+            "{} reads",
+            g.reads
+        );
+        // The first tree once, then four objects in and four out per commit.
+        assert_eq!(changed, tree + 200 * 8);
+        assert!(largest <= tree + 4, "{largest} objects held");
+    }
 }

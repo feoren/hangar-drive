@@ -4,7 +4,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import type { NumberRows as Rows } from "../backend/types";
 import { spellOut } from "../domain/codes";
-import { useT } from "../i18n";
+import { displayName, useT } from "../i18n";
 
 /** How long a number check's confirm button holds back clicks (UX 5, ADR 6). */
 export const ARM_DELAY_MS = 1000;
@@ -125,11 +125,12 @@ export function PathText({
   readonly path: string;
   readonly className?: string;
 }) {
-  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
-  const head = cut >= 0 ? path.slice(0, cut + 1) : "";
-  const tail = cut >= 0 ? path.slice(cut + 1) : path;
+  const shown = displayName(path);
+  const cut = Math.max(shown.lastIndexOf("\\"), shown.lastIndexOf("/"));
+  const head = cut >= 0 ? shown.slice(0, cut + 1) : "";
+  const tail = cut >= 0 ? shown.slice(cut + 1) : shown;
   return (
-    <span className={className ? `path ${className}` : "path"} title={path}>
+    <span className={className ? `path ${className}` : "path"} title={shown}>
       <span className="path-head">{head}</span>
       <span className="path-tail">{tail}</span>
     </span>

@@ -6,6 +6,12 @@
 //! longer cycle) are broken by parking one item in the reserved directory and putting it in
 //! place once its name is free.
 //!
+//! An operation that has to wait is registered under what it waits for (the creation of its
+//! parent, a name in a directory, the directory to empty) and tried again only once exactly that
+//! changed, so a chain of n renames, each onto the name the next one gives up, takes O(n) steps
+//! instead of one pass over every waiting item per rename (security review of the executor,
+//! MEDIUM 1: 65 s for a chain of 16,000).
+//!
 //! Every operation checks its precondition on the disk itself ([`DiskActions`]): a file that the
 //! person changed since the scan is never overwritten or deleted. A failed operation leaves the
 //! item as it was in both the working tree and the synced tree, so the next round merges it
@@ -124,16 +130,32 @@ fn key_parts(keys: &CaseKeys) -> [&str; 3] {
     [&keys.lower, &keys.fold, &keys.upper]
 }
 
+/// A change of the working tree that an operation may wait for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Event {
+    /// An entry named `name` left directory `parent` (moved away, renamed, removed, parked).
+    Left { parent: ItemId, name: String },
+    /// An item is in the working tree now that was not.
+    Arrived(ItemId),
+    /// An item changed its place or left the working tree.
+    Moved(ItemId),
+    /// A parked item came back with what was below it.
+    Unparked,
+}
+
 /// The working tree's entries by case key, per directory: a directory is indexed when it is
 /// first asked about, and every change of the working tree during a run goes through
-/// [`Siblings::insert`] and [`Siblings::remove`], which keep the index in step. Answers what
-/// [`Tree::colliding_children`] answers, without a pass over the directory.
+/// [`Siblings::insert`] and [`Siblings::remove`], which keep the index in step and record each
+/// change as an [`Event`]. Answers what [`Tree::colliding_children`] answers, without a pass
+/// over the directory.
 #[derive(Default)]
 struct Siblings {
     /// Per indexed directory and key kind (lower, fold, upper): the entries with each key.
     dirs: HashMap<ItemId, [HashMap<String, BTreeSet<ItemId>>; 3]>,
     /// Per entry of an indexed directory: the directory, the name and its keys.
     entries: HashMap<ItemId, (ItemId, String, CaseKeys)>,
+    /// The changes since the executor last took them.
+    events: Vec<Event>,
 }
 
 impl Siblings {
@@ -205,6 +227,17 @@ impl Siblings {
 
     /// `work.insert` with the index kept in step.
     fn insert(&mut self, work: &mut Tree, id: ItemId, node: Node) {
+        match work.get(&id) {
+            None => self.events.push(Event::Arrived(id)),
+            Some(before) if before.location() != node.location() => {
+                self.events.push(Event::Left {
+                    parent: before.parent,
+                    name: before.name.clone(),
+                });
+                self.events.push(Event::Moved(id));
+            }
+            Some(_) => {}
+        }
         let old = self.unlink(&id);
         if self.dirs.contains_key(&node.parent) {
             let keys = match old {
@@ -219,7 +252,105 @@ impl Siblings {
     /// `work.remove` with the index kept in step.
     fn remove(&mut self, work: &mut Tree, id: &ItemId) -> Option<Node> {
         self.unlink(id);
-        work.remove(id)
+        let node = work.remove(id)?;
+        self.events.push(Event::Left {
+            parent: node.parent,
+            name: node.name.clone(),
+        });
+        self.events.push(Event::Moved(*id));
+        Some(node)
+    }
+}
+
+/// What a waiting operation waits for ([`Step::Wait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reason {
+    /// The item is below a parked directory.
+    Parked,
+    /// The directory to delete still has entries.
+    Children(ItemId),
+    /// The target parent is not a directory of the working tree yet.
+    Parent(ItemId),
+    /// The target name is taken in the target directory.
+    Name(ItemId, String),
+    /// The target directory lies below the item itself.
+    Ancestor(ItemId),
+    /// Anything else: tried again after the next change of the working tree.
+    Again,
+}
+
+/// Waiting operations by what they wait for, woken by the [`Event`]s that end the wait.
+#[derive(Default)]
+struct Waits {
+    parent: HashMap<ItemId, Vec<ItemId>>,
+    name: HashMap<(ItemId, usize, String), Vec<ItemId>>,
+    children: HashMap<ItemId, Vec<ItemId>>,
+    moved: HashMap<ItemId, Vec<ItemId>>,
+    parked: Vec<ItemId>,
+    again: Vec<ItemId>,
+}
+
+impl Waits {
+    fn register(&mut self, id: ItemId, reason: Reason, work: &Tree) {
+        match reason {
+            Reason::Parked => self.parked.push(id),
+            Reason::Children(dir) => self.children.entry(dir).or_default().push(id),
+            Reason::Parent(parent) => self.parent.entry(parent).or_default().push(id),
+            Reason::Name(parent, name) => {
+                let keys = case_keys(&name);
+                for (kind, key) in key_parts(&keys).into_iter().enumerate() {
+                    self.name
+                        .entry((parent, kind, key.to_owned()))
+                        .or_default()
+                        .push(id);
+                }
+            }
+            Reason::Ancestor(target) => {
+                // The target lies below `id` as long as every directory between them keeps
+                // its place; a move of any of them may end the wait.
+                let mut at = target;
+                let mut steps = 0usize;
+                while at != id && at != ROOT && steps <= work.len() {
+                    self.moved.entry(at).or_default().push(id);
+                    match work.get(&at) {
+                        Some(node) => at = node.parent,
+                        None => break,
+                    }
+                    steps += 1;
+                }
+            }
+            Reason::Again => self.again.push(id),
+        }
+    }
+
+    /// Adds to `out` the operations `event` may let run.
+    fn wake(&mut self, event: &Event, out: &mut Vec<ItemId>) {
+        match event {
+            Event::Left { parent, name } => {
+                if self.name.keys().next().is_some() {
+                    let keys = case_keys(name);
+                    for (kind, key) in key_parts(&keys).into_iter().enumerate() {
+                        if let Some(ids) = self.name.remove(&(*parent, kind, key.to_owned())) {
+                            out.extend(ids);
+                        }
+                    }
+                }
+                if let Some(ids) = self.children.remove(parent) {
+                    out.extend(ids);
+                }
+            }
+            Event::Arrived(id) => {
+                if let Some(ids) = self.parent.remove(id) {
+                    out.extend(ids);
+                }
+            }
+            Event::Moved(id) => {
+                if let Some(ids) = self.moved.remove(id) {
+                    out.extend(ids);
+                }
+            }
+            Event::Unparked => out.append(&mut self.parked),
+        }
     }
 }
 
@@ -252,38 +383,56 @@ pub fn apply(
     }
     let mut parked = Parked::default();
     let mut names = Siblings::default();
-    let limit = 4 * (pending.len() + 2);
-    for _ in 0..limit {
-        if pending.is_empty() {
-            break;
-        }
-        let mut progress = false;
-        let snapshot: Vec<ItemId> = pending.iter().copied().collect();
-        for id in snapshot {
-            match step(&id, target, work, &mut names, &mut parked, disk) {
-                Step::Done => {
-                    pending.remove(&id);
-                    progress = true;
-                    if let Some(node) = target.get(&id) {
-                        if work.get(&id) == Some(node) {
-                            synced.insert(id, node.clone());
-                        }
-                    } else {
-                        synced.remove(&id);
+    // Passes in ID order as before, but a pass tries only the operations that may run: all of
+    // them at first, later those an event woke. One woken before the place the pass has reached
+    // runs in the next pass, as it would have.
+    let mut ready: BTreeSet<ItemId> = pending.clone();
+    let mut waits = Waits::default();
+    let mut cursor: Option<ItemId> = None;
+    let mut woken = Vec::new();
+    // Each operation runs once and waits a few times; the bound only guards against a bug.
+    let limit = 64usize.saturating_mul(pending.len() + 2);
+    let mut steps = 0usize;
+    while !pending.is_empty() && steps < limit {
+        let next = cursor
+            .and_then(|at| {
+                ready
+                    .range((std::ops::Bound::Excluded(at), std::ops::Bound::Unbounded))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| ready.first().copied());
+        let Some(id) = next else {
+            // Nothing can run: break a cycle by parking one item, which frees its name.
+            if !park_one(&pending, target, work, &mut names, &mut parked, disk) {
+                break;
+            }
+            wake_all(&mut names, &mut waits, &mut woken, &pending, &mut ready);
+            cursor = None;
+            continue;
+        };
+        ready.remove(&id);
+        cursor = Some(id);
+        steps += 1;
+        match step(&id, target, work, &mut names, &mut parked, disk) {
+            Step::Done => {
+                pending.remove(&id);
+                if let Some(node) = target.get(&id) {
+                    if work.get(&id) == Some(node) {
+                        synced.insert(id, node.clone());
                     }
-                    report.done.push(id);
+                } else {
+                    synced.remove(&id);
                 }
-                Step::Wait => {}
-                Step::Failed(error) => {
-                    pending.remove(&id);
-                    progress = true;
-                    report.failed.push((id, error));
-                }
+                report.done.push(id);
+            }
+            Step::Wait(reason) => waits.register(id, reason, work),
+            Step::Failed(error) => {
+                pending.remove(&id);
+                report.failed.push((id, error));
             }
         }
-        if !progress && !park_one(&pending, target, work, &mut names, &mut parked, disk) {
-            break;
-        }
+        wake_all(&mut names, &mut waits, &mut woken, &pending, &mut ready);
     }
     for id in pending {
         report.failed.push((id, ActionError::Blocked));
@@ -326,6 +475,30 @@ pub fn apply(
     report
 }
 
+/// Wakes the operations the recorded events may let run. Any change of the working tree also
+/// wakes those that wait for no particular change ([`Reason::Again`]).
+fn wake_all(
+    names: &mut Siblings,
+    waits: &mut Waits,
+    woken: &mut Vec<ItemId>,
+    pending: &BTreeSet<ItemId>,
+    ready: &mut BTreeSet<ItemId>,
+) {
+    let events = std::mem::take(&mut names.events);
+    if events.is_empty() {
+        return;
+    }
+    for event in &events {
+        waits.wake(event, woken);
+    }
+    woken.append(&mut waits.again);
+    for id in woken.drain(..) {
+        if pending.contains(&id) {
+            ready.insert(id);
+        }
+    }
+}
+
 /// Where a parked item can go back: its old place, then free names next to it, then the root.
 fn fallback_places(work: &Tree, names: &mut Siblings, node: &Node) -> Vec<(ItemId, String)> {
     let mut out = Vec::new();
@@ -335,14 +508,15 @@ fn fallback_places(work: &Tree, names: &mut Siblings, node: &Node) -> Vec<(ItemI
         } else {
             vec![ROOT]
         };
+    // No item has the root's ID, so no entry is left out of the check.
     for parent in parents {
-        if names.free(work, &parent, &node.name, &ItemId::from_bytes([0xff; 16])) {
+        if names.free(work, &parent, &node.name, &ROOT) {
             out.push((parent, node.name.clone()));
         }
         let (stem, ext) = crate::names::split_extension(&node.name);
         for n in 2..50u32 {
             let name = format!("{stem} ({n}){ext}");
-            if names.free(work, &parent, &name, &ItemId::from_bytes([0xff; 16])) {
+            if names.free(work, &parent, &name, &ROOT) {
                 out.push((parent, name));
                 break;
             }
@@ -362,7 +536,7 @@ struct Parked {
 
 enum Step {
     Done,
-    Wait,
+    Wait(Reason),
     Failed(ActionError),
 }
 
@@ -374,9 +548,11 @@ fn step(
     parked: &mut Parked,
     disk: &mut dyn DiskActions,
 ) -> Step {
+    #[cfg(test)]
+    tests::count_step();
     if parked.members.contains(id) {
         // Below a parked directory: wait until it is back in the tree.
-        return Step::Wait;
+        return Step::Wait(Reason::Parked);
     }
     let current = work.get(id).cloned();
     let wanted = target.get(id).cloned();
@@ -389,7 +565,7 @@ fn step(
             let result = match &have.kind {
                 NodeKind::Directory => {
                     if work.children(id).next().is_some() {
-                        return Step::Wait;
+                        return Step::Wait(Reason::Children(*id));
                     }
                     disk.remove_dir(&path)
                 }
@@ -404,12 +580,14 @@ fn step(
             }
         }
         (None, Some(want)) => {
-            if !parent_ready(work, &want.parent) || !names.free(work, &want.parent, &want.name, id)
-            {
-                return Step::Wait;
+            if !parent_ready(work, &want.parent) {
+                return Step::Wait(Reason::Parent(want.parent));
+            }
+            if !names.free(work, &want.parent, &want.name, id) {
+                return Step::Wait(Reason::Name(want.parent, want.name.clone()));
             }
             let Some(path) = full_path(work, &want.parent, &want.name) else {
-                return Step::Wait;
+                return Step::Wait(Reason::Again);
             };
             if let Some(nodes) = parked.roots.get(id).cloned() {
                 return match disk.unpark(id, &path) {
@@ -427,10 +605,11 @@ fn step(
                             names.insert(work, member, node);
                         }
                         // Content or metadata may still differ; the next pass handles it.
+                        names.events.push(Event::Unparked);
                         if work.get(id) == Some(&want) {
                             Step::Done
                         } else {
-                            Step::Wait
+                            Step::Wait(Reason::Again)
                         }
                     }
                     Err(e) => Step::Failed(e),
@@ -450,16 +629,19 @@ fn step(
         }
         (Some(have), Some(want)) => {
             if have.location() != want.location() {
-                if !parent_ready(work, &want.parent)
-                    || !names.free(work, &want.parent, &want.name, id)
-                    || work.is_ancestor_or_self(id, &want.parent)
-                {
-                    return Step::Wait;
+                if !parent_ready(work, &want.parent) {
+                    return Step::Wait(Reason::Parent(want.parent));
+                }
+                if !names.free(work, &want.parent, &want.name, id) {
+                    return Step::Wait(Reason::Name(want.parent, want.name.clone()));
+                }
+                if work.is_ancestor_or_self(id, &want.parent) {
+                    return Step::Wait(Reason::Ancestor(want.parent));
                 }
                 let (Some(from), Some(to)) =
                     (work.path(id), full_path(work, &want.parent, &want.name))
                 else {
-                    return Step::Wait;
+                    return Step::Wait(Reason::Again);
                 };
                 if let Err(e) = disk.rename(&from, &to) {
                     return Step::Failed(e);
@@ -471,13 +653,13 @@ fn step(
                 return if work.get(id) == Some(&want) {
                     Step::Done
                 } else {
-                    Step::Wait
+                    Step::Wait(Reason::Again)
                 };
             }
             match (&have.kind, &want.kind) {
                 (NodeKind::File(h), NodeKind::File(w)) if h != w => {
                     let Some(path) = work.path(id) else {
-                        return Step::Wait;
+                        return Step::Wait(Reason::Again);
                     };
                     let result = if h.same_content(w) {
                         disk.set_meta(id, &path, w, h)
@@ -961,6 +1143,274 @@ pub(crate) mod tests {
             work_done <= 3 * u64::from(n),
             "{work_done} key computations"
         );
+    }
+
+    thread_local! {
+        static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_step() {
+        STEPS.with(|s| s.set(s.get() + 1));
+    }
+
+    fn steps_taken() -> u64 {
+        STEPS.with(std::cell::Cell::get)
+    }
+
+    /// The earlier scheduling, kept as the reference: every pass tries every pending item, and
+    /// a pass without progress parks one item.
+    fn apply_reference(
+        target: &Tree,
+        work: &mut Tree,
+        synced: &mut Tree,
+        skip: &BTreeSet<ItemId>,
+        disk: &mut dyn DiskActions,
+    ) -> ApplyReport {
+        let mut report = ApplyReport::default();
+        let mut pending: BTreeSet<ItemId> = target
+            .ids()
+            .chain(work.ids())
+            .filter(|id| !skip.contains(id) && work.get(id) != target.get(id))
+            .copied()
+            .collect();
+        let equal: Vec<ItemId> = target
+            .iter()
+            .filter(|(id, node)| work.get(id) == Some(*node) && synced.get(id) != Some(*node))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in equal {
+            if let Some(node) = target.get(&id) {
+                synced.insert(id, node.clone());
+            }
+        }
+        let mut parked = super::Parked::default();
+        let mut names = Siblings::default();
+        let limit = 4 * (pending.len() + 2);
+        for _ in 0..limit {
+            if pending.is_empty() {
+                break;
+            }
+            let mut progress = false;
+            names.events.clear();
+            let snapshot: Vec<ItemId> = pending.iter().copied().collect();
+            for id in snapshot {
+                match step(&id, target, work, &mut names, &mut parked, disk) {
+                    Step::Done => {
+                        pending.remove(&id);
+                        progress = true;
+                        if let Some(node) = target.get(&id) {
+                            if work.get(&id) == Some(node) {
+                                synced.insert(id, node.clone());
+                            }
+                        } else {
+                            synced.remove(&id);
+                        }
+                        report.done.push(id);
+                    }
+                    Step::Wait(_) => {}
+                    Step::Failed(error) => {
+                        pending.remove(&id);
+                        progress = true;
+                        report.failed.push((id, error));
+                    }
+                }
+            }
+            // One correction of the earlier passes: a move that leaves the content to the
+            // next pass changed the working tree and counts as progress. Before, such a move
+            // as the last pending operation ended the run with that item blocked until the
+            // next round; the scheduling by events finishes it.
+            progress |= !names.events.is_empty();
+            if !progress && !park_one(&pending, target, work, &mut names, &mut parked, disk) {
+                break;
+            }
+        }
+        for id in pending {
+            report.failed.push((id, ActionError::Blocked));
+        }
+        let roots: Vec<ItemId> = parked.roots.keys().copied().collect();
+        for id in roots {
+            let Some(mut nodes) = parked.roots.remove(&id) else {
+                continue;
+            };
+            let Some((_, node)) = nodes.first().cloned() else {
+                continue;
+            };
+            let mut placed = None;
+            for candidate in fallback_places(work, &mut names, &node) {
+                let Some(path) = full_path(work, &candidate.0, &candidate.1) else {
+                    continue;
+                };
+                if disk.unpark(&id, &path).is_ok() {
+                    placed = Some(candidate);
+                    break;
+                }
+            }
+            match placed {
+                Some((parent, name)) => {
+                    if let Some(first) = nodes.first_mut() {
+                        first.1.parent = parent;
+                        first.1.name = name;
+                    }
+                    for (member, n) in nodes {
+                        parked.members.remove(&member);
+                        names.insert(work, member, n);
+                    }
+                }
+                None => report.parked.push(id),
+            }
+        }
+        report
+    }
+
+    /// A random working tree: directories and files over a small pool of IDs and colliding
+    /// names, parents from the pool, so the target below moves items into each other, swaps
+    /// names, makes chains and cycles of renames and moves directories below themselves.
+    fn random_tree(rng: &mut crate::names::tests::Rng, pool: &[ItemId], names: &[&str]) -> Tree {
+        let mut t = Tree::new();
+        let mut dirs = vec![ROOT];
+        for item in pool {
+            if rng.below(4) == 0 {
+                continue;
+            }
+            let parent = *rng.pick(&dirs);
+            let name = (*rng.pick(names)).to_owned();
+            if t.colliding_children(&parent, &name, item).is_empty() {
+                if rng.below(3) == 0 {
+                    t.insert(*item, Node::dir(parent, name));
+                    dirs.push(*item);
+                } else {
+                    t.insert(
+                        *item,
+                        Node::file(parent, name, file(1 + rng.below(3) as u8)),
+                    );
+                }
+            }
+        }
+        t
+    }
+
+    /// The target: the same items with the same kinds, mostly at other places and names, some
+    /// deleted, some new; a valid tree (no cycle, no collision), as the merge gives it.
+    fn random_target(
+        rng: &mut crate::names::tests::Rng,
+        from: &Tree,
+        pool: &[ItemId],
+        names: &[&str],
+    ) -> Tree {
+        for _ in 0..50 {
+            let mut t = Tree::new();
+            let mut dirs = vec![ROOT];
+            for item in pool {
+                let kind = match from.get(item) {
+                    Some(n) if rng.below(6) == 0 => {
+                        let _ = n;
+                        continue;
+                    }
+                    Some(n) => Some(n.is_dir()),
+                    None if rng.below(3) == 0 => Some(rng.below(2) == 0),
+                    None => None,
+                };
+                let Some(is_dir) = kind else {
+                    continue;
+                };
+                let parent = *rng.pick(&dirs);
+                let name = (*rng.pick(names)).to_owned();
+                if !t.colliding_children(&parent, &name, item).is_empty() {
+                    continue;
+                }
+                if is_dir {
+                    t.insert(*item, Node::dir(parent, name));
+                    dirs.push(*item);
+                } else {
+                    let version = match from.get(item).and_then(|n| n.kind.file()) {
+                        Some(v) if rng.below(2) == 0 => *v,
+                        _ => file(1 + rng.below(3) as u8),
+                    };
+                    t.insert(*item, Node::file(parent, name, version));
+                }
+            }
+            // Every directory of the target that was a file in `from` breaks the kind rule.
+            if t.check().is_ok() {
+                return t;
+            }
+        }
+        from.clone()
+    }
+
+    /// Security review of the executor, MEDIUM 1: the scheduling by events gives the result of
+    /// the passes over all pending items, on random runs with chains, swaps, cycles, moves into
+    /// the own subtree, deletes of directories that empty late and skipped items.
+    #[test]
+    fn event_scheduling_equals_the_passes() {
+        let mut rng = crate::names::tests::Rng(0xa991);
+        let names = ["a", "A", "b", "B", "c", "d", "e\u{301}", "\u{e9}"];
+        for case in 0..3000 {
+            let pool: Vec<ItemId> = (0..3 + rng.below(10))
+                .map(|_| id(1 + rng.below(30) as u8))
+                .collect::<BTreeSet<ItemId>>()
+                .into_iter()
+                .collect();
+            let from = random_tree(&mut rng, &pool, &names);
+            let to = random_target(&mut rng, &from, &pool, &names);
+            let skip: BTreeSet<ItemId> = pool
+                .iter()
+                .filter(|_| rng.below(12) == 0)
+                .copied()
+                .collect();
+            let run_with = |reference: bool| {
+                let mut disk = PathDisk::of(&from);
+                let mut work = from.clone();
+                let mut synced = from.clone();
+                let mut report = if reference {
+                    apply_reference(&to, &mut work, &mut synced, &skip, &mut disk)
+                } else {
+                    apply(&to, &mut work, &mut synced, &skip, &mut disk)
+                };
+                report.done.sort();
+                report.failed.sort_by_key(|(id, _)| *id);
+                report.parked.sort();
+                (disk, work, synced, report)
+            };
+            let (new_disk, new_work, new_synced, new_report) = run_with(false);
+            let (old_disk, old_work, old_synced, old_report) = run_with(true);
+            assert_eq!(new_work, old_work, "case {case}: work");
+            assert_eq!(new_synced, old_synced, "case {case}: synced");
+            assert_eq!(new_disk, old_disk, "case {case}: disk");
+            assert_eq!(new_report, old_report, "case {case}: report");
+        }
+    }
+
+    /// A chain of 20,000 renames in one directory, each item onto the name of the next one and
+    /// the last onto a free name: about two steps per item. The passes took one step per item
+    /// and pass, and the chain freed one name per pass (about 2 * 10^8 steps here).
+    #[test]
+    fn a_chain_of_renames_takes_linear_steps() {
+        let n = 20_000u32;
+        let wide = |i: u32| {
+            let mut bytes = [5u8; 16];
+            bytes[12..].copy_from_slice(&i.to_be_bytes());
+            ItemId::from_bytes(bytes)
+        };
+        let from = Tree::from_nodes(
+            (0..n).map(|i| (wide(i), Node::file(ROOT, format!("f{i:06}"), file(1)))),
+        );
+        let to = Tree::from_nodes(
+            (0..n).map(|i| (wide(i), Node::file(ROOT, format!("f{:06}", i + 1), file(1)))),
+        );
+        let mut work = from.clone();
+        let mut synced = from.clone();
+        let before = steps_taken();
+        let report = apply(
+            &to,
+            &mut work,
+            &mut synced,
+            &BTreeSet::new(),
+            &mut AcceptingDisk,
+        );
+        let steps = steps_taken() - before;
+        assert_eq!(report.done.len(), n as usize, "{:?}", report.failed.first());
+        assert_eq!(work, to);
+        assert!(steps <= 3 * u64::from(n), "{steps} steps");
     }
 
     impl PartialEq for PathDisk {

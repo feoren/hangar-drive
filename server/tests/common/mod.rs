@@ -71,6 +71,8 @@ pub struct Options {
     pub public_url: &'static str,
     /// Wraps the object store (`Deps::store_layer`).
     pub store_layer: Option<hangar_drive_server::StoreLayer>,
+    /// Test hooks (`Deps::hooks`).
+    pub hooks: hangar_drive_server::app::Hooks,
 }
 
 impl Default for Options {
@@ -86,6 +88,7 @@ impl Default for Options {
             concurrency: Concurrency::default(),
             public_url: TEST_URL,
             store_layer: None,
+            hooks: Default::default(),
         }
     }
 }
@@ -138,6 +141,7 @@ impl TestServer {
             limiter: options.limiter,
             gc_job: false,
             store_layer: options.store_layer,
+            hooks: options.hooks,
         };
         let mut server: Server = hangar_drive_server::build(&config, deps).await.unwrap();
         if let Some(timeout) = options.header_timeout {
@@ -600,6 +604,51 @@ impl Account {
         if reply.status == 200 {
             self.state = removal.state;
             self.secret = Some(removal.rotation.secret);
+        }
+        reply
+    }
+
+    /// The recovery in one append call through the recovery session `client`: `recovery` adds
+    /// `new`, which removes `targets` and rotates (`epoch::recover`).
+    pub async fn recover(
+        &mut self,
+        client: &Client,
+        recovery: &Device,
+        new: &Device,
+        targets: &[DeviceId],
+    ) -> Reply {
+        let recovered = epoch::recover(
+            &self.state,
+            &recovery.identity,
+            recovery.id,
+            &new.identity,
+            new.log_device(&self.id),
+            targets,
+            self.secret.as_ref(),
+            START_MS,
+            &mut OsEntropy,
+        )
+        .unwrap();
+        let request = LogAppendRequest {
+            entries: recovered.entries.iter().cloned().map(Blob).collect(),
+            wraps: recovered
+                .rotation
+                .wraps
+                .iter()
+                .map(|(d, w)| WrappedKeyEntry {
+                    device: *d,
+                    data: Blob(w.clone()),
+                })
+                .collect(),
+            device_wrap: recovered.device_wrap.map(|w| WrappedKeyEntry {
+                device: new.id,
+                data: Blob(w),
+            }),
+        };
+        let reply = client.post(LOG_PATH, &request).await;
+        if reply.status == 200 {
+            self.state = recovered.state;
+            self.secret = Some(recovered.rotation.secret);
         }
         reply
     }

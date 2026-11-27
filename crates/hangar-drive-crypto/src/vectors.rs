@@ -544,7 +544,7 @@ fn compute() -> BTreeMap<String, String> {
         "padme",
         lengths
             .iter()
-            .map(|n| format!("{n}:{}", padme(*n)))
+            .map(|n| format!("{n}:{}", padme(*n).unwrap()))
             .collect::<Vec<_>>()
             .join(" "),
     );

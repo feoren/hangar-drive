@@ -12,6 +12,10 @@ import {
   renderApp,
   text,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();
@@ -106,6 +110,30 @@ describe("reset this device", () => {
     expect(document.querySelector(".error-text, .feedback.error")).toBeNull();
     mock.controls.nativeConfirm = "yes";
     await click("Dieses Gerät zurücksetzen");
+    expect(document.querySelector("h1")?.textContent).toBe("Willkommen bei Hangar Drive");
+  });
+
+  // Follow-up review LOW 7: a recovery that is not finished makes the shell refuse the plain
+  // reset without a question; the window says what is at stake, and only "Reset anyway" plus
+  // the native question resets.
+  it("explains a pending recovery before it resets anyway", async () => {
+    const { mock } = await renderApp();
+    mock.resetDevice = () => Promise.resolve("recoveryPending");
+    await openMenu("Einstellungen");
+    await click("Dieses Gerät zurücksetzen");
+    expect(text()).toContain("Die Wiederherstellung ist noch nicht abgeschlossen");
+    expect(text()).toContain(
+      "Setzt du dieses Gerät jetzt zurück, geht sein neuer Schlüssel verloren. Hast du kein anderes Gerät mehr, kommst du dann vielleicht nie mehr an dein Konto.",
+    );
+    await click("Abbrechen");
+    expect(text()).not.toContain("Die Wiederherstellung ist noch nicht abgeschlossen");
+    await click("Dieses Gerät zurücksetzen");
+    mock.controls.nativeConfirm = "no";
+    await click("Trotzdem zurücksetzen");
+    expect(mock.calls).toContain("resetDeviceDiscardingRecovery");
+    expect(text()).toContain("Die Wiederherstellung ist noch nicht abgeschlossen");
+    mock.controls.nativeConfirm = "yes";
+    await click("Trotzdem zurücksetzen");
     expect(document.querySelector("h1")?.textContent).toBe("Willkommen bei Hangar Drive");
   });
 

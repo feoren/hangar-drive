@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { compareVersions, formatVersion, parseVersion, withBuild } from "./version";
+import { compareVersions, formatVersion, parseVersion, versionParts, withBuild } from "./version";
 
 describe("version scheme (ADR 0002)", () => {
   it("reads the internal, the displayed and the plain form", () => {
@@ -34,5 +34,17 @@ describe("version scheme (ADR 0002)", () => {
     expect(compareVersions("0.1.1", "0.1.0+500")).toBeGreaterThan(0);
     expect(compareVersions("0.1.0+1", "0.1.0+2")).toBe(0);
     expect(compareVersions("broken", "0.0.0")).toBeLessThan(0);
+  });
+});
+
+describe("versionParts", () => {
+  it("marks every 0.x version as beta, like Hangar", () => {
+    expect(versionParts("0.1.0+12")).toEqual({ number: "0.1.0-12", beta: true });
+    expect(versionParts("0.16.0")).toEqual({ number: "0.16.0", beta: true });
+  });
+
+  it("drops the badge from 1.0.0 on and for unreadable input", () => {
+    expect(versionParts("1.0.0-3")).toEqual({ number: "1.0.0-3", beta: false });
+    expect(versionParts("dev")).toEqual({ number: "dev", beta: false });
   });
 });

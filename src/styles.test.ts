@@ -92,12 +92,11 @@ describe("token contrast", () => {
     }
   });
 
-  it("tints the tray's attention icon with the window's --error (build.rs)", () => {
+  it("draws the tray's state dots in the window's dark --error and --muted (build.rs)", () => {
     const build = readFileSync(join(import.meta.dirname, "../src-tauri/build.rs"), "utf8");
-    expect(build).toContain(
-      `("light", "${light.get("text") ?? ""}", "${light.get("error") ?? ""}")`,
-    );
-    expect(build).toContain(`("dark", "#ffffff", "${dark.get("error") ?? ""}")`);
+    expect(build).toContain(`("error", Some("${dark.get("error") ?? ""}"))`);
+    expect(build).toContain(`("idle", Some("${dark.get("muted") ?? ""}"))`);
+    expect(build).toContain(`TRAY_BADGE_RING: &str = "${dark.get("logo-tile") ?? ""}"`);
   });
 
   it("fixes the light --warn on --panel of the sister app (4.46 : 1)", () => {

@@ -312,10 +312,89 @@ struct Renewal {
     added: bool,
 }
 
-/// A recovered installation between `recover_account` and `finish_recovery_cleanup`.
+/// A recovery between `recover_account` and `finish_recovery_cleanup`.
 struct Recovering {
     /// The server address of the sheet, for the new code's sheet.
     url: String,
+    /// The recovery session before its one append (ADR 0001, amendment "recovery in one
+    /// piece, adds per day, delta check on a growing log", H1): the device list is read, and the
+    /// new device joins only with the person's choice. Only in memory, so an end of the app in
+    /// between leaves nothing in the account and the code unused.
+    before_join: Option<RecoveryChoice>,
+}
+
+/// The recovery session waiting for the person's choice of devices to remove.
+struct RecoveryChoice {
+    sheet: crate::links::RecoverySheet,
+    code: RecoveryCode,
+    server: Box<dyn ServerApi>,
+    identity_export: zeroize::Zeroizing<Vec<u8>>,
+    device: DeviceId,
+    name: String,
+    devices: Vec<crate::recovery::LogDeviceInfo>,
+    /// The head of the log `devices` was read from: the append is refused when the log moved
+    /// on in between (security review "recovery" M1).
+    shown: LogHead,
+}
+
+/// The stored marker of a recovery whose one append was sent (security review "recovery" H1).
+/// Written, with the new device's identity in the keychain, right before the append goes out,
+/// so that no failure after it (a lost answer, a head the server made up, the end of the app, a
+/// failed join) can lose the only key the account may have left. It holds nothing secret. It
+/// goes once the new device joined and wrote the barriers, or once the recovery device's own
+/// verified log shows that the append did not go through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingRecovery {
+    account: AccountId,
+    device: DeviceId,
+    name: String,
+    server_url: String,
+    pin: Option<[u8; 32]>,
+    server: ServerId,
+    genesis: LogHash,
+    /// The log head after the batch, computed by this device: the anchor the join checks.
+    head: LogHead,
+    /// Every device the batch removes, for the barriers.
+    removed: Vec<DeviceId>,
+}
+
+/// The exported identity of a pending recovery's device.
+type PendingKey = zeroize::Zeroizing<Vec<u8>>;
+
+/// The store key of [`PendingRecovery`].
+const RECOVERY_PENDING_KEY: &str = "recovery-pending";
+/// The keychain entry of the new device's identity while a recovery is pending, with the
+/// SHA-256 of the marker (follow-up review LOW 3: the local index is not protected, the
+/// keychain is): format byte [`RECOVERY_KEY_FORMAT`], the 32 byte digest, the exported
+/// identity. The join stores its own copy of the identity under the device identity's entry.
+const RECOVERY_IDENTITY_KEY: &str = "recovery-identity";
+/// The format of [`RECOVERY_IDENTITY_KEY`].
+const RECOVERY_KEY_FORMAT: u8 = 1;
+
+/// The SHA-256 of a stored marker.
+fn marker_digest(marker: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(marker).into()
+}
+
+/// How an append of a recovery failed.
+enum RecoveryAttempt {
+    /// Nothing was sent: the account and the code are as they were.
+    NotSent(SyncError),
+    /// The append was sent, and the new device could not join (yet).
+    Sent(SyncError),
+}
+
+/// The engine's error for a refusal of the recovery module.
+fn recovery_error(error: crate::recovery::RecoveryError) -> SyncError {
+    match error {
+        crate::recovery::RecoveryError::Used => SyncError::RecoveryCodeUsed,
+        crate::recovery::RecoveryError::Unknown | crate::recovery::RecoveryError::WrongSheet => {
+            SyncError::RecoveryCodeUnknown
+        }
+        crate::recovery::RecoveryError::ListChanged => SyncError::RecoveryListChanged,
+        crate::recovery::RecoveryError::Sync(e) => e,
+    }
 }
 
 struct OpenOffer {
@@ -367,6 +446,10 @@ pub struct EngineCore {
     /// The pin of the key whose server number was shown last (`getServerNumber`), the only one
     /// `confirmServerNumber` takes.
     server_candidate: Option<[u8; 32]>,
+    /// A [`PendingRecovery`] is stored.
+    recovery_pending: bool,
+    /// The loop tries a pending recovery again from this time on.
+    recovery_retry_at: i64,
 }
 
 fn hex_id<T: std::fmt::Display>(id: &T) -> String {
@@ -489,7 +572,20 @@ impl EngineCore {
             undo: VecDeque::new(),
             remote_deletes: BTreeMap::new(),
             server_candidate: None,
+            recovery_pending: false,
+            recovery_retry_at: 0,
         };
+        // A marker that does not read cannot be finished; it must not keep the app from
+        // starting either (the key stays in the keychain).
+        core.recovery_pending = core.pending_recovery().ok().flatten().is_some();
+        // A key without its marker: the app ended between the two writes of `mark_recovery`,
+        // before the append went out, or after the marker of a finished recovery was removed.
+        // Either way no append waits for it.
+        if !core.recovery_pending {
+            if let Ok(Some(_)) = core.ports.keychain.load(RECOVERY_IDENTITY_KEY) {
+                let _ = core.ports.keychain.delete(RECOVERY_IDENTITY_KEY);
+            }
+        }
         core.connect()?;
         for (id, path) in core.persisted.folders.clone() {
             core.open_folder_at(id, &path)?;
@@ -584,6 +680,7 @@ impl EngineCore {
 
     /// One pass of the control loop (module docs). Returns the events for the window.
     pub fn tick(&mut self) -> Vec<BackendEvent> {
+        self.tick_recovery();
         // While the server reports this device as removed, sync stays stopped and the device
         // only signs in again now and then (security review H2).
         let report = self.persisted.removal_report;
@@ -614,6 +711,7 @@ impl EngineCore {
                 let _ = self.save();
             }
         }
+        self.after_recovery_join();
         self.poll_joining();
         let snapshot = self.snapshot();
         if self.last_snapshot.as_ref() != Some(&snapshot) {
@@ -623,6 +721,72 @@ impl EngineCore {
             });
         }
         self.take_events()
+    }
+
+    /// A pending recovery ([`PendingRecovery`]) is tried again now and then, until its device
+    /// joined, also after the app ended in between (security review "recovery" H1). Not while
+    /// the person chooses the devices of a new attempt.
+    fn tick_recovery(&mut self) {
+        let now = self.now();
+        if !self.recovery_pending
+            || now < self.recovery_retry_at
+            || self
+                .recovering
+                .as_ref()
+                .is_some_and(|r| r.before_join.is_some())
+        {
+            return;
+        }
+        if let Err(e) = self.resume_recovery() {
+            self.recovery_retry_at = now.saturating_add(POLL_INTERVAL_MS);
+            self.note_net(&e);
+        }
+    }
+
+    /// What the join after this device's recovery left for later: the barriers of the
+    /// recovery's removals in a folder whose key ring opened only now (follow-up review LOW 2;
+    /// without them the folder would stop at the removed devices' heads), and this device's
+    /// name once a remaining device re-sealed the names (follow-up review LOW 5).
+    fn after_recovery_join(&mut self) {
+        if self.recovery_pending {
+            return;
+        }
+        let Some(account) = self.account.as_mut() else {
+            return;
+        };
+        if account.take_recovered_rings() {
+            // The flag stays set, in memory and in every save the barrier job makes, until the
+            // barriers are written; only then is the account saved without it, so an end of the
+            // app in between writes them at the next start.
+            account.keep_recovered_rings();
+            let removed = account.removed_by_own_recovery();
+            let written = if removed.is_empty() {
+                Ok(0)
+            } else {
+                self.remove_with_barriers(&removed)
+            };
+            let saved = written.and_then(|_| match self.account.as_mut() {
+                Some(account) => {
+                    account.take_recovered_rings();
+                    account.save(&mut *self.ports.store)
+                }
+                None => Ok(()),
+            });
+            if let Err(e) = saved {
+                if let Some(account) = self.account.as_mut() {
+                    account.keep_recovered_rings();
+                }
+                self.note_net(&e);
+            }
+        }
+        let name_due = self.account.as_ref().is_some_and(|a| {
+            a.device_names().is_some() && a.device_display_name(a.device()).is_none()
+        });
+        if name_due {
+            if let Err(e) = self.write_own_name_if_missing() {
+                self.note_net(&e);
+            }
+        }
     }
 
     /// The name of the device that removed this one, when the "removed" answer of the server
@@ -823,7 +987,8 @@ impl EngineCore {
                     folder.sync.note_changes(changes.paths);
                 }
             }
-            if now - folder.last_full_scan >= FULL_SCAN_INTERVAL_MS {
+            let hourly = now - folder.last_full_scan >= FULL_SCAN_INTERVAL_MS;
+            if hourly {
                 folder.sync.request_full_scan();
                 folder.last_full_scan = now;
                 // The quarantine is cleaned with every hourly scan, not only when the app
@@ -847,6 +1012,11 @@ impl EngineCore {
                 Ok(r) => {
                     folder.failed_rounds = 0;
                     folder.last_error = None;
+                    // The caches of the index shrink with the hourly scan (security review,
+                    // MEDIUM 3). A failure here costs only space and is tried again in an hour.
+                    if hourly {
+                        let _ = folder.sync.prune_cache(&mut cx);
+                    }
                     r
                 }
                 Err(e) if e.is_offline() || e.is_device_removed() => return Err(e),
@@ -930,8 +1100,11 @@ impl EngineCore {
                     at: now,
                 });
             }
+            // One set, not a pass over the deletes per change (security review, LOW 2: a
+            // round that deletes a million items made 10^12 comparisons here).
+            let grouped: BTreeSet<ItemId> = remote_deleted.iter().map(|c| c.item).collect();
             for change in &report.changes {
-                if remote_deleted.iter().any(|c| c.item == change.item) {
+                if grouped.contains(&change.item) {
                     continue;
                 }
                 let file_name = change.path.rsplit('/').next().unwrap_or("").to_owned();
@@ -1182,6 +1355,41 @@ impl EngineCore {
                     sample,
                 });
             }
+            let incoming = f.sync.incoming_held_files() as u64;
+            if incoming > 0 {
+                let synced = f.sync.synced();
+                let sample = meta
+                    .incoming_held
+                    .iter()
+                    .filter_map(|i| synced.get(i).filter(|n| !n.is_dir()))
+                    .take(3)
+                    .map(|n| n.name.clone())
+                    .collect();
+                // Named only when one device wrote every commit the deletes came with, with the
+                // day the verified log added it, which a renamed device cannot change (L5).
+                let writer = match meta.incoming_devices.iter().collect::<Vec<_>>()[..] {
+                    [one] => Some(*one),
+                    _ => None,
+                };
+                let device = writer
+                    .map(|d| self.device_name_of(&d))
+                    .filter(|n| !n.trim().is_empty());
+                let device_added = writer.filter(|_| device.is_some()).and_then(|d| {
+                    self.account
+                        .as_ref()
+                        .and_then(|a| a.device_added_ms(&d))
+                        .and_then(|ms| i64::try_from(ms).ok())
+                });
+                warnings.push(Warning::IncomingDelete {
+                    id: format!("incomingDelete-{id}"),
+                    folder_id: hex_id(id),
+                    folder_name: meta.name.clone(),
+                    device,
+                    device_added,
+                    count: incoming,
+                    sample,
+                });
+            }
             conflicts += Self::conflict_groups(f).len() as u64;
             names += f
                 .sync
@@ -1220,6 +1428,38 @@ impl EngineCore {
             warnings.push(Warning::Removed {
                 id: "removed".into(),
                 by: by.clone(),
+            });
+        }
+        if self.recovery_pending && self.account.is_none() {
+            warnings.push(Warning::RecoveryPending {
+                id: "recoveryPending".into(),
+            });
+        }
+        // Folder data the join after this device's recovery could not read (follow-up review
+        // LOW 2).
+        if let Some(account) = &self.account {
+            let folders: Vec<String> = account
+                .unreadable_folders()
+                .into_iter()
+                .map(|f| f.name)
+                .collect();
+            let folder_list = account.folder_list_unreadable();
+            if !folders.is_empty() || folder_list {
+                warnings.push(Warning::FoldersUnreadable {
+                    id: "foldersUnreadable".into(),
+                    folders,
+                    folder_list,
+                });
+            }
+        }
+        // No code would work for this account (security review "recovery" L1).
+        if self
+            .account
+            .as_ref()
+            .is_some_and(|a| !a.setup_pending() && !a.state().current_devices().any(|d| d.recovery))
+        {
+            warnings.push(Warning::NoRecoveryCode {
+                id: "noRecoveryCode".into(),
             });
         }
         if conflicts > 0 {
@@ -1535,7 +1775,11 @@ impl EngineCore {
     /// changes until the person types the check group back ([`Self::confirm_recovery_group`]);
     /// the old code stays valid until then.
     pub fn renew_recovery_code(&mut self) -> Result<RecoveryCodeView, SyncError> {
-        if self.pending.is_some() || self.recovering.is_some() {
+        let choosing = self
+            .recovering
+            .as_ref()
+            .is_some_and(|r| r.before_join.is_some());
+        if self.pending.is_some() || choosing {
             return Err(SyncError::Invalid("the setup is not finished"));
         }
         let url = self
@@ -1551,6 +1795,9 @@ impl EngineCore {
         let sheet = self.own_sheet(account, &url, &code)?;
         let check_group = pick_check_group(&mut *self.ports.entropy)?;
         let groups = group(&code.reveal(), 4);
+        // A recovery that joined but stopped before its new code ends here: this code replaces
+        // it (security review "recovery" L1).
+        self.recovering = None;
         self.renewal = Some(Renewal {
             code,
             check_group,
@@ -1591,9 +1838,16 @@ impl EngineCore {
 
     /// Account recovery with the recovery sheet (`recoverAccount`, open point A): `sheet` is
     /// the sheet's link `hangar-drive://recover#...` (the app builds it from the printed fields
-    /// or a scan), `code` the typed code. The new installation is added by the recovery
-    /// device (`crate::recovery`) and joins the account; `recovery_devices` and
-    /// `finish_recovery_cleanup` follow.
+    /// or a scan), `code` the typed code. The recovery session reads and checks the account's
+    /// log (`crate::recovery::prepare`) and nothing is written yet; `recovery_devices` lists the
+    /// devices, and `finish_recovery_cleanup` adds this installation, removes the chosen
+    /// devices and the used recovery device and rotates in one append, then joins.
+    ///
+    /// With an earlier attempt of this account pending ([`PendingRecovery`]), its new device
+    /// tries to join first; when that works the recovery goes on at `finish_recovery_cleanup`
+    /// without a second append. Otherwise the recovery device's verified log tells: while it
+    /// still lists the recovery device, the earlier append did not go through, the earlier
+    /// attempt is dropped and this one starts afresh with the same code.
     pub fn recover_account(
         &mut self,
         sheet: &str,
@@ -1631,13 +1885,32 @@ impl EngineCore {
         if !sheet.is_for(&code) {
             return Ok(ApiResult::Err(RecoverError::WrongSheet));
         }
+        let url = sheet.server_url.to_string();
+        let pending = self.load_pending()?.map(|(marker, _)| marker);
+        let mut resume_error = None;
+        if let Some(marker) = &pending {
+            if marker.account != sheet.account {
+                return Err(SyncError::Invalid(
+                    "a recovery of another account is not finished",
+                ));
+            }
+            match self.resume_recovery() {
+                Ok(_) => {
+                    self.recovering = Some(Recovering {
+                        url,
+                        before_join: None,
+                    });
+                    return Ok(ApiResult::Ok(()));
+                }
+                Err(e) => resume_error = Some(e),
+            }
+        }
         let recovery_identity = code
             .identity()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
         let recovery_id = code
             .device_id()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
-        let url = sheet.server_url.to_string();
         let mut config = ServerConfig::new(&url, sheet.pin)?;
         config.server = Some(sheet.server);
         let net = |e: &NetError| match e {
@@ -1655,20 +1928,16 @@ impl EngineCore {
             Ok(s) => s,
             Err(e) => return Ok(ApiResult::Err(net(&e))),
         };
-        let identity = DeviceIdentity::generate(&mut DynEntropy(&mut *self.ports.entropy))
-            .map_err(|_| SyncError::Invalid("identity"))?;
-        let device = DeviceId::from_bytes(random_id(&mut *self.ports.entropy)?);
-        let entry = LogDevice::of(&identity, &sheet.account, device, false);
-        let now = u64::try_from(self.now()).unwrap_or(0);
-        let anchor = match crate::recovery::add_device_with_code(
-            recovery_server.as_mut(),
-            &sheet,
-            &code,
-            entry,
-            now,
-            &mut *self.ports.entropy,
-        ) {
-            Ok(head) => head,
+        // Steps 0 to 3: the log is read and checked, nothing is written. The new device joins
+        // with the one append of `finish_recovery_cleanup`, once the person chose the devices
+        // to remove.
+        let prepared = match crate::recovery::prepare(recovery_server.as_mut(), &sheet, &code) {
+            Ok(prepared) => prepared,
+            // The earlier append went through (it removed the recovery device), and its device
+            // cannot join yet: the account waits for it, never for a second append.
+            Err(_) if pending.is_some() => {
+                return Err(resume_error.unwrap_or(SyncError::Invalid("recovery pending")));
+            }
             Err(crate::recovery::RecoveryError::Unknown) => {
                 return Ok(ApiResult::Err(RecoverError::Unknown))
             }
@@ -1681,67 +1950,337 @@ impl EngineCore {
             Err(crate::recovery::RecoveryError::Sync(SyncError::Net(e))) => {
                 return Ok(ApiResult::Err(net(&e)))
             }
-            Err(crate::recovery::RecoveryError::Sync(e)) => return Err(e),
+            Err(e) => return Err(recovery_error(e)),
         };
-        drop(recovery_server);
-        let session = SessionIdentity {
-            account: sheet.account,
-            device,
-            prover: prover(
-                DeviceIdentity::import(&identity.export())
-                    .map_err(|_| SyncError::Invalid("identity"))?,
-            ),
-        };
-        let mut server = (self.ports.server)(&config, Some(session))?;
-        let mut account = Account::join(
-            server.as_mut(),
-            &mut *self.ports.keychain,
-            &mut *self.ports.store,
-            identity,
-            sheet.account,
-            device,
-            device_name,
-            // The new device's own view of the log must start with the sheet's entry 1 too, and
-            // contain the head its add device entry made (N1, N6).
-            &[
-                LogHead {
-                    index: 1,
-                    hash: sheet.genesis,
-                },
-                anchor,
-            ],
-        )?;
-        account.set_server_id(sheet.server);
-        account.save(&mut *self.ports.store)?;
-        // Its own name in the sealed device names, as a paired device's (finding E2E-4), so
-        // this device and the account's others show it. Should this fail (offline, or a
-        // rotation still due), `finish_recovery_cleanup` writes it after its re-seal.
-        let _ = account.set_device_name(
-            server.as_mut(),
-            &mut *self.ports.store,
-            &device,
-            device_name,
-            &mut *self.ports.entropy,
-        );
-        self.account = Some(account);
-        self.server = Some(server);
-        self.persisted.server_url = Some(url.clone());
-        self.persisted.pin = sheet.pin;
-        self.recovering = Some(Recovering { url });
-        self.save()?;
+        if let Some(marker) = &pending {
+            // The log still lists the recovery device, so the batch that removes it is not in;
+            // the earlier attempt's device must not be in it either.
+            if prepared.state.device(&marker.device).is_some() {
+                return Err(resume_error.unwrap_or(SyncError::Invalid("recovery pending")));
+            }
+            self.clear_pending_recovery()?;
+        }
+        let shown = prepared
+            .state
+            .head()
+            .ok_or(SyncError::Invalid("the account log is empty"))?;
+        let identity = DeviceIdentity::generate(&mut DynEntropy(&mut *self.ports.entropy))
+            .map_err(|_| SyncError::Invalid("identity"))?;
+        let device = DeviceId::from_bytes(random_id(&mut *self.ports.entropy)?);
+        self.recovering = Some(Recovering {
+            url,
+            before_join: Some(RecoveryChoice {
+                sheet,
+                code,
+                server: recovery_server,
+                identity_export: identity.export(),
+                device,
+                name: device_name.to_owned(),
+                devices: prepared.devices,
+                shown,
+            }),
+        });
         Ok(ApiResult::Ok(()))
     }
 
-    /// The devices of the account besides this one after a recovery (`recoveryDevices`): every
-    /// one is offered for removal.
+    /// Whether a [`PendingRecovery`] is stored.
+    fn pending_recovery(&self) -> Result<Option<()>, SyncError> {
+        Ok(self
+            .ports
+            .store
+            .account_value(RECOVERY_PENDING_KEY)?
+            .map(|_| ()))
+    }
+
+    /// The stored [`PendingRecovery`] with the new device's identity. The marker must be the
+    /// one whose digest the keychain entry holds (follow-up review LOW 3): a changed marker, or
+    /// one without its key, is refused, and nothing is acted on.
+    fn load_pending(&self) -> Result<Option<(PendingRecovery, PendingKey)>, SyncError> {
+        let Some(bytes) = self.ports.store.account_value(RECOVERY_PENDING_KEY)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.ports.keychain.load(RECOVERY_IDENTITY_KEY)? else {
+            return Err(SyncError::Corrupt(
+                "the pending recovery's device key is missing".into(),
+            ));
+        };
+        let (format, rest) = entry.split_first().unwrap_or((&0, &[]));
+        if *format != RECOVERY_KEY_FORMAT || rest.len() <= 32 {
+            return Err(SyncError::Corrupt(
+                "the pending recovery's device key is malformed".into(),
+            ));
+        }
+        let (digest, identity) = rest.split_at(32);
+        if digest != marker_digest(&bytes).as_slice() {
+            return Err(SyncError::Corrupt(
+                "the pending recovery's marker was changed".into(),
+            ));
+        }
+        let marker =
+            serde_json::from_slice(&bytes).map_err(|e| SyncError::Corrupt(e.to_string()))?;
+        Ok(Some((marker, zeroize::Zeroizing::new(identity.to_vec()))))
+    }
+
+    /// Records a recovery before its append goes out: the identity with the marker's digest
+    /// into the keychain first, so a marker never points to a key that is not there.
+    fn mark_recovery(
+        &mut self,
+        marker: &PendingRecovery,
+        identity: &[u8],
+    ) -> Result<(), SyncError> {
+        let bytes = serde_json::to_vec(marker).map_err(|e| SyncError::Corrupt(e.to_string()))?;
+        let mut entry = zeroize::Zeroizing::new(Vec::with_capacity(33 + identity.len()));
+        entry.push(RECOVERY_KEY_FORMAT);
+        entry.extend_from_slice(&marker_digest(&bytes));
+        entry.extend_from_slice(identity);
+        self.ports.keychain.store(RECOVERY_IDENTITY_KEY, &entry)?;
+        if let Err(e) = self
+            .ports
+            .store
+            .put_account_value(RECOVERY_PENDING_KEY, &bytes)
+        {
+            let _ = self.ports.keychain.delete(RECOVERY_IDENTITY_KEY);
+            return Err(e.into());
+        }
+        self.recovery_pending = true;
+        Ok(())
+    }
+
+    /// Drops the pending recovery: the marker first, then the key it points to. The recovery
+    /// counts as pending until the marker is gone (follow-up review LOW 4); a key left behind
+    /// without its marker is removed at the next start (`EngineCore::open`). The first failure
+    /// is returned.
+    fn clear_pending_recovery(&mut self) -> Result<(), SyncError> {
+        self.ports
+            .store
+            .delete_account_value(RECOVERY_PENDING_KEY)?;
+        self.recovery_pending = false;
+        self.ports.keychain.delete(RECOVERY_IDENTITY_KEY)?;
+        Ok(())
+    }
+
+    /// Finishes a recovery whose one append was sent ([`PendingRecovery`]): the new device signs
+    /// in and joins at the head this device computed for the batch, so its own verified log,
+    /// not the server's answer, tells whether the batch is in (security review "recovery" H1);
+    /// a join that the app's end cut short is completed. Then the barriers with the batch's
+    /// removals and this device's name. Returns whether a pending recovery was finished.
+    /// Nothing is deleted on a failure: the marker stays for the next try.
+    fn resume_recovery(&mut self) -> Result<bool, SyncError> {
+        let Some((marker, bytes)) = self.load_pending()? else {
+            self.recovery_pending = false;
+            return Ok(false);
+        };
+        match &self.account {
+            // Another account was set up since; its marker is not this device's business.
+            Some(account) if *account.device() != marker.device => return Ok(false),
+            Some(_) => {
+                let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut())
+                else {
+                    return Err(SyncError::NotSetUp("no connection"));
+                };
+                account.complete_recovery_join(
+                    server.as_mut(),
+                    &mut *self.ports.keychain,
+                    &mut *self.ports.store,
+                    &mut *self.ports.entropy,
+                )?;
+            }
+            None => {
+                let import = || {
+                    DeviceIdentity::import(&bytes)
+                        .map_err(|_| SyncError::Corrupt("device identity".into()))
+                };
+                let mut config = ServerConfig::new(&marker.server_url, marker.pin)?;
+                config.server = Some(marker.server);
+                let session = SessionIdentity {
+                    account: marker.account,
+                    device: marker.device,
+                    prover: prover(import()?),
+                };
+                Account::drop_unfinished_join(
+                    &mut *self.ports.keychain,
+                    &*self.ports.store,
+                    &import()?,
+                )?;
+                let mut server = (self.ports.server)(&config, Some(session))?;
+                let mut account = Account::join_recovered(
+                    server.as_mut(),
+                    &mut *self.ports.keychain,
+                    &mut *self.ports.store,
+                    &mut *self.ports.entropy,
+                    import()?,
+                    marker.account,
+                    marker.device,
+                    &marker.name,
+                    // The new device's own view of the log must start with the sheet's entry 1
+                    // too, and contain the head the recovery batch made (N1, N6, I1).
+                    &[
+                        LogHead {
+                            index: 1,
+                            hash: marker.genesis,
+                        },
+                        marker.head,
+                    ],
+                )?;
+                account.set_server_id(marker.server);
+                account.save(&mut *self.ports.store)?;
+                self.account = Some(account);
+                self.server = Some(server);
+                self.persisted.server_url = Some(marker.server_url.clone());
+                self.persisted.pin = marker.pin;
+                self.save()?;
+            }
+        }
+        // The batch made the removals; the job finds them in the log and re-seals and writes
+        // the barriers with this device's own removal.
+        self.remove_with_barriers(&marker.removed)?;
+        self.write_own_name_if_missing()?;
+        self.clear_pending_recovery()?;
+        Ok(true)
+    }
+
+    /// This device's name into the sealed device names, if it is not there yet (finding
+    /// E2E-4: the recovery device cannot write it). Not while this device could not read the
+    /// names and another regular device is left (follow-up review LOW 5): a list of this device
+    /// alone would drop every other name; that device re-seals the names under the new epoch,
+    /// and the name follows at a later call.
+    fn write_own_name_if_missing(&mut self) -> Result<(), SyncError> {
+        let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
+            return Err(SyncError::NotSetUp("no account"));
+        };
+        let me = *account.device();
+        let others = account
+            .state()
+            .current_devices()
+            .any(|d| !d.recovery && d.id != me);
+        if account.device_names().is_none() && others {
+            return Ok(());
+        }
+        if account.device_display_name(&me).is_none() {
+            let name = account.device_name().to_owned();
+            account.set_device_name(
+                server.as_mut(),
+                &mut *self.ports.store,
+                &me,
+                &name,
+                &mut *self.ports.entropy,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The one append of a recovery and the join of the new device (steps 4 and 5 of
+    /// `crate::recovery`): removes `remove` and every recovery device. The batch is built, the
+    /// recovery is marked as pending, the batch goes out, and whatever the server answers, the
+    /// new device tries to join at the head this device computed (security review "recovery"
+    /// H1).
+    fn append_recovery(
+        &mut self,
+        choice: &mut RecoveryChoice,
+        url: &str,
+        remove: &[DeviceId],
+    ) -> Result<(), RecoveryAttempt> {
+        let identity = DeviceIdentity::import(&choice.identity_export)
+            .map_err(|_| RecoveryAttempt::NotSent(SyncError::Invalid("identity")))?;
+        let entry = LogDevice::of(&identity, &choice.sheet.account, choice.device, false);
+        let now = u64::try_from(self.now()).unwrap_or(0);
+        let batch = crate::recovery::build_recovery(
+            choice.server.as_mut(),
+            &choice.sheet,
+            &choice.code,
+            &identity,
+            entry,
+            remove,
+            &choice.shown,
+            now,
+            &mut *self.ports.entropy,
+        )
+        .map_err(|e| RecoveryAttempt::NotSent(recovery_error(e)))?;
+        let marker = PendingRecovery {
+            account: choice.sheet.account,
+            device: choice.device,
+            name: choice.name.clone(),
+            server_url: url.to_owned(),
+            pin: choice.sheet.pin,
+            server: choice.sheet.server,
+            genesis: choice.sheet.genesis,
+            head: batch.head,
+            removed: batch.removed.clone(),
+        };
+        self.mark_recovery(&marker, &choice.identity_export)
+            .map_err(RecoveryAttempt::NotSent)?;
+        let sent = crate::recovery::send_recovery(choice.server.as_mut(), &batch);
+        match self.resume_recovery() {
+            Ok(_) => Ok(()),
+            Err(join_error) => Err(RecoveryAttempt::Sent(sent.err().unwrap_or(join_error))),
+        }
+    }
+
+    /// After an append whose device could not join: whether the recovery device's verified log
+    /// shows that the batch is not in (it still lists the recovery device, which the batch
+    /// removes, and not the new device). Then the pending recovery is dropped, so the person
+    /// can try again with the same code. When that log ends elsewhere than the one the person
+    /// chose from (follow-up review M1: a device was added in between, and the batch built on
+    /// the shorter log was refused), `choice` takes the new list and `Some(true)` asks the
+    /// caller to answer [`SyncError::RecoveryListChanged`]; a retry with the old choice would
+    /// leave the new device in the account unseen. `Some(false)`: not in, same log. `None`: in,
+    /// or not known (a failure to read counts as "maybe in"), and the marker stays.
+    fn settle_unsent(&mut self, choice: &mut RecoveryChoice) -> Option<bool> {
+        if self.account.is_some() {
+            return None;
+        }
+        let prepared =
+            crate::recovery::prepare(choice.server.as_mut(), &choice.sheet, &choice.code).ok()?;
+        let shown = prepared.state.head()?;
+        if prepared.state.device(&choice.device).is_some() || self.clear_pending_recovery().is_err()
+        {
+            return None;
+        }
+        let changed = shown != choice.shown;
+        if changed {
+            choice.devices = prepared.devices;
+            choice.shown = shown;
+        }
+        Some(changed)
+    }
+
+    /// The devices of the account besides this one during a recovery (`recoveryDevices`): every
+    /// one is offered for removal. Before the join they come from the verified log, without
+    /// names (the recovery session cannot open the sealed device names), with the time each was
+    /// added. After [`SyncError::RecoveryListChanged`] the list is the new one.
     pub fn recovery_devices(&self) -> Result<Vec<Device>, SyncError> {
+        if let Some(choice) = self
+            .recovering
+            .as_ref()
+            .and_then(|r| r.before_join.as_ref())
+        {
+            return Ok(choice
+                .devices
+                .iter()
+                .map(|d| Device {
+                    id: hex_id(&d.id),
+                    name: String::new(),
+                    kind: DeviceKind::Laptop,
+                    is_this: false,
+                    last_seen: None,
+                    added: i64::try_from(d.added_ms).unwrap_or(0),
+                })
+                .collect());
+        }
         let list = self.list_devices()?;
         Ok(list.devices.into_iter().filter(|d| !d.is_this).collect())
     }
 
     /// Ends a recovery (`finishRecoveryCleanup`): removes the chosen old devices and every
     /// recovery device, so the used code stops working, rotates and writes the barriers, and
-    /// adds the recovery device of a new code, which it returns with its sheet.
+    /// adds the recovery device of a new code, which it returns with its sheet. A recovery
+    /// before its join appends here, in one batch with the add of this device.
+    ///
+    /// Errors: [`SyncError::RecoveryListChanged`] when the account's devices changed since
+    /// `recovery_devices` listed them (nothing written; the list is the new one). Any other
+    /// error before the append leaves the choice, so the call can be repeated. After the append
+    /// the recovery is pending until this device joined: repeating the call, typing the code
+    /// again or the loop finishes it, and the device's key is kept until then.
     pub fn finish_recovery_cleanup(
         &mut self,
         remove: &[String],
@@ -1751,18 +2290,53 @@ impl EngineCore {
             .as_ref()
             .map(|r| r.url.clone())
             .ok_or(SyncError::Invalid("no recovery in progress"))?;
+        let mut chosen = Vec::new();
+        for text in remove {
+            chosen.push(DeviceId::from_hex(text).map_err(|_| SyncError::Invalid("device"))?);
+        }
+        if let Some(mut choice) = self.recovering.as_mut().and_then(|r| r.before_join.take()) {
+            let failed = match self.append_recovery(&mut choice, &url, &chosen) {
+                Ok(()) => None,
+                Err(RecoveryAttempt::NotSent(SyncError::RecoveryListChanged)) => {
+                    // The person chooses again from the log as it is now.
+                    if let Ok(prepared) = crate::recovery::prepare(
+                        choice.server.as_mut(),
+                        &choice.sheet,
+                        &choice.code,
+                    ) {
+                        if let Some(shown) = prepared.state.head() {
+                            choice.devices = prepared.devices;
+                            choice.shown = shown;
+                        }
+                    }
+                    Some((SyncError::RecoveryListChanged, true))
+                }
+                Err(RecoveryAttempt::NotSent(e)) => Some((e, true)),
+                Err(RecoveryAttempt::Sent(e)) => match self.settle_unsent(&mut choice) {
+                    Some(true) => Some((SyncError::RecoveryListChanged, true)),
+                    Some(false) => Some((e, true)),
+                    None => Some((e, false)),
+                },
+            };
+            if let Some((error, keep)) = failed {
+                if let (true, Some(recovering)) = (keep, self.recovering.as_mut()) {
+                    recovering.before_join = Some(choice);
+                }
+                return Err(error);
+            }
+        } else if self.recovery_pending {
+            self.resume_recovery()?;
+        }
         let account = self
             .account
             .as_ref()
             .ok_or(SyncError::NotSetUp("no account"))?;
         let me = *account.device();
-        let mut targets: Vec<DeviceId> = Vec::new();
-        for text in remove {
-            let id = DeviceId::from_hex(text).map_err(|_| SyncError::Invalid("device"))?;
-            if id != me && account.state().device(&id).is_some_and(|d| d.is_current()) {
-                targets.push(id);
-            }
-        }
+        let mut targets: Vec<DeviceId> = chosen
+            .iter()
+            .copied()
+            .filter(|id| *id != me && account.state().device(id).is_some_and(|d| d.is_current()))
+            .collect();
         targets.extend(
             account
                 .state()
@@ -1775,21 +2349,11 @@ impl EngineCore {
         if !targets.is_empty() {
             self.remove_with_barriers(&targets)?;
         }
+        self.write_own_name_if_missing()?;
         let code = RecoveryCode::generate(&mut DynEntropy(&mut *self.ports.entropy))?;
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Err(SyncError::NotSetUp("no account"));
         };
-        // This device's name, if `recover_account` could not write it (finding E2E-4).
-        if account.device_display_name(&me).is_none() {
-            let name = account.device_name().to_owned();
-            account.set_device_name(
-                server.as_mut(),
-                &mut *self.ports.store,
-                &me,
-                &name,
-                &mut *self.ports.entropy,
-            )?;
-        }
         let recovery_identity = code
             .identity()
             .map_err(|_| SyncError::Invalid("recovery identity"))?;
@@ -2151,6 +2715,13 @@ impl EngineCore {
     fn forget_device(&mut self, removed_by: Option<String>) -> Result<(), SyncError> {
         let mut first =
             crate::account::forget(&mut *self.ports.store, &mut *self.ports.keychain).err();
+        // A pending recovery's key goes too: forgetting is the person's choice, or the device
+        // was removed.
+        if self.recovery_pending {
+            if let Err(e) = self.clear_pending_recovery() {
+                first.get_or_insert(e);
+            }
+        }
         for (id, _) in &self.persisted.folders {
             if let Err(e) = self.ports.store.delete_folder(id) {
                 first.get_or_insert(e.into());
@@ -2186,7 +2757,21 @@ impl EngineCore {
     /// Resets this device (`resetDevice`): the account is forgotten as when the device is
     /// removed ([`Self::forget_device`]), without the warning. For "pair again" after a removal
     /// and for starting over.
+    ///
+    /// Refused with [`SyncError::RecoveryPending`] while a recovery sent its append and this
+    /// device has not joined yet (follow-up review LOW 7): its key may be the account's only
+    /// one. [`Self::reset_device_discarding_recovery`] resets anyway.
     pub fn reset_device(&mut self) -> Result<(), SyncError> {
+        if self.recovery_pending && self.account.is_none() {
+            return Err(SyncError::RecoveryPending);
+        }
+        self.forget_device(None)
+    }
+
+    /// Resets this device also while a recovery is pending (`resetDeviceDiscardingRecovery`):
+    /// the pending recovery's key leaves the keychain with every other secret. Only after the
+    /// person confirmed that the account may then be lost for good.
+    pub fn reset_device_discarding_recovery(&mut self) -> Result<(), SyncError> {
         self.forget_device(None)
     }
 
@@ -2597,9 +3182,12 @@ impl EngineCore {
             RootError::Unresolved(_) => FolderRefusal::NoAccess,
             RootError::Overlaps => FolderRefusal::Nested,
             RootError::DriveRoot => FolderRefusal::Root,
-            RootError::HoldsIndex | RootError::System | RootError::OtherCloud(_) => {
-                FolderRefusal::System
-            }
+            // A shell junction is a system object to Windows Explorer, so the window says the
+            // folder belongs to the system.
+            RootError::HoldsIndex
+            | RootError::System
+            | RootError::OtherCloud(_)
+            | RootError::ShellJunction => FolderRefusal::System,
         };
         let folder = if reason == FolderRefusal::Nested {
             self.overlapping_folder(path, except)
@@ -2652,6 +3240,45 @@ impl EngineCore {
             .get_mut(&id)
             .ok_or(SyncError::Invalid("unknown folder"))?;
         Ok(f.sync.resolve_held(restore, &mut *self.ports.store)? as u64)
+    }
+
+    /// The paths of the held incoming file deletes (`listIncomingDelete`).
+    pub fn list_incoming_delete(&self, folder: &str) -> Result<Vec<String>, SyncError> {
+        let f = self.folder(folder)?;
+        let synced = f.sync.synced();
+        Ok(f.sync
+            .meta()
+            .incoming_held
+            .iter()
+            .filter(|i| synced.get(i).is_some_and(|n| !n.is_dir()))
+            .filter_map(|i| synced.path_string(i))
+            .collect())
+    }
+
+    /// The state of the held incoming deletes, for binding an approval to what the person saw
+    /// ([`FolderSync::approve_incoming`]).
+    pub fn incoming_delete_revision(&self, folder: &str) -> Result<u64, SyncError> {
+        Ok(self.folder(folder)?.sync.meta().incoming_revision)
+    }
+
+    /// The person's decision on held incoming deletes (`resolveIncomingDelete`): `restore`
+    /// brings the files back on every device with a new commit; otherwise exactly the deletes
+    /// of `revision` are carried out here. Returns the files.
+    pub fn resolve_incoming_delete(
+        &mut self,
+        folder: &str,
+        restore: bool,
+        revision: u64,
+    ) -> Result<u64, SyncError> {
+        if restore {
+            return self.with_ctx(folder, |sync, cx| sync.restore_incoming(cx));
+        }
+        let id = parse_folder(folder)?;
+        let f = self
+            .folders
+            .get_mut(&id)
+            .ok_or(SyncError::Invalid("unknown folder"))?;
+        Ok(f.sync.approve_incoming(revision, &mut *self.ports.store)? as u64)
     }
 
     /// Whether the server still shows an older state (`checkOlderState`).
@@ -3938,7 +4565,13 @@ fn remember_dismissed(dismissed: &mut Vec<String>, id: &str) {
 /// only confirmed (`confirmDeviceRemoved`): hidden, the device would stay stopped without a
 /// word (follow-up check N-3). A new kind is not hideable until it is added here.
 fn dismissible(w: &Warning) -> bool {
-    matches!(w, Warning::Suspect { .. })
+    match w {
+        Warning::Suspect { .. } => true,
+        // Only the empty folder list can be acknowledged; a folder that cannot be opened yet
+        // stays named until it opens or leaves the list.
+        Warning::FoldersUnreadable { folders, .. } => folders.is_empty(),
+        _ => false,
+    }
 }
 
 fn warning_id(w: &Warning) -> String {

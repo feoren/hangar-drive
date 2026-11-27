@@ -136,6 +136,22 @@ pub fn net_key(ip: Option<IpAddr>) -> Vec<u8> {
     key
 }
 
+/// The network key of the connection limit (follow-up review L4): IPv4 per /24, IPv6 per /48.
+/// Narrower than [`net_key`] for IPv4: a /16 is often one provider or carrier NAT with many
+/// customers, a /24 is about one site. Never equal to an address key or a [`net_key`].
+pub fn connection_net_key(ip: Option<IpAddr>) -> Vec<u8> {
+    let mut key = match ip {
+        Some(IpAddr::V4(v4)) => v4.octets()[..3].to_vec(),
+        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.octets()[..3].to_vec(),
+            None => v6.octets()[..6].to_vec(),
+        },
+        None => b"unknown".to_vec(),
+    };
+    key.insert(0, b'c');
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

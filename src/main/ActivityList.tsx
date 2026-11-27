@@ -5,7 +5,7 @@ import { useId, useRef, useState } from "react";
 
 import type { ActivityEntry } from "../backend/types";
 import { formatRelative } from "../format";
-import { useLanguage, useT, type Translate } from "../i18n";
+import { displayName, useLanguage, useT, type Translate } from "../i18n";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { FileIcon, FolderIcon } from "../ui/icons";
@@ -22,7 +22,7 @@ function describe(entry: ActivityEntry, t: Translate): { title: string; what: st
         entry.action === "fromDevice"
           ? t("activity.fromDevice", { device: entry.device ?? "" })
           : t(`activity.${entry.action}`);
-      return { title: entry.name, what };
+      return { title: displayName(entry.name), what };
     }
     case "group":
       return {
@@ -99,7 +99,8 @@ function ActivityRow({
     void action.run(() => backend.openFolder(entry.folderId, path));
   };
   const hasFile = entry.kind === "file" || entry.kind === "cameBack";
-  const label = [title, hasFile ? entry.folderName : null, what, when].filter(Boolean).join(", ");
+  const folderName = hasFile ? displayName(entry.folderName) : null;
+  const label = [title, folderName, what, when].filter(Boolean).join(", ");
 
   return (
     <div role="listitem" className="row activity-row">
@@ -129,7 +130,7 @@ function ActivityRow({
           <span className={hasFile ? "activity-name" : "activity-name wide"} title={title}>
             {title}
           </span>
-          {hasFile && <span className="activity-folder">{entry.folderName}</span>}
+          {hasFile && <span className="activity-folder">{folderName}</span>}
           {what && <span className="activity-what">{what}</span>}
           <span className="activity-when">{when}</span>
         </button>

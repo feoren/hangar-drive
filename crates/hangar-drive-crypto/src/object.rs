@@ -45,21 +45,22 @@ const TAG_LEN: usize = 16;
 pub const OBJECT_HEADER_LEN: usize = 1 + 4 + 1 + NONCE_LEN;
 
 /// The Padmé length of `len` bytes: `len` rounded up so that only the top
-/// `floor(log2(floor(log2 len))) + 1` bits of the length can be non-zero.
-pub fn padme(len: u64) -> u64 {
+/// `floor(log2(floor(log2 len))) + 1` bits of the length can be non-zero. `None` when the
+/// rounded length does not fit in a `u64` (lengths close to `u64::MAX`, security review info).
+pub fn padme(len: u64) -> Option<u64> {
     if len < 2 {
-        return len;
+        return Some(len);
     }
     let e = 63 - u64::from(len.leading_zeros());
     let s = 64 - u64::from(e.leading_zeros());
     let last_bits = e - s;
     let mask = (1u64 << last_bits) - 1;
-    (len + mask) & !mask
+    Some(len.checked_add(mask)? & !mask)
 }
 
 /// The blob length of an object with a plaintext of `len` bytes.
 pub fn blob_len(len: usize) -> Option<usize> {
-    let padded = usize::try_from(padme(u64::try_from(len).ok()?.checked_add(8)?)).ok()?;
+    let padded = usize::try_from(padme(u64::try_from(len).ok()?.checked_add(8)?)?).ok()?;
     OBJECT_HEADER_LEN.checked_add(padded)?.checked_add(TAG_LEN)
 }
 
@@ -75,7 +76,7 @@ pub fn blob_len_fits(kind: ObjectType, len: usize) -> bool {
         return false;
     };
     padded >= 8
-        && padme(padded) == padded
+        && padme(padded) == Some(padded)
         && blob_len(kind.max_plaintext_len()).is_some_and(|max| len <= max)
 }
 
@@ -233,7 +234,11 @@ impl ObjectKeys {
         }
         let id = self.object_id(kind, plaintext)?;
         let len = u64::try_from(plaintext.len()).map_err(|_| ObjectError::TooLarge)?;
-        let padded_len = usize::try_from(padme(len + 8)).map_err(|_| ObjectError::TooLarge)?;
+        let padded_len = len
+            .checked_add(8)
+            .and_then(padme)
+            .and_then(|padded| usize::try_from(padded).ok())
+            .ok_or(ObjectError::TooLarge)?;
         let mut padded = Zeroizing::new(Vec::with_capacity(padded_len));
         padded.extend_from_slice(&len.to_be_bytes());
         padded.extend_from_slice(plaintext);
@@ -313,7 +318,7 @@ impl ObjectKeys {
         let len_usize = usize::try_from(len).map_err(|_| ObjectError::Padding)?;
         if len_usize > rest.len()
             || len_usize > kind.max_plaintext_len()
-            || u64::try_from(padded_len).ok() != Some(padme(len + 8))
+            || u64::try_from(padded_len).ok() != len.checked_add(8).and_then(padme)
         {
             return Err(ObjectError::Padding);
         }
@@ -390,14 +395,33 @@ mod tests {
             (1025, 1088),
             (4_194_312, 4_325_376),
         ] {
-            assert_eq!(padme(len), padded, "padme({len})");
+            assert_eq!(padme(len), Some(padded), "padme({len})");
         }
         // Never shorter, at most 12% longer.
         for len in (8..100_000u64).step_by(97) {
-            let p = padme(len);
+            let p = padme(len).unwrap();
             assert!(p >= len && p * 100 <= len * 112 + 100, "{len} -> {p}");
         }
         assert_eq!(blob_len(0), Some(30 + 8 + 16));
+    }
+
+    // Security review, info: lengths close to `u64::MAX` round up past it. They give `None`
+    // instead of a wrapped length or an overflow panic.
+    #[test]
+    fn padme_does_not_overflow_near_the_top() {
+        assert_eq!(padme(u64::MAX), None);
+        assert_eq!(padme(u64::MAX - 1), None);
+        // Above 2^63 a length rounds up to a multiple of 2^57: the highest one fits, a length
+        // above it would round past the top.
+        assert_eq!(padme(1 << 63), Some(1 << 63));
+        assert_eq!(padme((1 << 63) + 1), Some((1 << 63) + (1 << 57)));
+        let highest = u64::MAX - ((1 << 57) - 1);
+        assert_eq!(padme(highest), Some(highest));
+        assert_eq!(padme(highest + 1), None);
+        // The top bits only: 2^63 + 2^62 is a Padmé length.
+        assert_eq!(padme((1 << 63) | (1 << 62)), Some((1 << 63) | (1 << 62)));
+        assert_eq!(blob_len(usize::MAX), None);
+        assert!(!blob_len_fits(ObjectType::Chunk, usize::MAX));
     }
 
     #[test]
@@ -543,7 +567,7 @@ mod tests {
         let id = keys.object_id(ObjectType::Chunk, b"abc").unwrap();
         let mut good = 3u64.to_be_bytes().to_vec();
         good.extend_from_slice(b"abc");
-        good.resize(usize::try_from(padme(11)).unwrap(), 0);
+        good.resize(usize::try_from(padme(11).unwrap()).unwrap(), 0);
         let blob = seal_padded(&keys, ObjectType::Chunk, &id, &good);
         assert_eq!(
             keys.open(&id, ObjectType::Chunk, &blob).unwrap().as_slice(),

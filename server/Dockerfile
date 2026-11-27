@@ -40,8 +40,14 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 COPY --from=build /hangar-drive-server /usr/local/bin/hangar-drive-server
 # The data volume belongs to the user nonroot (65532), so the server can write to it.
 COPY --from=build --chown=65532:65532 /data-empty /data
+# Every interface of the container: the port mapping decides who reaches it (outside the image
+# the server listens on loopback by default). SQLite writes large temporary tables and sorts to
+# files, and the read-only root file system has no writable temporary folder, so they go to the
+# data volume, into the folder the server creates and empties at every start (`tmp`, mode 0700).
 ENV HANGAR_DRIVE_DATA_DIR=/data \
-    HANGAR_DRIVE_PORT=8080
+    HANGAR_DRIVE_PORT=8080 \
+    HANGAR_DRIVE_BIND=0.0.0.0 \
+    SQLITE_TMPDIR=/data/tmp
 VOLUME ["/data"]
 EXPOSE 8080
 USER nonroot:nonroot

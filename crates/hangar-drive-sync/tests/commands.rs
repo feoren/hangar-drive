@@ -798,3 +798,104 @@ fn a_reset_preview_counts_the_files_that_disappear() {
         b"n"
     );
 }
+
+/// A and B with 150 files in "Docs"; A deletes 120 of them (approving its own question), and
+/// B holds the deletes (ADR 0001, amendment "incoming mass deletes").
+fn incoming_held(world: &World) -> (EngineCore, EngineCore, String) {
+    let (mut a, mut b, folder) = two_devices(world);
+    let disk_a = world.disk("mem:/a/Docs");
+    for i in 0..150 {
+        assert!(disk_a.user_write(&p(&[&format!("f{i:03}.txt")]), b"x"));
+    }
+    world.settle(&mut [&mut a, &mut b]);
+    // A day later the files are no longer new on B: deleting them is no ordinary cleanup of
+    // what just arrived (security review M3).
+    world
+        .clock
+        .advance(hangar_drive_sync::folder::LONG_DELETE_WINDOW_MS);
+    world.settle(&mut [&mut a, &mut b]);
+    for i in 0..120 {
+        assert!(disk_a.user_delete(&p(&[&format!("f{i:03}.txt")])));
+    }
+    world.settle(&mut [&mut a, &mut b]);
+    a.resolve_mass_delete(&folder, false).unwrap();
+    world.settle(&mut [&mut a, &mut b]);
+    (a, b, folder)
+}
+
+type Incoming = (String, Option<String>, u64, Vec<String>, Option<i64>);
+
+fn incoming_warning(core: &EngineCore) -> Option<Incoming> {
+    core.snapshot().warnings.into_iter().find_map(|w| match w {
+        Warning::IncomingDelete {
+            id,
+            device,
+            count,
+            sample,
+            device_added,
+            ..
+        } => Some((id, device, count, sample, device_added)),
+        _ => None,
+    })
+}
+
+#[test]
+fn many_deletes_of_another_device_wait_for_the_person() {
+    let world = World::new();
+    let (mut a, mut b, folder) = incoming_held(&world);
+    let (id, device, count, sample, added) = incoming_warning(&b).expect("the question on B");
+    assert_eq!(id, format!("incomingDelete-{folder}"));
+    assert_eq!(device.as_deref(), Some("Laptop"));
+    // The day the verified log added the device, as the device list shows it (L5).
+    let listed = b
+        .list_devices()
+        .unwrap()
+        .devices
+        .into_iter()
+        .find(|d| d.name == "Laptop")
+        .map(|d| d.added);
+    assert!(added.is_some());
+    assert_eq!(added, listed);
+    assert_eq!(count, 120);
+    assert_eq!(sample.len(), 3);
+    assert!(incoming_warning(&a).is_none(), "A deleted, A is not asked");
+    let list = b.list_incoming_delete(&folder).unwrap();
+    assert_eq!(list.len(), 120);
+    assert!(list.contains(&"f000.txt".to_owned()));
+    let disk_b = world.disk("mem:/b/Docs");
+    assert!(disk_b.read_all(&p(&["f000.txt"])).is_some(), "still on B");
+    // An answer to an older state is refused; the current one lets them go.
+    let revision = b.incoming_delete_revision(&folder).unwrap();
+    assert!(b
+        .resolve_incoming_delete(&folder, false, revision + 1)
+        .is_err());
+    assert_eq!(
+        b.resolve_incoming_delete(&folder, false, revision).unwrap(),
+        120
+    );
+    world.settle(&mut [&mut a, &mut b]);
+    assert!(disk_b.read_all(&p(&["f000.txt"])).is_none());
+    assert!(disk_b.read_all(&p(&["f149.txt"])).is_some());
+    assert!(incoming_warning(&b).is_none());
+}
+
+#[test]
+fn held_deletes_of_another_device_come_back_on_every_device() {
+    let world = World::new();
+    let (mut a, mut b, folder) = incoming_held(&world);
+    assert!(incoming_warning(&b).is_some());
+    assert_eq!(b.resolve_incoming_delete(&folder, true, 0).unwrap(), 120);
+    world.settle(&mut [&mut a, &mut b]);
+    for disk in ["mem:/a/Docs", "mem:/b/Docs"] {
+        assert!(
+            world.disk(disk).read_all(&p(&["f000.txt"])).is_some(),
+            "{disk}"
+        );
+        assert!(
+            world.disk(disk).read_all(&p(&["f119.txt"])).is_some(),
+            "{disk}"
+        );
+    }
+    assert!(incoming_warning(&b).is_none());
+    assert!(incoming_warning(&a).is_none());
+}

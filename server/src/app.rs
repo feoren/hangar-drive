@@ -41,6 +41,9 @@ pub struct App {
     pub server_secret: ServerSecret,
     /// Commits and record writes in progress (finding M4).
     pub heavy: Arc<tokio::sync::Semaphore>,
+    /// Calls waiting for a slot of [`App::heavy`] now; while any waits, heavy bodies must keep
+    /// their least pace (`http::extract::HEAVY_PACE`, follow-up review L3).
+    pub heavy_waiting: std::sync::atomic::AtomicUsize,
     /// Slots of [`App::heavy`] each account holds: at most half of them, so one account that
     /// dribbles its bodies cannot stall the commits of every other account.
     pub heavy_accounts: UploadSlots,
@@ -51,6 +54,19 @@ pub struct App {
     pub concurrency: Concurrency,
     /// Becomes true when the server shuts down; long-lived streams end on it.
     pub shutdown: watch::Receiver<bool>,
+    /// Points where tests stop a call ([`Hooks`]); empty in a serving process.
+    pub hooks: Hooks,
+}
+
+/// A test hook: awaited at a fixed point of a call.
+pub type Hook = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Test hooks (`Deps::hooks`). Each is `None` in a serving process.
+#[derive(Clone, Default)]
+pub struct Hooks {
+    /// Awaited by a commit call after it loaded its IDs and checked that the objects exist,
+    /// right before it takes the write lock (server security review, MEDIUM 2).
+    pub commit_prepared: Option<Hook>,
 }
 
 pub type AppState = Arc<App>;

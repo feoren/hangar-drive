@@ -554,6 +554,67 @@ impl ServerApi for Recorded {
     }
 }
 
+/// A connection whose log ends one entry early while `hide` is set; the first append clears it.
+/// It stands for a device added right between a recovery's last read and its append.
+struct Hiding {
+    inner: Box<dyn ServerApi>,
+    hide: Rc<Cell<bool>>,
+}
+
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $out:ty;)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) -> Result<$out, NetError> {
+            self.inner.$name($($arg),*)
+        })*
+    };
+}
+
+impl ServerApi for Hiding {
+    fn log(&mut self, after: u64) -> Result<api::LogPage, NetError> {
+        let mut page = self.inner.log(after)?;
+        if self.hide.get() && page.length > 0 {
+            let shown = page.length - 1;
+            page.length = shown;
+            let keep = shown.saturating_sub(page.first_index.saturating_sub(1));
+            page.entries.truncate(usize::try_from(keep).unwrap_or(0));
+        }
+        Ok(page)
+    }
+    fn append_log(
+        &mut self,
+        request: &api::LogAppendRequest,
+    ) -> Result<api::LogAppendResponse, NetError> {
+        self.hide.set(false);
+        self.inner.append_log(request)
+    }
+    forward! {
+        create_account(r: &api::CreateAccountRequest) -> api::CreateAccountResponse;
+        challenge(a: &AccountId, d: &DeviceId) -> api::ChallengeResponse;
+        proof(a: &AccountId, d: &DeviceId, c: &Challenge, s: &Signature) -> api::SessionResponse;
+        epoch_key(e: Epoch) -> api::WrappedKeyResponse;
+        record(k: &api::RecordKey) -> Option<api::RecordResponse>;
+        put_record(k: &api::RecordKey, p: &api::RecordPut) -> ();
+        feed(a: u64) -> api::FeedPage;
+        reserve_pairing(i: &PairingId) -> api::PairingReservation;
+        post_pairing(i: &PairingId, r: &api::PairingRequest) -> ();
+        get_pairing(i: &PairingId) -> Option<api::PairingRequest>;
+        close_pairing(i: &PairingId) -> ();
+        missing_objects(f: &FolderId, i: &[ObjectId]) -> Vec<ObjectId>;
+        put_object(f: &FolderId, i: &ObjectId, b: &[u8]) -> api::UploadResponse;
+        get_object(f: &FolderId, i: &ObjectId) -> Vec<u8>;
+        commit(f: &FolderId, r: &api::CommitRequest) -> api::CommitResponse;
+        commits(f: &FolderId, a: u64) -> api::DeltaPage;
+        retire(f: &FolderId) -> ();
+        bring_back(f: &FolderId) -> ();
+    }
+    fn seen_pin(&self) -> Option<[u8; 32]> {
+        self.inner.seen_pin()
+    }
+    fn set_known_log_length(&mut self, length: u64) {
+        self.inner.set_known_log_length(length);
+    }
+}
+
 /// The real server factory (`engine::real_server_factory`) behind [`Recorded`].
 fn server_factory(errors: &CallLog) -> ServerFactory {
     let real = real_server_factory();
@@ -598,6 +659,17 @@ struct Peer {
 
 impl Peer {
     fn open(scratch: &Path, label: &'static str, clock: &TestClock) -> Self {
+        Self::open_with(scratch, label, clock, None)
+    }
+
+    /// [`Peer::open`] whose server connections end the log one entry early while `hide` is set
+    /// ([`Hiding`]).
+    fn open_with(
+        scratch: &Path,
+        label: &'static str,
+        clock: &TestClock,
+        hide: Option<Rc<Cell<bool>>>,
+    ) -> Self {
         let home = scratch.join(label);
         let root = home.join("Docs");
         std::fs::create_dir_all(&root).expect("sync folder");
@@ -612,7 +684,18 @@ impl Peer {
             clock: Box::new(clock.clone()),
             entropy: Box::new(hangar_drive_crypto::OsEntropy),
             fs: tracked_fs_factory(Arc::clone(&fs_log)),
-            server: server_factory(&errors),
+            server: match hide {
+                Some(hide) => {
+                    let recorded = server_factory(&errors);
+                    Box::new(move |config, identity| {
+                        Ok(Box::new(Hiding {
+                            inner: recorded(config, identity)?,
+                            hide: Rc::clone(&hide),
+                        }) as Box<dyn ServerApi>)
+                    })
+                }
+                None => server_factory(&errors),
+            },
             roots: real_root_check(),
         };
         let core = EngineCore::open(ports, EngineSettings::default()).expect("engine");
@@ -1044,8 +1127,8 @@ fn a_removed_device_learns_that_it_was_removed() {
 }
 
 /// Finding E2E-4: a device recovered with the sheet and the code shows its own name.
-/// `EngineCore::recover_account` adds the new device to the log through the recovery device
-/// (`recovery::add_device_with_code`) but never wrote its name into the sealed device names
+/// `EngineCore::recover_account` added the new device to the log through the recovery device
+/// (now the one batch of `recovery::recover_with_code`) but never wrote its name into the sealed device names
 /// (pairing does, in `Account::add_device`), so `listDevices` showed it with an empty name, on
 /// this device and on every other. Not specific to the real server.
 #[test]
@@ -1072,8 +1155,71 @@ fn a_recovered_device_shows_its_own_name() {
     assert_eq!(devices[0].name, "Rescue C", "{devices:?}");
 }
 
+/// Follow-up review of the recovery, M1, against the real server: a recovery whose reads miss
+/// a device added right before its append builds its batch on the shorter log. The real server
+/// refuses that append (its first entry does not chain to the log's head), nothing is written,
+/// and the recovery answers `RecoveryListChanged` with the added device in the list, so the
+/// person sees it before anything is removed.
+#[test]
+fn a_recovery_built_on_a_stale_log_is_refused_by_the_real_server() {
+    let scratch = Scratch::new("stale");
+    let clock = TestClock::default();
+    let server = TestServer::start(scratch.0.join("server"));
+    let mut a = Peer::open(&scratch.0, "a", &clock);
+    let code = create_account(&mut a, &server, "Laptop A");
+    let mut b = Peer::open(&scratch.0, "b", &clock);
+    pair(&mut a, &mut b, "Desktop B", &clock);
+    let a_id = a.device_id("Laptop A");
+    let b_id = a.device_id("Desktop B");
+    let hide = Rc::new(Cell::new(true));
+    let mut c = Peer::open_with(&scratch.0, "c", &clock, Some(Rc::clone(&hide)));
+    assert_eq!(
+        c.core
+            .recover_account(&code.sheet.link, &code.groups.join("-"), "Rescue C")
+            .expect("recover"),
+        ApiResult::Ok(())
+    );
+    let offered: Vec<String> = c
+        .core
+        .recovery_devices()
+        .expect("devices")
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(offered, vec![a_id.clone()], "B is hidden at first");
+    let refused = c.core.finish_recovery_cleanup(std::slice::from_ref(&a_id));
+    assert!(
+        matches!(
+            refused,
+            Err(hangar_drive_sync::error::SyncError::RecoveryListChanged)
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        c.errors
+            .borrow()
+            .iter()
+            .any(|e| e.contains("append_log") && e.contains("LogEntryRefused")),
+        "the real server refused the stale append: {:?}",
+        c.errors.borrow()
+    );
+    let offered: Vec<String> = c
+        .core
+        .recovery_devices()
+        .expect("devices")
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert!(offered.contains(&b_id), "{offered:?}");
+    c.core
+        .finish_recovery_cleanup(&[a_id, b_id])
+        .expect("the recovery with the new list");
+    let devices = c.core.list_devices().expect("devices").devices;
+    assert_eq!(devices.len(), 1, "{devices:?}");
+}
+
 /// Finding E2E-5: a recovery code that was used is reported as used (`RecoverError::Used`, the
-/// window's "this code was used before"). `recovery::add_device_with_code` tells "used" from
+/// window's "this code was used before"). `recovery::prepare` tells "used" from
 /// "unknown" by reading the log as the recovery device, but after the cleanup the real server
 /// refused that removed device's sign-in (`ProofInvalid`), which `recover_account` mapped to
 /// `Unknown` ("does not belong to an account on this server"). Same cause as E2E-3: the server

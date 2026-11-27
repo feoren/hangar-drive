@@ -1,5 +1,5 @@
 // The main window (UX 6.3): the one banner, the folders and the quiet lines at the bottom, below a
-// header with the main menu (recent activity, devices, settings, help), the logo and the status.
+// header with the main menu (File, View, Help), the logo with name and version, and the status.
 // The header comes last in the tab order (UX 12), so it follows the content in the document and
 // is placed on top by the layout; the status sentence still opens the content as its heading.
 
@@ -18,18 +18,19 @@ import { ReanchorDialog } from "../problems/ReanchorDialog";
 import { ServerCompareDialog, ServerScanDialog } from "../problems/ServerDialogs";
 import { NotMeDialog, SuspectDialog } from "../problems/SuspectDialog";
 import { RestoreDialog } from "../restore/RestoreDialog";
-import { DevicesDialog } from "../devices/DevicesDialog";
+import { DevicesDialog, RenewDialog } from "../devices/DevicesDialog";
 import { HelpDialog, noticeText, SettingsDialog } from "../settings/SettingsDialog";
 import { PairFlow } from "../setup/PairFlow";
-import { shortcutFor } from "../shortcuts";
+import { ariaCombo, formatCombo, SHORTCUTS, shortcutFor, type ShortcutId } from "../shortcuts";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { Feedback } from "../ui/parts";
-import { MenuIcon, PlusIcon } from "../ui/icons";
-import { RowMenu, type MenuItem } from "../ui/Menu";
-import { AppLogo } from "../ui/StatusMark";
+import { useLoad } from "../ui/useAsync";
+import { AppMenu, type AppMenuGroup } from "../ui/AppMenu";
+import { PlusIcon } from "../ui/icons";
 import { ActivityDialog } from "./ActivityList";
 import { BannerArea } from "./BannerArea";
+import { Brand } from "./Brand";
 import {
   AddFolderDialog,
   FolderNumberDialog,
@@ -120,43 +121,103 @@ export function MainWindow({
     };
   }, [dialog]);
 
-  const [menuOpen, setMenuOpen] = useState(false);
   const [folderView, setFolderView] = useFolderView();
-  const menuItems: MenuItem[] = [
+  const backend = useBackend();
+  const shortcut = (id: ShortcutId) => {
+    const combo = SHORTCUTS.find((entry) => entry.id === id)?.combo;
+    return combo ? { text: formatCombo(combo, t), aria: ariaCombo(combo) } : undefined;
+  };
+  const menuGroups: AppMenuGroup[] = [
     {
-      id: "addFolder",
-      label: t("main.addFolder"),
-      onSelect: () => {
-        open({ kind: "addFolder" });
-      },
+      id: "file",
+      label: t("menu.file"),
+      items: [
+        {
+          type: "action",
+          id: "addFolder",
+          label: t("main.addFolder"),
+          run: () => {
+            open({ kind: "addFolder" });
+          },
+        },
+        {
+          type: "action",
+          id: "devices",
+          label: t("main.devices"),
+          shortcut: shortcut("devices"),
+          run: () => {
+            open({ kind: "devices" });
+          },
+        },
+        {
+          type: "action",
+          id: "settings",
+          label: t("main.settings"),
+          shortcut: shortcut("settings"),
+          run: () => {
+            open({ kind: "settings" });
+          },
+        },
+        { type: "separator", id: "quit-separator" },
+        {
+          type: "action",
+          id: "quit",
+          label: t("menu.quit", { app: t("app.name") }),
+          run: () => {
+            backend.quit().catch((error: unknown) => {
+              console.error("Hangar Drive: quitting failed", error);
+            });
+          },
+        },
+      ],
     },
     {
-      id: "activity",
-      label: t("main.activity"),
-      onSelect: () => {
-        open({ kind: "activity" });
-      },
-    },
-    {
-      id: "devices",
-      label: t("main.devices"),
-      onSelect: () => {
-        open({ kind: "devices" });
-      },
-    },
-    {
-      id: "settings",
-      label: t("main.settings"),
-      onSelect: () => {
-        open({ kind: "settings" });
-      },
+      id: "view",
+      label: t("menu.view"),
+      items: [
+        {
+          type: "radio",
+          id: "list",
+          label: t("main.view.list"),
+          checked: folderView === "list",
+          run: () => {
+            setFolderView("list");
+          },
+        },
+        {
+          type: "radio",
+          id: "grid",
+          label: t("main.view.grid"),
+          checked: folderView === "grid",
+          run: () => {
+            setFolderView("grid");
+          },
+        },
+        { type: "separator", id: "activity-separator" },
+        {
+          type: "action",
+          id: "activity",
+          label: t("main.activity"),
+          run: () => {
+            open({ kind: "activity" });
+          },
+        },
+      ],
     },
     {
       id: "help",
-      label: t("help.title"),
-      onSelect: () => {
-        open({ kind: "help" });
-      },
+      label: t("menu.help"),
+      items: [
+        {
+          type: "action",
+          id: "help",
+          label: t("help.title"),
+          shortcut: shortcut("help"),
+          run: () => {
+            open({ kind: "help" });
+          },
+        },
+      ],
     },
   ];
 
@@ -230,18 +291,9 @@ export function MainWindow({
         </div>
       </main>
       <header className="topbar">
-        <div className="brand">
-          <RowMenu
-            items={menuItems}
-            label={t("main.menu")}
-            open={menuOpen}
-            onOpenChange={setMenuOpen}
-            icon={<MenuIcon size={18} />}
-            align="start"
-            tabbable
-          />
-          <AppLogo size={22} className="brand-mark" />
-          <span className="brand-name">{t("app.name")}</span>
+        <div className="topbar-start">
+          <AppMenu groups={menuGroups} label={t("main.menu")} />
+          <Brand />
         </div>
         <div className="topbar-actions">
           <StatusHeader danger={danger} />
@@ -316,9 +368,33 @@ function DialogHost({
       return <SuspectDialog warning={dialog.warning} open={open} onClose={onClose} />;
     case "notMe":
       return <NotMeDialog onClose={onClose} />;
+    case "renewRecovery":
+      return <RenewRecoveryDialog onClose={onClose} />;
     case "repair":
       return <RepairDialog initialLink={dialog.link} onClose={onClose} />;
   }
+}
+
+/**
+ * A new recovery code for an account without a valid one (banner `noRecoveryCode`): the same
+ * steps as "Create new" in Devices, with an intro that says why.
+ */
+function RenewRecoveryDialog({ onClose }: { readonly onClose: () => void }) {
+  const t = useT();
+  const backend = useBackend();
+  const [list] = useLoad(() => backend.listDevices(), [backend]);
+  return (
+    <RenewDialog
+      intro={t("noRecoveryCode.intro")}
+      deviceName={
+        list.status === "ready"
+          ? list.data.devices.find((device) => device.isThis)?.name
+          : undefined
+      }
+      onDone={() => undefined}
+      onClose={onClose}
+    />
+  );
 }
 
 /** "Pair again" after this device was removed or refused (UX 8.8): the pairing of 4.3. */

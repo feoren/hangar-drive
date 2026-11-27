@@ -42,6 +42,21 @@ describe("restore texts", () => {
     );
   });
 
+  it("moves a version from today to yesterday at midnight, not after 24 hours", () => {
+    const justAfterMidnight = new Date(2026, 10, 27, 0, 7).getTime();
+    const beforeMidnight = new Date(2026, 10, 26, 23, 47).getTime();
+    expect(dayHeading("de", de, beforeMidnight, justAfterMidnight)).toBe("Gestern");
+    expect(whenText("de", de, beforeMidnight, justAfterMidnight)).toBe("gestern, 23:47");
+    expect(dayHeading("de", de, new Date(2026, 10, 27, 0, 1).getTime(), justAfterMidnight)).toBe(
+      "Heute",
+    );
+    const newYear = new Date(2027, 0, 1, 0, 7).getTime();
+    expect(dayHeading("de", de, new Date(2026, 11, 31, 23, 0).getTime(), newYear)).toBe("Gestern");
+    expect(dayHeading("de", de, new Date(2026, 11, 30, 23, 0).getTime(), newYear)).toBe(
+      "Mittwoch, 30. Dezember 2026",
+    );
+  });
+
   it("summarizes only what is not zero", () => {
     expect(entrySummary(entry("a", NOW, { changed: 3 }), de)).toBe("3 Dateien geändert");
     expect(entrySummary(entry("a", NOW, { changed: 1, added: 12 }), de)).toBe(

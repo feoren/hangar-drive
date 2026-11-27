@@ -34,7 +34,7 @@
 //! another directory; that directory is walked again from its start, before the current one
 //! goes on if it comes first in the order, exactly as the round by round search would.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hangar_drive_protocol::ids::ItemId;
 use hangar_drive_protocol::name::CaseKeys;
@@ -471,15 +471,44 @@ impl Merger<'_> {
         reached == self.m.len()
     }
 
+    /// The items that reach the root through their parents (a node with the root's ID
+    /// included, as [`Tree::path`] gives it a path), found by one walk down from the root.
+    fn reached_from_root(&self) -> HashSet<ItemId> {
+        let mut reached = HashSet::new();
+        if self.m.contains(&ROOT) {
+            reached.insert(ROOT);
+        }
+        self.reach_below(ROOT, &mut reached);
+        reached
+    }
+
+    /// Adds everything below `at` to `reached`.
+    fn reach_below(&self, at: ItemId, reached: &mut HashSet<ItemId>) {
+        let mut stack = vec![at];
+        while let Some(dir) = stack.pop() {
+            for kid in self.m.children(&dir) {
+                if *kid != ROOT && reached.insert(*kid) {
+                    stack.push(*kid);
+                }
+            }
+        }
+    }
+
     /// Moves that form a cycle: the local moves in it fall back to the remote place.
+    ///
+    /// Which items reach the root is kept in one set, grown as the fixes link items back
+    /// (security review, LOW 3): asking [`Tree::path`] per item walked up to n steps for each
+    /// item on a cycle. A fix only moves an item that does not reach the root, so no item that
+    /// does ever loses its path; the set only grows, by what a fix links below a reached item.
     fn fix_cycles(&mut self) -> bool {
         if self.all_reach_root() {
             return false;
         }
+        let mut reached = self.reached_from_root();
         let mut changed = false;
         let ids: Vec<ItemId> = self.m.ids().copied().collect();
         for id in ids {
-            if self.m.path(&id).is_some() {
+            if reached.contains(&id) {
                 continue;
             }
             let mut cycle = Vec::new();
@@ -508,19 +537,31 @@ impl Merger<'_> {
                     }
                     None => node.parent = ROOT,
                 }
+                let parent = node.parent;
                 self.m.insert(*node_id, node);
                 self.from_local.remove(node_id);
                 self.dropped_local_moves += 1;
+                self.link_if_reached(*node_id, parent, &mut reached);
                 reverted = true;
                 break;
             }
             if !reverted {
                 // A cycle without a local move cannot come from a valid remote tree; break it.
                 self.move_to_root(id);
+                self.link_if_reached(id, ROOT, &mut reached);
             }
             changed = true;
         }
         changed
+    }
+
+    /// After `moved` got the parent `parent`: if that parent reaches the root, so does
+    /// `moved` with everything below it.
+    fn link_if_reached(&self, moved: ItemId, parent: ItemId, reached: &mut HashSet<ItemId>) {
+        if (parent == ROOT || reached.contains(&parent)) && self.m.contains(&moved) {
+            reached.insert(moved);
+            self.reach_below(moved, reached);
+        }
     }
 
     fn priority(&self, parent: &ItemId, id: &ItemId) -> (u8, ItemId) {
@@ -1472,6 +1513,40 @@ mod tests {
                 assert_eq!(merger.rekeys, old, "case {case}");
             }
         }
+    }
+
+    /// 10,000 local moves that make two directories each other's parent: every cycle is broken
+    /// with a few units of work per item. Asking for the path of each item on a cycle walked up
+    /// to n steps for it (security review, LOW 3; 4 * 10^8 steps here).
+    #[test]
+    fn many_cycles_take_linear_work() {
+        let words = LabelWords::default();
+        let labels = labels_for(&words);
+        let pairs = 10_000u32;
+        let wide = |n: u32, hi: u8| {
+            let mut bytes = [0u8; 16];
+            bytes[0] = hi;
+            bytes[12..].copy_from_slice(&n.to_be_bytes());
+            ItemId::from_bytes(bytes)
+        };
+        let base = Tree::from_nodes((0..pairs).flat_map(|i| {
+            [
+                (wide(i, 1), Node::dir(ROOT, format!("a{i}"))),
+                (wide(i, 2), Node::dir(ROOT, format!("b{i}"))),
+            ]
+        }));
+        let local = Tree::from_nodes((0..pairs).flat_map(|i| {
+            [
+                (wide(i, 1), Node::dir(wide(i, 2), format!("a{i}"))),
+                (wide(i, 2), Node::dir(wide(i, 1), format!("b{i}"))),
+            ]
+        }));
+        let before = crate::tree::tests::work_done();
+        let out = merge3(&base, &base, &local, &labels, &mut Fresh(0));
+        let work = crate::tree::tests::work_done() - before;
+        assert_eq!(out.tree.check(), Ok(()));
+        assert_eq!(out.dropped_local_moves, pairs as usize);
+        assert!(work <= 20 * u64::from(pairs), "{work} units of work");
     }
 
     /// Work bounds that hold in a debug build without a clock (security review HIGH 2): the keys

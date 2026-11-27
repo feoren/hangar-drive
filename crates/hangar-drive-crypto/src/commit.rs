@@ -103,6 +103,16 @@
 //! as [`SignedCommit::verify_signer`] plus that the signer is a current device of the log when
 //! the call arrives, whatever log head the commit names.
 //!
+//! # Delta pages
+//!
+//! [`FolderView::begin_check`] checks a delta page by page ([`DeltaVerifier`]) and accepts and
+//! refuses exactly what [`FolderView::check_delta`] does for the whole delta, whatever the page
+//! boundaries; [`FolderView::check_delta`] is that check with the delta as one page. It holds per
+//! verified head only its chain entry, so a device that reads a long history no longer needs
+//! every commit in memory at once, and its state can be stored between pages. The removed signer
+//! rule is kept as one number: the highest removal index among the heads of removed devices that
+//! still wait for a later head of a current device naming a log head at or after it.
+//!
 //! # Re-anchor
 //!
 //! After "the server shows an older state" and only after the person confirmed,
@@ -588,6 +598,18 @@ impl SignedCommit {
         state: &AccountState,
         folder: &FolderId,
     ) -> Result<(), CommitError> {
+        self.verify_signer_at(state, folder, state.len())
+    }
+
+    /// [`SignedCommit::verify_signer`] against the first `len` entries of `state` (at most its
+    /// length): the log as it was at that length, since signers and keys up to it do not change
+    /// when the log grows.
+    fn verify_signer_at(
+        &self,
+        state: &AccountState,
+        folder: &FolderId,
+        len: u64,
+    ) -> Result<(), CommitError> {
         let c = &self.commit;
         if c.account != *state.account() {
             return Err(CommitError::AccountMismatch);
@@ -595,7 +617,7 @@ impl SignedCommit {
         if c.folder != *folder {
             return Err(CommitError::FolderMismatch);
         }
-        if c.log_head.index > state.len() {
+        if c.log_head.index > len.min(state.len()) {
             return Err(CommitError::AheadOfLog {
                 index: c.log_head.index,
             });
@@ -802,6 +824,10 @@ pub enum ChainError {
     /// The barrier permit does not cover the last removal of this device log.
     #[error("the barrier permit does not cover the last removal of the device log")]
     Permit,
+    /// A page of a delta check got another device log than the check began with
+    /// ([`DeltaVerifier`]): begin the check again.
+    #[error("the device log changed during the delta check")]
+    LogChanged,
 }
 
 /// A head of a removed device that [`FolderView::verify_delta_before_barrier`] let in.
@@ -906,6 +932,7 @@ pub struct ReanchorBase {
     marks: BTreeMap<DeviceId, u64>,
 }
 
+#[derive(Debug, Clone)]
 struct Parsed {
     sequence: u64,
     commit: SignedCommit,
@@ -1232,7 +1259,53 @@ impl FolderView {
         })
     }
 
+    /// The whole delta through the page by page check ([`DeltaVerifier`]) as one page.
     fn verify(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+        delta: &[DeltaCommit],
+        removed_rule: bool,
+    ) -> Result<DeltaOutcome, ChainError> {
+        let result = self.verify_pages(state, newest_generation, &[delta], removed_rule);
+        // Every delta any test verifies is also checked against the check of the whole delta
+        // at once, cut into pages at several boundaries and stored between them.
+        #[cfg(test)]
+        tests::pages_agree(self, state, newest_generation, delta, removed_rule, &result);
+        result
+    }
+
+    /// The pages in order through the page by page check, with the result put together as
+    /// the whole delta's.
+    fn verify_pages(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+        pages: &[&[DeltaCommit]],
+        removed_rule: bool,
+    ) -> Result<DeltaOutcome, ChainError> {
+        let mut verifier = self.begin(state, newest_generation, removed_rule)?;
+        let mut all = DeltaPart::default();
+        for page in pages {
+            all.append(verifier.push_page(state, page)?);
+        }
+        match verifier.finish(state)? {
+            DeltaVerdict::Accepted { view, rest } => {
+                all.append(rest);
+                Ok(DeltaOutcome {
+                    view,
+                    heads: all.heads,
+                    sides: all.sides,
+                })
+            }
+            DeltaVerdict::RemovedSigner(_) => Err(ChainError::RemovedSigner),
+        }
+    }
+
+    /// The check of the whole delta at once as it was before the page by page check: the
+    /// reference the equivalence tests compare [`DeltaVerifier`] with.
+    #[cfg(test)]
+    fn verify_whole(
         &self,
         state: &AccountState,
         newest_generation: Generation,
@@ -1379,10 +1452,13 @@ impl FolderView {
         check_removed_signers(state, order.iter().map(|&at| &heads[at].commit))?;
 
         // Forward over the segment with the normal rules; counters rise within the segment, not
-        // necessarily above this device's marks.
-        let kept = &self.chain[..self.kept_until(base.as_ref())];
+        // necessarily above this device's marks. A side commit's base is a commit of the kept
+        // chain (up to the base) or of the segment so far, found by map lookups (security
+        // review, info: a linear search per head made a long segment quadratic).
+        let kept = self.kept_until(base.as_ref());
         let mut segment_marks = BTreeMap::new();
         let mut entries: Vec<ChainEntry> = Vec::with_capacity(order.len());
+        let mut segment_positions: BTreeMap<CommitId, usize> = BTreeMap::new();
         let mut segment = Vec::with_capacity(order.len());
         let mut segment_sides = Vec::new();
         let mut prev = base;
@@ -1391,9 +1467,15 @@ impl FolderView {
             let side = sides.remove(&head.sequence);
             let entry = {
                 let lookup = |id: &CommitId| {
-                    kept.iter()
-                        .chain(entries.iter())
-                        .find(|e| e.commit == *id)
+                    self.positions
+                        .get(id)
+                        .filter(|&&position| position < kept)
+                        .and_then(|&position| self.chain.get(position))
+                        .or_else(|| {
+                            segment_positions
+                                .get(id)
+                                .and_then(|&position| entries.get(position))
+                        })
                         .copied()
                 };
                 step(
@@ -1409,13 +1491,15 @@ impl FolderView {
                 segment_sides.push(side.commit);
             }
             segment.push(head.commit.clone());
+            segment_positions.insert(entry.commit, entries.len());
             entries.push(entry);
             prev = Some(entry);
         }
         // A side commit whose sequence no head of the delta has belongs to no call.
+        let head_sequences: BTreeSet<u64> = heads.iter().map(|h| h.sequence).collect();
         if sides
             .keys()
-            .any(|sequence| !heads.iter().any(|h| h.sequence == *sequence))
+            .any(|sequence| !head_sequences.contains(sequence))
         {
             return Err(ChainError::SideUnexpected);
         }
@@ -1486,10 +1570,870 @@ impl FolderView {
     }
 }
 
+/// What one page of an incremental delta check let through ([`DeltaVerifier::push_page`]):
+/// the heads that passed the chain rules so far, in order, their side commits, and, in the
+/// check before a barrier, the heads of removed devices among them. Nothing of it is accepted
+/// before [`DeltaVerifier::finish`] says so: a later page can still refuse the whole delta.
+/// The last call of a page with heads may come out with the next page, because a head waits for
+/// a side commit of its call that may start the next page.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaPart {
+    /// Heads that passed the chain rules, in order.
+    pub heads: Vec<SignedCommit>,
+    /// Their side commits.
+    pub sides: Vec<SignedCommit>,
+    /// Heads of removed devices among them (only in the check before a barrier).
+    pub removed_heads: Vec<RemovedHead>,
+}
+
+impl DeltaPart {
+    fn append(&mut self, other: DeltaPart) {
+        self.heads.extend(other.heads);
+        self.sides.extend(other.sides);
+        self.removed_heads.extend(other.removed_heads);
+    }
+}
+
+/// The result of [`DeltaVerifier::finish`]: what [`FolderView::check_delta`] returns for the
+/// whole delta.
+#[derive(Debug, Clone)]
+pub enum DeltaVerdict {
+    /// The delta passed every rule: the view with every head, and the part the last page
+    /// still held back.
+    Accepted {
+        /// The view with the new heads; the caller stores it only now.
+        view: FolderView,
+        /// Heads and side commits not yet returned by a page.
+        rest: DeltaPart,
+    },
+    /// The delta failed the removed signer rule ([`FolderView::check_delta`]).
+    RemovedSigner(RemovedSignerRefusal),
+}
+
+/// A call of the delta not yet checked: its head and side commit wait until the call is
+/// complete, which only the next item or the end of the delta tells.
+#[derive(Debug, Clone)]
+struct OpenCall {
+    sequence: u64,
+    head: Option<Parsed>,
+    side: Option<Parsed>,
+}
+
+/// The refusals of `step` and the discarded rule, as a stored [`DeltaVerifier`] keeps them: a
+/// commit that does not decode or verify later in the delta, and the removed signer rule, are
+/// reported before them, as [`FolderView::check_delta`] does, so they wait for the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepError {
+    OlderState,
+    Height,
+    GenerationBack,
+    LogHeadBack,
+    UnknownGeneration(u32),
+    Counter,
+    SideMissing,
+    SideUnexpected,
+    SideRule,
+    SideAsHead,
+    Discarded,
+}
+
+impl StepError {
+    fn of(error: &ChainError) -> Option<Self> {
+        Some(match error {
+            ChainError::OlderState => Self::OlderState,
+            ChainError::Height => Self::Height,
+            ChainError::GenerationBack => Self::GenerationBack,
+            ChainError::LogHeadBack => Self::LogHeadBack,
+            ChainError::UnknownGeneration(g) => Self::UnknownGeneration(*g),
+            ChainError::Counter => Self::Counter,
+            ChainError::SideMissing => Self::SideMissing,
+            ChainError::SideUnexpected => Self::SideUnexpected,
+            ChainError::SideRule => Self::SideRule,
+            ChainError::SideAsHead => Self::SideAsHead,
+            ChainError::Discarded => Self::Discarded,
+            _ => return None,
+        })
+    }
+
+    fn error(self) -> ChainError {
+        match self {
+            Self::OlderState => ChainError::OlderState,
+            Self::Height => ChainError::Height,
+            Self::GenerationBack => ChainError::GenerationBack,
+            Self::LogHeadBack => ChainError::LogHeadBack,
+            Self::UnknownGeneration(g) => ChainError::UnknownGeneration(g),
+            Self::Counter => ChainError::Counter,
+            Self::SideMissing => ChainError::SideMissing,
+            Self::SideUnexpected => ChainError::SideUnexpected,
+            Self::SideRule => ChainError::SideRule,
+            Self::SideAsHead => ChainError::SideAsHead,
+            Self::Discarded => ChainError::Discarded,
+        }
+    }
+
+    fn code(self) -> (u8, u32) {
+        match self {
+            Self::OlderState => (1, 0),
+            Self::Height => (2, 0),
+            Self::GenerationBack => (3, 0),
+            Self::LogHeadBack => (4, 0),
+            Self::UnknownGeneration(g) => (5, g),
+            Self::Counter => (6, 0),
+            Self::SideMissing => (7, 0),
+            Self::SideUnexpected => (8, 0),
+            Self::SideRule => (9, 0),
+            Self::SideAsHead => (10, 0),
+            Self::Discarded => (11, 0),
+        }
+    }
+
+    fn from_code(tag: u8, value: u32) -> Option<Self> {
+        Some(match (tag, value) {
+            (1, 0) => Self::OlderState,
+            (2, 0) => Self::Height,
+            (3, 0) => Self::GenerationBack,
+            (4, 0) => Self::LogHeadBack,
+            (5, g) => Self::UnknownGeneration(g),
+            (6, 0) => Self::Counter,
+            (7, 0) => Self::SideMissing,
+            (8, 0) => Self::SideUnexpected,
+            (9, 0) => Self::SideRule,
+            (10, 0) => Self::SideAsHead,
+            (11, 0) => Self::Discarded,
+            _ => return None,
+        })
+    }
+}
+
+const VERIFIER_FORMAT: u8 = 2;
+/// Bytes one verified head adds to an encoded [`DeltaVerifier`]: its chain entry.
+pub const VERIFIER_BYTES_PER_HEAD: usize = 32 + 8 + 8 + 4 + 8;
+
+/// The folder delta check page by page (module docs, "Delta pages"; ADR 0001, amendment
+/// "delta pages"). It accepts and refuses exactly what [`FolderView::check_delta`] (or
+/// [`FolderView::verify_delta_before_barrier`]) does for the pages put together, whatever the page boundaries, and holds per verified head
+/// only its chain entry: a scratch [`FolderView`], the newest log index a removed signer's
+/// pending head needs, and at most one open call of two commits.
+///
+/// The removed signer rule needs the whole delta: a head of a removed device is let in only
+/// with a later head of a current device that names a log head at or after the removal. The
+/// check keeps the highest removal index of the heads still waiting for such a head; a head of
+/// a current device that names a log head at or after it settles every waiting head at once,
+/// and [`DeltaVerifier::finish`] refuses the delta if one still waits.
+///
+/// **A growing log** (security review follow-up, M5): the check is pinned to the device log as
+/// it was at [`FolderView::begin_check`], and every page and [`DeltaVerifier::finish`] may get
+/// a newer verified log that extends it (one that does not is [`ChainError::LogChanged`]). The
+/// rules are applied to the pinned log, so the result is that of [`FolderView::check_delta`]
+/// against it. Where the newer log matters, the check stops instead ([`DeltaVerifier::cut`]):
+/// at the first call with a commit that names a log head beyond the pinned one, or whose
+/// signer the newer log has removed since; that call and everything after it is the next
+/// delta, checked from the accepted view against the newer log. And [`DeltaVerifier::finish`]
+/// refuses with [`ChainError::LogChanged`] when the newer log removed a device whose heads were
+/// already checked. So an accepted result is accepted by [`FolderView::check_delta`] against the
+/// newer log too, with the same view: every commit names a head of the pinned log, where the
+/// newer log vouches for the same signers, and no head comes from a device it removed later, so
+/// the removed signer rule reads the same. With an unchanged log nothing of this applies.
+///
+/// The state can be stored between pages ([`DeltaVerifier::encode`]) and resumed after a
+/// restart ([`DeltaVerifier::decode`]), also with a newer log; like the rest of the local index
+/// it is trusted.
+#[derive(Debug, Clone)]
+pub struct DeltaVerifier {
+    view: FolderView,
+    newest_generation: Generation,
+    removed_rule: bool,
+    log: Option<LogHead>,
+    last_sequence: u64,
+    last_head_sequence: Option<u64>,
+    open: Option<OpenCall>,
+    waiting_removal: u64,
+    step_error: Option<ChainError>,
+    side_left: bool,
+    failed: Option<ChainError>,
+    /// The sequence of the first call left for the next delta (module docs, a growing log).
+    cut: Option<u64>,
+    /// The signers of the heads checked so far, for the removals of a newer log.
+    signers: BTreeSet<DeviceId>,
+}
+
+impl FolderView {
+    /// Starts the page by page form of [`FolderView::check_delta`] after this view's frontier.
+    pub fn begin_check(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+    ) -> Result<DeltaVerifier, ChainError> {
+        self.begin(state, newest_generation, true)
+    }
+
+    /// Starts the page by page form of [`FolderView::verify_delta_before_barrier`]: every rule
+    /// but the removed signer rule, for the holder of `permit` only.
+    pub fn begin_check_before_barrier(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+        permit: &crate::epoch::BarrierPermit,
+    ) -> Result<DeltaVerifier, ChainError> {
+        if !permit.covers(state) || !permit.allows_folder(&self.folder) {
+            return Err(ChainError::Permit);
+        }
+        self.begin(state, newest_generation, false)
+    }
+
+    fn begin(
+        &self,
+        state: &AccountState,
+        newest_generation: Generation,
+        removed_rule: bool,
+    ) -> Result<DeltaVerifier, ChainError> {
+        if state.account() != &self.account {
+            return Err(CommitError::AccountMismatch.into());
+        }
+        Ok(DeltaVerifier {
+            view: self.clone(),
+            newest_generation,
+            removed_rule,
+            log: state.head(),
+            last_sequence: 0,
+            last_head_sequence: None,
+            open: None,
+            waiting_removal: 0,
+            step_error: None,
+            side_left: false,
+            failed: None,
+            cut: None,
+            signers: BTreeSet::new(),
+        })
+    }
+}
+
+impl DeltaVerifier {
+    /// Checks the next page of the delta (any length, the pages in the server's order) and
+    /// returns what passed so far. A commit that does not decode, verify or keep the sequence
+    /// order refuses the whole delta at once; every later call returns the same error.
+    pub fn push_page(
+        &mut self,
+        state: &AccountState,
+        page: &[DeltaCommit],
+    ) -> Result<DeltaPart, ChainError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        self.check_log(state)?;
+        let mut part = DeltaPart::default();
+        for item in page {
+            if let Err(error) = self.take(state, item, &mut part) {
+                self.failed = Some(error.clone());
+                return Err(error);
+            }
+        }
+        Ok(part)
+    }
+
+    /// The end of the delta: the verdict [`FolderView::check_delta`] gives for the whole delta
+    /// against the pinned log, or for the part before [`DeltaVerifier::cut`]. In the check
+    /// before a barrier a refusal by the removed signer rule cannot occur.
+    pub fn finish(mut self, state: &AccountState) -> Result<DeltaVerdict, ChainError> {
+        if let Some(error) = self.failed.take() {
+            return Err(error);
+        }
+        self.check_log(state)?;
+        let mut rest = DeltaPart::default();
+        self.settle(state, &mut rest);
+        // A device the newer log removed after the pinned head signed heads checked already.
+        let pinned = self.pinned_len();
+        if self.signers.iter().any(|d| {
+            state
+                .device(d)
+                .and_then(|r| r.removed_at)
+                .is_some_and(|r| r > pinned)
+        }) {
+            return Err(ChainError::LogChanged);
+        }
+        if self.removed_rule && self.waiting_removal > 0 {
+            return Ok(DeltaVerdict::RemovedSigner(RemovedSignerRefusal {
+                account: self.view.account,
+                folder: self.view.folder,
+                removal_index: self.pinned_last_removal(state),
+            }));
+        }
+        if let Some(error) = self.step_error {
+            return Err(error);
+        }
+        if self.side_left {
+            return Err(ChainError::SideUnexpected);
+        }
+        Ok(DeltaVerdict::Accepted {
+            view: self.view,
+            rest,
+        })
+    }
+
+    /// Heads checked so far (the scratch view's chain beyond the starting view counts them).
+    pub fn view(&self) -> &FolderView {
+        &self.view
+    }
+
+    /// Commits held back for an open call: at most two (a head and its side commit).
+    pub fn held_commits(&self) -> usize {
+        self.open.as_ref().map_or(0, |c| {
+            usize::from(c.head.is_some()) + usize::from(c.side.is_some())
+        })
+    }
+
+    /// Where the next delta starts when the check stopped early (module docs, a growing log):
+    /// the sequence of the first call it left out. The caller then moves its cursor only to the
+    /// accepted view's frontier and pulls again with its newer log.
+    pub fn cut(&self) -> Option<u64> {
+        self.cut
+    }
+
+    /// The pinned log must be a prefix of `state` (module docs, a growing log).
+    fn check_log(&self, state: &AccountState) -> Result<(), ChainError> {
+        let extends = self.log.as_ref().is_none_or(|head| state.contains(head));
+        if state.account() != &self.view.account || !extends {
+            return Err(ChainError::LogChanged);
+        }
+        Ok(())
+    }
+
+    fn pinned_len(&self) -> u64 {
+        self.log.as_ref().map_or(0, |h| h.index)
+    }
+
+    /// When `device` was removed in the pinned log.
+    fn pinned_removal(&self, state: &AccountState, device: &DeviceId) -> Option<u64> {
+        let pinned = self.pinned_len();
+        state
+            .device(device)
+            .and_then(|d| d.removed_at)
+            .filter(|r| *r <= pinned)
+    }
+
+    /// The last removal of the pinned log.
+    fn pinned_last_removal(&self, state: &AccountState) -> u64 {
+        state.last_removal_index_at(self.pinned_len())
+    }
+
+    /// Whether `commit` belongs to the next delta: it names a log head beyond the pinned one
+    /// that the newer log holds, or the newer log removed its signer after the pinned head.
+    fn beyond_pinned(&self, state: &AccountState, commit: &SignedCommit) -> bool {
+        let pinned = self.pinned_len();
+        let c = &commit.commit;
+        (c.log_head.index > pinned && c.log_head.index <= state.len())
+            || state
+                .device(&c.device)
+                .and_then(|d| d.removed_at)
+                .is_some_and(|r| r > pinned)
+    }
+
+    /// One item, in the order [`FolderView::check_delta`] reads them.
+    fn take(
+        &mut self,
+        state: &AccountState,
+        item: &DeltaCommit,
+        part: &mut DeltaPart,
+    ) -> Result<(), ChainError> {
+        if self.cut.is_some() {
+            // The next delta's.
+            return Ok(());
+        }
+        if item.sequence < self.last_sequence {
+            return Err(ChainError::Sequence);
+        }
+        self.last_sequence = item.sequence;
+        let commit = SignedCommit::decode(item.commit.as_bytes())?;
+        if self.beyond_pinned(state, &commit) {
+            // The call this commit belongs to and everything after it are the next delta.
+            if self
+                .open
+                .as_ref()
+                .is_some_and(|c| c.sequence == item.sequence)
+            {
+                self.open = None;
+            } else {
+                self.settle(state, part);
+            }
+            self.cut = Some(item.sequence);
+            return Ok(());
+        }
+        commit.verify_signer_at(state, &self.view.folder, self.pinned_len())?;
+        let parsed = Parsed {
+            sequence: item.sequence,
+            commit,
+        };
+        // A later sequence completes the open call.
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|c| c.sequence < item.sequence)
+        {
+            self.settle(state, part);
+        }
+        match item.role {
+            CommitRole::Head => {
+                if self.last_head_sequence.is_some_and(|s| s >= item.sequence) {
+                    return Err(ChainError::Sequence);
+                }
+                self.last_head_sequence = Some(item.sequence);
+                self.open_call(item.sequence).head = Some(parsed);
+            }
+            CommitRole::Side => {
+                let call = self.open_call(item.sequence);
+                if call.side.is_some() {
+                    return Err(ChainError::SideUnexpected);
+                }
+                call.side = Some(parsed);
+            }
+        }
+        Ok(())
+    }
+
+    fn open_call(&mut self, sequence: u64) -> &mut OpenCall {
+        self.open.get_or_insert(OpenCall {
+            sequence,
+            head: None,
+            side: None,
+        })
+    }
+
+    /// The removed signer rule over the heads in order (`check_removed_signers`): a head of a
+    /// removed device waits for a later head of a current device naming a log head at or
+    /// after the removal.
+    fn note_removed_rule(&mut self, state: &AccountState, head: &SignedCommit) {
+        let c = &head.commit;
+        match self.pinned_removal(state, &c.device) {
+            Some(removed_at) => self.waiting_removal = self.waiting_removal.max(removed_at),
+            None => {
+                if c.log_head.index >= self.waiting_removal {
+                    self.waiting_removal = 0;
+                }
+            }
+        }
+    }
+
+    /// Checks the open call's head with its side commit on the scratch view, as the loop of
+    /// [`FolderView::check_delta`] does. The first refusal is kept for the end and stops the
+    /// chain; the items after it are still read for the refusals that come first.
+    fn settle(&mut self, state: &AccountState, part: &mut DeltaPart) {
+        let Some(call) = self.open.take() else {
+            return;
+        };
+        // Every head counts for the removed signer rule, also after a refusal of the chain
+        // rules, as in the check of the whole delta; a head waits for its call to be complete
+        // so that a cut can still leave it to the next delta.
+        if let Some(head) = &call.head {
+            self.note_removed_rule(state, &head.commit);
+        }
+        if self.step_error.is_some() {
+            return;
+        }
+        let Some(head) = call.head else {
+            // A side commit whose call has no head.
+            self.side_left |= call.side.is_some();
+            return;
+        };
+        if self.view.discarded.contains(&head.commit.id) {
+            self.step_error = Some(ChainError::Discarded);
+            return;
+        }
+        let mut marks = self.view.marks.clone();
+        let entry = {
+            let view = &self.view;
+            let lookup = |id: &CommitId| view.entry(id).copied();
+            step(
+                view.frontier(),
+                &head,
+                call.side.as_ref(),
+                self.newest_generation,
+                &mut marks,
+                &lookup,
+            )
+        };
+        match entry {
+            Ok(entry) => {
+                self.view.marks = marks;
+                self.view.push(entry);
+                self.signers.insert(head.commit.commit.device);
+                if !self.removed_rule {
+                    if let Some(removed_at) = self.pinned_removal(state, &head.commit.commit.device)
+                    {
+                        part.removed_heads.push(RemovedHead {
+                            commit: head.commit.id,
+                            device: head.commit.commit.device,
+                            sequence: head.sequence,
+                            removed_at,
+                        });
+                    }
+                }
+                if let Some(side) = call.side {
+                    part.sides.push(side.commit);
+                }
+                part.heads.push(head.commit);
+            }
+            Err(error) => self.step_error = Some(error),
+        }
+    }
+
+    /// The state to store between pages; `None` once a page refused the delta (nothing to
+    /// resume), or for a kept refusal that has no code below (none that `step` makes).
+    /// Strict format of this crate's own, local only:
+    ///
+    /// ```text
+    /// 0x01 || account (16) || folder (16) || newest generation (u32) || removed rule (u8)
+    ///      || log head: 0, or 1 || index (u64) || hash (32)
+    ///      || last sequence (u64) || last head sequence: 0, or 1 || u64
+    ///      || waiting removal (u64) || step error: tag (u8) || value (u32), tag 0 for none
+    ///      (format byte 0x02)
+    ///      || side left (u8) || cut: 0, or 1 || sequence (u64)
+    ///      || open call: 0, or 1 || sequence (u64) || field(head wire)
+    ///      || field(side wire) (empty for none)
+    ///      || signers count (u64) || count x device (16)
+    ///      || chain count (u64) || count x (commit (32) || height (u64) || sequence (u64)
+    ///      || generation (u32) || log index (u64))
+    ///      || marks count (u64) || count x (device (16) || counter (u64))
+    ///      || discarded count (u64) || count x commit (32)
+    /// ```
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        if self.failed.is_some() {
+            return None;
+        }
+        let (tag, value) = match &self.step_error {
+            None => (0, 0),
+            Some(error) => StepError::of(error)?.code(),
+        };
+        let v = &self.view;
+        let mut w = Writer::with_capacity(256 + v.chain.len() * VERIFIER_BYTES_PER_HEAD);
+        w.u8(VERIFIER_FORMAT)
+            .raw(v.account.as_bytes())
+            .raw(v.folder.as_bytes())
+            .u32(self.newest_generation.0)
+            .u8(u8::from(self.removed_rule));
+        match &self.log {
+            None => {
+                w.u8(0);
+            }
+            Some(head) => {
+                w.u8(1).u64(head.index).raw(head.hash.as_bytes());
+            }
+        }
+        w.u64(self.last_sequence);
+        match self.last_head_sequence {
+            None => {
+                w.u8(0);
+            }
+            Some(s) => {
+                w.u8(1).u64(s);
+            }
+        }
+        w.u64(self.waiting_removal)
+            .u8(tag)
+            .u32(value)
+            .u8(u8::from(self.side_left));
+        match self.cut {
+            None => {
+                w.u8(0);
+            }
+            Some(s) => {
+                w.u8(1).u64(s);
+            }
+        }
+        match &self.open {
+            None => {
+                w.u8(0);
+            }
+            Some(call) => {
+                let wire = |p: &Option<Parsed>| p.as_ref().map(|p| p.commit.wire.clone());
+                w.u8(1)
+                    .u64(call.sequence)
+                    .field(&wire(&call.head).unwrap_or_default())
+                    .field(&wire(&call.side).unwrap_or_default());
+            }
+        }
+        w.u64(self.signers.len() as u64);
+        for device in &self.signers {
+            w.raw(device.as_bytes());
+        }
+        w.u64(v.chain.len() as u64);
+        for e in &v.chain {
+            w.raw(e.commit.as_bytes())
+                .u64(e.height)
+                .u64(e.sequence)
+                .u32(e.generation.0)
+                .u64(e.log_index);
+        }
+        w.u64(v.marks.len() as u64);
+        for (device, counter) in &v.marks {
+            w.raw(device.as_bytes()).u64(*counter);
+        }
+        w.u64(v.discarded.len() as u64);
+        for commit in &v.discarded {
+            w.raw(commit.as_bytes());
+        }
+        Some(w.into_bytes())
+    }
+
+    /// A stored state ([`DeltaVerifier::encode`]), checked strictly against the verified log
+    /// `state`, which must be the one the check began with or one that extends it. The open
+    /// call's commits are decoded and verified again against the pinned log.
+    pub fn decode(state: &AccountState, bytes: &[u8]) -> Result<Self, ChainError> {
+        let bad = || ChainError::InvalidView;
+        let mut r = Reader::new(bytes);
+        if r.u8().ok_or_else(bad)? != VERIFIER_FORMAT {
+            return Err(bad());
+        }
+        let account = AccountId::from_bytes(r.raw().ok_or_else(bad)?);
+        let folder = FolderId::from_bytes(r.raw().ok_or_else(bad)?);
+        let newest_generation = Generation(r.u32().ok_or_else(bad)?);
+        let removed_rule = read_bool(&mut r).ok_or_else(bad)?;
+        let log = if read_bool(&mut r).ok_or_else(bad)? {
+            Some(LogHead {
+                index: r.u64().ok_or_else(bad)?,
+                hash: LogHash::from_bytes(r.raw().ok_or_else(bad)?),
+            })
+        } else {
+            None
+        };
+        let last_sequence = r.u64().ok_or_else(bad)?;
+        let last_head_sequence = if read_bool(&mut r).ok_or_else(bad)? {
+            Some(r.u64().ok_or_else(bad)?)
+        } else {
+            None
+        };
+        let waiting_removal = r.u64().ok_or_else(bad)?;
+        let tag = r.u8().ok_or_else(bad)?;
+        let value = r.u32().ok_or_else(bad)?;
+        let step_error = match (tag, value) {
+            (0, 0) => None,
+            _ => Some(StepError::from_code(tag, value).ok_or_else(bad)?.error()),
+        };
+        let side_left = read_bool(&mut r).ok_or_else(bad)?;
+        let cut = if read_bool(&mut r).ok_or_else(bad)? {
+            Some(r.u64().ok_or_else(bad)?)
+        } else {
+            None
+        };
+        // The pinned log first: the open call is verified against it.
+        if state.account() != &account || !log.as_ref().is_none_or(|h| state.contains(h)) {
+            return Err(ChainError::LogChanged);
+        }
+        let pinned = log.as_ref().map_or(0, |h| h.index);
+        let open = if read_bool(&mut r).ok_or_else(bad)? {
+            let sequence = r.u64().ok_or_else(bad)?;
+            let parsed = |wire: &[u8]| -> Result<Option<Parsed>, ChainError> {
+                if wire.is_empty() {
+                    return Ok(None);
+                }
+                let commit = SignedCommit::decode(wire)?;
+                commit.verify_signer_at(state, &folder, pinned)?;
+                Ok(Some(Parsed { sequence, commit }))
+            };
+            let head = parsed(r.field().ok_or_else(bad)?)?;
+            let side = parsed(r.field().ok_or_else(bad)?)?;
+            if head.is_none() && side.is_none() {
+                return Err(bad());
+            }
+            Some(OpenCall {
+                sequence,
+                head,
+                side,
+            })
+        } else {
+            None
+        };
+        let count = |r: &mut Reader<'_>, size: usize| -> Option<usize> {
+            let n = usize::try_from(r.u64()?).ok()?;
+            (n.checked_mul(size)? <= r.remaining()).then_some(n)
+        };
+        let n = count(&mut r, 16).ok_or_else(bad)?;
+        let mut signers = BTreeSet::new();
+        for _ in 0..n {
+            signers.insert(DeviceId::from_bytes(r.raw().ok_or_else(bad)?));
+        }
+        let n = count(&mut r, VERIFIER_BYTES_PER_HEAD).ok_or_else(bad)?;
+        let mut chain = Vec::with_capacity(n);
+        for _ in 0..n {
+            chain.push(ChainEntry {
+                commit: CommitId::from_bytes(r.raw().ok_or_else(bad)?),
+                height: r.u64().ok_or_else(bad)?,
+                sequence: r.u64().ok_or_else(bad)?,
+                generation: Generation(r.u32().ok_or_else(bad)?),
+                log_index: r.u64().ok_or_else(bad)?,
+            });
+        }
+        let n = count(&mut r, 16 + 8).ok_or_else(bad)?;
+        let mut marks = BTreeMap::new();
+        for _ in 0..n {
+            let device = DeviceId::from_bytes(r.raw().ok_or_else(bad)?);
+            marks.insert(device, r.u64().ok_or_else(bad)?);
+        }
+        let n = count(&mut r, 32).ok_or_else(bad)?;
+        let mut discarded = BTreeSet::new();
+        for _ in 0..n {
+            discarded.insert(CommitId::from_bytes(r.raw().ok_or_else(bad)?));
+        }
+        r.finish().ok_or_else(bad)?;
+        let verifier = Self {
+            view: FolderView::restore(account, folder, chain, marks, discarded)?,
+            newest_generation,
+            removed_rule,
+            log,
+            last_sequence,
+            last_head_sequence,
+            open,
+            waiting_removal,
+            step_error,
+            side_left,
+            failed: None,
+            cut,
+            signers,
+        };
+        verifier.check_log(state)?;
+        Ok(verifier)
+    }
+}
+
+fn read_bool(r: &mut Reader<'_>) -> Option<bool> {
+    match r.u8()? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::devicelog::tests::{dev, Dev, ACCOUNT};
+
+    /// A small deterministic generator for page boundaries and random deltas (no dependency).
+    pub(super) struct Rng(u64);
+
+    impl Rng {
+        pub(super) fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+        }
+
+        pub(super) fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        pub(super) fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                usize::try_from(self.next() % n as u64).unwrap()
+            }
+        }
+    }
+
+    fn same(a: &Result<DeltaOutcome, ChainError>, b: &Result<DeltaOutcome, ChainError>) -> bool {
+        match (a, b) {
+            (Ok(a), Ok(b)) => a.view == b.view && a.heads == b.heads && a.sides == b.sides,
+            (Err(a), Err(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Runs the page by page check on `delta` cut at random boundaries (empty pages included),
+    /// storing and resuming the state between pages, and returns the result put together.
+    pub(super) fn run_in_pages(
+        view: &FolderView,
+        state: &AccountState,
+        generation: Generation,
+        delta: &[DeltaCommit],
+        removed_rule: bool,
+        rng: &mut Rng,
+    ) -> (Result<DeltaOutcome, ChainError>, Vec<RemovedHead>) {
+        let mut verifier = match view.begin(state, generation, removed_rule) {
+            Ok(v) => v,
+            Err(e) => return (Err(e), Vec::new()),
+        };
+        let mut all = DeltaPart::default();
+        let mut at = 0;
+        while at <= delta.len() {
+            let len = rng.below(delta.len() - at + 2);
+            let end = (at + len).min(delta.len());
+            match verifier.push_page(state, &delta[at..end]) {
+                Ok(part) => all.append(part),
+                Err(e) => {
+                    // A refused page stays refused, and nothing is stored.
+                    assert_eq!(verifier.push_page(state, &[]).unwrap_err(), e);
+                    assert!(verifier.encode().is_none());
+                    return (Err(e), Vec::new());
+                }
+            }
+            assert!(verifier.held_commits() <= 2);
+            if rng.below(2) == 0 {
+                let bytes = verifier.encode().expect("a running check is stored");
+                let back = DeltaVerifier::decode(state, &bytes).expect("and resumed");
+                assert_eq!(back.encode().as_deref(), Some(bytes.as_slice()));
+                verifier = back;
+            }
+            if end == delta.len() {
+                break;
+            }
+            at = end;
+        }
+        let result = match verifier.finish(state) {
+            Ok(DeltaVerdict::Accepted { view, rest }) => {
+                all.append(rest);
+                Ok(DeltaOutcome {
+                    view,
+                    heads: all.heads,
+                    sides: all.sides,
+                })
+            }
+            Ok(DeltaVerdict::RemovedSigner(refusal)) => {
+                assert_eq!(refusal.removal_index(), state.last_removal_index());
+                Err(ChainError::RemovedSigner)
+            }
+            Err(e) => Err(e),
+        };
+        (result, all.removed_heads)
+    }
+
+    /// The page by page check gives the result of the whole delta at once, at every boundary
+    /// tried, and in the check before a barrier the removed heads it lists are those of the
+    /// whole delta's accepted heads.
+    pub(super) fn pages_agree(
+        view: &FolderView,
+        state: &AccountState,
+        generation: Generation,
+        delta: &[DeltaCommit],
+        removed_rule: bool,
+        result: &Result<DeltaOutcome, ChainError>,
+    ) {
+        let whole = view.verify_whole(state, generation, delta, removed_rule);
+        assert!(same(&whole, result), "{whole:?} != {result:?}");
+        let mut rng = Rng::new(delta.len() as u64 + u64::from(removed_rule));
+        for _ in 0..4 {
+            let (paged, removed) =
+                run_in_pages(view, state, generation, delta, removed_rule, &mut rng);
+            assert!(same(&whole, &paged), "{whole:?} != {paged:?}");
+            if let (Ok(outcome), false) = (&whole, removed_rule) {
+                let expected: Vec<CommitId> = outcome
+                    .heads
+                    .iter()
+                    .filter(|h| {
+                        state
+                            .device(&h.commit.device)
+                            .is_some_and(|d| d.removed_at.is_some())
+                    })
+                    .map(|h| h.id)
+                    .collect();
+                assert_eq!(
+                    removed.iter().map(|r| r.commit).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
     use crate::devicelog::{EntryKind, LogDevice, LogError};
     use crate::record::tests::setup;
     use hangar_drive_protocol::ids::Blob;
@@ -2794,6 +3738,496 @@ mod tests {
             .view
             .verify_delta(&w.state, g2, &[head(&late, 6)])
             .is_err());
+    }
+
+    // Security review, info: a re-anchor finds the bases of the segment's side commits by map
+    // lookups. The results are those of the linear search it replaces: a base on the kept
+    // chain or earlier in the segment is found, one on the verified chain after the base is not.
+    #[test]
+    fn reanchor_finds_side_bases_on_the_kept_chain_and_in_the_segment() {
+        let mut w = world();
+        let (a, b) = (w.a.id, w.b.id);
+        let (view, _) = linear(&mut w);
+        let (e1, e2, e3) = (view.chain()[0], view.chain()[1], view.chain()[2]);
+        // The server's fork from c2: c3b, a merge whose side commit is on c1 (kept chain), and a
+        // merge whose side commit is on c3b (segment).
+        let c3b = Commit::on(ACCOUNT, FOLDER, &e2, w.content(b, 40, G1))
+            .sign(&w.b.identity)
+            .unwrap();
+        let e3b = ChainEntry::of(&c3b, 4);
+        let s1 = Commit::side(ACCOUNT, FOLDER, &e1, w.content(a, 41, G1))
+            .sign(&w.a.identity)
+            .unwrap();
+        let m1 = Commit::merge(ACCOUNT, FOLDER, &e3b, &s1, w.content(a, 42, G1))
+            .sign(&w.a.identity)
+            .unwrap();
+        let em1 = ChainEntry::of(&m1, 5);
+        let s2 = Commit::side(ACCOUNT, FOLDER, &e3b, w.content(b, 43, G1))
+            .sign(&w.b.identity)
+            .unwrap();
+        let m2 = Commit::merge(ACCOUNT, FOLDER, &em1, &s2, w.content(b, 44, G1))
+            .sign(&w.b.identity)
+            .unwrap();
+        let delta = [
+            head(&c3b, 4),
+            side(&s1, 5),
+            head(&m1, 5),
+            side(&s2, 6),
+            head(&m2, 6),
+        ];
+        let base = view.reanchor_base(&w.state, G1, &delta).unwrap();
+        assert_eq!(base.base, Some(e2));
+        assert_eq!(base.head.commit, m2.id);
+        assert_eq!(
+            base.segment.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![c3b.id, m1.id, m2.id]
+        );
+        assert_eq!(base.sides, vec![s1, s2]);
+        // A side commit on c3, which the re-anchor drops: on the verified chain, but after the
+        // base, so not a base the segment may use.
+        let s3 = Commit::side(ACCOUNT, FOLDER, &e3, w.content(a, 45, G1))
+            .sign(&w.a.identity)
+            .unwrap();
+        let m3 = Commit::merge(ACCOUNT, FOLDER, &e3b, &s3, w.content(a, 46, G1))
+            .sign(&w.a.identity)
+            .unwrap();
+        assert_eq!(
+            view.reanchor_base(&w.state, G1, &[head(&c3b, 4), side(&s3, 5), head(&m3, 5)])
+                .unwrap_err(),
+            ChainError::SideRule
+        );
+    }
+
+    /// A random delta after `base` in a log where b is removed at the end: heads of a (current,
+    /// at the old or the new log head) and b (removed, at the old head), merges with side
+    /// commits, and mistakes of every kind: a wrong parent, a counter that does not rise, a
+    /// head with the side bit, a side commit without its head or twice, a sequence that goes
+    /// back, bytes that are no commit, a commit of b at a head after its removal.
+    fn random_delta(
+        rng: &mut Rng,
+        w: &mut World,
+        base: Option<ChainEntry>,
+        before: LogHead,
+        after: LogHead,
+        len: usize,
+    ) -> Vec<DeltaCommit> {
+        let (a, b) = (w.a.id, w.b.id);
+        let mut chain: Vec<ChainEntry> = base.into_iter().collect();
+        let mut delta = Vec::new();
+        let mut sequence = base.map_or(1, |e| e.sequence + 1);
+        for n in 0..len {
+            let root = u8::try_from(n % 250).unwrap();
+            let by_b = rng.below(3) == 0;
+            let (device, log_head) = if by_b {
+                (b, before)
+            } else if rng.below(2) == 0 {
+                (a, after)
+            } else {
+                (a, before)
+            };
+            let mut content = w.content(device, root, G1);
+            content.log_head = log_head;
+            let mistake = rng.below(40);
+            if mistake == 0 {
+                content.counter = 1;
+            }
+            if mistake == 1 && by_b {
+                content.log_head = after;
+            }
+            let tip = chain.last().copied();
+            let parent = if mistake == 2 && !chain.is_empty() {
+                Some(chain[rng.below(chain.len())])
+            } else {
+                tip
+            };
+            let call = match (parent, rng.below(4)) {
+                (Some(on), 0) if !chain.is_empty() => {
+                    // A merge with a side commit on an earlier head.
+                    let side_base = chain[rng.below(chain.len())];
+                    let mut side_content = w.content(device, root ^ 0x80, G1);
+                    side_content.log_head = log_head;
+                    let identity = if by_b { &w.b.identity } else { &w.a.identity };
+                    let s = Commit::side(ACCOUNT, FOLDER, &side_base, side_content)
+                        .sign(identity)
+                        .unwrap();
+                    let m = Commit::merge(ACCOUNT, FOLDER, &on, &s, content)
+                        .sign(identity)
+                        .unwrap();
+                    vec![(CommitRole::Side, s), (CommitRole::Head, m)]
+                }
+                (Some(on), _) => {
+                    let identity = if by_b { &w.b.identity } else { &w.a.identity };
+                    let mut commit = Commit::on(ACCOUNT, FOLDER, &on, content);
+                    commit.side = mistake == 3;
+                    match commit.sign(identity) {
+                        Ok(c) => vec![(CommitRole::Head, c)],
+                        Err(_) => Vec::new(),
+                    }
+                }
+                (None, _) => vec![(
+                    CommitRole::Head,
+                    Commit::first(ACCOUNT, FOLDER, content)
+                        .sign(if by_b { &w.b.identity } else { &w.a.identity })
+                        .unwrap(),
+                )],
+            };
+            let at = if mistake == 4 && sequence > 1 {
+                sequence - 1
+            } else {
+                sequence
+            };
+            for (role, c) in &call {
+                let keep = !(mistake == 5 && *role == CommitRole::Head && call.len() == 2);
+                if keep {
+                    delta.push(DeltaCommit {
+                        sequence: at,
+                        role: *role,
+                        commit: Blob(c.wire.clone()),
+                        server_ms: None,
+                    });
+                }
+                if mistake == 6 && *role == CommitRole::Side {
+                    delta.push(DeltaCommit {
+                        sequence: at,
+                        role: CommitRole::Side,
+                        commit: Blob(c.wire.clone()),
+                        server_ms: None,
+                    });
+                }
+                if *role == CommitRole::Head && keep {
+                    chain.push(ChainEntry::of(c, at));
+                }
+            }
+            if mistake == 7 && rng.below(4) == 0 {
+                delta.push(DeltaCommit {
+                    sequence: at,
+                    role: CommitRole::Head,
+                    commit: Blob(vec![1, 2, 3]),
+                    server_ms: None,
+                });
+            }
+            sequence = at + 1 + u64::from(rng.below(3) == 0);
+        }
+        delta
+    }
+
+    // Delta pages (ADR 0001, amendment "security review of the crypto and protocol crates"):
+    // the page by page check accepts and refuses exactly what the check of the whole delta does,
+    // on random deltas with removed signers, barriers, side commits and mistakes, from an empty
+    // view and from a verified chain, with the removed signer rule and without it.
+    #[test]
+    fn pages_check_exactly_what_the_whole_delta_check_does() {
+        let mut outcomes = BTreeMap::<String, usize>::new();
+        for seed in 0..60u64 {
+            let mut rng = Rng::new(seed);
+            let mut w = world();
+            let (linear_view, _) = linear(&mut w);
+            let before = w.state.head().unwrap();
+            let removal = crate::epoch::remove_devices(
+                &w.state,
+                &w.a.identity,
+                w.a.id,
+                0,
+                &[w.b.id],
+                &mut crate::OsEntropy,
+            )
+            .unwrap();
+            w.state = removal.state;
+            let after = w.state.head().unwrap();
+            for view in [FolderView::new(ACCOUNT, FOLDER), linear_view.clone()] {
+                let len = 1 + rng.below(24);
+                let delta = random_delta(
+                    &mut rng,
+                    &mut w,
+                    view.frontier().copied(),
+                    before,
+                    after,
+                    len,
+                );
+                for removed_rule in [true, false] {
+                    let whole = view.verify_whole(&w.state, G1, &delta, removed_rule);
+                    let key = match &whole {
+                        Ok(o) => format!("ok({})", o.heads.len().min(3)),
+                        Err(e) => format!("{e:?}"),
+                    };
+                    *outcomes.entry(key).or_default() += 1;
+                    let result = view.verify_pages(&w.state, G1, &[&delta], removed_rule);
+                    pages_agree(&view, &w.state, G1, &delta, removed_rule, &result);
+                }
+            }
+        }
+        // The deltas reach acceptance as well as the refusals that matter here.
+        for key in [
+            "ok(3)",
+            "RemovedSigner",
+            "Counter",
+            "Sequence",
+            "SideUnexpected",
+        ] {
+            assert!(
+                outcomes.contains_key(key),
+                "{key} never reached: {outcomes:?}"
+            );
+        }
+    }
+
+    // A long delta keeps per verified head only its chain entry: at most two commits are held
+    // back between pages, and the stored state grows by `VERIFIER_BYTES_PER_HEAD` per head.
+    #[test]
+    fn the_page_by_page_check_holds_a_fixed_size_per_head() {
+        let mut w = world();
+        let a = w.a.id;
+        let mut tip: Option<ChainEntry> = None;
+        let mut delta = Vec::new();
+        for n in 0..3000u64 {
+            let content = w.content(a, u8::try_from(n % 250).unwrap(), G1);
+            let c = match &tip {
+                None => Commit::first(ACCOUNT, FOLDER, content),
+                Some(on) => Commit::on(ACCOUNT, FOLDER, on, content),
+            }
+            .sign(&w.a.identity)
+            .unwrap();
+            tip = Some(ChainEntry::of(&c, n + 1));
+            delta.push(head(&c, n + 1));
+        }
+        let view = FolderView::new(ACCOUNT, FOLDER);
+        let mut verifier = view.begin_check(&w.state, G1).unwrap();
+        let empty = verifier.encode().unwrap().len();
+        let mut fixed = 0usize;
+        let mut seen = 0usize;
+        for page in delta.chunks(512) {
+            let part = verifier.push_page(&w.state, page).unwrap();
+            seen += part.heads.len();
+            assert!(part.heads.len() <= page.len());
+            assert!(verifier.held_commits() <= 2);
+            let heads = verifier.view().chain().len();
+            assert_eq!(heads, seen, "the chain holds the heads returned so far");
+            let bytes = verifier.encode().unwrap().len();
+            // The state minus one chain entry per head is bounded: the open call (one commit
+            // here), the one device's mark, and the fixed fields.
+            let rest = bytes - heads * VERIFIER_BYTES_PER_HEAD;
+            fixed = fixed.max(rest);
+            assert!(rest <= empty + 4096, "{rest} bytes besides the chain");
+        }
+        match verifier.finish(&w.state).unwrap() {
+            DeltaVerdict::Accepted { view, rest } => {
+                assert_eq!(seen + rest.heads.len(), 3000);
+                assert_eq!(view.chain().len(), 3000);
+                assert_eq!(view.frontier(), tip.as_ref());
+            }
+            DeltaVerdict::RemovedSigner(_) => panic!("no removed signer here"),
+        }
+        assert!(fixed > 0);
+    }
+
+    // The stored state is read strictly, and only with the log the check began with.
+    #[test]
+    fn a_stored_delta_check_resumes_with_its_own_log_or_a_longer_one() {
+        let mut w = world();
+        let (view, _) = linear(&mut w);
+        let frontier = *view.frontier().unwrap();
+        let c4 = Commit::on(ACCOUNT, FOLDER, &frontier, w.content(w.a.id, 4, G1))
+            .sign(&w.a.identity)
+            .unwrap();
+        let mut verifier = view.begin_check(&w.state, G1).unwrap();
+        verifier.push_page(&w.state, &[head(&c4, 4)]).unwrap();
+        let bytes = verifier.encode().unwrap();
+        let back = DeltaVerifier::decode(&w.state, &bytes).unwrap();
+        assert_eq!(
+            back.held_commits(),
+            1,
+            "c4 waits for a side commit of its call"
+        );
+        for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
+            assert!(DeltaVerifier::decode(&w.state, &bytes[..cut]).is_err());
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(
+            DeltaVerifier::decode(&w.state, &longer).unwrap_err(),
+            ChainError::InvalidView
+        );
+        // A log that grew since the check began is no reason to begin again (security review
+        // follow-up, M5); a log that does not hold the pinned head is.
+        let n = dev(8);
+        let entry = w
+            .state
+            .next_entry(
+                &w.a.identity,
+                w.a.id,
+                0,
+                EntryKind::AddDevice(LogDevice::of(&n.identity, &ACCOUNT, n.id, false)),
+            )
+            .unwrap();
+        let mut grown = w.state.clone();
+        grown.apply(&entry).unwrap();
+        let other = world().state;
+        assert_eq!(
+            DeltaVerifier::decode(&other, &bytes).unwrap_err(),
+            ChainError::LogChanged
+        );
+        let mut resumed = DeltaVerifier::decode(&grown, &bytes).unwrap();
+        assert_eq!(
+            resumed.push_page(&other, &[]).unwrap_err(),
+            ChainError::LogChanged
+        );
+        resumed.push_page(&grown, &[]).unwrap();
+        match resumed.finish(&grown).unwrap() {
+            DeltaVerdict::Accepted { view, rest } => {
+                assert_eq!(rest.heads, vec![c4.clone()]);
+                assert_eq!(view.frontier().unwrap().commit, c4.id);
+            }
+            DeltaVerdict::RemovedSigner(_) => panic!("no removed signer here"),
+        }
+    }
+
+    /// `n` commits of a on `on` at sequences `from..`, naming the log head of `w` now.
+    fn chain_of(w: &mut World, on: &ChainEntry, from: u64, n: usize) -> Vec<SignedCommit> {
+        let mut tip = *on;
+        let mut out = Vec::new();
+        for k in 0..n {
+            let c = Commit::on(ACCOUNT, FOLDER, &tip, w.content(w.a.id, 60 + k as u8, G1))
+                .sign(&w.a.identity)
+                .unwrap();
+            tip = ChainEntry::of(&c, from + k as u64);
+            out.push(c);
+        }
+        out
+    }
+
+    // Security review follow-up, M5: the log grows while a slow device reads a long delta. The
+    // check stays pinned to the log it began with and stops before the first call that needs
+    // the newer log; that part is the next delta against the newer log. Checked that way, the
+    // result is the one the check of the whole delta against the newer log gives.
+    #[test]
+    fn a_growing_log_does_not_restart_the_check() {
+        let mut w = world();
+        let (view, _) = linear(&mut w);
+        let pinned = w.state.clone();
+        let frontier = *view.frontier().unwrap();
+        let before = chain_of(&mut w, &frontier, 4, 5);
+        // The log grows (another device is added), and later commits name the newer head.
+        let n = dev(8);
+        let entry = w
+            .state
+            .next_entry(
+                &w.a.identity,
+                w.a.id,
+                0,
+                EntryKind::AddDevice(LogDevice::of(&n.identity, &ACCOUNT, n.id, false)),
+            )
+            .unwrap();
+        w.state.apply(&entry).unwrap();
+        let last = ChainEntry::of(before.last().unwrap(), 8);
+        let after = chain_of(&mut w, &last, 9, 4);
+        let delta: Vec<DeltaCommit> = before
+            .iter()
+            .enumerate()
+            .map(|(k, c)| head(c, 4 + k as u64))
+            .chain(after.iter().enumerate().map(|(k, c)| head(c, 9 + k as u64)))
+            .collect();
+
+        let mut verifier = view.begin_check(&pinned, G1).unwrap();
+        let mut part = verifier.push_page(&pinned, &delta[..3]).unwrap();
+        // The newer log arrives between pages.
+        part.append(verifier.push_page(&w.state, &delta[3..]).unwrap());
+        assert_eq!(
+            verifier.cut(),
+            Some(9),
+            "the first call naming the newer head"
+        );
+        let DeltaVerdict::Accepted { view: first, rest } = verifier.finish(&w.state).unwrap()
+        else {
+            panic!("accepted");
+        };
+        part.append(rest);
+        assert_eq!(part.heads, before);
+        assert_eq!(first.frontier().unwrap().commit, before.last().unwrap().id);
+        // The rest is the next delta, against the newer log.
+        let next = first.check_delta(&w.state, G1, &delta[5..]).unwrap();
+        let DeltaCheck::Accepted(next) = next else {
+            panic!("accepted");
+        };
+        // The same as the whole delta against the newer log.
+        let whole = view.verify_whole(&w.state, G1, &delta, true).unwrap();
+        assert_eq!(next.view, whole.view);
+        assert_eq!(
+            part.heads
+                .iter()
+                .chain(next.heads.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            whole.heads
+        );
+        // Against the pinned log alone the newer commits are ahead of it, as before.
+        assert_eq!(
+            view.check_delta(&pinned, G1, &delta).unwrap_err(),
+            ChainError::Commit(CommitError::AheadOfLog {
+                index: w.state.len()
+            })
+        );
+    }
+
+    // The attack the pin must not let through: b is removed while a device reads a delta with
+    // b's commits from before, and the server leaves out the barrier. Against the newer log the
+    // delta is refused by the removed signer rule; the pinned check never accepts more.
+    #[test]
+    fn a_removal_in_the_newer_log_is_never_missed() {
+        let mut w = world();
+        let (view, commits) = linear(&mut w);
+        let pinned = w.state.clone();
+        let frontier = *view.frontier().unwrap();
+        let c4 = Commit::on(ACCOUNT, FOLDER, &frontier, w.content(w.b.id, 40, G1))
+            .sign(&w.b.identity)
+            .unwrap();
+        let e4 = ChainEntry::of(&c4, 4);
+        let c5 = Commit::on(ACCOUNT, FOLDER, &e4, w.content(w.b.id, 41, G1))
+            .sign(&w.b.identity)
+            .unwrap();
+        let delta = [head(&c4, 4), head(&c5, 5)];
+        let removal = crate::epoch::remove_devices(
+            &w.state,
+            &w.a.identity,
+            w.a.id,
+            0,
+            &[w.b.id],
+            &mut crate::OsEntropy,
+        )
+        .unwrap();
+        let newer = removal.state;
+        // The whole delta against the newer log: refused.
+        assert!(matches!(
+            view.check_delta(&newer, G1, &delta).unwrap(),
+            DeltaCheck::RemovedSigner(_)
+        ));
+        // The newer log known from the first page on: the check stops before b's first head, so
+        // nothing of b's is accepted; the rest is the next delta, which the rule refuses.
+        let mut verifier = view.begin_check(&pinned, G1).unwrap();
+        let part = verifier.push_page(&newer, &delta).unwrap();
+        assert!(part.heads.is_empty());
+        assert_eq!(verifier.cut(), Some(4));
+        let DeltaVerdict::Accepted { view: same, .. } = verifier.finish(&newer).unwrap() else {
+            panic!("nothing to refuse yet");
+        };
+        assert_eq!(same.frontier(), view.frontier());
+        assert!(matches!(
+            same.check_delta(&newer, G1, &delta).unwrap(),
+            DeltaCheck::RemovedSigner(_)
+        ));
+        // The newer log known only at the end: b's heads were checked already, so the check
+        // must begin again against the newer log.
+        let mut verifier = view.begin_check(&pinned, G1).unwrap();
+        verifier.push_page(&pinned, &delta).unwrap();
+        assert_eq!(verifier.finish(&newer).unwrap_err(), ChainError::LogChanged);
+        // And resumed from storage with the newer log, the same.
+        let mut verifier = view.begin_check(&pinned, G1).unwrap();
+        verifier.push_page(&pinned, &delta[..1]).unwrap();
+        let bytes = verifier.encode().unwrap();
+        let mut resumed = DeltaVerifier::decode(&newer, &bytes).unwrap();
+        resumed.push_page(&newer, &delta[1..]).unwrap();
+        assert_eq!(resumed.cut(), Some(5));
+        assert_eq!(resumed.finish(&newer).unwrap_err(), ChainError::LogChanged);
+        let _ = commits;
     }
 
     #[test]

@@ -42,10 +42,24 @@
 //!
 //! # Replay guard
 //!
-//! [`RecordGuard`] keeps per record the highest version this device accepted and the digest of
-//! its bytes. It refuses an older version ([`GuardError::Replay`]) and a different record under
-//! the same version ([`GuardError::Equivocation`]). It cannot tell a device that a newer version
-//! exists; the freshness rule for `folder-keys` is in [`crate::folder_keys`].
+//! [`RecordGuard`] keeps per record a [`RecordMark`]: the epoch and version of the newest record
+//! this device accepted and the digest of its bytes. Records are ordered by `(epoch, version)`
+//! (security review, low): a record under a newer epoch than the mark's is newer whatever its
+//! version, one under an older epoch is refused ([`GuardError::StaleEpoch`]), and within one
+//! epoch an older version is refused ([`GuardError::Replay`]) and a different record under the
+//! same version too ([`GuardError::Equivocation`]). The guard only sees records that
+//! [`RecordCipher::open`] opened, so a record under a newer epoch always comes from a device
+//! that is current in the verified log. Without the epoch a compromised device and a malicious
+//! server could set a version near `u64::MAX` under the old epoch; after the device's removal
+//! the guard would then refuse every re-sealed record of the new epoch for good.
+//!
+//! The honest server orders records the same way: it stores only the current epoch and only
+//! the stored version plus one, so epochs and versions never go back along what it stores. A
+//! mark stored before the epoch was part of it ([`RecordMark::epoch`] `None`) keeps the old
+//! rule, versions only, until the device accepts a newer record.
+//!
+//! The guard cannot tell a device that a newer version exists; the freshness rule for
+//! `folder-keys` is in [`crate::folder_keys`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -500,8 +514,11 @@ impl RecordCipher {
 /// `length (u64) || plaintext || zeros` to `padme(8 + len)` bytes (module docs, N13).
 fn pad(plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SealError> {
     let len = u64::try_from(plaintext.len()).map_err(|_| SealError::TooLarge)?;
-    let padded_len = usize::try_from(padme(len.checked_add(8).ok_or(SealError::TooLarge)?))
-        .map_err(|_| SealError::TooLarge)?;
+    let padded_len = len
+        .checked_add(8)
+        .and_then(padme)
+        .and_then(|padded| usize::try_from(padded).ok())
+        .ok_or(SealError::TooLarge)?;
     let mut padded = Zeroizing::new(Vec::with_capacity(padded_len));
     padded.extend_from_slice(&len.to_be_bytes());
     padded.extend_from_slice(plaintext);
@@ -519,7 +536,7 @@ fn unpad(padded: &[u8]) -> Result<Zeroizing<Vec<u8>>, OpenError> {
     let len_usize = usize::try_from(len).map_err(|_| OpenError::Padding)?;
     if len_usize > rest.len()
         || len_usize > MAX_RECORD_PLAINTEXT
-        || u64::try_from(padded.len()).ok() != len.checked_add(8).map(padme)
+        || u64::try_from(padded.len()).ok() != len.checked_add(8).and_then(padme)
     {
         return Err(OpenError::Padding);
     }
@@ -544,13 +561,53 @@ pub enum GuardError {
     /// Another record under a version this device accepted: two writers or a lying server.
     #[error("a different record was accepted under the same version")]
     Equivocation,
+    /// A record under an older epoch than one this device accepted.
+    #[error("the record was sealed under epoch {got}, older than the accepted epoch {accepted}")]
+    StaleEpoch {
+        /// The record's epoch.
+        got: u32,
+        /// The epoch accepted.
+        accepted: u32,
+    },
 }
 
-/// The highest accepted version per record (module docs). The app stores
+/// What the guard keeps per record: the newest record this device accepted (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordMark {
+    /// The epoch it was sealed under; `None` for a mark stored before marks held the epoch,
+    /// which then compares by version only.
+    pub epoch: Option<Epoch>,
+    /// Its version.
+    pub version: u64,
+    /// SHA-256 of its sealed bytes.
+    pub digest: [u8; 32],
+}
+
+impl RecordMark {
+    /// A mark stored before marks held the epoch (version and digest only). The epoch comes
+    /// from `stored`, the sealed record the device kept for that key, when those are exactly the
+    /// bytes the mark names (digest and version); otherwise it stays unknown and the mark
+    /// compares by version only, as before (module docs). The kept record was opened when the
+    /// guard accepted it, so its clear header is the one that was checked.
+    pub fn from_legacy(version: u64, digest: [u8; 32], stored: Option<&[u8]>) -> Self {
+        let epoch = stored
+            .filter(|data| crate::encoding::constant_time_eq(&sha256(data), &digest))
+            .and_then(record_header)
+            .filter(|header| header.version == version)
+            .map(|header| header.epoch);
+        Self {
+            epoch,
+            version,
+            digest,
+        }
+    }
+}
+
+/// The newest accepted record per record key (module docs). The app stores
 /// [`RecordGuard::marks`] and resumes it after a restart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordGuard {
-    marks: BTreeMap<RecordKey, (u64, [u8; 32])>,
+    marks: BTreeMap<RecordKey, RecordMark>,
 }
 
 impl RecordGuard {
@@ -560,42 +617,61 @@ impl RecordGuard {
     }
 
     /// A guard with stored marks.
-    pub fn resume(marks: BTreeMap<RecordKey, (u64, [u8; 32])>) -> Self {
+    pub fn resume(marks: BTreeMap<RecordKey, RecordMark>) -> Self {
         Self { marks }
     }
 
     /// The marks to store.
-    pub fn marks(&self) -> &BTreeMap<RecordKey, (u64, [u8; 32])> {
+    pub fn marks(&self) -> &BTreeMap<RecordKey, RecordMark> {
         &self.marks
     }
 
-    /// The highest version accepted for `key`.
+    /// The version of the newest record accepted for `key`.
     pub fn accepted(&self, key: &RecordKey) -> Option<u64> {
-        self.marks.get(key).map(|(version, _)| *version)
+        self.marks.get(key).map(|mark| mark.version)
     }
 
-    /// Checks an opened record without recording it.
+    /// Checks an opened record without recording it (module docs: `(epoch, version)` order).
     pub fn check(&self, record: &OpenedRecord) -> Result<(), GuardError> {
-        match self.marks.get(&record.key) {
-            Some((accepted, _)) if record.version < *accepted => Err(GuardError::Replay {
-                got: record.version,
-                accepted: *accepted,
-            }),
-            Some((accepted, digest))
-                if record.version == *accepted
-                    && !crate::encoding::constant_time_eq(digest, &record.digest) =>
-            {
-                Err(GuardError::Equivocation)
+        let Some(mark) = self.marks.get(&record.key) else {
+            return Ok(());
+        };
+        if let Some(accepted) = mark.epoch {
+            if record.epoch < accepted {
+                return Err(GuardError::StaleEpoch {
+                    got: record.epoch.0,
+                    accepted: accepted.0,
+                });
             }
-            _ => Ok(()),
+            if record.epoch > accepted {
+                return Ok(());
+            }
         }
+        if record.version < mark.version {
+            return Err(GuardError::Replay {
+                got: record.version,
+                accepted: mark.version,
+            });
+        }
+        if record.version == mark.version
+            && !crate::encoding::constant_time_eq(&mark.digest, &record.digest)
+        {
+            return Err(GuardError::Equivocation);
+        }
+        Ok(())
     }
 
     /// Checks and records an opened record. The same record again is accepted (idempotent).
     pub fn accept(&mut self, record: &OpenedRecord) -> Result<(), GuardError> {
         self.check(record)?;
-        self.marks
-            .insert(record.key, (record.version, record.digest));
+        self.marks.insert(
+            record.key,
+            RecordMark {
+                epoch: Some(record.epoch),
+                version: record.version,
+                digest: record.digest,
+            },
+        );
         Ok(())
     }
 }
@@ -1010,7 +1086,7 @@ pub(crate) mod tests {
         // The bound the server checks is the largest padded record.
         assert_eq!(
             padme(8 + MAX_RECORD_PLAINTEXT as u64),
-            MAX_RECORD_PADDED as u64
+            Some(MAX_RECORD_PADDED as u64)
         );
         let largest = vec![0u8; MAX_RECORD_PLAINTEXT];
         let sealed = cipher
@@ -1048,7 +1124,10 @@ pub(crate) mod tests {
                     &mut OsEntropy,
                 )
                 .unwrap();
-            assert_eq!(data.len(), RECORD_OVERHEAD + padme(8 + len as u64) as usize);
+            assert_eq!(
+                data.len(),
+                RECORD_OVERHEAD + padme(8 + len as u64).unwrap() as usize
+            );
             lengths.insert(data.len());
         }
         assert!(lengths.len() < 10, "{lengths:?}");
@@ -1103,5 +1182,157 @@ pub(crate) mod tests {
         // Another record key is independent.
         let other = RecordKey::new(RecordKind::Folders, None).unwrap();
         assert_eq!(resumed.accepted(&other), None);
+    }
+
+    /// Opens `version` of `key` sealed by `sender` under `epoch` at the log head.
+    fn opened_by(
+        state: &AccountState,
+        secret: &AccountSecret,
+        epoch: Epoch,
+        sender: &Dev,
+        key: &RecordKey,
+        version: u64,
+        plaintext: &[u8],
+    ) -> OpenedRecord {
+        let cipher = RecordCipher::for_epoch(state, secret, epoch).unwrap();
+        let data = cipher
+            .seal(
+                key,
+                version,
+                &sender.identity,
+                &sender.id,
+                &state.head().unwrap(),
+                plaintext,
+                &mut OsEntropy,
+            )
+            .unwrap();
+        cipher.open(state, key, version, &data).unwrap()
+    }
+
+    // Security review, low: a compromised current device b and a malicious server give a device
+    // b's record at version u64::MAX. Ordered by version alone, the guard then refused every
+    // record the remaining devices re-sealed after b's removal, for good. Ordered by
+    // `(epoch, version)`, the first record of the new epoch from a current device replaces the
+    // mark; older epochs and older versions of the new epoch stay refused.
+    #[test]
+    fn a_huge_version_of_a_removed_device_does_not_block_the_next_epoch() {
+        let s = setup();
+        let key = ring_key();
+        let poisoned = opened_by(&s.state, &s.secret, Epoch(1), &s.b, &key, u64::MAX, b"b");
+        let older = opened_by(&s.state, &s.secret, Epoch(1), &s.a, &key, 3, b"a3");
+        let mut guard = RecordGuard::new();
+        guard.accept(&poisoned).unwrap();
+        assert_eq!(
+            guard.check(&older),
+            Err(GuardError::Replay {
+                got: 3,
+                accepted: u64::MAX
+            })
+        );
+
+        // a removes b and rotates to epoch 2, then re-seals at the server's next version.
+        let removal = crate::epoch::remove_devices(
+            &s.state,
+            &s.a.identity,
+            s.a.id,
+            0,
+            &[s.b.id],
+            &mut OsEntropy,
+        )
+        .unwrap();
+        let state = removal.state;
+        let secret2 = removal.rotation.secret;
+        let resealed = opened_by(&state, &secret2, Epoch(2), &s.a, &key, 4, b"a4");
+        assert_eq!(guard.accept(&resealed), Ok(()));
+        assert_eq!(
+            guard.marks().get(&key),
+            Some(&RecordMark {
+                epoch: Some(Epoch(2)),
+                version: 4,
+                digest: resealed.digest
+            })
+        );
+        // The record of epoch 1 again, and an older version or another record under epoch 2.
+        assert_eq!(
+            guard.check(&older),
+            Err(GuardError::StaleEpoch {
+                got: 1,
+                accepted: 2
+            })
+        );
+        assert_eq!(
+            guard.check(&poisoned),
+            Err(GuardError::StaleEpoch {
+                got: 1,
+                accepted: 2
+            })
+        );
+        let earlier = opened_by(&state, &secret2, Epoch(2), &s.a, &key, 3, b"a3'");
+        assert_eq!(
+            guard.check(&earlier),
+            Err(GuardError::Replay {
+                got: 3,
+                accepted: 4
+            })
+        );
+        let other = opened_by(&state, &secret2, Epoch(2), &s.a, &key, 4, b"a4'");
+        assert_eq!(guard.check(&other), Err(GuardError::Equivocation));
+        let next = opened_by(&state, &secret2, Epoch(2), &s.a, &key, 5, b"a5");
+        assert_eq!(guard.accept(&next), Ok(()));
+    }
+
+    // An old mark takes its epoch from the kept record only when the bytes are the ones it names.
+    #[test]
+    fn a_legacy_mark_takes_the_epoch_of_its_own_record() {
+        let s = setup();
+        let key = ring_key();
+        let data = sealed(&s, &key, 3, b"three");
+        let digest = sha256(&data);
+        assert_eq!(
+            RecordMark::from_legacy(3, digest, Some(&data)).epoch,
+            Some(Epoch(1))
+        );
+        assert_eq!(RecordMark::from_legacy(3, digest, None).epoch, None);
+        assert_eq!(
+            RecordMark::from_legacy(4, digest, Some(&data)).epoch,
+            None,
+            "another version than the record's"
+        );
+        let other = sealed(&s, &key, 3, b"other");
+        assert_eq!(
+            RecordMark::from_legacy(3, digest, Some(&other)).epoch,
+            None,
+            "other bytes than the mark names"
+        );
+        let mark = RecordMark::from_legacy(3, digest, Some(&data));
+        assert_eq!((mark.version, mark.digest), (3, digest));
+    }
+
+    // A mark stored before marks held the epoch compares by version only, as before.
+    #[test]
+    fn a_mark_without_epoch_keeps_the_version_rule() {
+        let s = setup();
+        let key = ring_key();
+        let v2 = opened_by(&s.state, &s.secret, Epoch(1), &s.a, &key, 2, b"two");
+        let mut legacy = RecordGuard::resume(BTreeMap::from([(
+            key,
+            RecordMark {
+                epoch: None,
+                version: 3,
+                digest: [0; 32],
+            },
+        )]));
+        assert_eq!(
+            legacy.check(&v2),
+            Err(GuardError::Replay {
+                got: 2,
+                accepted: 3
+            })
+        );
+        let v3 = opened_by(&s.state, &s.secret, Epoch(1), &s.a, &key, 3, b"three");
+        assert_eq!(legacy.check(&v3), Err(GuardError::Equivocation));
+        let v4 = opened_by(&s.state, &s.secret, Epoch(1), &s.a, &key, 4, b"four");
+        legacy.accept(&v4).unwrap();
+        assert_eq!(legacy.marks().get(&key).unwrap().epoch, Some(Epoch(1)));
     }
 }

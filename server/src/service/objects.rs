@@ -71,14 +71,14 @@ pub enum Precheck {
 }
 
 /// The checks that need no body: the folder is not retired, whether the object is already
-/// held, and that the disk stays above its reserve with the `expected` bytes of this upload on
-/// top of what uploads in flight still write (finding M5).
+/// held, and that the disk stays above its reserve with what uploads in flight still write
+/// (finding M5). The caller claims this upload's expected bytes in [`App::staging`] first, so
+/// they are part of that sum and two uploads cannot both pass on the same free space.
 pub async fn precheck(
     app: &App,
     session: &Session,
     folder: &FolderId,
     id: &ObjectId,
-    expected: u64,
 ) -> ApiResult<Precheck> {
     let mut conn = app.db.acquire().await?;
     if let Some(row) = folders::find(&mut conn, session.account_pk, folder).await? {
@@ -96,7 +96,7 @@ pub async fn precheck(
         }
     }
     drop(conn);
-    if !usage::disk_has_room(app, expected) {
+    if !usage::disk_has_room(app, 0) {
         return Err(disk_reserve_hit(app, session).await);
     }
     Ok(Precheck::Receive)

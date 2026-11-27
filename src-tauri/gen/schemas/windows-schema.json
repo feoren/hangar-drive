@@ -453,6 +453,12 @@
           "markdownDescription": "Enables the list_devices command without any pre-configured scope."
         },
         {
+          "description": "Enables the list_incoming_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-incoming-delete",
+          "markdownDescription": "Enables the list_incoming_delete command without any pre-configured scope."
+        },
+        {
           "description": "Enables the list_mass_delete command without any pre-configured scope.",
           "type": "string",
           "const": "allow-list-mass-delete",
@@ -585,10 +591,22 @@
           "markdownDescription": "Enables the reset_device command without any pre-configured scope."
         },
         {
+          "description": "Enables the reset_device_discarding_recovery command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reset-device-discarding-recovery",
+          "markdownDescription": "Enables the reset_device_discarding_recovery command without any pre-configured scope."
+        },
+        {
           "description": "Enables the reset_folder command without any pre-configured scope.",
           "type": "string",
           "const": "allow-reset-folder",
           "markdownDescription": "Enables the reset_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resolve_incoming_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resolve-incoming-delete",
+          "markdownDescription": "Enables the resolve_incoming_delete command without any pre-configured scope."
         },
         {
           "description": "Enables the resolve_mass_delete command without any pre-configured scope.",
@@ -999,6 +1017,12 @@
           "markdownDescription": "Denies the list_devices command without any pre-configured scope."
         },
         {
+          "description": "Denies the list_incoming_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-incoming-delete",
+          "markdownDescription": "Denies the list_incoming_delete command without any pre-configured scope."
+        },
+        {
           "description": "Denies the list_mass_delete command without any pre-configured scope.",
           "type": "string",
           "const": "deny-list-mass-delete",
@@ -1131,10 +1155,22 @@
           "markdownDescription": "Denies the reset_device command without any pre-configured scope."
         },
         {
+          "description": "Denies the reset_device_discarding_recovery command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reset-device-discarding-recovery",
+          "markdownDescription": "Denies the reset_device_discarding_recovery command without any pre-configured scope."
+        },
+        {
           "description": "Denies the reset_folder command without any pre-configured scope.",
           "type": "string",
           "const": "deny-reset-folder",
           "markdownDescription": "Denies the reset_folder command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resolve_incoming_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resolve-incoming-delete",
+          "markdownDescription": "Denies the resolve_incoming_delete command without any pre-configured scope."
         },
         {
           "description": "Denies the resolve_mass_delete command without any pre-configured scope.",

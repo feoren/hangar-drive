@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { MockBackend } from "../backend/mock/mockBackend";
 import type { ScenarioId } from "../backend/mock/scenarios";
 import {
   all,
@@ -10,14 +11,21 @@ import {
   click,
   dialog,
   dialogTitle,
+  field,
   flush,
   key,
   maybeButton,
+  menuLabel,
   openMenu,
   renderApp,
   renderWith,
   text,
+  type,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();
@@ -98,30 +106,149 @@ describe("status", () => {
   it("opens the main menu before the logo, closes it with Escape and opens a dialog from it", async () => {
     await renderApp();
     const menu = button("Menü");
-    expect(menu.closest(".brand")?.querySelector(".brand-mark")).toBeTruthy();
+    expect(menu.closest(".topbar-start")?.querySelector(".brand .brand-mark")).toBeTruthy();
     expect(menu.tabIndex).toBe(0);
+    expect(menu.getAttribute("aria-haspopup")).toBe("menu");
     expect(menu.getAttribute("aria-expanded")).toBe("false");
     await click(menu);
     expect(menu.getAttribute("aria-expanded")).toBe("true");
-    expect(all('[role="menu"] [role="menuitem"]').map((item) => item.textContent)).toEqual([
-      "Ordner hinzufügen",
-      "Letzte Aktivitäten",
-      "Geräte",
-      "Einstellungen",
-      "Hilfe",
+    // A menu bar like Hangar's: three menus, each opening a submenu, none open by itself.
+    const groups = all('.menu-root > li > [role="menuitem"]');
+    expect(groups.map(menuLabel)).toEqual(["Datei", "Ansicht", "Hilfe"]);
+    expect(groups.map((item) => item.getAttribute("aria-haspopup"))).toEqual([
+      "menu",
+      "menu",
+      "menu",
     ]);
-    expect(document.activeElement?.textContent).toBe("Ordner hinzufügen");
+    expect(all(".menu-sub")).toHaveLength(0);
+    expect(document.activeElement).toBe(groups[0]);
     await key(document.activeElement ?? document.body, "Escape");
     expect(all('[role="menu"]')).toHaveLength(0);
     expect(document.activeElement).toBe(menu);
-    await click(menu);
-    await click("Einstellungen");
+    await openMenu("Einstellungen");
     expect(dialogTitle()).toBe("Einstellungen");
     // The bar holds only the menu, the logo with the name and the status.
     expect(all(".topbar button").map((element) => element.className)).toEqual([
-      "icon-button row-menu-button",
+      "icon-button menu-button",
       "quiet-button status-button",
     ]);
+  });
+
+  it("groups the entries into File, View and Help, with shortcuts and the current view", async () => {
+    await renderApp();
+    await click(button("Menü"));
+    const entriesOf = async (group: string) => {
+      const item = all('.menu-root > li > [role="menuitem"]').find(
+        (element) => menuLabel(element) === group,
+      );
+      await click(item ?? document.body);
+      return all('.menu-sub [role^="menuitem"]').map((element) => ({
+        label: menuLabel(element),
+        role: element.getAttribute("role"),
+        checked: element.getAttribute("aria-checked"),
+        keys: element.getAttribute("aria-keyshortcuts"),
+      }));
+    };
+    expect(await entriesOf("Datei")).toEqual([
+      { label: "Ordner hinzufügen", role: "menuitem", checked: null, keys: null },
+      { label: "Geräte", role: "menuitem", checked: null, keys: "Control+Shift+D" },
+      { label: "Einstellungen", role: "menuitem", checked: null, keys: "Control+," },
+      { label: "Hangar Drive beenden", role: "menuitem", checked: null, keys: null },
+    ]);
+    expect(await entriesOf("Ansicht")).toEqual([
+      { label: "Liste", role: "menuitemradio", checked: "true", keys: null },
+      { label: "Kacheln", role: "menuitemradio", checked: "false", keys: null },
+      { label: "Letzte Aktivitäten", role: "menuitem", checked: null, keys: null },
+    ]);
+    expect(await entriesOf("Hilfe")).toEqual([
+      { label: "Hilfe", role: "menuitem", checked: null, keys: "F1" },
+    ]);
+    // The shortcut is shown next to the entry, in the UI language.
+    expect(document.querySelector(".menu-sub .menu-hint")?.textContent).toBe("F1");
+  });
+
+  it("walks the menus with the arrow keys and opens a submenu only on Right arrow", async () => {
+    const { mock } = await renderApp();
+    const menu = button("Menü");
+    menu.focus();
+    await key(menu, "ArrowDown");
+    const focused = () => menuLabel(document.activeElement ?? document.body);
+    expect(focused()).toBe("Datei");
+    await key(document.activeElement ?? document.body, "ArrowDown");
+    expect(focused()).toBe("Ansicht");
+    expect(all(".menu-sub")).toHaveLength(0);
+    await key(document.activeElement ?? document.body, "ArrowRight");
+    const view = all('.menu-root > li > [role="menuitem"]')[1];
+    expect(view?.getAttribute("aria-expanded")).toBe("true");
+    expect(focused()).toBe("Liste");
+    // Left arrow closes only the submenu and puts the focus back on its entry.
+    await key(document.activeElement ?? document.body, "ArrowLeft");
+    expect(all(".menu-sub")).toHaveLength(0);
+    expect(view?.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(view);
+    // Enter opens it as well, and Escape in a submenu closes one level only.
+    await key(document.activeElement ?? document.body, "Enter");
+    expect(focused()).toBe("Liste");
+    await key(document.activeElement ?? document.body, "Escape");
+    expect(document.activeElement).toBe(view);
+    expect(all(".menu-root")).toHaveLength(1);
+    // Choosing "Kacheln" switches and stores the view, closes the menu and returns the focus.
+    await key(document.activeElement ?? document.body, "ArrowRight");
+    await key(document.activeElement ?? document.body, "ArrowDown");
+    expect(focused()).toBe("Kacheln");
+    await key(document.activeElement ?? document.body, "Enter");
+    expect(all('[role="menu"]')).toHaveLength(0);
+    expect(document.activeElement).toBe(menu);
+    expect(mock.calls).toContain("setFolderView:grid");
+    expect(document.querySelector(".folder-list.is-grid")).not.toBeNull();
+    expect(button("Kacheln").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("closes the whole menu with Tab and gives the focus back to its button", async () => {
+    await renderApp();
+    const menu = button("Menü");
+    await click(menu);
+    await key(document.activeElement ?? document.body, "ArrowRight");
+    await key(document.activeElement ?? document.body, "Tab");
+    expect(all('[role="menu"]')).toHaveLength(0);
+    expect(document.activeElement).toBe(menu);
+  });
+
+  it("quits from the File menu", async () => {
+    const { mock } = await renderApp();
+    await openMenu("Hangar Drive beenden");
+    expect(mock.calls).toContain("quit");
+  });
+
+  it("shows the version below the name with the beta badge, keeping its line before it loads", async () => {
+    const { mock } = await renderApp();
+    const version = document.querySelector(".topbar .brand-version");
+    expect(document.querySelector(".topbar .brand-name")?.textContent).toBe("Hangar Drive");
+    // The build number comes from the build (vite define), so it may or may not be there.
+    expect(version?.textContent).toMatch(/^0\.1\.0(-\d+)?beta$/);
+    expect(version?.querySelector(".beta-badge")?.textContent).toBe("beta");
+    expect(mock.calls).toContain("getAbout");
+    // Before the answer the line is there but empty, so the name does not move when it arrives.
+    let release: () => void = () => undefined;
+    const slow = new MockBackend({ scenario: "upToDate" });
+    await slow.setLanguage("de");
+    const original = slow.getAbout.bind(slow);
+    slow.getAbout = async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return original();
+    };
+    await renderWith(slow);
+    const waiting = document.querySelector(".topbar .brand-version");
+    expect(waiting).not.toBeNull();
+    expect(waiting?.textContent).toBe("");
+    expect(waiting?.getAttribute("aria-hidden")).toBe("true");
+    release();
+    await flush();
+    expect(document.querySelector(".topbar .brand-version")?.textContent).toMatch(
+      /^0\.1\.0(-\d+)?beta$/,
+    );
   });
 
   it("announces only changes of the state, not every file count", async () => {
@@ -161,6 +288,12 @@ describe("banners", () => {
   it.each<[ScenarioId, string, string[]]>([
     ["suspect", "Auf „Büro-PC“ wurden sehr viele Dateien verändert", ["Was jetzt?", "Das war ich"]],
     ["massDelete", "342 Dateien gelöscht", ["Entscheiden"]],
+    ["incomingDelete", "Büro-PC hat 342 Dateien in „Fotos“ gelöscht", ["Entscheiden"]],
+    [
+      "incomingDeleteUnknown",
+      "Ein anderes Gerät hat 342 Dateien in „Fotos“ gelöscht",
+      ["Entscheiden"],
+    ],
     [
       "removed",
       "Dieses Gerät wurde von „Büro-PC“ entfernt.",
@@ -191,6 +324,13 @@ describe("banners", () => {
     ["serverLong", "Dein Server antwortet seit", ["Fehlerbericht kopieren", "Jetzt versuchen"]],
     ["conflicts", "2 Dateien gibt es in zwei Fassungen", ["Ansehen"]],
     ["names", "4 Dateien können auf diesem Gerät nicht gespeichert werden", ["Ansehen"]],
+    [
+      "noRecoveryCode",
+      "Kein gültiger Wiederherstellungscode",
+      ["Neuen Wiederherstellungscode erstellen"],
+    ],
+    ["foldersUnreadable", "Noch nicht erreichbar: Fotos und Musik", []],
+    ["folderListUnreadable", "Ordnerliste neu begonnen", ["Ausblenden"]],
   ])("%s shows its banner", async (scenario, title, buttons) => {
     await renderApp(scenario);
     await closeDialog();
@@ -260,6 +400,50 @@ describe("banners", () => {
     await click("Ja, löschen");
     expect(mock.calls).toContain("resolveMassDelete:delete");
     expect(text()).toContain("342 Dateien sind jetzt auch auf deinen anderen Geräten gelöscht.");
+  });
+
+  // ADR 0001, amendment "incoming mass deletes": the same dialog in its incoming variant.
+  it("asks about many deletes of another device, restore first", async () => {
+    const { mock } = await renderApp("incomingDelete");
+    expect(dialogTitle()).toBe("Büro-PC hat 342 Dateien in „Fotos“ gelöscht");
+    expect(text()).toContain("Hier liegen sie noch. Sollen sie auch hier gelöscht werden?");
+    // The day the device joined, from the verified log, so a look-alike name stands out (L5).
+    expect(text()).toMatch(/Büro-PC ist seit .+ in deinem Konto\./);
+    expect(text()).not.toContain("Im Papierkorb bleiben sie");
+    const restore = button("Wiederherstellen");
+    expect(document.activeElement).toBe(restore);
+    expect(restore.className).toContain("primary");
+    const hint = document.getElementById(restore.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toBe("Die Dateien kommen auf allen Geräten zurück.");
+    expect(dialog()?.getAttribute("role")).toBe("alertdialog");
+    await key(dialog() ?? document.body, "Escape");
+    expect(dialog()).toBeNull();
+    expect(mock.calls.some((call) => call.startsWith("resolveIncomingDelete"))).toBe(false);
+    expect(banner()?.textContent).toContain("Hier liegen sie noch.");
+    await click("Entscheiden");
+    await click("Liste ansehen");
+    expect(mock.calls).toContain("listIncomingDelete");
+    expect(text()).toContain("Urlaub/Urlaub 342.jpg");
+    await click("Wiederherstellen");
+    expect(mock.calls).toContain("resolveIncomingDelete:restore");
+    expect(text()).toContain("342 Dateien sind wieder da, auf allen Geräten.");
+    await click("Schließen");
+    expect(banner()).toBeNull();
+  });
+
+  it("names no device it does not know and deletes here only through the danger button", async () => {
+    const { mock } = await renderApp("incomingDeleteUnknown");
+    expect(dialogTitle()).toBe("Ein anderes Gerät hat 342 Dateien in „Fotos“ gelöscht");
+    expect(text()).not.toContain("in deinem Konto");
+    expect(button("Ja, hier löschen").className).toContain("danger");
+    mock.controls.nativeConfirm = "no";
+    await click("Ja, hier löschen");
+    expect(mock.calls).toContain("resolveIncomingDelete:delete");
+    expect(text()).not.toContain("jetzt auch hier gelöscht");
+    mock.controls.nativeConfirm = "yes";
+    await click("Ja, hier löschen");
+    expect(text()).toContain("342 Dateien sind jetzt auch hier gelöscht.");
+    expect(mock.calls.some((call) => call.startsWith("resolveMassDelete"))).toBe(false);
   });
 
   it("finds a missing folder, or says it is the wrong one", async () => {
@@ -360,6 +544,61 @@ describe("banners", () => {
     expect(text()).toContain("Angehalten: zu großer Stand auf dem Server");
     await click("Frühere Versionen");
     expect(dialogTitle()).toBe("Frühere Versionen von „Hangar Drive“");
+  });
+
+  // Security review "recovery" L1: an account without a valid recovery code says so until a new
+  // code is confirmed; the banner cannot be hidden, and it leads through the code's steps.
+  it("leads from 'no valid recovery code' to a new code, and the banner goes", async () => {
+    const { mock } = await renderApp("noRecoveryCode");
+    const shown = banner();
+    expect(shown?.className).toContain("banner-attention");
+    expect(shown?.getAttribute("role")).toBe("alert");
+    expect(shown?.textContent).toContain(
+      "Erstelle einen neuen. Ohne ihn kommst du nicht mehr an deine Dateien, wenn du alle Geräte verlierst.",
+    );
+    await click("Neuen Wiederherstellungscode erstellen");
+    expect(mock.calls).toContain("renewRecoveryCode");
+    expect(dialog()?.textContent).toContain(
+      "Dein Konto hatte keinen gültigen Code. Dieser hier gilt, sobald du ihn bestätigt hast.",
+    );
+    const groups = all(".code-group").map((group) => group.textContent);
+    await click("Ich habe ihn gesichert");
+    const index = Number(/Tippe die (\d)\./.exec(text())?.[1]);
+    await type(field(`Gruppe ${String(index)}`), groups[index - 1] ?? "");
+    expect(mock.calls).toContain("confirmRecoveryGroup");
+    expect(dialog()).toBeNull();
+    expect(banner()).toBeNull();
+  });
+
+  // Follow-up review LOW 2: folders whose key could not be read after the recovery are named
+  // calmly and come back by themselves; nothing to hide while a folder is named.
+  it("names the folders not readable after a recovery, calmly", async () => {
+    await renderApp("foldersUnreadable");
+    const shown = banner();
+    expect(shown?.className).toContain("banner-info");
+    expect(shown?.getAttribute("role")).toBe("status");
+    expect(shown?.textContent).toContain(
+      "Diese Ordner ließen sich nach der Wiederherstellung noch nicht öffnen. Sobald dein Server oder ein anderes Gerät sie liefert, sind sie von selbst wieder da.",
+    );
+    expect(shown?.textContent).not.toContain("Ordnerliste");
+  });
+
+  it("hides the started-over folder list on request", async () => {
+    const { mock } = await renderApp("folderListUnreadable");
+    expect(banner()?.textContent).toContain(
+      "Die Liste deiner Ordner ließ sich nach der Wiederherstellung nicht lesen und wurde leer neu begonnen.",
+    );
+    await click("Ausblenden");
+    expect(mock.calls).toContain("dismissSuspect");
+    expect(banner()).toBeNull();
+  });
+
+  it("keeps 'no valid recovery code' when the new code is cancelled", async () => {
+    await renderApp("noRecoveryCode");
+    await click("Neuen Wiederherstellungscode erstellen");
+    await click("Abbrechen");
+    expect(dialog()).toBeNull();
+    expect(banner()?.textContent).toContain("Kein gültiger Wiederherstellungscode");
   });
 
   it("names no device when the server only said this device was removed", async () => {
@@ -623,6 +862,14 @@ describe("activity", () => {
     expect(button("Bericht.docx, Hangar Drive, geändert, vor 2 Min.")).toBeTruthy();
     expect(button("Urlaub 014.jpg, Fotos, von Büro-PC, vor 1 Std.")).toBeTruthy();
     expect(button("Fotos: 120 neue Dateien")).toBeTruthy();
+  });
+
+  it("says yesterday for an hour old entry shortly after midnight", async () => {
+    vi.setSystemTime(new Date(2026, 10, 27, 0, 7));
+    await renderApp();
+    await openMenu("Letzte Aktivitäten");
+    expect(button("Bericht.docx, Hangar Drive, geändert, vor 2 Min.")).toBeTruthy();
+    expect(button("Urlaub 014.jpg, Fotos, von Büro-PC, gestern")).toBeTruthy();
   });
 
   it("shows a file in Explorer and opens its versions", async () => {

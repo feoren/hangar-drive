@@ -123,14 +123,29 @@ export async function click(target: string | RegExp | HTMLElement): Promise<void
   await flush();
 }
 
-/** Opens an entry of the window's main menu ("≡" in the header): devices, settings, help. */
+/** The name an entry of the main menu shows, without its "›", check mark or shortcut. */
+export function menuLabel(element: Element): string {
+  return element.querySelector(".menu-label")?.textContent ?? element.textContent;
+}
+
+/**
+ * Opens an entry of the window's main menu ("≡" in the header), such as "Geräte" or "Hilfe": it
+ * opens each top-level menu (File, View, Help) in turn until one holds the entry, and clicks it.
+ */
 export async function openMenu(entry: string): Promise<void> {
   await click(button(/^(Menü|Menu)$/));
-  const item = all('[role="menu"] [role="menuitem"]').find(
-    (element) => element.textContent === entry,
-  );
-  if (!item) throw new Error(`no menu entry "${entry}"`);
-  await click(item);
+  const groups = all('.menu-root > li > [role="menuitem"]');
+  for (const group of groups) {
+    await click(group);
+    const item = all('.menu-sub [role^="menuitem"]').find(
+      (element) => menuLabel(element) === entry,
+    );
+    if (item) {
+      await click(item);
+      return;
+    }
+  }
+  throw new Error(`no menu entry "${entry}"`);
 }
 
 export async function key(

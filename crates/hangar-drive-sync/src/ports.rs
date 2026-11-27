@@ -549,6 +549,10 @@ pub enum StoreError {
     /// A stored value does not decode.
     #[error("the local index holds an invalid value: {0}")]
     Corrupt(String),
+    /// The volume of the local index has no room left beyond its reserve: the cache is not
+    /// written, so the index never fills the system drive (security review, MEDIUM 3).
+    #[error("the disk of the local index is full")]
+    DiskFull,
 }
 
 /// The chunk IDs of one content, and the generation they were sealed under if known.
@@ -637,6 +641,16 @@ pub trait Store {
         id: &ObjectId,
         plaintext: &[u8],
     ) -> Result<(), StoreError>;
+    /// Keeps of a folder's caches only the plaintexts and object IDs of `objects` and the chunk
+    /// lists of `contents`; returns how many rows went (security review, MEDIUM 3: the caches
+    /// grew without a bound). Everything dropped is a cache: a plaintext is fetched from the
+    /// server again, a chunk list comes again from its manifest.
+    fn retain_cache(
+        &mut self,
+        folder: &FolderId,
+        objects: &std::collections::BTreeSet<ObjectId>,
+        contents: &std::collections::BTreeSet<ContentKey>,
+    ) -> Result<u64, StoreError>;
     /// A value of the account state (JSON), for example the verified log and the counter.
     fn account_value(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
     /// Stores a value of the account state.

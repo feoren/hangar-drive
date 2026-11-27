@@ -6,7 +6,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import type { FolderId, RestoreOutcome, Timeline, TimelineEntry, TreeNode } from "../backend/types";
 import { formatRelative, formatTime } from "../format";
-import { useLanguage, useT } from "../i18n";
+import { displayName, useLanguage, useT } from "../i18n";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
 import { Dialog } from "../ui/Dialog";
 import { FileIcon, FolderIcon, SearchIcon } from "../ui/icons";
@@ -619,7 +619,7 @@ function TreeRow({
         <span className="row-icon small">
           {node.kind === "dir" ? <FolderIcon size={18} /> : <FileIcon size={18} />}
         </span>
-        <span className="tree-name">{node.name}</span>
+        <span className="tree-name">{displayName(node.name)}</span>
         {diffLabel && <span className="tree-diff-label">{diffLabel}</span>}
         {restorable && (
           <>
@@ -870,9 +870,9 @@ function TrashTab({ folderId }: { readonly folderId: FolderId }) {
                 readOnly
               />
               <span className="trash-text">
-                <span className="trash-name">{item.name}</span>
+                <span className="trash-name">{displayName(item.name)}</span>
                 <span className="trash-sub">
-                  {item.dir ? `${item.dir.replaceAll("/", "\\")}\\ ` : ""}
+                  {item.dir ? `${displayName(item.dir).replaceAll("/", "\\")}\\ ` : ""}
                   {t("trash.deleted", {
                     when: formatRelative(language, item.deletedAt, now),
                     device: item.device,

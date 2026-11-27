@@ -7,7 +7,7 @@
 //! stopped: `docker compose run --rm server purge ...`.
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -469,7 +469,14 @@ async fn shutdown_signal() {
 /// With TLS in the server the probe cannot speak plain HTTP to it; then an accepted TCP
 /// connection counts as healthy.
 fn healthcheck(config: &Config) -> ExitCode {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.port));
+    // The address the server listens on; an unspecified one (every interface) is reached over
+    // loopback of its family.
+    let ip = match config.bind {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    let addr = SocketAddr::new(ip, config.port);
     let timeout = Duration::from_secs(3);
     let ok = if config.tls.is_some() {
         std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()

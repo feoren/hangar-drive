@@ -15,12 +15,12 @@ crate-type = ["rlib"]
 # Generates the app context and the permission files of capabilities/ (official Tauri crate,
 # MIT/Apache-2.0).
 tauri-build = { version = "2.7", features = [] }
-# Rasterizes the tray icons of src/tray/icons/*.svg at build time (build.rs), so the window's
-# icon geometry (src/tray/icons.ts) stays the one source and no PNG has to be kept in sync by
-# hand. Build time only, not part of the binary. linebender (the maintained home of resvg),
+# Rasterizes the tray icons at build time (build.rs): the app logo (app-icon.svg, the one source
+# of every app icon) with a state dot, so no PNG has to be kept in sync by hand. Build time
+# only, not part of the binary. linebender (the maintained home of resvg),
 # Apache-2.0 OR MIT; without default features: no text, fonts or raster images, only the
 # path renderer (usvg, tiny-skia under BSD-3-Clause, strict-num, kurbo, roxmltree, svgtypes).
-# Alternative: PNGs generated once and committed, which drift from the SVGs unnoticed.
+# Alternative: PNGs generated once and committed, which drift from the logo unnoticed.
 resvg = { version = "0.50", default-features = false }
 
 [dependencies]
@@ -95,17 +95,19 @@ qrcode = { version = "0.15", default-features = false, features = ["std", "svg"]
 tauri-plugin-updater = { version = "2.14", default-features = false, features = ["rustls-tls", "zip"] }
 
 [target.'cfg(windows)'.dependencies]
-# Taskbar theme (registry), free disk space and volume labels, the user's locale, the time zone
-# offset, and the file manager through the shell API (`SHOpenFolderAndSelectItems`,
-# `ShellExecuteW` with COM, security review L5). MIT/Apache-2.0, Microsoft; already in the tree
-# at this version through Tauri and the sync crate, so only features are added.
+# Free disk space and volume labels, the user's locale, the time zone
+# offset, the file manager through the shell API (`SHOpenFolderAndSelectItems`,
+# `ShellExecuteW` with COM, security review L5) and the native questions with "no" as the
+# default button (`TaskDialogIndirect`, security review LOW 1). MIT/Apache-2.0, Microsoft;
+# already in the tree at this version through Tauri, rfd and the sync crate, so only features
+# are added.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
-  "Win32_System_Registry",
   "Win32_System_Time",
+  "Win32_UI_Controls",
   "Win32_UI_Shell",
   "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",

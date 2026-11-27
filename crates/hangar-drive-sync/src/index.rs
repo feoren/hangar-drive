@@ -137,9 +137,74 @@ fn db(e: rusqlite::Error) -> StoreError {
     StoreError::Db(e.to_string())
 }
 
+/// Free bytes and size of the volume of a directory (`space::free_bytes`, `space::volume_bytes`).
+type SpaceProbe = fn(&Path) -> (Option<u64>, Option<u64>);
+
+fn probe_space(dir: &Path) -> (Option<u64>, Option<u64>) {
+    (
+        crate::space::free_bytes(dir),
+        crate::space::volume_bytes(dir),
+    )
+}
+
+/// Cache bytes written between two readings of the free space.
+const SPACE_CHECK_BYTES: u64 = 8 * 1024 * 1024;
+/// The longest time between two readings of the free space while the cache is written.
+const SPACE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the index volume has room for more cache rows (security review, MEDIUM 3): the free
+/// space is read again after [`SPACE_CHECK_BYTES`] or [`SPACE_CHECK_INTERVAL`], not before each
+/// row, and the cache needs the reserve a download leaves free ([`crate::folder::disk_reserve`]),
+/// so the index never fills the system drive. Unknown free space is no reason to stop: every
+/// supported platform reports it, and the folder state the index holds must still be written.
+struct SpaceGuard {
+    dir: Option<PathBuf>,
+    probe: SpaceProbe,
+    written: u64,
+    checked: Option<std::time::Instant>,
+    room: bool,
+}
+
+impl SpaceGuard {
+    fn new(dir: Option<PathBuf>) -> Self {
+        Self {
+            dir,
+            probe: probe_space,
+            written: 0,
+            checked: None,
+            room: true,
+        }
+    }
+
+    fn ensure(&mut self, bytes: usize) -> Result<(), StoreError> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        self.written = self.written.saturating_add(bytes as u64);
+        let due = self
+            .checked
+            .is_none_or(|at| at.elapsed() >= SPACE_CHECK_INTERVAL)
+            || self.written >= SPACE_CHECK_BYTES;
+        if due {
+            let (free, volume) = (self.probe)(dir);
+            self.room = free.is_none_or(|f| {
+                f >= crate::folder::disk_reserve(volume).saturating_add(bytes as u64)
+            });
+            self.written = 0;
+            self.checked = Some(std::time::Instant::now());
+        }
+        if self.room {
+            Ok(())
+        } else {
+            Err(StoreError::DiskFull)
+        }
+    }
+}
+
 /// The local index in SQLite (module docs).
 pub struct SqliteStore {
     conn: Connection,
+    space: SpaceGuard,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -181,7 +246,8 @@ impl SqliteStore {
         }
         create_private_file(path)?;
         let conn = Connection::open(path).map_err(db)?;
-        let store = Self::init(conn)?;
+        let mut store = Self::init(conn)?;
+        store.space = SpaceGuard::new(path.parent().map(Path::to_path_buf));
         // SQLite creates `-wal` and `-shm` with the database file's mode (`findCreateFileMode`
         // in `os_unix.c`); they are set again here, so an index made by an older version is
         // private as well (security review L7).
@@ -201,6 +267,10 @@ impl SqliteStore {
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db)?;
+        // Deleted rows are overwritten, so the paths and names of a folder removed or of a
+        // device reset do not stay readable in free pages of the file (security review, info).
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(db)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db)?;
         let version: i64 = conn
@@ -215,7 +285,46 @@ impl SqliteStore {
             conn.execute_batch(SCHEMA_V1).map_err(db)?;
             conn.pragma_update(None, "user_version", 1).map_err(db)?;
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            space: SpaceGuard::new(None),
+        })
+    }
+
+    /// Deletes the rows of `table` of `folder` whose `column` is not in `keep`. Table and
+    /// column names come only from the fixed calls in [`Store::retain_cache`].
+    fn retain_rows(
+        tx: &rusqlite::Transaction<'_>,
+        table: &str,
+        column: &str,
+        folder: &FolderId,
+        keep: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Result<u64, StoreError> {
+        let f = folder.as_bytes().as_slice();
+        let mut gone: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare(&format!("SELECT {column} FROM {table} WHERE folder = ?1"))
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![f], |r| r.get::<_, Vec<u8>>(0))
+                .map_err(db)?;
+            for row in rows {
+                let value = row.map_err(db)?;
+                if !keep(&blob32(&value)?) {
+                    gone.push(value);
+                }
+            }
+        }
+        let mut del = tx
+            .prepare(&format!(
+                "DELETE FROM {table} WHERE folder = ?1 AND {column} = ?2"
+            ))
+            .map_err(db)?;
+        for value in &gone {
+            del.execute(params![f, value]).map_err(db)?;
+        }
+        Ok(gone.len() as u64)
     }
 
     fn read_nodes(&self, folder: &FolderId, tree: i64) -> Result<Vec<(ItemId, Node)>, StoreError> {
@@ -436,6 +545,13 @@ impl Store for SqliteStore {
             )
             .map_err(db)?;
         }
+        // A pull of the folder stored between pages (`folder::pull`) goes with it.
+        let pull = format!("pull/{}", folder.to_hex());
+        tx.execute(
+            "DELETE FROM account WHERE key = ?1 OR key LIKE ?2",
+            params![pull, format!("{pull}/%")],
+        )
+        .map_err(db)?;
         tx.commit().map_err(db)
     }
 
@@ -481,6 +597,7 @@ impl Store for SqliteStore {
         for c in &list.chunks {
             bytes.extend_from_slice(c.as_bytes());
         }
+        self.space.ensure(bytes.len())?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO chunks (folder, content, generation, chunks)
@@ -550,6 +667,7 @@ impl Store for SqliteStore {
         id: &ObjectId,
         plaintext: &[u8],
     ) -> Result<(), StoreError> {
+        self.space.ensure(plaintext.len())?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO plaintexts (folder, id, data) VALUES (?1, ?2, ?3)",
@@ -561,6 +679,22 @@ impl Store for SqliteStore {
             )
             .map_err(db)?;
         Ok(())
+    }
+
+    fn retain_cache(
+        &mut self,
+        folder: &FolderId,
+        objects: &std::collections::BTreeSet<ObjectId>,
+        contents: &std::collections::BTreeSet<ContentKey>,
+    ) -> Result<u64, StoreError> {
+        let tx = self.conn.transaction().map_err(db)?;
+        let object = |id: &[u8; 32]| objects.contains(&ObjectId::from_bytes(*id));
+        let content = |c: &[u8; 32]| contents.contains(&ContentKey(*c));
+        let mut gone = Self::retain_rows(&tx, "plaintexts", "id", folder, &object)?;
+        gone += Self::retain_rows(&tx, "objects", "id", folder, &object)?;
+        gone += Self::retain_rows(&tx, "chunks", "content", folder, &content)?;
+        tx.commit().map_err(db)?;
+        Ok(gone)
     }
 
     fn account_value(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -693,6 +827,87 @@ mod tests {
         store.put_account_value("account", b"v").unwrap();
         assert_eq!(store.account_value("account").unwrap().unwrap(), b"v");
         assert_eq!(store.account_value("other").unwrap(), None);
+    }
+
+    /// Security review, MEDIUM 3: the cache keeps only what it is told to, in every table,
+    /// and only of that folder.
+    #[test]
+    fn the_cache_keeps_only_what_is_named() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let (a, b) = (FolderId::from_bytes([1; 16]), FolderId::from_bytes([2; 16]));
+        let oid = |n: u8| ObjectId::from_bytes([n; 32]);
+        let list = ChunkList {
+            generation: Some(1),
+            chunks: vec![oid(9)],
+        };
+        for folder in [a, b] {
+            for n in 1..=4u8 {
+                store.put_plaintext(&folder, &oid(n), b"p").unwrap();
+                store.put_object_for(&folder, &[n; 32], &oid(n)).unwrap();
+                store
+                    .put_chunk_list(&folder, &ContentKey([n; 32]), &list)
+                    .unwrap();
+            }
+        }
+        let keep: std::collections::BTreeSet<ObjectId> = [oid(1), oid(3)].into();
+        let contents: std::collections::BTreeSet<ContentKey> = [ContentKey([2; 32])].into();
+        assert_eq!(store.retain_cache(&a, &keep, &contents).unwrap(), 2 + 2 + 3);
+        assert!(store.plaintext(&a, &oid(1)).unwrap().is_some());
+        assert!(store.plaintext(&a, &oid(2)).unwrap().is_none());
+        assert_eq!(store.object_for(&a, &[3; 32]).unwrap(), Some(oid(3)));
+        assert_eq!(store.object_for(&a, &[4; 32]).unwrap(), None);
+        assert!(store
+            .chunk_list(&a, &ContentKey([2; 32]))
+            .unwrap()
+            .is_some());
+        assert!(store
+            .chunk_list(&a, &ContentKey([1; 32]))
+            .unwrap()
+            .is_none());
+        // The other folder keeps everything.
+        assert!(store.plaintext(&b, &oid(2)).unwrap().is_some());
+        let secure: i64 = store
+            .conn
+            .pragma_query_value(None, "secure_delete", |r| r.get(0))
+            .unwrap();
+        assert_eq!(secure, 1);
+    }
+
+    /// Security review, MEDIUM 3: without room beyond the reserve on the index volume, the
+    /// cache is not written and the store says why; once there is room, it is written again.
+    #[test]
+    fn a_full_index_volume_stops_the_cache_with_its_own_error() {
+        fn full(_: &Path) -> (Option<u64>, Option<u64>) {
+            (Some(100 * 1024 * 1024), Some(1 << 40))
+        }
+        fn roomy(_: &Path) -> (Option<u64>, Option<u64>) {
+            (Some(1 << 39), Some(1 << 40))
+        }
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.space = SpaceGuard::new(Some(PathBuf::from("index")));
+        store.space.probe = full;
+        let folder = FolderId::from_bytes([1; 16]);
+        let oid = ObjectId::from_bytes([7; 32]);
+        assert_eq!(
+            store.put_plaintext(&folder, &oid, b"plain"),
+            Err(StoreError::DiskFull)
+        );
+        let list = ChunkList {
+            generation: None,
+            chunks: vec![oid],
+        };
+        assert_eq!(
+            store.put_chunk_list(&folder, &ContentKey([1; 32]), &list),
+            Err(StoreError::DiskFull)
+        );
+        assert!(store.plaintext(&folder, &oid).unwrap().is_none());
+        store.space.probe = roomy;
+        store.space.checked = None;
+        store.put_plaintext(&folder, &oid, b"plain").unwrap();
+        assert_eq!(
+            crate::error::SyncError::from(StoreError::DiskFull).code(),
+            crate::error::ErrorKind::DiskFull
+        );
     }
 
     #[test]

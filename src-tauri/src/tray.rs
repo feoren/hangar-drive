@@ -5,8 +5,10 @@
 //! stuck: "quit" ends the app, "openApp" brings the window to the front (and is reported too).
 //! A left click shows the window, a double click runs the default item.
 //!
-//! The icons are rasterized at build time from src/tray/icons/*.svg (build.rs) for a light and a
-//! dark taskbar at 16, 20, 24 and 32 px; the size follows the display scale.
+//! The icon is the app logo with a small state dot in the bottom right corner (ux-concept 6.1),
+//! rasterized at build time from app-icon.svg (build.rs) at 16, 20, 24 and 32 px; the size
+//! follows the display scale. The tooltip names the state, so the dot's color is never the only
+//! signal.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -42,15 +44,42 @@ pub enum TrayIcon {
     Setup,
 }
 
-impl TrayIcon {
+/// The state dot on the logo (build.rs `TRAY_BADGES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Badge {
+    /// The plain logo.
+    None,
+    /// Green: everything is up to date.
+    Ok,
+    /// Red: something needs the person.
+    Error,
+    /// Gray: nothing moves on purpose or for now.
+    Idle,
+}
+
+impl Badge {
     pub fn name(self) -> &'static str {
         match self {
-            TrayIcon::Attention => "attention",
-            TrayIcon::Paused => "paused",
-            TrayIcon::Offline => "offline",
-            TrayIcon::Syncing => "syncing",
-            TrayIcon::UpToDate => "upToDate",
-            TrayIcon::Setup => "setup",
+            Badge::None => "none",
+            Badge::Ok => "ok",
+            Badge::Error => "error",
+            Badge::Idle => "idle",
+        }
+    }
+}
+
+impl TrayIcon {
+    /// Which dot a state shows. Syncing has none: it is a passing state between two others, and
+    /// a dot that changed color with every saved file would draw the eye all day. Setup has none
+    /// either: it is also the icon at start, before the window sent its first model, and nothing
+    /// is known yet. Paused and offline are gray: nothing moves, but nothing is wrong (offline
+    /// is promoted to "needs you" after 24 hours, ux-concept 8.3).
+    pub fn badge(self) -> Badge {
+        match self {
+            TrayIcon::Attention => Badge::Error,
+            TrayIcon::Paused | TrayIcon::Offline => Badge::Idle,
+            TrayIcon::Syncing | TrayIcon::Setup => Badge::None,
+            TrayIcon::UpToDate => Badge::Ok,
         }
     }
 }
@@ -205,20 +234,19 @@ pub fn icon_size(scale: f64) -> u32 {
     }
 }
 
-/// The rasterized icon (straight RGBA) of a state for a taskbar theme and size.
-pub fn icon_rgba(icon: TrayIcon, dark_taskbar: bool, size: u32) -> Option<&'static [u8]> {
-    let theme = if dark_taskbar { "dark" } else { "light" };
+/// The rasterized icon (straight RGBA) of a state at a size. The logo brings its own dark tile,
+/// so one icon serves light and dark taskbars.
+pub fn icon_rgba(icon: TrayIcon, size: u32) -> Option<&'static [u8]> {
+    let badge = icon.badge().name();
     TRAY_ICONS
         .iter()
-        .find(|(name, t, s, _)| *name == icon.name() && *t == theme && *s == size)
-        .map(|(_, _, _, rgba)| *rgba)
+        .find(|(name, s, _)| *name == badge && *s == size)
+        .map(|(_, _, rgba)| *rgba)
 }
 
 fn image(icon: TrayIcon, scale: f64) -> Option<Image<'static>> {
     let size = icon_size(scale);
-    // The macOS menu bar tints a template image itself; it gets the dark glyph.
-    let dark = !cfg!(target_os = "macos") && crate::platform::taskbar_is_dark();
-    icon_rgba(icon, dark, size).map(|rgba| Image::new(rgba, size, size))
+    icon_rgba(icon, size).map(|rgba| Image::new(rgba, size, size))
 }
 
 fn scale<R: Runtime>(app: &AppHandle<R>) -> f64 {
@@ -286,12 +314,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
             _ => {}
         });
+    // No template image on macOS: the menu bar would flatten the colored logo and its dot into
+    // one silhouette.
     if let Some(icon) = image(TrayIcon::Setup, scale(app)) {
         builder = builder.icon(icon);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder.icon_as_template(true);
     }
     builder.build(app)?;
     Ok(())
@@ -346,8 +372,6 @@ pub fn apply(app: &AppHandle, model: TrayModel, ids: MenuIds) -> tauri::Result<(
             if let Some(icon) = image(model.icon, scale(&handle)) {
                 tray.set_icon(Some(icon))?;
             }
-            #[cfg(target_os = "macos")]
-            tray.set_icon_as_template(true)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -427,35 +451,120 @@ mod tests {
         .is_err());
     }
 
+    const ALL: [TrayIcon; 6] = [
+        TrayIcon::Attention,
+        TrayIcon::Paused,
+        TrayIcon::Offline,
+        TrayIcon::Syncing,
+        TrayIcon::UpToDate,
+        TrayIcon::Setup,
+    ];
+
+    fn rgb(hex: &str) -> [u8; 3] {
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
+        [channel(1), channel(3), channel(5)]
+    }
+
+    fn pixel(rgba: &[u8], size: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * size + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    fn badge_color(badge: Badge) -> Option<[u8; 3]> {
+        TRAY_BADGE_COLORS
+            .iter()
+            .find(|(name, _)| *name == badge.name())
+            .map(|(_, hex)| rgb(hex))
+    }
+
+    /// A token of the dark theme (`:root`) in src/styles.css.
+    fn dark_token(name: &str) -> String {
+        let css = include_str!("../../src/styles.css");
+        let start = css.find(":root {").unwrap();
+        let block = &css[start..start + css[start..].find("\n}").unwrap()];
+        let needle = format!("--{name}: ");
+        let at = block.find(&needle).unwrap() + needle.len();
+        block[at..at + 7].to_owned()
+    }
+
     #[test]
-    fn every_state_has_an_icon_per_theme_and_size() {
-        for icon in [
-            TrayIcon::Attention,
-            TrayIcon::Paused,
-            TrayIcon::Offline,
-            TrayIcon::Syncing,
-            TrayIcon::UpToDate,
-            TrayIcon::Setup,
-        ] {
-            for dark in [false, true] {
-                for size in [16, 20, 24, 32] {
-                    let rgba = icon_rgba(icon, dark, size).unwrap();
-                    assert_eq!(rgba.len(), (size * size * 4) as usize);
-                    // Something is drawn, and the corners stay transparent.
-                    assert!(rgba.chunks(4).any(|p| p[3] > 200), "{icon:?} {size}");
-                    assert_eq!(rgba[3], 0);
+    fn every_state_shows_its_dot() {
+        assert_eq!(TrayIcon::UpToDate.badge(), Badge::Ok);
+        assert_eq!(TrayIcon::Attention.badge(), Badge::Error);
+        assert_eq!(TrayIcon::Paused.badge(), Badge::Idle);
+        assert_eq!(TrayIcon::Offline.badge(), Badge::Idle);
+        assert_eq!(TrayIcon::Syncing.badge(), Badge::None);
+        assert_eq!(TrayIcon::Setup.badge(), Badge::None);
+    }
+
+    #[test]
+    fn every_state_has_an_icon_per_size_with_its_dot() {
+        for icon in ALL {
+            for size in [16, 20, 24, 32] {
+                let rgba = icon_rgba(icon, size).unwrap();
+                assert_eq!(rgba.len(), (size * size * 4) as usize);
+                // The logo's rounded corners stay transparent; the ring's edge reaches into the
+                // bottom right one only when there is a dot.
+                assert_eq!(pixel(rgba, size, 0, 0)[3], 0, "{icon:?} {size}");
+                assert_eq!(pixel(rgba, size, size - 1, 0)[3], 0, "{icon:?} {size}");
+                if icon.badge() == Badge::None {
+                    let corner = pixel(rgba, size, size - 1, size - 1);
+                    assert_eq!(corner[3], 0, "{icon:?} {size}");
+                }
+                // The middle of the dot carries the state's color, solid.
+                let c = TRAY_BADGE_CENTER * size / 256;
+                let middle = pixel(rgba, size, c, c);
+                match badge_color(icon.badge()) {
+                    Some(color) => assert_eq!(middle, [color[0], color[1], color[2], 255]),
+                    None => {
+                        for (_, hex) in TRAY_BADGE_COLORS {
+                            assert_ne!(middle[..3], rgb(hex), "{icon:?} {size}");
+                        }
+                    }
                 }
             }
         }
-        // The glyph follows the taskbar: dark on light, light on dark.
-        let light = icon_rgba(TrayIcon::UpToDate, false, 32).unwrap();
-        let dark = icon_rgba(TrayIcon::UpToDate, true, 32).unwrap();
-        let opaque = |rgba: &[u8]| rgba.chunks(4).find(|p| p[3] == 255).map(|p| p[0]).unwrap();
-        assert!(opaque(light) < 0x40);
-        assert!(opaque(dark) > 0xc0);
+        // The dark ring separates the dot from the D (32 px, between dot and D).
+        let ring = rgb(TRAY_BADGE_RING);
+        let rgba = icon_rgba(TrayIcon::UpToDate, 32).unwrap();
+        assert_eq!(pixel(rgba, 32, 20, 20), [ring[0], ring[1], ring[2], 255]);
         assert_eq!(icon_size(1.0), 16);
         assert_eq!(icon_size(1.25), 20);
         assert_eq!(icon_size(1.5), 24);
         assert_eq!(icon_size(2.0), 32);
+    }
+
+    #[test]
+    fn the_small_icons_leave_out_the_cream_squares() {
+        let cream = rgb(&dark_token("logo-squares"));
+        let has_cream = |size: u32| {
+            icon_rgba(TrayIcon::Syncing, size)
+                .unwrap()
+                .chunks(4)
+                .any(|p| p[..3] == cream && p[3] == 255)
+        };
+        assert!(!has_cream(16));
+        assert!(!has_cream(20));
+        assert!(has_cream(24));
+        assert!(has_cream(32));
+    }
+
+    #[test]
+    fn the_dot_colors_follow_the_window_tokens() {
+        let hex = |badge: Badge| {
+            TRAY_BADGE_COLORS
+                .iter()
+                .find(|(name, _)| *name == badge.name())
+                .map(|(_, hex)| *hex)
+                .unwrap()
+        };
+        assert_eq!(hex(Badge::Error), dark_token("error"));
+        assert_eq!(hex(Badge::Idle), dark_token("muted"));
+        assert_eq!(TRAY_BADGE_RING, dark_token("logo-tile"));
+        // The green dot is not the logo's green, or it would read as part of the D.
+        assert_ne!(hex(Badge::Ok), dark_token("logo-fold"));
+        let [r, g, b] = rgb(hex(Badge::Ok));
+        assert!(g > r && g > b, "the up to date dot is green");
+        assert_eq!(TRAY_BADGE_COLORS.len(), 3);
     }
 }

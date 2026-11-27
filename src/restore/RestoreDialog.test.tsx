@@ -15,7 +15,11 @@ import {
   text,
   type,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
 import { withParents } from "./RestoreDialog";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();

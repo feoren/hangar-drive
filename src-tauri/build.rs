@@ -2,9 +2,9 @@
 //
 // 1. Registers the app's commands (`COMMANDS`), so Tauri generates one permission per command
 //    (allow-<command>) and the window may only call what capabilities/default.json grants.
-// 2. Rasterizes the tray icons of src/tray/icons/*.svg with resvg at 16, 20, 24 and 32 px for a
-//    light and a dark taskbar, as straight RGBA, into OUT_DIR (`tray_icons.rs`). The window's
-//    icons.ts writes the SVGs and a test there keeps them equal, so the geometry has one source.
+// 2. Rasterizes the tray icons with resvg at 16, 20, 24 and 32 px, as straight RGBA, into
+//    OUT_DIR (`tray_icons.rs`): the app logo (app-icon.svg, the one source of every app icon)
+//    with a state dot in the bottom right corner (ux-concept 6.1).
 // 3. Extracts the texts the backend shows itself (notifications, native confirmations) from
 //    src/i18n.ts for all twelve languages into OUT_DIR (`texts.rs`), so there is still only one
 //    text catalog (project rule: every UI text lives in the i18n module).
@@ -54,6 +54,8 @@ const COMMANDS: &[&str] = &[
     "get_folder_number",
     "list_mass_delete",
     "resolve_mass_delete",
+    "list_incoming_delete",
+    "resolve_incoming_delete",
     "find_missing_folder",
     "check_older_state",
     "reanchor",
@@ -86,6 +88,7 @@ const COMMANDS: &[&str] = &[
     "answer_pair_request",
     "renew_recovery_code",
     "reset_device",
+    "reset_device_discarding_recovery",
     "disconnect_this_device",
     "undo",
     "restore_deleted_folder",
@@ -107,23 +110,30 @@ const COMMANDS: &[&str] = &[
     "quit",
 ];
 
-/// The tray icons by state, as named in src/tray/icons.ts (`iconFileName`).
-const TRAY_ICONS: &[(&str, &str)] = &[
-    ("attention", "tray-attention.svg"),
-    ("paused", "tray-paused.svg"),
-    ("offline", "tray-offline.svg"),
-    ("syncing", "tray-syncing.svg"),
-    ("upToDate", "tray-up-to-date.svg"),
-    ("setup", "tray-setup.svg"),
+/// The tray's state dots: (badge, fill), `None` for the plain logo. src/tray.rs maps each state
+/// to one of them. "error" and "idle" are the window's dark `--error` and `--muted` tokens
+/// (src/styles.css; a test on each side keeps them equal). "ok" is a deeper, more saturated green
+/// than the logo's `#4fd1a5`, so the dot never reads as a piece of the green D next to it.
+const TRAY_BADGES: &[(&str, Option<&str>)] = &[
+    ("none", None),
+    ("ok", Some("#3fb950")),
+    ("error", Some("#ff9491")),
+    ("idle", Some("#8592a3")),
 ];
+/// The dark ring around the dot: the logo tile (`--logo-tile`). It cuts the dot free from the D
+/// and from light and dark taskbars alike.
+const TRAY_BADGE_RING: &str = "#141a24";
+/// The dot in the logo's 256 unit square: centered at (200, 200), so at 16 px it covers exactly
+/// pixels 10 to 14 (5 px); the ring reaches past the corner, which leaves 1 px of ring to the
+/// taskbar and at least 1.5 px to the D, whose corner it cuts cleanly through to the inner edge.
+const TRAY_BADGE_CENTER: u32 = 200;
+const TRAY_BADGE_RADIUS: u32 = 40;
+const TRAY_BADGE_RING_RADIUS: u32 = 64;
+/// The logo's two cream squares become a gray smudge below 24 px; the smaller icons leave them
+/// out (judged by rendering every size on a light and a dark taskbar).
+const TRAY_DETAIL_FROM: u32 = 24;
+const LOGO_DETAIL_FILL: &str = "fill=\"#f2e3c6\"";
 const TRAY_SIZES: &[u32] = &[16, 20, 24, 32];
-/// Glyph colors per taskbar: the window's `--text` and `--error` tokens of the light and the
-/// dark theme (src/styles.css), so tray and window speak one language.
-const THEMES: &[(&str, &str, &str)] = &[
-    // (theme, glyph, attention)
-    ("light", "#1f2328", "#bb022a"),
-    ("dark", "#ffffff", "#ff9491"),
-];
 
 /// Text keys the backend shows itself; a key ending in `.` takes every key with that prefix.
 const TEXT_KEYS: &[&str] = &[
@@ -167,6 +177,10 @@ const TEXT_KEYS: &[&str] = &[
     "reset.question",
     "reset.body",
     "reset.confirm",
+    "reset.pending.question",
+    "reset.pending.body",
+    "reset.pending.anyway",
+    "noRecoveryCode.confirmBody",
     "devices.recovery.renewConfirm",
     "devices.recovery.renewBody",
     "devices.recovery.renewYes",
@@ -183,6 +197,12 @@ const TEXT_KEYS: &[&str] = &[
     "heads.accept",
     "deletes.body.",
     "deletes.confirm",
+    // Many deletes another device made (ADR 0001, amendment "incoming mass deletes").
+    "incoming.title.",
+    "incoming.titleUnknown.",
+    "incoming.ask.",
+    "incoming.askBody",
+    "incoming.confirm",
     "settings.autostart.offTitle",
     "settings.autostart.offBody",
     "settings.autostart.offConfirm",
@@ -204,6 +224,7 @@ const TEXT_KEYS: &[&str] = &[
     "restore.folder.confirm",
     "recover.cleanup.ask.",
     "recover.cleanup.askBody",
+    "recover.cleanup.device",
     "pair.request.lookAlike",
     "devices.lookAlike.question",
     "devices.lookAlike.yes",
@@ -213,7 +234,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.join("..");
     let out = PathBuf::from(env("OUT_DIR"));
-    tray_icons(&root.join("src").join("tray").join("icons"), &out);
+    tray_icons(&manifest_dir.join("app-icon.svg"), &out);
     texts(&root.join("src").join("i18n.ts"), &out);
 
     let windows = tauri_build::WindowsAttributes::new()
@@ -234,42 +255,84 @@ fn env(name: &str) -> String {
     }
 }
 
-fn tray_icons(dir: &Path, out: &Path) {
-    println!("cargo:rerun-if-changed={}", dir.display());
+fn tray_icons(logo_path: &Path, out: &Path) {
+    println!("cargo:rerun-if-changed={}", logo_path.display());
+    let logo = match std::fs::read_to_string(logo_path) {
+        Ok(logo) => logo,
+        Err(error) => panic!("cannot read {}: {error}", logo_path.display()),
+    };
     let mut code = String::from(
-        "/// (icon, theme, size, straight RGBA) of every tray icon, rasterized by build.rs.\n\
-         pub const TRAY_ICONS: &[(&str, &str, u32, &[u8])] = &[\n",
+        "/// (badge, fill) of every tray state dot, as build.rs draws them; for the tests.\n\
+         #[cfg(test)]\n\
+         pub const TRAY_BADGE_COLORS: &[(&str, &str)] = &[\n",
     );
-    for (icon, file) in TRAY_ICONS {
-        let path = dir.join(file);
-        println!("cargo:rerun-if-changed={}", path.display());
-        let svg = match std::fs::read_to_string(&path) {
-            Ok(svg) => svg,
-            Err(error) => panic!("cannot read {}: {error}", path.display()),
-        };
-        for (theme, glyph, attention) in THEMES {
-            let color = if *icon == "attention" {
-                attention
-            } else {
-                glyph
-            };
-            for size in TRAY_SIZES {
-                let rgba = rasterize(&svg.replace("currentColor", color), *size, file);
-                let name = format!("tray-{icon}-{theme}-{size}.rgba");
-                if let Err(error) = std::fs::write(out.join(&name), &rgba) {
-                    panic!("cannot write {name}: {error}");
-                }
-                let _ = writeln!(
-                    code,
-                    "    ({icon:?}, {theme:?}, {size}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{name}\"))),"
-                );
+    for (badge, fill) in TRAY_BADGES {
+        if let Some(fill) = fill {
+            let _ = writeln!(code, "    ({badge:?}, {fill:?}),");
+        }
+    }
+    let _ = writeln!(
+        code,
+        "];\n\
+         /// The ring around the dot; for the tests.\n\
+         #[cfg(test)]\n\
+         pub const TRAY_BADGE_RING: &str = {TRAY_BADGE_RING:?};\n\
+         /// The dot's center in the logo's 256 unit square; for the tests.\n\
+         #[cfg(test)]\n\
+         pub const TRAY_BADGE_CENTER: u32 = {TRAY_BADGE_CENTER};\n\
+         /// (badge, size, straight RGBA) of every tray icon, rasterized by build.rs.\n\
+         pub const TRAY_ICONS: &[(&str, u32, &[u8])] = &["
+    );
+    for (badge, fill) in TRAY_BADGES {
+        for size in TRAY_SIZES {
+            let svg = tray_svg(&logo, *fill, *size);
+            let rgba = rasterize(&svg, *size, "app-icon.svg");
+            let name = format!("tray-{badge}-{size}.rgba");
+            if let Err(error) = std::fs::write(out.join(&name), &rgba) {
+                panic!("cannot write {name}: {error}");
             }
+            let _ = writeln!(
+                code,
+                "    ({badge:?}, {size}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{name}\"))),"
+            );
         }
     }
     code.push_str("];\n");
     if let Err(error) = std::fs::write(out.join("tray_icons.rs"), code) {
         panic!("cannot write tray_icons.rs: {error}");
     }
+}
+
+/// The logo as one tray icon: without the cream squares below [`TRAY_DETAIL_FROM`], with the
+/// state dot and its ring on top. The logo keeps one element per line (app-icon.svg); a changed
+/// layout fails the build instead of drawing a wrong icon.
+fn tray_svg(logo: &str, badge: Option<&str>, size: u32) -> String {
+    let Some(end) = logo.rfind("</svg>") else {
+        panic!("app-icon.svg: no closing </svg>");
+    };
+    if logo
+        .lines()
+        .filter(|l| l.contains(LOGO_DETAIL_FILL))
+        .count()
+        != 1
+    {
+        panic!("app-icon.svg: expected the cream squares as one element of {LOGO_DETAIL_FILL}");
+    }
+    let mut svg: String = logo[..end]
+        .lines()
+        .filter(|line| size >= TRAY_DETAIL_FROM || !line.contains(LOGO_DETAIL_FILL))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(fill) = badge {
+        let c = TRAY_BADGE_CENTER;
+        let _ = write!(
+            svg,
+            "\n<circle cx=\"{c}\" cy=\"{c}\" r=\"{TRAY_BADGE_RING_RADIUS}\" fill=\"{TRAY_BADGE_RING}\"/>\
+             <circle cx=\"{c}\" cy=\"{c}\" r=\"{TRAY_BADGE_RADIUS}\" fill=\"{fill}\"/>"
+        );
+    }
+    svg.push_str("\n</svg>\n");
+    svg
 }
 
 /// The SVG drawn into a `size` square, as straight (not premultiplied) RGBA.

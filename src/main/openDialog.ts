@@ -22,7 +22,8 @@ export type OpenDialog =
   | { readonly kind: "names" }
   | {
       readonly kind: "massDelete";
-      readonly warning: Extract<Warning, { kind: "massDelete" }>;
+      /** This device's deletes, or another device's that wait here (one dialog, two variants). */
+      readonly warning: Extract<Warning, { kind: "massDelete" | "incomingDelete" }>;
       /** Opened by the window itself, so closing it puts the focus on the banner. */
       readonly auto?: boolean;
     }
@@ -43,6 +44,8 @@ export type OpenDialog =
   | { readonly kind: "reanchor"; readonly folderId: string; readonly folderName: string }
   | { readonly kind: "suspect"; readonly warning: Extract<Warning, { kind: "suspect" }> }
   | { readonly kind: "notMe" }
+  /** A new recovery code, from the banner of an account without a valid one. */
+  | { readonly kind: "renewRecovery" }
   | { readonly kind: "repair"; readonly link?: string };
 
 export type Open = (dialog: OpenDialog) => void;

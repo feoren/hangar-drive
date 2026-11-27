@@ -13,6 +13,7 @@ import { BackendError, type BackendErrorCode } from "../errors";
 import type {
   About,
   Confirmation,
+  ResetOutcome,
   HeadsAnswer,
   JoinOutcome,
   MassDeleteOutcome,
@@ -52,6 +53,7 @@ import type {
   PickResult,
   RecoverError,
   RecoveryCode,
+  RecoveryCleanupError,
   RecoverySheetDocument,
   RenameError,
   RestoreOutcome,
@@ -90,7 +92,8 @@ export const MOCK_INPUTS = {
   pairErrors: "…#expired, …#declined, …#toomany, …#other, …#offline, …#damaged",
   recoverLink: START_LINKS.recover,
   recoverLinkErrors: "…#damaged, …#offline, …#insecure",
-  recovery: "any 32 characters; starting with H: other app, 0000…: unknown, 1111…: used",
+  recovery:
+    "any 32 characters; starting with H: other app, 0000…: unknown, 1111…: used; at the last step 2222…: used meanwhile, 3333…: offline once, 4444…: the list changes once",
 } as const;
 
 /** The host of the "idn" pairing link before the window sees it in punycode. */
@@ -171,6 +174,12 @@ export class MockBackend implements Backend {
   private timers = new Set<ReturnType<typeof setTimeout>>();
   private ticker: ReturnType<typeof setInterval> | null = null;
   private recovery: RecoveryCode | null = null;
+  /** The code of a recovery between `recoverAccount` and `finishRecoveryCleanup`. */
+  private recovering: string | null = null;
+  /** A device another device added while the person chose (the 4444… code), once. */
+  private recoveryAdded: Device | null = null;
+  /** The server did not answer the last step once (the 3333… code). */
+  private recoveryUnanswered = false;
   private offer: PairingOffer | null = null;
   private undoTokens = new Map<string, () => void>();
   /** Places handed out with a token, as the shell keeps them (security review L2). */
@@ -517,6 +526,13 @@ export class MockBackend implements Backend {
     // A renewed code of a set-up account asks natively before it replaces the old one.
     if (this.state.setup === "done" && this.controls.nativeConfirm === "no") return "declined";
     this.state.recoveryCreated = this.now();
+    // As the engine: a confirmed code ends "no valid recovery code".
+    if (this.state.warnings.some((warning) => warning.kind === "noRecoveryCode")) {
+      this.state.warnings = this.state.warnings.filter(
+        (warning) => warning.kind !== "noRecoveryCode",
+      );
+      this.emitSnapshot();
+    }
     return "confirmed";
   }
 
@@ -612,6 +628,11 @@ export class MockBackend implements Backend {
     const stranger = input.kind === "link" && input.link.toLowerCase().endsWith("#stranger");
     this.state.devices = stranger ? fx.strangerDevices(this.now()) : fx.devices(this.now());
     this.later(2500, () => {
+      // As the engine: the joined account is stored (setup "done") before the result goes out.
+      if (outcome === "ok") {
+        this.state.setup = "done";
+        this.emitSnapshot();
+      }
       this.emit({
         type: "pairResult",
         result: outcome === "ok" ? { kind: "joined" } : { kind: "failed", error: outcome },
@@ -713,6 +734,19 @@ export class MockBackend implements Backend {
     if (!/^[0-9A-HJKMNP-TV-Z]{32}$/.test(clean)) return { ok: false, error: "typo" };
     if (clean.startsWith("0000")) return { ok: false, error: "unknown" };
     if (clean.startsWith("1111")) return { ok: false, error: "used" };
+    // As the engine: an earlier attempt that is still pending lets its device join first, so the
+    // account exists from here on and the last step needs no second change.
+    if (this.state.warnings.some((warning) => warning.kind === "recoveryPending")) {
+      this.state.warnings = this.state.warnings.filter(
+        (warning) => warning.kind !== "recoveryPending",
+      );
+      this.state.setup = "done";
+      this.emitSnapshot();
+    }
+    // As the engine: signed in as the recovery device, nothing written yet.
+    this.recovering = clean;
+    this.recoveryAdded = null;
+    this.recoveryUnanswered = false;
     return { ok: true, value: null };
   }
 
@@ -733,16 +767,57 @@ export class MockBackend implements Backend {
     );
   }
 
+  /** As the engine before the join: from the device log, without the sealed names. */
   async recoveryDevices(): Promise<readonly Device[]> {
     await this.call("recoveryDevices");
-    return fx.devices(this.now()).map((device) => ({ ...device, isThis: false }));
+    const listed = this.recoveryAdded
+      ? [...fx.devices(this.now()), this.recoveryAdded]
+      : fx.devices(this.now());
+    return listed.map((device): Device => ({
+      ...device,
+      name: "",
+      kind: "laptop",
+      isThis: false,
+      lastSeen: null,
+    }));
   }
 
-  async finishRecoveryCleanup(remove: readonly DeviceId[]): Promise<RecoveryCode | null> {
+  /**
+   * As the engine: the one step that adds this device; the account exists only afterwards. A
+   * device added meanwhile (4444…, once) asks for a new choice, a server that does not answer
+   * (3333…, once) for another try; a code another device made unusable meanwhile (2222…) ends
+   * the recovery. Without a recovery in progress the engine refuses.
+   */
+  async finishRecoveryCleanup(
+    remove: readonly DeviceId[],
+  ): Promise<Result<RecoveryCode | null, RecoveryCleanupError>> {
     await this.call(`finishRecoveryCleanup:${String(remove.length)}`);
-    if (remove.length > 0 && this.controls.nativeConfirm === "no") return null;
+    if (remove.length > 0 && this.controls.nativeConfirm === "no") return { ok: true, value: null };
+    const code = this.recovering;
+    if (code?.startsWith("4444") && this.recoveryAdded === null) {
+      const now = this.now();
+      this.recoveryAdded = {
+        id: "d-new",
+        name: "",
+        kind: "laptop",
+        isThis: false,
+        lastSeen: null,
+        added: now,
+      };
+      return { ok: false, error: "listChanged" };
+    }
+    if (code === null) throw new BackendError("unexpected", "finishRecoveryCleanup");
+    if (code.startsWith("3333") && !this.recoveryUnanswered) {
+      this.recoveryUnanswered = true;
+      return { ok: false, error: "unreachable" };
+    }
+    this.recovering = null;
+    this.recoveryAdded = null;
+    if (code.startsWith("2222")) return { ok: false, error: "used" };
     this.recovery = this.newRecoveryCode();
-    return this.recovery;
+    this.state.setup = "done";
+    this.emitSnapshot();
+    return { ok: true, value: this.recovery };
   }
 
   // Everyday
@@ -923,6 +998,24 @@ export class MockBackend implements Backend {
     return { kind: "resolved", count: warning?.kind === "massDelete" ? warning.count : 0 };
   }
 
+  async listIncomingDelete(warningId: string): Promise<readonly string[]> {
+    await this.call("listIncomingDelete");
+    const warning = this.state.warnings.find((item) => item.id === warningId);
+    return fx.massDeleteList(warning?.kind === "incomingDelete" ? warning.count : 0);
+  }
+
+  async resolveIncomingDelete(
+    warningId: string,
+    decision: "restore" | "delete",
+  ): Promise<MassDeleteOutcome> {
+    await this.call(`resolveIncomingDelete:${decision}`);
+    if (decision === "delete" && this.controls.nativeConfirm === "no") return { kind: "declined" };
+    const warning = this.state.warnings.find((item) => item.id === warningId);
+    this.removeWarning(warningId);
+    this.emitSnapshot();
+    return { kind: "resolved", count: warning?.kind === "incomingDelete" ? warning.count : 0 };
+  }
+
   async findMissingFolder(folderId: FolderId): Promise<PickResult> {
     await this.call("findMissingFolder");
     const result = this.pick({ kind: "find", folderId });
@@ -1007,6 +1100,15 @@ export class MockBackend implements Backend {
 
   async dismissSuspect(warningId: string): Promise<void> {
     await this.call("dismissSuspect");
+    // As the engine: "no valid recovery code" goes only with a new code, never by hiding it.
+    const warning = this.state.warnings.find((item) => item.id === warningId);
+    if (
+      warning?.kind === "noRecoveryCode" ||
+      warning?.kind === "removalReported" ||
+      (warning?.kind === "foldersUnreadable" && warning.folders.length > 0)
+    ) {
+      throw new BackendError("unexpected", "dismissSuspect", "warning cannot be dismissed");
+    }
     this.removeWarning(warningId);
     this.emitSnapshot();
   }
@@ -1334,12 +1436,29 @@ export class MockBackend implements Backend {
     return "confirmed";
   }
 
-  async resetDevice(): Promise<Confirmation> {
+  async resetDevice(): Promise<ResetOutcome> {
     await this.call("resetDevice");
+    // As the shell: during a pending recovery nothing is asked and nothing changes.
+    if (this.state.warnings.some((warning) => warning.kind === "recoveryPending")) {
+      return "recoveryPending";
+    }
     if (this.controls.nativeConfirm === "no") return "declined";
     this.state = scenarioState("setup", this.now());
     this.recovery = null;
     this.offer = null;
+    this.places.clear();
+    this.emitSnapshot();
+    return "confirmed";
+  }
+
+  /** As the shell: after the native question, the pending recovery's key goes with the rest. */
+  async resetDeviceDiscardingRecovery(): Promise<Confirmation> {
+    await this.call("resetDeviceDiscardingRecovery");
+    if (this.controls.nativeConfirm === "no") return "declined";
+    this.state = scenarioState("setup", this.now());
+    this.recovery = null;
+    this.offer = null;
+    this.recovering = null;
     this.places.clear();
     this.emitSnapshot();
     return "confirmed";

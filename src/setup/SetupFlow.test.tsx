@@ -12,12 +12,17 @@ import {
   click,
   field,
   flush,
+  maybeButton,
   renderApp,
   renderWith,
   text,
   type,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
 import { ARM_DELAY_MS } from "../ui/parts";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();
@@ -253,6 +258,18 @@ describe("additional device", () => {
     expect(heading()).toBe("Alles aktuell");
   });
 
+  // The engine stores the joined account before it reports the pairing: the snapshot already
+  // says "done" while the devices check (N2) and the folders are still to come. The setup has to
+  // stay on screen for both instead of switching to the main window.
+  it("stays in the setup after the account came into being at the pairing", async () => {
+    const { mock } = await pastServerQuestion();
+    await wait(1100);
+    expect((await mock.getSnapshot()).setup).toBe("done");
+    expect(heading()).toBe("Das sind deine Geräte?");
+    await click("Ja, das sind meine");
+    expect(heading()).toBe("Welche Ordner sollen auf dieses Gerät?");
+  });
+
   it("disconnects again when the devices are strangers", async () => {
     const { mock } = await pastServerQuestion(MOCK_INPUTS.pairStranger);
     await wait(1100);
@@ -476,6 +493,13 @@ describe("links from the OS", () => {
 });
 
 describe("recovery with the sheet", () => {
+  /** Whether each old device in the list is chosen for removal. */
+  function checked(): boolean[] {
+    return all('.choice-list input[type="checkbox"]').map(
+      (box) => box instanceof HTMLInputElement && box.checked,
+    );
+  }
+
   const CODE = "d7kq-m2xp-9h4t-rw8c-zb3n-f6ja-q1ve-k5sy";
 
   async function enterSheet(link: string, code = CODE) {
@@ -499,8 +523,9 @@ describe("recovery with the sheet", () => {
     expect(heading()).toBe("Alte Geräte entfernen");
     expect(all('.choice-list input[type="checkbox"]')).toHaveLength(3);
     await click(all('.choice-list input[type="checkbox"]')[0] ?? document.body);
-    await click("Weiter");
+    await click("Wiederherstellen");
     expect(mock.calls).toContain("finishRecoveryCleanup:2");
+    // The account exists now (the snapshot says so), and the setup stays for the new code.
     expect(heading()).toBe("Dein Wiederherstellungscode");
     const groups = all(".code-group").map((group) => group.textContent);
     await click("Ich habe ihn gesichert");
@@ -516,9 +541,113 @@ describe("recovery with the sheet", () => {
     await click("Weiter");
     expect(heading()).toBe("Alte Geräte entfernen");
     mock.controls.nativeConfirm = "no";
-    await click("Weiter");
+    await click("Wiederherstellen");
     expect(mock.calls).toContain("finishRecoveryCleanup:3");
     expect(heading()).toBe("Alte Geräte entfernen");
+    expect((await mock.getSnapshot()).setup).toBe("needed");
+  });
+
+  // ADR 0001, "the engine on the recovery in one piece": before the join the names are sealed,
+  // so a device is named by the day it was added, never by an empty line; every device starts
+  // chosen, and the step says what "Recover" does and that stopping before changes nothing.
+  it("names the old devices by the day they were added, all of them chosen", async () => {
+    await enterSheet(MOCK_INPUTS.recoverLink);
+    await click("Weiter");
+    const names = all(".choice-list .row-name").map((name) => name.textContent);
+    expect(names).toEqual([
+      "Gerät, hinzugefügt am 27. Oktober 2026",
+      "Gerät, hinzugefügt am 3. Oktober 2026",
+      "Gerät, hinzugefügt am 22. Oktober 2025",
+    ]);
+    expect(checked()).toEqual([true, true, true]);
+    expect(all('.choice-list input[type="checkbox"]')[0]?.getAttribute("aria-label")).toBe(
+      "„Gerät, hinzugefügt am 27. Oktober 2026“ entfernen",
+    );
+    expect(text()).toContain(
+      "Erst mit „Wiederherstellen“ kommt dieses Gerät in dein Konto. Dein alter Code gilt danach nicht mehr. Brichst du vorher ab, bleibt alles, wie es war.",
+    );
+  });
+
+  it("keeps every old device when none is chosen, and the code still renews", async () => {
+    const { mock } = await enterSheet(MOCK_INPUTS.recoverLink);
+    await click("Weiter");
+    for (const box of all('.choice-list input[type="checkbox"]')) await click(box);
+    await click("Wiederherstellen");
+    expect(mock.calls).toContain("finishRecoveryCleanup:0");
+    expect(heading()).toBe("Dein Wiederherstellungscode");
+  });
+
+  it("ends without a change when the step is cancelled before Recover", async () => {
+    const { mock } = await enterSheet(MOCK_INPUTS.recoverLink);
+    await click("Weiter");
+    await click("Abbrechen");
+    expect(text()).toContain("Kein Gerät mehr da? Wiederherstellungsblatt nutzen");
+    expect(mock.calls.some((call) => call.startsWith("finishRecoveryCleanup"))).toBe(false);
+    expect((await mock.getSnapshot()).setup).toBe("needed");
+  });
+
+  // Security review "recovery" M1: a device added while the person chose is shown, chosen, and
+  // nothing was written; the next "Recover" finishes.
+  it("shows the new list when the account's devices changed in between", async () => {
+    const { mock } = await enterSheet(
+      MOCK_INPUTS.recoverLink,
+      "4444 M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY",
+    );
+    await click("Weiter");
+    await click(all('.choice-list input[type="checkbox"]')[2] ?? document.body);
+    await click("Wiederherstellen");
+    expect(heading()).toBe("Alte Geräte entfernen");
+    expect(text()).toContain(
+      "Die Geräte deines Kontos haben sich gerade geändert. Prüfe die Liste noch einmal.",
+    );
+    expect((await mock.getSnapshot()).setup).toBe("needed");
+    expect(checked()).toEqual([true, true, false, true]);
+    expect(all(".choice-list .row-name").at(-1)?.textContent).toBe(
+      "Gerät, hinzugefügt am 26. November 2026",
+    );
+    await click("Wiederherstellen");
+    expect(mock.calls).toContain("finishRecoveryCleanup:3");
+    expect(heading()).toBe("Dein Wiederherstellungscode");
+  });
+
+  // The code can stop working between the steps (another device removed its recovery device):
+  // the recovery is over, and it starts again with the sheet's link.
+  it("offers to start again when the code stopped working in between", async () => {
+    const { mock } = await enterSheet(
+      MOCK_INPUTS.recoverLink,
+      "2222 M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY",
+    );
+    await click("Weiter");
+    await click("Wiederherstellen");
+    expect(text()).toContain(
+      "Die Wiederherstellung ist nicht abgeschlossen. Starte sie noch einmal. Dieser Code wurde ersetzt. Nimm das neuere Blatt.",
+    );
+    expect(all(".choice-list")).toHaveLength(0);
+    expect((await mock.getSnapshot()).setup).toBe("needed");
+    await click("Von vorn beginnen");
+    expect(heading()).toBe("Mit dem Wiederherstellungsblatt einrichten");
+    expect(text()).toContain("Schritt 1 von 4");
+    expect(field("Link vom Blatt").value).toBe(MOCK_INPUTS.recoverLink);
+    expect(field("Wiederherstellungscode").value).toBe("");
+  });
+
+  // A server that does not answer: the step stays with the choice, and trying again finishes.
+  it("tries the last step again when the server did not answer", async () => {
+    const { mock } = await enterSheet(
+      MOCK_INPUTS.recoverLink,
+      "3333 M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY",
+    );
+    await click("Weiter");
+    await click(all('.choice-list input[type="checkbox"]')[0] ?? document.body);
+    await click("Wiederherstellen");
+    expect(heading()).toBe("Alte Geräte entfernen");
+    expect(text()).toContain("Der Server antwortet nicht.");
+    expect(checked()).toEqual([false, true, true]);
+    // The same step finishes the recovery, and the button says so.
+    expect(maybeButton("Wiederherstellen")).toBeUndefined();
+    await click("Erneut versuchen");
+    expect(mock.calls.filter((call) => call === "finishRecoveryCleanup:2")).toHaveLength(2);
+    expect(heading()).toBe("Dein Wiederherstellungscode");
   });
 
   it("takes a link that broke over lines", async () => {
@@ -562,6 +691,83 @@ describe("recovery with the sheet", () => {
     expect(text()).toContain("Dieser Link gehört nicht zu deinem Code.");
     expect(text()).toContain("Hat dir jemand diesen Link geschickt, nutze ihn nicht.");
     expect(text()).toContain("Schritt 1 von 4");
+  });
+});
+
+// Security review "recovery" H1: a recovery that sent its change but could not join yet is
+// finished by the engine; the window says so calmly, offers no other door, and typing the code
+// again finishes it as well.
+describe("a pending recovery", () => {
+  const CODE = "d7kq-m2xp-9h4t-rw8c-zb3n-f6ja-q1ve-k5sy";
+
+  it("takes the place of the welcome, without the other doors", async () => {
+    await renderApp("recoveryPending");
+    expect(heading()).toBe("Wiederherstellung wird abgeschlossen …");
+    expect(text()).toContain(
+      "Hangar Drive fügt dieses Gerät deinem Konto hinzu, sobald dein Server erreichbar ist. Das geschieht von selbst, du musst nichts tun.",
+    );
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("Hangar Drive fügt");
+    expect(maybeButton("Mit Einladungslink starten")).toBeUndefined();
+    expect(maybeButton("Ich nutze Hangar Drive schon auf einem anderen Gerät")).toBeUndefined();
+    expect(maybeButton("Zurücksetzen")).toBeUndefined();
+    expect(button("Code erneut eingeben")).toBeTruthy();
+  });
+
+  it("opens only the sheet's link while it is pending", async () => {
+    const { mock } = await renderApp("recoveryPending");
+    act(() => {
+      mock.openLink(MOCK_INPUTS.inviteDeep);
+    });
+    await wait(400);
+    expect(heading()).toBe("Wiederherstellung wird abgeschlossen …");
+    act(() => {
+      mock.openLink(MOCK_INPUTS.recoverLink);
+    });
+    await wait(400);
+    expect(heading()).toBe("Mit dem Wiederherstellungsblatt einrichten");
+  });
+
+  it("is finished by typing the code again, and the setup stays for the next steps", async () => {
+    const { mock } = await renderApp("recoveryPending");
+    await click("Code erneut eingeben");
+    expect(heading()).toBe("Mit dem Wiederherstellungsblatt einrichten");
+    await type(field("Link vom Blatt"), MOCK_INPUTS.recoverLink);
+    await wait(400);
+    await type(field("Wiederherstellungscode"), CODE);
+    await click("Weiter");
+    // The pending device joined in this call: the account exists, the setup stays on screen.
+    expect((await mock.getSnapshot()).setup).toBe("done");
+    expect(heading()).toBe("Alte Geräte entfernen");
+    await click("Wiederherstellen");
+    expect(heading()).toBe("Dein Wiederherstellungscode");
+  });
+
+  // Follow-up review LOW 7: a way out stays, behind a warning and the native question, so a
+  // recovery whose server is gone does not lock the device in this screen.
+  it("discards the recovery only after the warning and the native question", async () => {
+    const { mock } = await renderApp("recoveryPending");
+    await click("Wiederherstellung verwerfen …");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      "Die Wiederherstellung ist noch nicht abgeschlossen",
+    );
+    expect(button("Trotzdem zurücksetzen").className).toContain("danger");
+    await click("Abbrechen");
+    expect(maybeButton("Trotzdem zurücksetzen")).toBeUndefined();
+    await click("Wiederherstellung verwerfen …");
+    mock.controls.nativeConfirm = "no";
+    await click("Trotzdem zurücksetzen");
+    expect(mock.calls).toContain("resetDeviceDiscardingRecovery");
+    expect(heading()).toBe("Wiederherstellung wird abgeschlossen …");
+    mock.controls.nativeConfirm = "yes";
+    await click("Trotzdem zurücksetzen");
+    expect(heading()).toBe("Willkommen bei Hangar Drive");
+  });
+
+  it("comes back to the notice when the sheet step is left", async () => {
+    await renderApp("recoveryPending");
+    await click("Code erneut eingeben");
+    await click("Zurück");
+    expect(heading()).toBe("Wiederherstellung wird abgeschlossen …");
   });
 });
 

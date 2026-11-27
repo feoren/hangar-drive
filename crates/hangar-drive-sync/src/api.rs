@@ -320,6 +320,28 @@ pub enum Warning {
         /// The first few names.
         sample: Vec<String>,
     },
+    /// Many deletes another device made wait on this device for the person's decision (ADR
+    /// 0001, amendment "incoming mass deletes"): the files are still here.
+    #[serde(rename_all = "camelCase")]
+    IncomingDelete {
+        /// Warning ID.
+        id: String,
+        /// The folder.
+        folder_id: String,
+        /// Its name.
+        folder_name: String,
+        /// The device that deleted, when the verified timeline names exactly one; `None`
+        /// otherwise.
+        device: Option<String>,
+        /// When that device was added to the account, from the verified device log: a device
+        /// can rename itself to look like another one, but not change this (security review
+        /// L5). `None` without a device.
+        device_added: Option<Millis>,
+        /// Files held.
+        count: u64,
+        /// The first few names.
+        sample: Vec<String>,
+    },
     /// The folder is missing.
     #[serde(rename_all = "camelCase")]
     MissingFolder {
@@ -414,6 +436,37 @@ pub enum Warning {
         id: String,
         /// When the server said it first (Unix ms).
         since: i64,
+    },
+    /// The account has no current recovery device, so no recovery code works for it (security
+    /// review "recovery" L1): the app ended after a recovery joined and before it added the new
+    /// code. The window offers "Create a new recovery code" (`renewRecoveryCode`). This warning
+    /// cannot be dismissed; it goes once a new code is confirmed.
+    NoRecoveryCode {
+        /// Warning ID.
+        id: String,
+    },
+    /// A recovery sent its one append, but this device could not join the account yet (no
+    /// connection, or the app ended in between; security review "recovery" H1). The engine
+    /// tries again by itself; typing the code again resolves it too. The new device's key stays
+    /// in the keychain until the account's log shows whether the append went through.
+    RecoveryPending {
+        /// Warning ID.
+        id: String,
+    },
+    /// After this device's recovery some of the account's folder data could not be read
+    /// (follow-up review LOW 2): the key of each folder in `folders` (by name), which this
+    /// device tries again at every refresh and opens as soon as the server shows it intact or
+    /// a remaining device re-seals it; and with `folder_list` the list of folders itself, which
+    /// this device, as the only one left, had to start empty. Cannot be dismissed while
+    /// `folders` names a folder; with only `folder_list` it can.
+    #[serde(rename_all = "camelCase")]
+    FoldersUnreadable {
+        /// Warning ID.
+        id: String,
+        /// The names of the folders whose key could not be read.
+        folders: Vec<String>,
+        /// The folder list could not be read.
+        folder_list: bool,
     },
     /// The server needs a newer app.
     UpdateRequired {
@@ -1278,6 +1331,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(w).unwrap(),
             json!({"kind": "massDelete", "id": "w", "folderId": "f", "folderName": "Docs", "count": 3, "sample": ["a"]})
+        );
+        let w = Warning::IncomingDelete {
+            id: "w".into(),
+            folder_id: "f".into(),
+            folder_name: "Docs".into(),
+            device: None,
+            device_added: None,
+            count: 120,
+            sample: vec!["a".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(w).unwrap(),
+            json!({"kind": "incomingDelete", "id": "w", "folderId": "f", "folderName": "Docs", "device": null, "deviceAdded": null, "count": 120, "sample": ["a"]})
         );
         let e = BackendEvent::PairRequestGone {
             offer_id: "o".into(),

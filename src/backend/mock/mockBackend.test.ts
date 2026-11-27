@@ -22,12 +22,16 @@ describe("mock scenarios", () => {
       [
         "conflicts",
         "diskFull",
+        "foldersUnreadable",
+        "incomingDelete",
         "massDelete",
         "missingFolder",
         "names",
+        "noRecoveryCode",
         "olderState",
         "quota",
         "quotaFull",
+        "recoveryPending",
         "refused",
         "removalReported",
         "removed",
@@ -145,6 +149,42 @@ describe("mock magic inputs", () => {
       error: "unreachable",
     });
     expect(await recover(sheet, code, " Laptop")).toEqual({ ok: false, error: "edgeWhitespace" });
+  });
+
+  // As the engine: nameless devices before the join, the account only after the last step,
+  // which can also end the recovery.
+  it("join a recovered device only in its last step", async () => {
+    const fresh = new MockBackend({ scenario: "setup" });
+    const code = "D7KQ M2XP 9H4T RW8C ZB3N F6JA Q1VE K5SY";
+    expect(await fresh.recoverAccount(MOCK_INPUTS.recoverLink, code, "Neu")).toMatchObject({
+      ok: true,
+    });
+    const devices = await fresh.recoveryDevices();
+    expect(devices.length).toBeGreaterThan(0);
+    expect(devices.every((device) => device.name === "" && device.added > 0)).toBe(true);
+    expect((await fresh.getSnapshot()).setup).toBe("needed");
+    const done = await fresh.finishRecoveryCleanup([]);
+    expect(done.ok && done.value !== null).toBe(true);
+    expect((await fresh.getSnapshot()).setup).toBe("done");
+
+    const ended = new MockBackend({ scenario: "setup" });
+    await ended.recoverAccount(MOCK_INPUTS.recoverLink, `2222${code.slice(4)}`, "Neu");
+    expect(await ended.finishRecoveryCleanup([])).toEqual({ ok: false, error: "used" });
+    expect((await ended.getSnapshot()).setup).toBe("needed");
+    // Nothing waits any more: the engine refuses, and the recovery starts again.
+    await expect(ended.finishRecoveryCleanup([])).rejects.toMatchObject({ code: "unexpected" });
+
+    const offline = new MockBackend({ scenario: "setup" });
+    await offline.recoverAccount(MOCK_INPUTS.recoverLink, `3333${code.slice(4)}`, "Neu");
+    expect(await offline.finishRecoveryCleanup([])).toEqual({ ok: false, error: "unreachable" });
+    expect((await offline.finishRecoveryCleanup([])).ok).toBe(true);
+
+    const changed = new MockBackend({ scenario: "setup" });
+    await changed.recoverAccount(MOCK_INPUTS.recoverLink, `4444${code.slice(4)}`, "Neu");
+    const before = (await changed.recoveryDevices()).length;
+    expect(await changed.finishRecoveryCleanup([])).toEqual({ ok: false, error: "listChanged" });
+    expect(await changed.recoveryDevices()).toHaveLength(before + 1);
+    expect((await changed.finishRecoveryCleanup([])).ok).toBe(true);
   });
 
   it("read links offline", async () => {

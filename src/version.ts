@@ -53,3 +53,12 @@ export function compareVersions(a: string, b: string): number {
   if (!left || !right) return Number(left !== null) - Number(right !== null);
   return left.major - right.major || left.minor - right.minor || left.revision - right.revision;
 }
+
+/**
+ * Splits for display with a badge, as in Hangar: the number "0.1.0-12" and whether "beta" belongs
+ * to it. While the major version is 0 the app counts as beta; from 1.0.0 on the badge goes.
+ */
+export function versionParts(text: string): { number: string; beta: boolean } {
+  const version = parseVersion(text);
+  return { number: formatVersion(text), beta: version !== null && version.major === 0 };
+}

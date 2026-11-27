@@ -22,20 +22,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hangar_drive_crypto::commit::{
-    ChainEntry, Commit, CommitContent, DeltaCheck, DeltaDigest, DeltaOutcome, FolderView,
-    RemovedHead, SignedCommit,
+    ChainEntry, Commit, CommitContent, DeltaDigest, FolderView, RemovedHead, SignedCommit,
 };
 use hangar_drive_crypto::epoch::BarrierPermit;
 use hangar_drive_crypto::Entropy;
-use hangar_drive_protocol::api::{
-    CommitRequest, CommitUpload, DeltaCommit, ErrorCode, ReferenceDelta,
-};
+use hangar_drive_protocol::api::{CommitRequest, CommitUpload, ErrorCode, ReferenceDelta};
 use hangar_drive_protocol::ids::{
     Blob, CommitId, DeviceId, FolderId, Generation, ItemId, ObjectId,
 };
 use hangar_drive_protocol::name::{is_ignored, RESERVED_ROOT_DIR};
 use hangar_drive_protocol::object::ObjectType;
 use serde::{Deserialize, Serialize};
+
+mod pull;
+
+pub use pull::MAX_PULL_COMMITS;
+pub(crate) use pull::{PullMode, PullVerdict, Pulled};
 
 use crate::account::Account;
 use crate::apply::{apply, ActionError, DiskActions};
@@ -44,17 +46,35 @@ use crate::codec::{self, CodecError, Encoded, FolderCrypto};
 use crate::error::SyncError;
 use crate::merge::{ConflictCopy, ItemIds, MergeLabels};
 use crate::names::{date_label, LabelWords};
-use crate::planner::{plan, Plan, PlanInput, MASS_DELETE_THRESHOLD};
+use crate::planner::{hold_deletes, plan, Plan, PlanInput, MASS_DELETE_THRESHOLD};
 use crate::ports::{
     random_item_id, ChunkList, Clock, EntryType, Expect, FileSystem, FsError, Keychain, NetError,
     SaveBatch, ServerApi, Stat, Store,
 };
-use crate::tree::{ContentKey, FileVersion, Node, NodeKind, Tree, ROOT};
+use crate::tree::{ContentKey, FileVersion, NameIndex, Node, NodeKind, Tree, ROOT};
 
 /// Name of the root marker inside the reserved directory.
 pub const MARKER_NAME: &str = "marker";
 /// Name of the park directory inside the reserved directory.
 pub const PARK_DIR: &str = "park";
+/// The window over which the mass delete guard adds up this device's local deletes (security
+/// review, LOW 1): a guard per round let a slow delete through, 50 files every 10 seconds
+/// never reached 100 in one round.
+pub const DELETE_WINDOW_MS: i64 = 10 * 60 * 1000;
+/// The long window of the mass delete guards (security review M3): deletes since the last
+/// decision add up over a day, so 99 deletes every 10 minutes do not slip through, and the share
+/// of the folder is taken of the fewest files it held over the day, so files added just before a
+/// delete do not dilute it.
+pub const LONG_DELETE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+/// The steps in which the folder's file count is kept for the long window: the fewest per hour.
+const FILE_COUNT_STEP_MS: i64 = 60 * 60 * 1000;
+/// The most files remembered as having just arrived (deleting them again is ordinary work, not
+/// a mass delete); past it the oldest are forgotten and then count like any other file, which
+/// only makes the guard ask sooner.
+pub const FRESH_FILES_CAP: usize = 20_000;
+/// How long the cache of the local index keeps the nodes of the history
+/// ([`FolderSync::prune_cache`]): the server's default retention of 30 days.
+pub const HISTORY_CACHE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// How soon a folder stopped as too large tries again after a change in it.
 const TOO_LARGE_RETRY_MS: i64 = 60 * 1000;
 
@@ -86,6 +106,8 @@ pub struct FolderSettings {
     pub max_tree_items: usize,
     /// The deepest item a folder may hold ([`codec::MAX_TREE_DEPTH`]; smaller in tests).
     pub max_tree_depth: usize,
+    /// The most commits one pull reads ([`MAX_PULL_COMMITS`]; smaller in tests).
+    pub max_pull_commits: usize,
 }
 
 impl Default for FolderSettings {
@@ -100,6 +122,7 @@ impl Default for FolderSettings {
             max_delta_ids: hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS,
             max_tree_items: codec::MAX_TREE_ITEMS,
             max_tree_depth: codec::MAX_TREE_DEPTH,
+            max_pull_commits: MAX_PULL_COMMITS,
         }
     }
 }
@@ -273,8 +296,50 @@ pub struct FolderMeta {
     pub held: BTreeSet<ItemId>,
     /// Held deletes the person undid.
     pub restore: BTreeSet<ItemId>,
-    /// The person allowed the held deletes.
-    pub approve_deletes: bool,
+    /// Held deletes the person let go: exactly these pass the mass delete guard, not deletes
+    /// that came later (security review, LOW 1). Each leaves the set once it went out.
+    #[serde(default)]
+    pub approved: BTreeSet<ItemId>,
+    /// Local deletes this device propagated, as (time, count), for the guard's window of
+    /// [`DELETE_WINDOW_MS`]; deletes the person approved are not counted.
+    #[serde(default)]
+    pub recent_deletes: Vec<(i64, u64)>,
+    /// Local file deletes this device propagated since the person's last decision, as (time,
+    /// count), for the long window [`LONG_DELETE_WINDOW_MS`]; approved deletes and files that
+    /// only just arrived are not counted.
+    #[serde(default)]
+    pub long_deletes: Vec<(i64, u64)>,
+    /// The fewest files the synced tree held per hour, as (hour start, count), within
+    /// [`LONG_DELETE_WINDOW_MS`]: the size of the folder the guards take a share of. Kept only
+    /// while the folder was fully synced once (a first download is no baseline).
+    #[serde(default)]
+    pub file_minimums: Vec<(i64, u64)>,
+    /// Files that came into the synced tree within [`LONG_DELETE_WINDOW_MS`] of a folder that
+    /// was fully synced already, with the time; at most [`FRESH_FILES_CAP`].
+    #[serde(default)]
+    pub fresh_files: BTreeMap<ItemId, i64>,
+    /// Deletes another device made that this device keeps on its disk and in its synced tree
+    /// until the person decides (ADR 0001, amendment "incoming mass deletes"): files and the
+    /// directories deleted with them.
+    #[serde(default)]
+    pub incoming_held: BTreeSet<ItemId>,
+    /// Grows by one whenever [`Self::incoming_held`] gains items, so an approval names the
+    /// state the person saw ([`FolderSync::approve_incoming`]).
+    #[serde(default)]
+    pub incoming_revision: u64,
+    /// The devices that wrote the commits the held deletes came with, from the verified
+    /// timeline; the question names the device when it is one.
+    #[serde(default)]
+    pub incoming_devices: BTreeSet<DeviceId>,
+    /// Incoming deletes the person let go, or that this device's own action made: exactly these
+    /// pass the guard. Each leaves the set once it is no longer an incoming delete.
+    #[serde(default)]
+    pub incoming_approved: BTreeSet<ItemId>,
+    /// Incoming file deletes this device carried out since the person's last decision, as
+    /// (time, count), for the long window [`LONG_DELETE_WINDOW_MS`] (which holds the short one);
+    /// approved ones and files that only just arrived are not counted.
+    #[serde(default)]
+    pub recent_incoming: Vec<(i64, u64)>,
     /// Items retried later (locked files), with the attempt count and the time to retry.
     pub backoff: BTreeMap<ItemId, (u32, i64)>,
     /// Entries never synced (links, system files, names that are not UTF-8).
@@ -437,13 +502,46 @@ pub struct Ctx<'a> {
     pub settings: &'a FolderSettings,
 }
 
-struct EntropyIds<'a>(&'a mut dyn Entropy);
+/// New item IDs from the generator. The merge needs an ID whenever it asks, so a failing
+/// generator still gets one, distinct within the run, and the failure is kept: the caller
+/// refuses the result ([`EntropyIds::check`]) instead of publishing it. Before, every ID after a
+/// failure was the same constant, so two new items could share one ID (security review, info).
+struct EntropyIds<'a> {
+    entropy: &'a mut dyn Entropy,
+    failed: Option<hangar_drive_crypto::EntropyError>,
+    fallback: u64,
+}
+
+impl<'a> EntropyIds<'a> {
+    fn new(entropy: &'a mut dyn Entropy) -> Self {
+        Self {
+            entropy,
+            failed: None,
+            fallback: 0,
+        }
+    }
+
+    /// The generator's failure, if it failed during the run.
+    fn check(self) -> Result<(), SyncError> {
+        match self.failed {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+}
 
 impl ItemIds for EntropyIds<'_> {
     fn new_item_id(&mut self) -> ItemId {
-        // A failing generator here would leave no safe ID; fall back to a hash of a counter
-        // so the merge stays total. The OS generator does not fail in practice.
-        random_item_id(self.0).unwrap_or_else(|_| ItemId::from_bytes([0xff; 16]))
+        match random_item_id(self.entropy) {
+            Ok(id) => id,
+            Err(e) => {
+                self.failed.get_or_insert(e);
+                self.fallback += 1;
+                let mut bytes = [0xff; 16];
+                bytes[8..].copy_from_slice(&self.fallback.to_be_bytes());
+                ItemId::from_bytes(bytes)
+            }
+        }
     }
 }
 
@@ -475,6 +573,10 @@ pub struct FolderSync {
     /// Whether the local tree shows the disk: after a scan of this run, or loaded non-empty from
     /// the index. A new folder's empty tree says nothing about its size yet. Not stored.
     local_known: bool,
+    /// The length of the timeline when the disk was last brought to the plan: the commits after
+    /// it are the ones whose deletes the next plan sees, for naming the writing device. Not
+    /// stored: after a restart the held deletes keep the devices they were stored with.
+    applied_timeline: usize,
 }
 
 /// What the next scan reads from the disk.
@@ -819,6 +921,7 @@ impl FolderSync {
             last_action: None,
             rehash: BTreeSet::new(),
             local_known: false,
+            applied_timeline: 0,
         }
     }
 
@@ -847,7 +950,6 @@ impl FolderSync {
             synced: Tree::from_nodes(stored.synced),
             file_ids: stored.file_ids.into_iter().collect(),
             file_ids_dirty: BTreeMap::new(),
-            meta,
             view,
             scan_scope: ScanScope::Full,
             too_large_at: None,
@@ -855,6 +957,8 @@ impl FolderSync {
             rehash: BTreeSet::new(),
             local_known: !local.is_empty(),
             local,
+            applied_timeline: meta.timeline.len(),
+            meta,
         }))
     }
 
@@ -879,6 +983,57 @@ impl FolderSync {
     /// Stores the folder's state now.
     pub(crate) fn save_state(&mut self, store: &mut dyn Store) -> Result<(), SyncError> {
         self.save(store)
+    }
+
+    /// Shrinks the folder's caches in the local index to what this device still uses (security
+    /// review, MEDIUM 3; the engine calls it with the hourly scan): before, every plaintext,
+    /// object ID and chunk list ever seen stayed until the folder was removed. Kept are
+    ///
+    /// - the object IDs of the remote and the local tree, found by encoding them against the
+    ///   cache (nothing is uploaded), so the next publish seals no unchanged node again;
+    /// - the plaintexts and object IDs of the nodes and manifests reachable from the remote
+    ///   root, the last fully synced head and every commit of the timeline seen within
+    ///   [`HISTORY_CACHE_MS`], so the history opens without the network as before;
+    /// - the chunk lists of every file of the three trees, which a download, the next
+    ///   publish and the scan need, and which cannot all be fetched again (local contents).
+    ///
+    /// What goes is a cache: a restore of an older commit fetches its nodes and manifests
+    /// from the server again, and the chunk lists come with them. A tree that does not encode
+    /// (a chunk list missing already) leaves everything as it is.
+    pub fn prune_cache(&self, cx: &mut Ctx<'_>) -> Result<u64, SyncError> {
+        let now = cx.clock.now_ms();
+        let chain_generation = self.view.frontier().map(|f| f.generation);
+        let crypto = cx.account.folder_crypto(&self.folder, chain_generation)?;
+        let mut objects = BTreeSet::new();
+        for tree in [&self.remote, &self.local] {
+            match codec::encode(tree, &crypto, cx.store, cx.entropy) {
+                Ok(encoded) => objects.extend(encoded.reachable),
+                Err(CodecError::UnknownContent) => return Ok(0),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let roots: Vec<ObjectId> = self
+            .meta
+            .remote_root
+            .into_iter()
+            .chain(self.meta.sync_base.map(|b| b.root))
+            .chain(
+                self.meta
+                    .timeline
+                    .iter()
+                    .filter(|t| now.saturating_sub(t.seen_at_ms) < HISTORY_CACHE_MS)
+                    .map(|t| t.root),
+            )
+            .collect();
+        objects.extend(codec::cached_reachable(&roots, &self.folder, cx.store)?);
+        let contents: BTreeSet<ContentKey> = [&self.remote, &self.synced, &self.local]
+            .into_iter()
+            .flat_map(|t| {
+                t.iter()
+                    .filter_map(|(_, n)| n.kind.file().map(|v| v.content))
+            })
+            .collect();
+        Ok(cx.store.retain_cache(&self.folder, &objects, &contents)?)
     }
 
     /// Writes the root marker (when the person sets the folder up at a place).
@@ -959,10 +1114,15 @@ impl FolderSync {
         self.meta.state
     }
 
-    /// Paths the watcher reported as changed (below the root); the next scan reads them.
+    /// Paths the watcher reported as changed (below the root); the next scan reads them. Past
+    /// [`crate::watch::MAX_CHANGED_PATHS`] (changes that pile up while rounds wait) the next
+    /// scan reads everything instead.
     pub fn note_changes(&mut self, paths: impl IntoIterator<Item = Vec<String>>) {
         if let ScanScope::Paths(set) = &mut self.scan_scope {
             set.extend(paths);
+            if set.len() > crate::watch::MAX_CHANGED_PATHS {
+                self.scan_scope = ScanScope::Full;
+            }
         }
     }
 
@@ -1003,10 +1163,87 @@ impl FolderSync {
         if restore {
             self.meta.restore.extend(held);
         } else {
-            self.meta.approve_deletes = true;
+            self.meta.approved.extend(held);
         }
+        // A decision starts the long window again.
+        self.meta.long_deletes.clear();
         self.save(store)?;
         Ok(n)
+    }
+
+    /// The files among the held incoming deletes (the number the question shows).
+    pub fn incoming_held_files(&self) -> usize {
+        self.meta
+            .incoming_held
+            .iter()
+            .filter(|id| self.synced.get(id).is_some_and(|n| !n.is_dir()))
+            .count()
+    }
+
+    /// "Delete here too" for the held incoming deletes: exactly the held items pass the guard,
+    /// and only when `revision` is the state the person was shown; deletes held since ask
+    /// again. Returns the files approved.
+    pub fn approve_incoming(
+        &mut self,
+        revision: u64,
+        store: &mut dyn Store,
+    ) -> Result<usize, SyncError> {
+        if revision != self.meta.incoming_revision {
+            return Err(SyncError::Invalid("the held deletes changed"));
+        }
+        let n = self.incoming_held_files();
+        let held = std::mem::take(&mut self.meta.incoming_held);
+        self.meta.incoming_approved.extend(held);
+        self.meta.incoming_devices.clear();
+        // A decision starts the long window again.
+        self.meta.recent_incoming.clear();
+        self.save(store)?;
+        Ok(n)
+    }
+
+    /// "Restore on all devices" for the held incoming deletes: a new commit on the current head
+    /// puts every held item that is still gone back at its place, from this device's synced
+    /// tree (the files are still on this disk, so their content can be uploaded again). An
+    /// item that is back already stays as it is. Returns the files that came back.
+    pub fn restore_incoming(&mut self, cx: &mut Ctx<'_>) -> Result<u64, SyncError> {
+        self.pull(cx)?;
+        let date = date_label(cx.clock.now_ms(), cx.settings.tz_offset_minutes);
+        let base = self.synced.clone();
+        let (files, dirs): (Vec<ItemId>, Vec<ItemId>) = self
+            .meta
+            .incoming_held
+            .iter()
+            .filter(|id| base.contains(id))
+            .partition(|id| base.get(id).is_some_and(|n| !n.is_dir()));
+        // A directory comes back with its first file, an empty one on its own. One whose
+        // entries moved elsewhere stays gone: grafting its subtree would bring them twice.
+        let empty_dirs: Vec<ItemId> = dirs
+            .into_iter()
+            .filter(|id| base.children(id).next().is_none())
+            .collect();
+        let mut tree = self.remote.clone();
+        for item in files.iter().chain(empty_dirs.iter()) {
+            if tree.contains(item) {
+                continue;
+            }
+            let mut ids = EntropyIds::new(cx.entropy);
+            tree = graft(&tree, &base, item, &cx.settings.words, &date, &mut ids)?.0;
+            ids.check()?;
+        }
+        let back = tree
+            .iter()
+            .filter(|(id, n)| !n.is_dir() && !self.remote.contains(id))
+            .count() as u64;
+        if tree != self.remote {
+            self.publish_tree(cx, tree)?;
+            // Brought back from a question, not an action with its own undo.
+            self.last_action = None;
+        }
+        self.meta.incoming_held.clear();
+        self.meta.incoming_devices.clear();
+        self.meta.recent_incoming.clear();
+        self.save(cx.store)?;
+        Ok(back)
     }
 
     /// Whether disk, server and synced tree agree (cannot-sync items aside).
@@ -1083,7 +1320,7 @@ impl FolderSync {
         let attempts = cx.settings.max_publish_attempts.max(1);
         let mut planned: Option<Plan> = None;
         for _ in 0..attempts {
-            let p = self.plan_round(cx, &mut report);
+            let p = self.plan_round(cx, &mut report)?;
             if !p.publish {
                 planned = Some(p);
                 break;
@@ -1101,6 +1338,7 @@ impl FolderSync {
             match self.publish(cx, &p) {
                 Ok(()) => {
                     report.published = true;
+                    self.note_deletes(cx.clock.now_ms(), &p.local_deletes);
                     planned = Some(p);
                     break;
                 }
@@ -1202,9 +1440,161 @@ impl FolderSync {
         Err(e)
     }
 
-    fn plan_round(&mut self, cx: &mut Ctx<'_>, report: &mut RoundReport) -> Plan {
+    /// Records local deletes that went out, for the windows of the mass delete guard.
+    fn note_deletes(&mut self, now: i64, deletes: &[ItemId]) {
+        let counted = deletes
+            .iter()
+            .filter(|id| !self.meta.approved.contains(id))
+            .count() as u64;
+        if counted > 0 {
+            self.meta.recent_deletes.push((now, counted));
+        }
+        let old = self.old_files(deletes.iter().filter(|id| !self.meta.approved.contains(id)));
+        if old > 0 {
+            self.meta.long_deletes.push((now, old));
+        }
+    }
+
+    /// Local deletes this device propagated within the window before `now`; older records go.
+    fn recent_deletes(&mut self, now: i64) -> u64 {
+        window_sum(&mut self.meta.recent_deletes, now, DELETE_WINDOW_MS)
+    }
+
+    /// The files among `items` that the synced tree holds and that did not just arrive: what
+    /// the guards count.
+    fn old_files<'a>(&self, items: impl Iterator<Item = &'a ItemId>) -> u64 {
+        items
+            .filter(|id| {
+                self.synced.get(id).is_some_and(|n| !n.is_dir())
+                    && !self.meta.fresh_files.contains_key(id)
+            })
+            .count() as u64
+    }
+
+    /// The folder's size the guards take a share of (security review M3): the fewest files the
+    /// synced tree held over the long window, now included, plus the deletes carried out within
+    /// it (which took files away from that count). Files added just before a delete raise the
+    /// count only after the fewest of the day, so they do not dilute it. Also keeps this hour's
+    /// fewest files, once the folder was fully synced.
+    fn files_before(&mut self, now: i64) -> u64 {
+        let count = self.synced.count_files() as u64;
+        let minimums = &mut self.meta.file_minimums;
+        minimums.retain(|(at, _)| (now - at).abs() < LONG_DELETE_WINDOW_MS);
+        if self.meta.sync_base.is_some() {
+            let hour = now - now.rem_euclid(FILE_COUNT_STEP_MS);
+            match minimums.iter_mut().find(|(at, _)| *at == hour) {
+                Some((_, fewest)) => *fewest = (*fewest).min(count),
+                None => minimums.push((hour, count)),
+            }
+        }
+        let fewest = minimums
+            .iter()
+            .map(|(_, n)| *n)
+            .chain([count])
+            .min()
+            .unwrap_or(count);
+        let carried =
+            window_sum(&mut self.meta.recent_incoming, now, LONG_DELETE_WINDOW_MS).saturating_add(
+                window_sum(&mut self.meta.long_deletes, now, LONG_DELETE_WINDOW_MS),
+            );
+        fewest.saturating_add(carried)
+    }
+
+    /// Remembers the files that came into the synced tree in this round (`arriving`, files of
+    /// the plan the base lacked), when the folder was fully synced before; forgets the ones
+    /// past the long window or gone from the base, and the oldest past [`FRESH_FILES_CAP`].
+    fn note_fresh(&mut self, now: i64, arriving: &[ItemId], baseline: bool) {
+        let synced = &self.synced;
+        let fresh = &mut self.meta.fresh_files;
+        if baseline {
+            for id in arriving.iter().filter(|id| synced.contains(id)) {
+                fresh.entry(*id).or_insert(now);
+            }
+        }
+        fresh.retain(|id, at| synced.contains(id) && (now - *at).abs() < LONG_DELETE_WINDOW_MS);
+        if fresh.len() > FRESH_FILES_CAP {
+            let mut by_age: Vec<(i64, ItemId)> = fresh.iter().map(|(id, at)| (*at, *id)).collect();
+            by_age.sort_unstable();
+            for (_, id) in by_age.iter().take(fresh.len() - FRESH_FILES_CAP) {
+                fresh.remove(id);
+            }
+        }
+    }
+
+    /// The guard for deletes another device made (ADR 0001, amendment "incoming mass deletes";
+    /// security review, LOW 4). An incoming delete is an item of the base and of the disk that
+    /// the server's tree and the plan no longer have; moves keep their item and are none. Once
+    /// the incoming file deletes of the window reach the threshold ([`hold_deletes`]), or while
+    /// a question is open, the new ones are held: the executor leaves them (and the deleted
+    /// directories above them) on the disk and in the synced tree, so everything else of the
+    /// folder keeps syncing. A local change to a held file makes the plan keep it (the merge
+    /// rules), so it leaves the question by itself.
+    fn guard_incoming(&mut self, now: i64, files: u64, own: DeviceId, p: &mut Plan) {
+        let (synced, remote) = (&self.synced, &self.remote);
+        let incoming: BTreeSet<ItemId> = p
+            .disk
+            .ids()
+            .filter(|id| synced.contains(id) && !remote.contains(id) && !p.merged.contains(id))
+            .copied()
+            .collect();
+        self.meta.incoming_held.retain(|id| incoming.contains(id));
+        self.meta
+            .incoming_approved
+            .retain(|id| incoming.contains(id));
+        if self.meta.incoming_held.is_empty() {
+            self.meta.incoming_devices.clear();
+        }
+        let new: Vec<ItemId> = incoming
+            .iter()
+            .filter(|id| {
+                !self.meta.incoming_approved.contains(id) && !self.meta.incoming_held.contains(id)
+            })
+            .copied()
+            .collect();
+        if !new.is_empty() {
+            let asking = !self.meta.incoming_held.is_empty();
+            let recent = window_sum(&mut self.meta.recent_incoming, now, LONG_DELETE_WINDOW_MS);
+            let deleted = self.old_files(new.iter());
+            if asking || (deleted > 0 && hold_deletes(deleted.saturating_add(recent), files)) {
+                self.meta.incoming_held.extend(new);
+                self.meta.incoming_revision = self.meta.incoming_revision.saturating_add(1);
+                let writers = self
+                    .meta
+                    .timeline
+                    .get(self.applied_timeline..)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|t| !t.side && t.device != own)
+                    .map(|t| t.device)
+                    .collect::<Vec<_>>();
+                self.meta.incoming_devices.extend(writers);
+            }
+        }
+        for id in &self.meta.incoming_held {
+            p.skip.insert(*id);
+            let mut at = p.disk.get(id).map(|n| n.parent);
+            while let Some(parent) = at {
+                if parent == ROOT || !incoming.contains(&parent) || !p.skip.insert(parent) {
+                    break;
+                }
+                at = p.disk.get(&parent).map(|n| n.parent);
+            }
+        }
+    }
+
+    fn plan_round(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        report: &mut RoundReport,
+    ) -> Result<Plan, SyncError> {
         let now = cx.clock.now_ms();
         let delay = cx.settings.delete_delay_ms;
+        // A held delete whose item is back on the disk (or gone from the base) is no question
+        // any more.
+        let (synced, local) = (&self.synced, &self.local);
+        self.meta
+            .held
+            .retain(|id| synced.contains(id) && !local.contains(id));
         let delayed: BTreeSet<ItemId> = self
             .meta
             .deleted_seen
@@ -1221,6 +1611,7 @@ impl FolderSync {
             device: &device_name,
             date: &date,
         };
+        let mut ids = EntropyIds::new(cx.entropy);
         let mut p = plan(
             PlanInput {
                 remote: &self.remote,
@@ -1230,13 +1621,36 @@ impl FolderSync {
                 restore: &restore,
             },
             &labels,
-            &mut EntropyIds(cx.entropy),
+            &mut ids,
         );
-        if p.local_deletes.len() >= cx.settings.mass_delete_threshold && !self.meta.approve_deletes
+        ids.check()?;
+        // The guard (security review, LOW 1): deletes the person approved pass; the others are
+        // held while a question is open, or when they reach the threshold together with what
+        // this device propagated within the window.
+        let unapproved: Vec<ItemId> = p
+            .local_deletes
+            .iter()
+            .filter(|id| !self.meta.approved.contains(id))
+            .copied()
+            .collect();
+        let asking = !self.meta.held.is_empty();
+        let recent = self.recent_deletes(now);
+        let threshold = cx.settings.mass_delete_threshold as u64;
+        let files = self.files_before(now);
+        // The long window (security review M3): the old files this device deleted since the
+        // last decision, by the share rule of the incoming guard and never below the set
+        // threshold.
+        let old = self.old_files(unapproved.iter());
+        let long =
+            window_sum(&mut self.meta.long_deletes, now, LONG_DELETE_WINDOW_MS).saturating_add(old);
+        let slow = old > 0 && long >= threshold && hold_deletes(long, files);
+        if !unapproved.is_empty()
+            && (asking || slow || (unapproved.len() as u64).saturating_add(recent) >= threshold)
         {
-            self.meta.held.extend(p.local_deletes.iter().copied());
+            self.meta.held.extend(unapproved);
             report.held = self.meta.held.iter().copied().collect();
             let delayed: BTreeSet<ItemId> = delayed.union(&self.meta.held).copied().collect();
+            let mut ids = EntropyIds::new(cx.entropy);
             p = plan(
                 PlanInput {
                     remote: &self.remote,
@@ -1246,11 +1660,13 @@ impl FolderSync {
                     restore: &restore,
                 },
                 &labels,
-                &mut EntropyIds(cx.entropy),
+                &mut ids,
             );
+            ids.check()?;
         }
+        self.guard_incoming(now, files, *cx.account.device(), &mut p);
         report.copies.extend(p.copies.iter().copied());
-        p
+        Ok(p)
     }
 
     // -- Scan -------------------------------------------------------------------------------
@@ -1356,6 +1772,10 @@ impl FolderSync {
                 .collect(),
         };
         let mut dirs: Vec<Vec<String>> = vec![Vec::new()];
+        // Every lookup of the scan goes through indexes of the names, built once per scan
+        // (security review of the scan, HIGH 1); the remote one only when a new file needs it.
+        let local_index = NameIndex::new(&self.local);
+        let remote_index = std::cell::OnceCell::new();
         // The limits of a folder (follow-up check N-4), checked while walking, so a folder far
         // beyond them is not read to its end: more items than a device decodes, or an item
         // deeper than it decodes.
@@ -1372,7 +1792,7 @@ impl FolderSync {
                 let known = if dir.is_empty() {
                     Some(ROOT)
                 } else {
-                    self.local
+                    local_index
                         .lookup_exact(&dir)
                         .filter(|id| self.local.path(id).as_deref() == Some(&dir[..]))
                 };
@@ -1470,8 +1890,7 @@ impl FolderSync {
         let mut items: Vec<(ItemId, Vec<String>, Stat)> = Vec::new();
         for (path, stat) in &found {
             let is_dir = stat.kind == EntryType::Directory;
-            let at_path = self
-                .local
+            let at_path = local_index
                 .lookup_exact(path)
                 .filter(|id| self.local.get(id).is_some_and(|n| n.is_dir() == is_dir));
             let by_id = stat
@@ -1530,7 +1949,8 @@ impl FolderSync {
                 .and_then(|l| l.generation)
                 .or_else(|| {
                     // A join: the remote item at the same path.
-                    self.remote
+                    remote_index
+                        .get_or_init(|| NameIndex::new(&self.remote))
                         .lookup_exact(path)
                         .and_then(|r| self.remote.get(&r))
                         .and_then(|n| n.kind.file())
@@ -1684,7 +2104,7 @@ impl FolderSync {
         }
         // A directory that could not be read keeps what the index knew below it.
         for dir in &unreadable {
-            if let Some(dir_id) = self.local.lookup(dir) {
+            if let Some(dir_id) = local_index.lookup(dir) {
                 for id in self.local.subtree(&dir_id) {
                     if id == dir_id || tree.contains(&id) {
                         continue;
@@ -1740,33 +2160,22 @@ impl FolderSync {
     // -- Pull -------------------------------------------------------------------------------
 
     fn pull(&mut self, cx: &mut Ctx<'_>) -> Result<usize, SyncError> {
-        let after = self.view.frontier().map_or(0, |f| f.sequence);
-        let folder = self.folder;
-        let (delta, server_sequence) =
-            crate::paging::collect_delta(after, |cursor| cx.server.commits(&folder, cursor))?;
-        self.view.check_server_sequence(server_sequence)?;
-        if delta.is_empty() {
-            return Ok(0);
-        }
-        let checked = match self.check(cx, &delta) {
-            Ok(o) => o,
-            Err(SyncError::Commit(hangar_drive_crypto::commit::CommitError::AheadOfLog {
-                ..
-            }))
-            | Err(SyncError::Chain(hangar_drive_crypto::commit::ChainError::Commit(
-                hangar_drive_crypto::commit::CommitError::AheadOfLog { .. },
-            )))
-            | Err(SyncError::Chain(hangar_drive_crypto::commit::ChainError::UnknownGeneration(
-                _,
-            ))) => {
-                cx.account.refresh(cx.server, cx.keychain, cx.store)?;
-                self.check(cx, &delta)?
+        // A commit ahead of this device's log or of an unknown generation, or a stored pull of
+        // another log: the account is read again and the pull begins again, once.
+        let mut refreshed = false;
+        let verdict = loop {
+            match self.pull_delta(cx, PullMode::Check { persist: true }) {
+                Ok(v) => break v,
+                Err(e) if !refreshed && needs_refresh(&e) => {
+                    refreshed = true;
+                    cx.account.refresh(cx.server, cx.keychain, cx.store)?;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
-        let outcome = match checked {
-            DeltaCheck::Accepted(outcome) => outcome,
-            DeltaCheck::RemovedSigner(refusal) => {
+        let pulled = match verdict {
+            PullVerdict::Accepted(pulled) => pulled,
+            PullVerdict::RemovedSigner(refusal) => {
                 // Only after this real refusal does this device look at the delta without the
                 // removed signer rule, and it writes no barrier on its own: the heads it would
                 // let in go to the person (security review H1).
@@ -1775,41 +2184,40 @@ impl FolderSync {
                         .ok_or(SyncError::Chain(
                             hangar_drive_crypto::commit::ChainError::RemovedSigner,
                         ))?;
-                let newest = self.newest(cx)?;
-                let before = self.view.verify_delta_before_barrier(
-                    cx.account.state(),
-                    newest,
-                    &delta,
-                    &permit,
-                )?;
+                let before = match self.pull_delta(cx, PullMode::BeforeBarrier(&permit))? {
+                    PullVerdict::Accepted(before) => before,
+                    PullVerdict::RemovedSigner(_) => {
+                        return Err(SyncError::Chain(
+                            hangar_drive_crypto::commit::ChainError::RemovedSigner,
+                        ))
+                    }
+                };
                 self.meta.removed_heads = before.removed_heads.iter().map(Into::into).collect();
                 self.meta.state = FolderState::Stopped(StopReason::RemovedHeads);
                 return Ok(0);
             }
         };
-        let Some(head) = outcome.heads.last().cloned() else {
+        let Some(head) = pulled.last_head.clone() else {
             return Ok(0);
         };
-        let checked = self.verify_tree_deltas(cx, &outcome, &delta)?;
         let reader = cx.account.folder_reader(&self.folder)?;
-        let decoded = if checked.limit {
+        let decoded = if pulled.tree_limit {
             // A head on the way is beyond the limits: its delta could not be checked, and the
             // folder stops as for a head beyond the limits (HIGH 1 of the follow-up review).
             Err(codec::CodecError::Limit)
         } else {
             codec::decode(&head.commit.root, &reader, cx.store, cx.server)
         };
+        let n = pulled.heads;
         let tree = match decoded {
             Ok(tree) => tree,
             Err(codec::CodecError::Limit) => {
                 // The commits verified, so they are the folder's chain and its history; only
                 // the head's tree stays out (security review M3). The remote tree keeps the last
                 // one taken in, and the folder waits for a restore, which carries a full delta.
-                self.record_timeline(&outcome, &delta, cx.clock.now_ms());
-                self.annotate_timeline(&checked.drops);
+                self.meta.timeline.extend(pulled.timeline);
                 self.meta.full_next = true;
-                let n = outcome.heads.len();
-                self.view = outcome.view;
+                self.view = pulled.view;
                 self.meta.remote_root = Some(head.commit.root);
                 self.meta.frontier_wire = Some(Blob(head.wire.clone()));
                 self.meta.sync_base = None;
@@ -1818,152 +2226,13 @@ impl FolderSync {
             }
             Err(e) => return Err(e.into()),
         };
-        self.record_timeline(&outcome, &delta, cx.clock.now_ms());
-        self.annotate_timeline(&checked.drops);
-        let n = outcome.heads.len();
-        self.view = outcome.view;
+        self.meta.timeline.extend(pulled.timeline);
+        self.meta.full_next |= pulled.unchecked;
+        self.view = pulled.view;
         self.set_remote(tree);
         self.meta.remote_root = Some(head.commit.root);
         self.meta.frontier_wire = Some(Blob(head.wire.clone()));
         Ok(n)
-    }
-
-    /// Checks every head and side commit of an accepted delta against the trees (ADR 0001,
-    /// amendment "reference deltas bound to the tree"): the delta digest it signed must be the
-    /// digest of `reachable(tree)` against `reachable(first parent's tree)` (a side commit's:
-    /// its base), or of `reachable(tree)` alone for a full delta. The server applied exactly that
-    /// delta to its live set, so a commit whose delta does not fit its tree would let the
-    /// collection delete live data or keep garbage live: it is refused like a commit with a bad
-    /// signature, and the folder stops until the person removes the device that wrote it.
-    ///
-    /// - A mismatching commit of a device the verified log has removed since is let through:
-    ///   such commits come in only behind a barrier that the removing device or the person
-    ///   accepted.
-    /// - A tree the server no longer holds (an object is gone) is accepted as unreadable only
-    ///   for a commit whose call is older than [`UNREADABLE_AFTER_MS`] by the server's unsigned
-    ///   time, or whose time the server already dropped because it expired: only then may the
-    ///   collection have taken its trees. For a younger commit of a current device it is a
-    ///   mismatch, so a device cannot hide a forged delta behind a tree it never uploaded
-    ///   (HIGH 1 of the follow-up review). The server decides retention anyway, so trusting its
-    ///   time here gives it nothing it lacks.
-    /// - A tree beyond the limits stops the folder as [`StopReason::TreeLimit`] does
-    ///   ([`TreeCheck::limit`]).
-    ///
-    /// Whatever is let through or cannot be checked sets [`FolderMeta::full_next`], and the
-    /// round then writes a repair commit at once ([`Self::repair`]), which resets the server's
-    /// live set to the tree whatever happened before.
-    fn verify_tree_deltas(
-        &mut self,
-        cx: &mut Ctx<'_>,
-        outcome: &DeltaOutcome,
-        delta: &[DeltaCommit],
-    ) -> Result<TreeCheck, SyncError> {
-        let mut check = TreeCheck::default();
-        if outcome.heads.is_empty() && outcome.sides.is_empty() {
-            return Ok(check);
-        }
-        let now = u64::try_from(cx.clock.now_ms()).unwrap_or(0);
-        let times: BTreeMap<CommitId, Option<u64>> = delta
-            .iter()
-            .filter_map(|d| {
-                SignedCommit::decode(d.commit.as_bytes())
-                    .ok()
-                    .map(|c| (c.id, d.server_ms))
-            })
-            .collect();
-        let old_enough = |id: &CommitId| match times.get(id).copied().flatten() {
-            None => true,
-            Some(at) => now.saturating_sub(at) > UNREADABLE_AFTER_MS,
-        };
-        let reader = cx.account.folder_reader(&self.folder)?;
-        let mut roots: BTreeMap<CommitId, ObjectId> = self
-            .meta
-            .timeline
-            .iter()
-            .map(|t| (t.commit, t.root))
-            .collect();
-        if let (Some(frontier), Some(root)) = (self.view.frontier(), self.meta.remote_root) {
-            roots.insert(frontier.commit, root);
-        }
-        for head in &outcome.heads {
-            roots.insert(head.id, head.commit.root);
-        }
-        let mut sets: BTreeMap<ObjectId, Readable> = BTreeMap::new();
-        let empty = Readable::Set(codec::Reachable::default());
-        for c in outcome.heads.iter().chain(outcome.sides.iter()) {
-            let after = readable_set(&c.commit.root, &reader, cx, &mut sets)?;
-            let before = match c.commit.parents.first() {
-                None => empty.clone(),
-                Some(parent) => match roots.get(parent).copied() {
-                    None => Readable::Gone,
-                    Some(root) => readable_set(&root, &reader, cx, &mut sets)?,
-                },
-            };
-            let verdict = match (&after, &before) {
-                (Readable::Limit, _) | (_, Readable::Limit) => {
-                    check.limit = true;
-                    Verdict::Unchecked
-                }
-                (Readable::Set(after), _) if c.commit.delta.full => {
-                    Verdict::of(DeltaDigest::full(&after.all) == c.commit.delta)
-                }
-                (Readable::Set(after), Readable::Set(before)) => {
-                    let fits = DeltaDigest::diff(&before.all, &after.all) == c.commit.delta;
-                    if fits && !c.commit.side {
-                        check
-                            .drops
-                            .insert(c.id, DropCount::of(before, after, false));
-                    }
-                    Verdict::of(fits)
-                }
-                // A tree the server no longer holds: only an old enough commit may have lost it.
-                _ if old_enough(&c.id) => Verdict::Unchecked,
-                _ => Verdict::Mismatch,
-            };
-            if c.commit.delta.full && !c.commit.side {
-                if let (Readable::Set(before), Readable::Set(after)) = (&before, &after) {
-                    if verdict == Verdict::Fits {
-                        check.drops.insert(c.id, DropCount::of(before, after, true));
-                    }
-                }
-            }
-            match verdict {
-                Verdict::Fits => {}
-                Verdict::Unchecked => self.meta.full_next = true,
-                Verdict::Mismatch => {
-                    let current = cx
-                        .account
-                        .state()
-                        .device(&c.commit.device)
-                        .is_some_and(|d| d.is_current());
-                    if current {
-                        return Err(SyncError::Chain(
-                            hangar_drive_crypto::commit::ChainError::Commit(
-                                hangar_drive_crypto::commit::CommitError::DeltaMismatch,
-                            ),
-                        ));
-                    }
-                    self.meta.full_next = true;
-                }
-            }
-        }
-        Ok(check)
-    }
-
-    /// Writes what [`Self::verify_tree_deltas`] counted into the timeline records just added.
-    fn annotate_timeline(&mut self, drops: &BTreeMap<CommitId, DropCount>) {
-        for rec in self
-            .meta
-            .timeline
-            .iter_mut()
-            .rev()
-            .take(drops.len().max(1) * 2 + 2)
-        {
-            if let Some(d) = drops.get(&rec.commit) {
-                rec.dropped_files = Some(d.dropped);
-                rec.files_before = Some(d.before);
-            }
-        }
     }
 
     /// The repair commit: the remote tree once more on the frontier, with a full delta, so the
@@ -2000,45 +2269,10 @@ impl FolderSync {
         Ok(())
     }
 
-    /// Adds the heads and side commits of an accepted delta to the timeline.
-    pub(crate) fn record_timeline(
-        &mut self,
-        outcome: &DeltaOutcome,
-        delta: &[DeltaCommit],
-        now: i64,
-    ) {
-        let sequences: BTreeMap<CommitId, u64> = delta
-            .iter()
-            .filter_map(|d| {
-                SignedCommit::decode(d.commit.as_bytes())
-                    .ok()
-                    .map(|c| (c.id, d.sequence))
-            })
-            .collect();
-        for c in outcome.sides.iter().chain(outcome.heads.iter()) {
-            self.meta.timeline.push(TimelineRec {
-                commit: c.id,
-                sequence: sequences.get(&c.id).copied().unwrap_or(0),
-                device: c.commit.device,
-                seen_at_ms: now,
-                reanchor: c.commit.reanchor,
-                side: c.commit.side,
-                root: c.commit.root,
-                dropped_files: None,
-                files_before: None,
-            });
-        }
-    }
-
     fn newest(&self, cx: &Ctx<'_>) -> Result<Generation, SyncError> {
         cx.account
             .newest_generation(&self.folder)
             .ok_or(SyncError::NotSetUp("no key ring for the folder"))
-    }
-
-    fn check(&self, cx: &Ctx<'_>, delta: &[DeltaCommit]) -> Result<DeltaCheck, SyncError> {
-        let newest = self.newest(cx)?;
-        Ok(self.view.check_delta(cx.account.state(), newest, delta)?)
     }
 
     /// The heads of removed devices the person was asked about.
@@ -2493,6 +2727,19 @@ impl FolderSync {
         );
         let reader = cx.account.folder_reader(&self.folder)?;
         let before = p.disk.clone();
+        // Files the base lacks that this round may bring in: once synced, they count as just
+        // arrived for the long window (security review M3), unless the folder was never fully
+        // synced (a first download or "download again" is no baseline).
+        let baseline = self.meta.sync_base.is_some();
+        let arriving: Vec<ItemId> = if baseline {
+            p.merged
+                .iter()
+                .filter(|(id, n)| !n.is_dir() && !self.synced.contains(id))
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut work = p.disk;
         let mut disk = FsDisk {
             fs: cx.fs,
@@ -2505,6 +2752,21 @@ impl FolderSync {
         };
         let result = apply(&p.merged, &mut work, &mut self.synced, &skip, &mut disk);
         report.applied = result.done.len();
+        // Incoming file deletes carried out, for the window of the incoming guard.
+        let carried = result
+            .done
+            .iter()
+            .filter(|id| {
+                before.get(id).is_some_and(|n| !n.is_dir())
+                    && !p.merged.contains(id)
+                    && !self.meta.incoming_approved.contains(id)
+                    && !self.meta.fresh_files.contains_key(id)
+            })
+            .count() as u64;
+        if carried > 0 {
+            self.meta.recent_incoming.push((now, carried));
+        }
+        self.note_fresh(now, &arriving, baseline);
         for id in &result.done {
             let action = match (before.get(id), p.merged.get(id)) {
                 (None, Some(_)) => ChangeAction::Added,
@@ -2581,9 +2843,16 @@ impl FolderSync {
         for id in dropped {
             self.synced.remove(&id);
         }
-        if self.meta.held.is_empty() {
-            self.meta.approve_deletes = false;
-        }
+        // An approved delete that went out, or whose item is back, leaves the approval.
+        let (synced, local) = (&self.synced, &self.local);
+        self.meta
+            .approved
+            .retain(|id| synced.contains(id) && !local.contains(id));
+        // An approved incoming delete that was carried out leaves the approval.
+        self.meta
+            .incoming_approved
+            .retain(|id| synced.contains(id) && local.contains(id));
+        self.applied_timeline = self.meta.timeline.len();
         Ok(())
     }
 
@@ -2593,6 +2862,14 @@ impl FolderSync {
     /// section 5 ("a restore is a commit"). Local changes are merged in the next round.
     pub fn publish_tree(&mut self, cx: &mut Ctx<'_>, tree: Tree) -> Result<(), SyncError> {
         let change = UndoState::between(&self.remote, &tree);
+        // What the person's own action removes is their decision: the incoming guard lets it
+        // pass on this device (other devices ask).
+        let dropped: Vec<ItemId> = self
+            .remote
+            .ids()
+            .filter(|id| !tree.contains(id))
+            .copied()
+            .collect();
         let p = Plan {
             merged: tree,
             disk: self.local.clone(),
@@ -2606,6 +2883,10 @@ impl FolderSync {
         match self.publish(cx, &p) {
             Ok(()) => {
                 self.last_action = Some(change);
+                if !dropped.is_empty() {
+                    self.meta.incoming_approved.extend(dropped);
+                    self.save(cx.store)?;
+                }
                 // A restore replaced a head beyond the limits (M3): the folder syncs again.
                 if self.meta.state == FolderState::Stopped(StopReason::TreeLimit) {
                     self.meta.state = FolderState::Active;
@@ -2653,14 +2934,16 @@ impl FolderSync {
         self.pull(cx)?;
         let old = self.tree_at(cx, commit)?;
         let date = date_label(cx.clock.now_ms(), cx.settings.tz_offset_minutes);
+        let mut ids = EntropyIds::new(cx.entropy);
         let (tree, name) = graft(
             &self.remote,
             &old,
             item,
             &cx.settings.words,
             &date,
-            &mut EntropyIds(cx.entropy),
+            &mut ids,
         )?;
+        ids.check()?;
         self.publish_tree(cx, tree)?;
         Ok(name)
     }
@@ -2682,15 +2965,9 @@ impl FolderSync {
             if tree.contains(item) || !old.contains(item) {
                 continue;
             }
-            tree = graft(
-                &tree,
-                &old,
-                item,
-                &cx.settings.words,
-                &date,
-                &mut EntropyIds(cx.entropy),
-            )?
-            .0;
+            let mut ids = EntropyIds::new(cx.entropy);
+            tree = graft(&tree, &old, item, &cx.settings.words, &date, &mut ids)?.0;
+            ids.check()?;
         }
         let back = tree
             .iter()
@@ -2745,7 +3022,15 @@ impl FolderSync {
         self.meta.deleted_seen.clear();
         self.meta.held.clear();
         self.meta.restore.clear();
-        self.meta.approve_deletes = false;
+        self.meta.approved.clear();
+        self.meta.recent_deletes.clear();
+        self.meta.incoming_held.clear();
+        self.meta.incoming_devices.clear();
+        self.meta.incoming_approved.clear();
+        self.meta.recent_incoming.clear();
+        self.meta.long_deletes.clear();
+        self.meta.file_minimums.clear();
+        self.meta.fresh_files.clear();
         self.meta.backoff.clear();
         self.meta.not_synced.clear();
         if self.meta.state == FolderState::Stopped(StopReason::MarkerMissing) {
@@ -2816,13 +3101,9 @@ impl FolderSync {
             device: &device_name,
             date: &date,
         };
-        let merged = crate::merge::merge3(
-            &base_tree,
-            &remote,
-            &self.local,
-            &labels,
-            &mut EntropyIds(cx.entropy),
-        );
+        let mut ids = EntropyIds::new(cx.entropy);
+        let merged = crate::merge::merge3(&base_tree, &remote, &self.local, &labels, &mut ids);
+        ids.check()?;
         let crypto = cx
             .account
             .folder_crypto(&self.folder, Some(base.head.generation))?;
@@ -2896,7 +3177,7 @@ impl FolderSync {
         head: &SignedCommit,
         sequence: u64,
         view: FolderView,
-        taken: Option<(&DeltaOutcome, &[DeltaCommit])>,
+        taken: Option<Vec<TimelineRec>>,
     ) -> Result<(), SyncError> {
         let chain_generation = Some(head.commit.generation);
         let crypto = cx.account.folder_crypto(&self.folder, chain_generation)?;
@@ -2982,9 +3263,9 @@ impl FolderSync {
         self.set_remote(tree);
         self.meta.remote_root = Some(head.commit.root);
         self.meta.frontier_wire = Some(Blob(signed.wire.clone()));
-        if let Some((outcome, delta)) = taken {
+        if let Some(records) = taken {
             // The heads the barrier covers, so "Undo a device" finds them (N2).
-            self.record_timeline(outcome, delta, cx.clock.now_ms());
+            self.meta.timeline.extend(records);
         }
         self.meta.timeline.push(TimelineRec {
             commit: signed.id,
@@ -3006,14 +3287,6 @@ impl FolderSync {
         self.save(cx.store)
     }
 
-    /// The whole delta after the frontier (every page), for the removal job.
-    pub fn fetch_delta(&self, server: &mut dyn ServerApi) -> Result<Vec<DeltaCommit>, SyncError> {
-        let after = self.view.frontier().map_or(0, |f| f.sequence);
-        let (delta, _) =
-            crate::paging::collect_delta(after, |cursor| server.commits(&self.folder, cursor))?;
-        Ok(delta)
-    }
-
     /// The frontier's signed commit, if it is stored.
     pub fn frontier_commit(&self) -> Option<SignedCommit> {
         self.meta
@@ -3022,25 +3295,23 @@ impl FolderSync {
             .and_then(|w| SignedCommit::decode(w.as_bytes()).ok())
     }
 
-    /// Takes a pulled delta outcome as the new verified state (the removal job after its
-    /// barrier check).
-    pub fn take_outcome(
+    /// Takes a pulled delta, checked with every rule, as the new verified state (the removal
+    /// job after its barrier check).
+    pub(crate) fn take_outcome(
         &mut self,
         cx: &mut Ctx<'_>,
-        outcome: DeltaOutcome,
-        delta: &[DeltaCommit],
+        pulled: Pulled,
     ) -> Result<(), SyncError> {
-        let checked = self.verify_tree_deltas(cx, &outcome, delta)?;
-        self.record_timeline(&outcome, delta, cx.clock.now_ms());
-        self.annotate_timeline(&checked.drops);
-        if let Some(head) = outcome.heads.last() {
+        self.meta.timeline.extend(pulled.timeline);
+        self.meta.full_next |= pulled.unchecked;
+        if let Some(head) = &pulled.last_head {
             let reader = cx.account.folder_reader(&self.folder)?;
             let tree = codec::decode(&head.commit.root, &reader, cx.store, cx.server)?;
             self.set_remote(tree);
             self.meta.remote_root = Some(head.commit.root);
             self.meta.frontier_wire = Some(Blob(head.wire.clone()));
         }
-        self.view = outcome.view;
+        self.view = pulled.view;
         self.save(cx.store)
     }
 
@@ -3079,8 +3350,29 @@ impl FolderSync {
     }
 }
 
+/// Whether a refused pull may pass once the account is read again: a commit names a log head
+/// or a generation this device does not know yet, or the device log changed under a stored
+/// pull.
+fn needs_refresh(e: &SyncError) -> bool {
+    use hangar_drive_crypto::commit::{ChainError, CommitError};
+    matches!(
+        e,
+        SyncError::Commit(CommitError::AheadOfLog { .. })
+            | SyncError::Chain(ChainError::Commit(CommitError::AheadOfLog { .. }))
+            | SyncError::Chain(ChainError::UnknownGeneration(_))
+            | SyncError::Chain(ChainError::LogChanged)
+    )
+}
+
 /// The IDs one commit's delta may list: the setting, at least 1 and at most
 /// `hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS`.
+/// The sum of `records` within `window` before `now`; older records go.
+fn window_sum(records: &mut Vec<(i64, u64)>, now: i64, window: i64) -> u64 {
+    // A record from the future (the clock went back) counts until it is a window ahead.
+    records.retain(|(at, _)| (now - at).abs() < window);
+    records.iter().map(|(_, n)| *n).sum()
+}
+
 fn delta_limit(setting: usize) -> usize {
     setting.clamp(1, hangar_drive_protocol::api::MAX_REFERENCE_DELTA_IDS)
 }
@@ -3193,35 +3485,119 @@ pub(crate) struct DropCount {
     pub before: u64,
 }
 
-impl DropCount {
-    /// Manifests and chunks dropped from `before` to `after`. A full delta counts chunks only:
-    /// a barrier or a repair seals manifests again, which renames them without dropping a
-    /// file, while the chunks of a dropped file go in every case.
-    fn of(before: &codec::Reachable, after: &codec::Reachable, full: bool) -> Self {
-        let chunks_after: BTreeSet<&ObjectId> = after.chunks().collect();
-        let mut dropped = before
-            .chunks()
-            .filter(|id| !chunks_after.contains(id))
-            .count() as u64;
-        let mut count_before = before.chunks().count() as u64;
+/// A tree as [`DeltaWalk::goto`] reached it.
+#[derive(Debug, Clone)]
+enum Seen {
+    /// Readable: the move to it from where the set was (`None` when the move failed and the
+    /// tree was read alone), and the set's manifests and chunks before the move.
+    Set {
+        moved: Option<codec::Transition>,
+        manifests_before: u64,
+        chunks_before: u64,
+    },
+    /// An object the server no longer holds.
+    Gone,
+    /// Beyond the limits of a folder.
+    Limit,
+}
+
+impl Seen {
+    /// Manifests and chunks the move dropped, against those before it. A full delta counts
+    /// chunks only: a barrier or a repair seals manifests again, which renames them without
+    /// dropping a file, while the chunks of a dropped file go in every case.
+    fn drops(&self, full: bool) -> DropCount {
+        let Seen::Set {
+            moved: Some(moved),
+            manifests_before,
+            chunks_before,
+        } = self
+        else {
+            return DropCount {
+                dropped: 0,
+                before: 0,
+            };
+        };
+        let (mut dropped, mut before) = (moved.dropped_chunks, *chunks_before);
         if !full {
-            dropped += before.manifests.difference(&after.manifests).count() as u64;
-            count_before += before.manifests.len() as u64;
+            dropped += moved.dropped_manifests;
+            before += manifests_before;
         }
-        Self {
-            dropped,
-            before: count_before,
-        }
+        DropCount { dropped, before }
     }
 }
 
-/// What [`FolderSync::verify_tree_deltas`] found besides a refusal.
-#[derive(Debug, Clone, Default)]
-struct TreeCheck {
-    /// A tree on the way is beyond the limits of a folder.
-    limit: bool,
-    /// File objects each checked head dropped, for "Undo a device" ([`TimelineRec`]).
-    drops: BTreeMap<CommitId, DropCount>,
+impl codec::Transition {
+    /// The diff digest of this move, as `DeltaDigest::diff` of the two sets gives it.
+    fn digest(&self) -> DeltaDigest {
+        DeltaDigest::of(false, &self.added, &self.dropped).unwrap_or(DeltaDigest {
+            full: false,
+            hash: [0; 32],
+        })
+    }
+}
+
+/// The counted reachable set of [`FolderSync::verify_tree_deltas`] with the roots found
+/// unreadable, which are not read again.
+#[derive(Debug, Default)]
+struct DeltaWalk {
+    state: codec::ReachState,
+    unreadable: BTreeMap<ObjectId, Seen>,
+}
+
+impl DeltaWalk {
+    /// Moves the set to the tree of `target` (`None`: the empty tree).
+    fn goto(
+        &mut self,
+        target: Option<ObjectId>,
+        crypto: &FolderCrypto,
+        cx: &mut Ctx<'_>,
+    ) -> Result<Seen, SyncError> {
+        if let Some(known) = target.and_then(|root| self.unreadable.get(&root)) {
+            return Ok(known.clone());
+        }
+        let (manifests_before, chunks_before) = (self.state.manifests(), self.state.chunks());
+        let from_elsewhere = !self.state.is_empty();
+        let mut graph = codec::StoreGraph {
+            crypto,
+            store: &mut *cx.store,
+            server: &mut *cx.server,
+        };
+        let mut result = self.state.goto(target, &mut graph).map(Some);
+        // A move also reads the old tree's dropped nodes (from the cache); a failure there is
+        // not the target's. The set is empty after any failure, so one more try reads the
+        // target alone and finds out; that read is no move from the old tree, which counts as
+        // unreadable then, as a full read of it would have found.
+        if from_elsewhere && result.is_err() {
+            result = self.state.goto(target, &mut graph).map(|_| None);
+        }
+        let seen = match result {
+            Ok(moved) => {
+                return Ok(Seen::Set {
+                    moved,
+                    manifests_before,
+                    chunks_before,
+                })
+            }
+            Err(CodecError::Limit) => Seen::Limit,
+            Err(CodecError::Net(NetError::Server(body))) if body.code == ErrorCode::NotFound => {
+                Seen::Gone
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(root) = target {
+            self.unreadable.insert(root, seen.clone());
+        }
+        Ok(seen)
+    }
+
+    /// The full digest of the set.
+    fn full_digest(&self) -> DeltaDigest {
+        let all: Vec<ObjectId> = self.state.ids().copied().collect();
+        DeltaDigest::of(true, &all, &[]).unwrap_or(DeltaDigest {
+            full: true,
+            hash: [0; 32],
+        })
+    }
 }
 
 /// The reachable objects of `root`, from `cache` or the objects (see [`Readable`]).
@@ -3454,4 +3830,59 @@ pub fn graft(
     }
     out.check().map_err(CodecError::from)?;
     Ok((out, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Broken;
+
+    impl Entropy for Broken {
+        fn fill(&mut self, _: &mut [u8]) -> Result<(), hangar_drive_crypto::EntropyError> {
+            Err(hangar_drive_crypto::EntropyError)
+        }
+    }
+
+    /// A failing generator gives distinct IDs for the rest of the run and the run is refused,
+    /// never two items under one constant ID (security review, info).
+    #[test]
+    fn a_failing_generator_gives_distinct_ids_and_an_error() {
+        let mut broken = Broken;
+        let mut ids = EntropyIds::new(&mut broken);
+        let a = ids.new_item_id();
+        let b = ids.new_item_id();
+        assert_ne!(a, b);
+        assert!(matches!(ids.check(), Err(SyncError::Entropy(_))));
+    }
+
+    /// Metadata stored before the incoming guard existed still loads, with no question open.
+    #[test]
+    fn metadata_without_the_incoming_guard_fields_loads() {
+        let mut stored = serde_json::to_value(FolderMeta {
+            name: "Docs".into(),
+            ..FolderMeta::default()
+        })
+        .unwrap();
+        let fields = stored.as_object_mut().unwrap();
+        for key in [
+            "incoming_held",
+            "incoming_revision",
+            "incoming_devices",
+            "incoming_approved",
+            "recent_incoming",
+            "long_deletes",
+            "file_minimums",
+            "fresh_files",
+        ] {
+            assert!(fields.remove(key).is_some(), "{key}");
+        }
+        let meta: FolderMeta = serde_json::from_value(stored).unwrap();
+        assert_eq!(meta.name, "Docs");
+        assert!(meta.incoming_held.is_empty() && meta.incoming_approved.is_empty());
+        assert_eq!(meta.incoming_revision, 0);
+        assert!(meta.incoming_devices.is_empty() && meta.recent_incoming.is_empty());
+        assert!(meta.long_deletes.is_empty() && meta.file_minimums.is_empty());
+        assert!(meta.fresh_files.is_empty());
+    }
 }

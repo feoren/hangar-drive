@@ -18,6 +18,11 @@ export function calendarDaysBetween(earlier: number, later: number): number {
   return Math.round((startOfDay(later) - startOfDay(earlier)) / DAY);
 }
 
+/** "Fotos, Musik und Projekte": names as one list in the UI language ("、" in Japanese). */
+export function formatList(language: Language, items: readonly string[]): string {
+  return new Intl.ListFormat(LOCALES[language], { type: "conjunction" }).format(items);
+}
+
 /** "14:31" */
 export function formatTime(language: Language, ms: number): string {
   return new Intl.DateTimeFormat(LOCALES[language], { hour: "2-digit", minute: "2-digit" }).format(
@@ -38,6 +43,14 @@ export function formatDate(language: Language, ms: number, now: number = Date.no
 /** "26. November 2026", for the recovery sheet and the long date of a day heading. */
 export function formatLongDate(language: Language, ms: number): string {
   return new Intl.DateTimeFormat(LOCALES[language], { dateStyle: "long" }).format(ms);
+}
+
+/** "26. November 2026 um 14:31", where the date alone does not tell two moments apart. */
+export function formatLongDateTime(language: Language, ms: number): string {
+  return new Intl.DateTimeFormat(LOCALES[language], {
+    dateStyle: "long",
+    timeStyle: "short",
+  }).format(ms);
 }
 
 /** A day heading in the timeline: the weekday and date ("Montag, 23. November"). */

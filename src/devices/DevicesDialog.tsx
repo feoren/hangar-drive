@@ -390,12 +390,19 @@ function SafetyDialog({
   );
 }
 
-function RenewDialog({
+/**
+ * A new recovery code: shown, kept, one group typed back. Also opened by the banner of an
+ * account without a valid code, with its own `intro`.
+ */
+export function RenewDialog({
   deviceName,
+  intro,
   onDone,
   onClose,
 }: {
   readonly deviceName: string | undefined;
+  /** The sentence before the code; by default that the new code replaces the old one. */
+  readonly intro?: string;
   readonly onDone: () => void;
   readonly onClose: () => void;
 }) {
@@ -406,12 +413,24 @@ function RenewDialog({
   return (
     <Dialog labelledBy={titleId} size="medium" onClose={onClose} closeOnOutside={false}>
       {code.status === "loading" && <Loading />}
-      {code.status === "failed" && <Feedback tone="error">{errorText(code.error, t)}</Feedback>}
+      {code.status === "failed" && (
+        <>
+          <h2 id={titleId} className="dialog-title">
+            {t("devices.recovery")}
+          </h2>
+          <Feedback tone="error">{errorText(code.error, t)}</Feedback>
+          <div className="dialog-actions">
+            <button type="button" className="button primary" data-autofocus onClick={onClose}>
+              {t("common.close")}
+            </button>
+          </div>
+        </>
+      )}
       {code.status === "ready" && (
         <RecoveryCodeStep
           code={code.data}
           titleId={titleId}
-          intro={t("devices.recovery.renewBody")}
+          intro={intro ?? t("devices.recovery.renewBody")}
           deviceName={deviceName}
           secondary={
             <button type="button" className="button secondary" onClick={onClose}>

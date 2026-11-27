@@ -1,14 +1,12 @@
-// The tray icons (UX 6.1): one shape per state, never color alone. The same geometry draws the
-// large status mark at the top of the main window (StatusMark.tsx), so tray and window look alike.
+// The status shapes (UX 6.1): one shape per state, never color alone. StatusMark.tsx draws them as
+// the large status mark at the top of the main window and in the setup. The tray itself shows the
+// app logo with a state dot, rasterized from src-tauri/app-icon.svg by src-tauri/build.rs.
 //
 // A cloud from three circles (left, top, right lobe) with a flat base. The glyph is cut out of the
-// filled cloud, so it stays readable on any taskbar color: check (up to date), two arrows
-// (syncing), two bars (paused), exclamation mark (needs you). Offline is the cloud outline with a
-// slash, setup the plain outline. All shapes use `currentColor`; the backend tints them for light
-// and dark taskbars and high contrast, and uses the error color for "needs you".
-//
-// src/tray/icons/*.svg are generated from this file (`node src/tray/writeIcons.ts`) and a test
-// keeps them equal.
+// filled cloud, so it stays readable on any background: check (up to date), two arrows (syncing),
+// two bars (paused), exclamation mark (needs you). Offline is the cloud outline with a slash,
+// setup the plain outline. All shapes use `currentColor`, so the window's color tokens tint them.
+// `iconBody` writes one shape as SVG markup, which the tests compare.
 
 import type { TrayIcon } from "./trayModel";
 
@@ -97,17 +95,4 @@ export function iconBody(icon: TrayIcon): string {
     `${cloud} mask="url(#${id})"/>` +
     `<path d="${SLASH}" stroke="currentColor" stroke-width="${String(OUTLINE_WIDTH)}" stroke-linecap="round"/>`
   );
-}
-
-/** A standalone SVG file for the backend to rasterize at 16, 20, 24 and 32 px. */
-export function iconSvg(icon: TrayIcon): string {
-  return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${VIEW_BOX}" width="32" height="32">` +
-    `${iconBody(icon)}</svg>\n`
-  );
-}
-
-/** File name of an icon under src/tray/icons/. */
-export function iconFileName(icon: TrayIcon): string {
-  return `tray-${icon.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}.svg`;
 }

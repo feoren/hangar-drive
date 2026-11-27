@@ -13,7 +13,7 @@
 //! A tree records which items changed since the last [`Tree::take_delta`], so the local index
 //! persists only those rows instead of the whole tree after every step.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use hangar_drive_protocol::ids::{ItemId, ObjectId};
 use hangar_drive_protocol::name::comparison_key;
@@ -137,7 +137,7 @@ impl Node {
 
     /// The comparison key of the name (NFC).
     pub fn key(&self) -> String {
-        comparison_key(&self.name)
+        counted_key(&self.name)
     }
 
     /// Parent and name.
@@ -281,10 +281,14 @@ impl Tree {
         }
     }
 
-    /// The child of `parent` whose comparison key is `key`.
+    /// The child of `parent` whose comparison key is `key`. This looks at every child; a caller
+    /// that asks many times keeps a [`NameIndex`] instead.
     pub fn child_by_key(&self, parent: &ItemId, key: &str) -> Option<ItemId> {
         self.children(parent)
-            .find(|id| self.nodes.get(id).is_some_and(|n| n.key() == key))
+            .find(|id| {
+                count_work();
+                self.nodes.get(id).is_some_and(|n| n.key() == key)
+            })
             .copied()
     }
 
@@ -313,6 +317,7 @@ impl Tree {
         let mut at = *id;
         let mut steps = 0usize;
         while at != ROOT {
+            count_work();
             let node = self.nodes.get(&at)?;
             names.push(node.name.clone());
             at = node.parent;
@@ -334,23 +339,27 @@ impl Tree {
     pub fn lookup(&self, path: &[String]) -> Option<ItemId> {
         let mut at = ROOT;
         for name in path {
-            at = self.child_by_key(&at, &comparison_key(name))?;
+            at = self.child_by_key(&at, &counted_key(name))?;
         }
         (at != ROOT).then_some(at)
     }
 
     /// The item at a path of exact names (byte for byte), falling back to the comparison key
-    /// per step only where no exact name matches.
+    /// per step only where no exact name matches. Each step looks at every entry of its
+    /// directory; for many lookups, as in a scan, use [`NameIndex::lookup_exact`].
     pub fn lookup_exact(&self, path: &[String]) -> Option<ItemId> {
         let mut at = ROOT;
         for name in path {
             let exact = self
                 .children(&at)
-                .find(|id| self.nodes.get(id).is_some_and(|n| n.name == *name))
+                .find(|id| {
+                    count_work();
+                    self.nodes.get(id).is_some_and(|n| n.name == *name)
+                })
                 .copied();
             at = match exact {
                 Some(id) => id,
-                None => self.child_by_key(&at, &comparison_key(name))?,
+                None => self.child_by_key(&at, &counted_key(name))?,
             };
         }
         (at != ROOT).then_some(at)
@@ -528,9 +537,119 @@ impl Tree {
     }
 }
 
+/// The comparison key of a name, counted in tests (the work bound of the scan tests).
+fn counted_key(name: &str) -> String {
+    count_work();
+    comparison_key(name)
+}
+
+/// One unit of lookup work in tests: an entry looked at or a key computed.
+#[inline]
+fn count_work() {
+    #[cfg(test)]
+    tests::count_work();
+}
+
+/// A tree's entries by exact name and by comparison key per directory, built once for many
+/// lookups (security review of the scan, HIGH 1): [`Tree::lookup_exact`] looks at every entry
+/// of each directory on the path and computes the key of each when no exact name matches, so a
+/// scan that asks for every entry of a directory of n entries did O(n^2) work, about two
+/// minutes per round for 64,000 entries. The exact names borrow from the tree; the comparison
+/// keys are computed once per node, and only when a lookup first needs them.
+///
+/// Answers what [`Tree::lookup_exact`] and [`Tree::lookup`] answer: where several entries
+/// match, the one with the smallest item ID, as the walk over the children in ID order finds
+/// it first.
+pub struct NameIndex<'a> {
+    tree: &'a Tree,
+    exact: HashMap<ItemId, HashMap<&'a str, ItemId>>,
+    keys: std::cell::OnceCell<HashMap<ItemId, HashMap<String, ItemId>>>,
+}
+
+impl<'a> NameIndex<'a> {
+    /// The index of `tree`.
+    pub fn new(tree: &'a Tree) -> Self {
+        let mut exact: HashMap<ItemId, HashMap<&'a str, ItemId>> = HashMap::new();
+        // The nodes in ID order, so the first entry kept per name has the smallest ID.
+        for (id, node) in tree.iter() {
+            count_work();
+            exact
+                .entry(node.parent)
+                .or_default()
+                .entry(node.name.as_str())
+                .or_insert(*id);
+        }
+        Self {
+            tree,
+            exact,
+            keys: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn keys(&self) -> &HashMap<ItemId, HashMap<String, ItemId>> {
+        self.keys.get_or_init(|| {
+            let mut keys: HashMap<ItemId, HashMap<String, ItemId>> = HashMap::new();
+            for (id, node) in self.tree.iter() {
+                keys.entry(node.parent)
+                    .or_default()
+                    .entry(node.key())
+                    .or_insert(*id);
+            }
+            keys
+        })
+    }
+
+    /// The child of `parent` named exactly `name`.
+    pub fn child_exact(&self, parent: &ItemId, name: &str) -> Option<ItemId> {
+        count_work();
+        self.exact.get(parent)?.get(name).copied()
+    }
+
+    /// The child of `parent` whose comparison key is `key`.
+    pub fn child_by_key(&self, parent: &ItemId, key: &str) -> Option<ItemId> {
+        count_work();
+        self.keys().get(parent)?.get(key).copied()
+    }
+
+    /// [`Tree::lookup_exact`] through the index.
+    pub fn lookup_exact(&self, path: &[String]) -> Option<ItemId> {
+        let mut at = ROOT;
+        for name in path {
+            at = match self.child_exact(&at, name) {
+                Some(id) => id,
+                None => self.child_by_key(&at, &counted_key(name))?,
+            };
+        }
+        (at != ROOT).then_some(at)
+    }
+
+    /// [`Tree::lookup`] through the index.
+    pub fn lookup(&self, path: &[String]) -> Option<ItemId> {
+        let mut at = ROOT;
+        for name in path {
+            at = self.child_by_key(&at, &counted_key(name))?;
+        }
+        (at != ROOT).then_some(at)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static WORK: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count_work() {
+        WORK.with(|w| w.set(w.get() + 1));
+    }
+
+    /// Lookup work on this thread: entries looked at and keys computed ([`count_work`]).
+    pub(crate) fn work_done() -> u64 {
+        WORK.with(Cell::get)
+    }
 
     pub(crate) fn id(n: u8) -> ItemId {
         ItemId::from_bytes([n; 16])
@@ -622,5 +741,87 @@ pub(crate) mod tests {
         );
         assert!(t.colliding_children(&ROOT, "Report.txt", &id(1)).is_empty());
         assert!(t.colliding_children(&ROOT, "other", &id(9)).is_empty());
+    }
+
+    /// The index answers what the walks over the children answer, on random trees full of
+    /// names that are equal by comparison key but not byte for byte, and with several entries
+    /// of one name (a tree the check would refuse, which the scan may still hold).
+    #[test]
+    fn name_index_equals_the_walk_over_the_children() {
+        use crate::names::tests::{Rng, PIECES};
+        let mut rng = Rng(0x1d);
+        for case in 0..400 {
+            let mut t = Tree::new();
+            let dirs = [ROOT, id(1), id(2)];
+            t.insert(id(1), Node::dir(ROOT, "d"));
+            t.insert(id(2), Node::dir(id(1), "D"));
+            for _ in 0..20 {
+                let name: String = (0..1 + rng.below(3)).map(|_| *rng.pick(&PIECES)).collect();
+                let item = id(3 + rng.below(40) as u8);
+                t.insert(item, Node::file(*rng.pick(&dirs), name, file(1)));
+            }
+            let index = NameIndex::new(&t);
+            for _ in 0..30 {
+                let path: Vec<String> = (0..1 + rng.below(3))
+                    .map(|_| {
+                        if rng.below(3) == 0 {
+                            (*rng.pick(&["d", "D", "\u{17f}"])).to_owned()
+                        } else {
+                            (0..1 + rng.below(3)).map(|_| *rng.pick(&PIECES)).collect()
+                        }
+                    })
+                    .collect();
+                assert_eq!(index.lookup_exact(&path), t.lookup_exact(&path), "{case}");
+                assert_eq!(index.lookup(&path), t.lookup(&path), "{case}");
+            }
+        }
+    }
+
+    /// A scan looks up every entry it found (security review of the scan, HIGH 1): with 50,000
+    /// entries in one directory that is a few units of work per entry through the index, where
+    /// the walk over the children took one per entry and sibling (2.5 * 10^9 here; measured at
+    /// 117 s per round for 64,000 entries). Half the names are found only by comparison key
+    /// (another normalization form), which computed the key of every sibling per lookup.
+    #[test]
+    fn scan_lookups_take_linear_work() {
+        let n = 50_000u32;
+        let wide = |i: u32| {
+            let mut bytes = [3u8; 16];
+            bytes[12..].copy_from_slice(&i.to_be_bytes());
+            ItemId::from_bytes(bytes)
+        };
+        let dir = wide(0);
+        let mut nodes = vec![(dir, Node::dir(ROOT, "big"))];
+        nodes.extend((1..=n).map(|i| {
+            (
+                wide(i),
+                Node::file(dir, format!("caf\u{e9} {i:06}"), file(1)),
+            )
+        }));
+        let tree = Tree::from_nodes(nodes);
+        let paths: Vec<Vec<String>> = (1..=n)
+            .map(|i| {
+                // Every second name as found on a disk that keeps the decomposed form.
+                let name = if i % 2 == 0 {
+                    format!("cafe\u{301} {i:06}")
+                } else {
+                    format!("caf\u{e9} {i:06}")
+                };
+                vec!["big".to_owned(), name]
+            })
+            .collect();
+        let before = work_done();
+        let index = NameIndex::new(&tree);
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(index.lookup_exact(path), Some(wide(i as u32 + 1)));
+        }
+        let work = work_done() - before;
+        assert!(work <= 6 * u64::from(n), "{work} units of work");
+        // The walk over the children for the first 200 lookups alone already does more.
+        let before = work_done();
+        for path in paths.iter().take(200) {
+            tree.lookup_exact(path);
+        }
+        assert!(work_done() - before > 10 * u64::from(n));
     }
 }

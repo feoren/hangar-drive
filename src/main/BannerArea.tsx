@@ -4,11 +4,12 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 
 import type { FocusRequest, HeadsRequest } from "../App";
-import { formatSince, formatSize } from "../format";
+import { formatList, formatSince, formatSize } from "../format";
 import { shownWarnings, tone, type ShownWarning } from "../domain/warnings";
 import { useLanguage, useT, type Translate } from "../i18n";
 import { errorCode } from "../backend/errors";
 import type { Backend } from "../backend/types";
+import { deleteBody, deleteTitle } from "../problems/MassDeleteDialog";
 import { headsBody } from "../problems/RemovedHeadsDialog";
 import { suspectTitle } from "../problems/SuspectDialog";
 import { useBackend, useNow, useSnapshot } from "../ui/backendContext";
@@ -44,6 +45,7 @@ function content(
   since: (ms: number) => string,
   size: (bytes: number) => string,
   updates: { readonly state: UpdatesState; readonly turnedOff: () => void },
+  list: (items: readonly string[]) => string,
 ): BannerContent {
   const app = t("app.name");
   const copyReport: BannerButton = {
@@ -78,9 +80,10 @@ function content(
         ],
       };
     case "massDelete":
+    case "incomingDelete":
       return {
-        title: t("deletes.title", { count: warning.count }),
-        body: t("deletes.body", { count: warning.count, folder: warning.folderName }),
+        title: deleteTitle(warning, t),
+        body: deleteBody(warning, t),
         buttons: [
           {
             label: t("deletes.decide"),
@@ -285,6 +288,60 @@ function content(
           },
         ],
       };
+    // No recovery code works for the account (the app ended between a recovery's join and its
+    // new code): the person makes one now. The banner cannot be hidden, it goes once the new
+    // code is confirmed.
+    case "noRecoveryCode":
+      return {
+        title: t("noRecoveryCode.title"),
+        body: t("noRecoveryCode.body"),
+        buttons: [
+          {
+            label: t("noRecoveryCode.create"),
+            primary: true,
+            onClick: () => {
+              open({ kind: "renewRecovery" });
+            },
+          },
+        ],
+      };
+    // Only shown before the device has an account (the setup says it there); kept here so a
+    // pending recovery never ends up without a word.
+    case "recoveryPending":
+      return {
+        title: t("recoveryPending.title"),
+        body: t("recoveryPending.body", { app }),
+        buttons: [],
+      };
+    // Folders whose key could not be read after this device's recovery (follow-up review LOW 2).
+    // Calm: they come back by themselves. Only the started-over folder list, where waiting
+    // brings nothing back, can be hidden (the engine refuses it while folders are named).
+    case "foldersUnreadable": {
+      const named = warning.folders.length > 0;
+      const parts = [
+        named
+          ? t(warning.folders.length === 1 ? "unreadable.bodyOne" : "unreadable.bodyMany")
+          : null,
+        warning.folderList ? t("unreadable.list") : null,
+      ].filter((part) => part !== null);
+      return {
+        title: named
+          ? t("unreadable.title", { folders: list(warning.folders) })
+          : t("unreadable.listTitle"),
+        body: parts.join(" "),
+        buttons: named
+          ? []
+          : [
+              {
+                label: t("unreadable.dismiss"),
+                onClick: async () => {
+                  await backend.dismissSuspect(warning.id);
+                  return null;
+                },
+              },
+            ],
+      };
+    }
     case "quotaFull":
       return { title: t("quotaFull.title"), body: t("quotaFull.body"), buttons: [copyReport] };
     case "quota":
@@ -444,7 +501,7 @@ export function BannerArea({
     }
     for (const item of warnings) {
       if (autoOpened.current.has(item.id)) continue;
-      if (item.kind === "massDelete") {
+      if (item.kind === "massDelete" || item.kind === "incomingDelete") {
         autoOpened.current.add(item.id);
         open({ kind: "massDelete", warning: item, auto: true });
         break;
@@ -478,6 +535,7 @@ export function BannerArea({
         setRefusedUpdate(true);
       },
     },
+    (items) => formatList(language, items),
   );
   const others = warnings.length - 1;
   const kind = tone(warning);

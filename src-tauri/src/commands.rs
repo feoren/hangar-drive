@@ -180,6 +180,21 @@ pub enum Confirmation {
     Declined,
 }
 
+/// How `resetDevice` ended. `RecoveryPending`: a recovery sent its change and this device has
+/// not joined yet, so its key may be the account's only one (follow-up review LOW 7); nothing
+/// was asked and nothing changed, and the window explains before it offers
+/// `resetDeviceDiscardingRecovery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResetOutcome {
+    /// The person confirmed; this device was reset.
+    Confirmed,
+    /// The person said no in the native dialog; nothing changed.
+    Declined,
+    /// Refused while a recovery is pending; nothing changed.
+    RecoveryPending,
+}
+
 impl From<bool> for Confirmation {
     fn from(yes: bool) -> Self {
         if yes {
@@ -201,6 +216,43 @@ pub enum RecoveryCheck {
     /// The group matched a renewed code, but the person said no in the native dialog; the old
     /// code stays valid.
     Declined,
+}
+
+/// Why the last step of a recovery (`finishRecoveryCleanup`) did not add this device, where the
+/// window has something to say beyond a general error. `ListChanged`: nothing was written, the
+/// person chooses again from the new list. `Unreachable`: the same step is tried again. The
+/// others: the step cannot succeed with this sheet, so the window offers to start the recovery
+/// again. Any other engine error stays an error. The engine keeps the choice (or, after the
+/// append, the pending recovery) in every case but a new start, so trying again is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryCleanupError {
+    /// The account's devices changed since they were shown; nothing was written.
+    ListChanged,
+    /// The server could not be reached; the step can be tried again.
+    Unreachable,
+    /// The code stopped working between the steps (another device removed its recovery device).
+    Used,
+    /// The code does not belong to the account (any more).
+    Unknown,
+    /// The server's identity does not match the sheet, or the connection is not secure.
+    Insecure,
+}
+
+impl RecoveryCleanupError {
+    /// Only the engine's typed refusals name a reason; a message text never does, so a reworded
+    /// error falls back to a plain (repeatable) error instead of a wrong reason.
+    fn of(error: &SyncError) -> Option<Self> {
+        use hangar_drive_sync::ports::NetError;
+        match error {
+            SyncError::RecoveryListChanged => Some(Self::ListChanged),
+            SyncError::RecoveryCodeUsed => Some(Self::Used),
+            SyncError::RecoveryCodeUnknown => Some(Self::Unknown),
+            SyncError::Net(NetError::PinMismatch | NetError::Tls(_)) => Some(Self::Insecure),
+            SyncError::Net(net) if net.is_transient() => Some(Self::Unreachable),
+            _ => None,
+        }
+    }
 }
 
 /// How `resolveMassDelete` ended.
@@ -405,6 +457,54 @@ pub fn safe_dir_name(name: &str) -> String {
     }
 }
 
+/// The longest root name in UTF-16 units, so that `Name (99)` still fits Windows' 255.
+pub const ROOT_NAME_UNITS: usize = 200;
+
+/// A folder name from the account as the name of a new sync root (security review MEDIUM 1).
+/// The name was chosen on another device, so after [`safe_dir_name`] it loses everything the
+/// Windows shell or the macOS Finder would read as more than a folder: a `.{GUID}` ending,
+/// which makes Explorer treat the folder as a namespace junction whose "open" shows another
+/// place, loses its dot; a reserved device name gets a leading `_`; the shape of an 8.3 short
+/// name, which can address another entry of the same directory, loses its `~`; an overlong name
+/// is cut; and a bundle ending (`.app` and the like, [`crate::platform::is_bundle_name`]), which
+/// `open` would run instead of showing, loses its dot. Every platform applies every rule, so a
+/// folder gets the same name on each device of the account.
+pub fn root_dir_name(name: &str) -> String {
+    use hangar_drive_protocol::name::{windows_problem, WindowsNameProblem};
+    let cut: String = name
+        .chars()
+        .scan(0usize, |units, c| {
+            *units += c.len_utf16();
+            (*units <= ROOT_NAME_UNITS).then_some(c)
+        })
+        .collect();
+    let mut dir = safe_dir_name(&cut);
+    // Each step removes its own problem and cannot bring back an earlier one; the bound only
+    // keeps a rule this function does not know from looping.
+    for _ in 0..4 {
+        dir = match windows_problem(&dir) {
+            None if crate::platform::is_bundle_name(&dir) => without_last_dot(&dir),
+            None => return dir,
+            // The ending is `.{GUID}`: the last dot is the one before the brace.
+            Some(WindowsNameProblem::ShellJunction) => without_last_dot(&dir),
+            Some(WindowsNameProblem::Reserved) => format!("_{dir}"),
+            Some(WindowsNameProblem::ShortNameAlias) => dir.replace('~', "_"),
+            // `safe_dir_name` already replaced forbidden and control characters and trimmed
+            // trailing dots and spaces, and the name was cut above.
+            Some(_) => break,
+        };
+    }
+    "Hangar Drive".to_owned()
+}
+
+/// `name` with its last dot replaced by `_`.
+fn without_last_dot(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}_{ext}"),
+        None => name.to_owned(),
+    }
+}
+
 /// How many places `proposed_place` tries for one folder: `Name`, `Name (2)` ... `Name (99)`.
 const PROPOSAL_TRIES: u32 = 99;
 
@@ -412,9 +512,9 @@ const PROPOSAL_TRIES: u32 = 99;
 /// Drive`), never an existing one and never a direct child of the home folder, where folders
 /// like Documents live that a stranger's account must not be offered (security review H1, N8).
 /// `taken` says whether a candidate is out (it exists, the engine refuses it, or another folder
-/// of the same list got it).
+/// of the same list got it). The name is the account's, so it goes through [`root_dir_name`].
 pub fn proposed_place(base: &Path, name: &str, taken: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    let dir = safe_dir_name(name);
+    let dir = root_dir_name(name);
     (1..=PROPOSAL_TRIES)
         .map(|n| {
             if n == 1 {
@@ -494,10 +594,20 @@ fn copy_and_clear(app: &AppHandle, shell: &Shell, text: Zeroizing<String>) -> An
     crate::clipboard::copy_and_clear(
         Arc::new(AppClipboard(app.clone())),
         Arc::clone(&shell.clipboard_writes),
+        Arc::clone(&shell.clipboard_secret),
         text,
         crate::clipboard::CLEAR_AFTER,
     )
     .map_err(|e| CommandError::unexpected(e.to_string()))
+}
+
+/// Takes a code or link the app copied off the clipboard now, if it is still there, before the
+/// app ends: on exit (lib.rs, `RunEvent::Exit`) and before an update installs, which on Windows
+/// ends the process without that event (security review LOW 2).
+pub fn clear_copied_secret(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        crate::clipboard::clear_now(&AppClipboard(app.clone()), &shell.clipboard_secret);
+    }
 }
 
 /// The canonical form of `inside` (a `/` separated path in the synced folder `root`), which must
@@ -626,6 +736,16 @@ fn folder_of_warning(snapshot: &Snapshot, warning_id: &str) -> Option<String> {
     })
 }
 
+/// The folder of a shown `incomingDelete` warning; an ID of any other kind is refused.
+fn folder_of_incoming(snapshot: &Snapshot, warning_id: &str) -> Option<String> {
+    snapshot.warnings.iter().find_map(|w| match w {
+        Warning::IncomingDelete { id, folder_id, .. } if id == warning_id => {
+            Some(folder_id.clone())
+        }
+        _ => None,
+    })
+}
+
 fn folder_path(snapshot: &Snapshot, folder_id: Option<&str>) -> Option<PathBuf> {
     let folder = match folder_id {
         Some(id) => snapshot.folders.iter().find(|f| f.id == id),
@@ -736,6 +856,7 @@ pub async fn print_recovery_sheet(app: AppHandle, document: SheetDocument) -> An
     .inner_size(720.0, 900.0)
     .incognito(true)
     .on_navigation(crate::print::may_navigate)
+    .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
     .on_page_load(|window, payload| {
         if payload.event() == tauri::webview::PageLoadEvent::Finished {
             if let Err(error) = window.print() {
@@ -806,12 +927,18 @@ async fn check_recovery_group(
     let renewal_matches = lock(&shell.shown)
         .as_ref()
         .is_some_and(|shown| shown.renewal && shown.group_matches(&group));
-    if renewal_matches
-        && !asker
-            .ask(shell, crate::confirm::renew_code(shell.language()))
+    if renewal_matches {
+        // Without a valid code (warning `noRecoveryCode`) there is no old one to replace, and
+        // the question must not say so.
+        let has_code = !fresh_snapshot(shell)
             .await?
-    {
-        return Ok(RecoveryCheck::Declined);
+            .warnings
+            .iter()
+            .any(|w| matches!(w, Warning::NoRecoveryCode { .. }));
+        let confirm = crate::confirm::renew_code(shell.language(), has_code);
+        if !asker.ask(shell, confirm).await? {
+            return Ok(RecoveryCheck::Declined);
+        }
     }
     let ok = shell
         .engine(move |core| core.confirm_recovery_group(&group))
@@ -1072,15 +1199,17 @@ pub async fn recovery_devices(shell: State<'_, Shell>) -> Answer<Vec<Device>> {
 }
 
 /// Removing regular devices asks natively first and names them (follow-up check N-2); the
-/// window asks nothing before it. `None`: the person said no and nothing was removed. Only
+/// window asks nothing before it. `Ok(None)`: the person said no and nothing was removed. Only
 /// devices the engine offered for removal are passed on, so nothing is removed that the
-/// question did not name.
+/// question did not name. `Err`: this device was not added, for a reason the window explains
+/// (see [`RecoveryCleanupError`]); any other failure is an error, and the same call is tried
+/// again.
 #[tauri::command]
 pub async fn finish_recovery_cleanup(
     app: AppHandle,
     shell: State<'_, Shell>,
     remove: Vec<String>,
-) -> Answer<Option<RecoveryCodeView>> {
+) -> Answer<ApiResult<Option<RecoveryCodeView>, RecoveryCleanupError>> {
     cleanup_after_recovery(&shell, &Native(&app), remove).await
 }
 
@@ -1088,22 +1217,46 @@ async fn cleanup_after_recovery(
     shell: &Shell,
     asker: &impl Ask,
     remove: Vec<String>,
-) -> Answer<Option<RecoveryCodeView>> {
+) -> Answer<ApiResult<Option<RecoveryCodeView>, RecoveryCleanupError>> {
     let offered = shell.engine(|core| core.recovery_devices()).await?;
     let chosen: Vec<&Device> = offered.iter().filter(|d| remove.contains(&d.id)).collect();
     if !chosen.is_empty() {
-        let names: Vec<String> = chosen.iter().map(|d| d.name.clone()).collect();
-        let confirm = crate::confirm::recovery_cleanup(shell.language(), &names);
+        let language = shell.language();
+        // Before the join the recovery session cannot open the sealed names: such a device is
+        // named by the day it was added, as the window lists it.
+        let labels: Vec<String> = chosen
+            .iter()
+            .map(|d| {
+                crate::confirm::recovery_device_label(
+                    language,
+                    &d.name,
+                    d.added,
+                    shell.tz_offset_minutes,
+                )
+            })
+            .collect();
+        let confirm = crate::confirm::recovery_cleanup(language, &labels);
         if !asker.ask(shell, confirm).await? {
-            return Ok(None);
+            return Ok(ApiResult::Ok(None));
         }
     }
     let remove: Vec<String> = chosen.into_iter().map(|d| d.id.clone()).collect();
-    let view = shell
-        .engine(move |core| core.finish_recovery_cleanup(&remove))
+    let finished = shell
+        .engine(move |core| match core.finish_recovery_cleanup(&remove) {
+            Ok(view) => Ok(ApiResult::Ok(view)),
+            Err(error) => match RecoveryCleanupError::of(&error) {
+                Some(reason) => Ok(ApiResult::Err(reason)),
+                None => Err(error),
+            },
+        })
         .await?;
-    remember_code(shell, &view, false);
-    Ok(Some(view))
+    Ok(match finished {
+        ApiResult::Ok(view) => {
+            remember_code(shell, &view, false);
+            ApiResult::Ok(Some(view))
+        }
+        ApiResult::Err(reason) => ApiResult::Err(reason),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1402,6 +1555,76 @@ async fn resolve_deletes(
                 .ok_or(SyncError::Invalid("unknown warning"))?;
             core.resolve_mass_delete(&folder, decision == MassDeleteDecision::Restore)
         })
+        .await?;
+    Ok(MassDeleteOutcome::Resolved { count })
+}
+
+/// The paths of the files another device deleted that wait here (`listIncomingDelete`).
+#[tauri::command]
+pub async fn list_incoming_delete(
+    shell: State<'_, Shell>,
+    warning_id: String,
+) -> Answer<Vec<String>> {
+    shell
+        .engine(move |core| {
+            let folder = folder_of_incoming(&core.snapshot(), &warning_id)
+                .ok_or(SyncError::Invalid("unknown warning"))?;
+            core.list_incoming_delete(&folder)
+        })
+        .await
+}
+
+/// "Restore" brings the files back on every device at once; "delete here" asks once more in a
+/// native dialog with the folder and the number of files, and approves exactly the state that
+/// number was read from: deletes that arrived since ask again (ADR 0001, amendment "incoming
+/// mass deletes").
+#[tauri::command]
+pub async fn resolve_incoming_delete(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+    warning_id: String,
+    decision: MassDeleteDecision,
+) -> Answer<MassDeleteOutcome> {
+    resolve_incoming(&shell, &Native(&app), warning_id, decision).await
+}
+
+async fn resolve_incoming(
+    shell: &Shell,
+    asker: &impl Ask,
+    warning_id: String,
+    decision: MassDeleteDecision,
+) -> Answer<MassDeleteOutcome> {
+    let probe = warning_id.clone();
+    let (folder, folder_name, count, revision) = shell
+        .engine(move |core| {
+            let snapshot = core.snapshot();
+            let (folder, name, count) = snapshot
+                .warnings
+                .iter()
+                .find_map(|w| match w {
+                    Warning::IncomingDelete {
+                        id,
+                        folder_id,
+                        folder_name,
+                        count,
+                        ..
+                    } if *id == probe => Some((folder_id.clone(), folder_name.clone(), *count)),
+                    _ => None,
+                })
+                .ok_or(SyncError::Invalid("unknown warning"))?;
+            let revision = core.incoming_delete_revision(&folder)?;
+            Ok((folder, name, count, revision))
+        })
+        .await?;
+    let restore = decision == MassDeleteDecision::Restore;
+    if !restore {
+        let confirm = crate::confirm::incoming_delete(shell.language(), &folder_name, count);
+        if !asker.ask(shell, confirm).await? {
+            return Ok(MassDeleteOutcome::Declined);
+        }
+    }
+    let count = shell
+        .engine(move |core| core.resolve_incoming_delete(&folder, restore, revision))
         .await?;
     Ok(MassDeleteOutcome::Resolved { count })
 }
@@ -2006,22 +2229,81 @@ async fn forget_removed(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation>
 /// Forgets the account on this device (security review L1): secrets, stored account and the
 /// folders' sync state; the files stay. For "pair again" after a removal and for starting over.
 ///
-/// Asks in a native dialog first (security review M4); the window asks nothing before it.
+/// Asks in a native dialog first (security review M4); the window asks nothing before it. While
+/// a recovery is pending it asks nothing and answers [`ResetOutcome::RecoveryPending`]; the
+/// engine refuses the plain reset then as well.
 #[tauri::command]
-pub async fn reset_device(app: AppHandle, shell: State<'_, Shell>) -> Answer<Confirmation> {
+pub async fn reset_device(app: AppHandle, shell: State<'_, Shell>) -> Answer<ResetOutcome> {
     reset(&shell, &Native(&app)).await
 }
 
-async fn reset(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation> {
+async fn reset(shell: &Shell, asker: &impl Ask) -> Answer<ResetOutcome> {
+    if recovery_pending(&fresh_snapshot(shell).await?) {
+        return Ok(ResetOutcome::RecoveryPending);
+    }
     if !asker
         .ask(shell, crate::confirm::reset(shell.language()))
         .await?
     {
-        return Ok(Confirmation::Declined);
+        return Ok(ResetOutcome::Declined);
     }
-    shell.engine(|core| core.reset_device()).await?;
+    let reset = shell.engine(|core| Ok(core.reset_device())).await?;
+    let outcome = reset_outcome(reset)?;
+    if outcome == ResetOutcome::Confirmed {
+        forget_shown(shell);
+    }
+    Ok(outcome)
+}
+
+/// Whether the snapshot shows a recovery that is not finished (warning `recoveryPending`).
+fn recovery_pending(snapshot: &Snapshot) -> bool {
+    snapshot
+        .warnings
+        .iter()
+        .any(|w| matches!(w, Warning::RecoveryPending { .. }))
+}
+
+/// The engine's answer to a plain reset: its refusal during a pending recovery is an outcome the
+/// window explains (a recovery can become pending between the check and the reset), every other
+/// error stays an error.
+fn reset_outcome(result: Result<(), SyncError>) -> Answer<ResetOutcome> {
+    match result {
+        Ok(()) => Ok(ResetOutcome::Confirmed),
+        Err(SyncError::RecoveryPending) => Ok(ResetOutcome::RecoveryPending),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn forget_shown(shell: &Shell) {
     *lock(&shell.shown) = None;
     *lock(&shell.device_name) = None;
+}
+
+/// Resets this device although a recovery is pending (follow-up review LOW 7): the pending
+/// recovery's key leaves with every other secret, so the account may be lost for good. Only
+/// after a native question that says so, "no" as its default; the window explains first.
+#[tauri::command]
+pub async fn reset_device_discarding_recovery(
+    app: AppHandle,
+    shell: State<'_, Shell>,
+) -> Answer<Confirmation> {
+    reset_discarding(&shell, &Native(&app)).await
+}
+
+async fn reset_discarding(shell: &Shell, asker: &impl Ask) -> Answer<Confirmation> {
+    if !asker
+        .ask(
+            shell,
+            crate::confirm::reset_discarding_recovery(shell.language()),
+        )
+        .await?
+    {
+        return Ok(Confirmation::Declined);
+    }
+    shell
+        .engine(|core| core.reset_device_discarding_recovery())
+        .await?;
+    forget_shown(shell);
     Ok(Confirmation::Confirmed)
 }
 
@@ -2085,6 +2367,7 @@ pub async fn install_update(
     if !Native(&app).ask(&shell, confirm).await? {
         return Ok(crate::updater::UpdateOutcome::Declined);
     }
+    clear_copied_secret(&app);
     update
         .download_and_install(|_, _| {}, || {})
         .await
@@ -2242,6 +2525,8 @@ macro_rules! command_handler {
             $crate::commands::get_folder_number,
             $crate::commands::list_mass_delete,
             $crate::commands::resolve_mass_delete,
+            $crate::commands::list_incoming_delete,
+            $crate::commands::resolve_incoming_delete,
             $crate::commands::find_missing_folder,
             $crate::commands::check_older_state,
             $crate::commands::reanchor,
@@ -2274,6 +2559,7 @@ macro_rules! command_handler {
             $crate::commands::answer_pair_request,
             $crate::commands::renew_recovery_code,
             $crate::commands::reset_device,
+            $crate::commands::reset_device_discarding_recovery,
             $crate::commands::disconnect_this_device,
             $crate::commands::undo,
             $crate::commands::restore_deleted_folder,
@@ -2338,6 +2624,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "get_folder_number",
     "list_mass_delete",
     "resolve_mass_delete",
+    "list_incoming_delete",
+    "resolve_incoming_delete",
     "find_missing_folder",
     "check_older_state",
     "reanchor",
@@ -2370,6 +2658,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "answer_pair_request",
     "renew_recovery_code",
     "reset_device",
+    "reset_device_discarding_recovery",
     "disconnect_this_device",
     "undo",
     "restore_deleted_folder",
@@ -2675,6 +2964,20 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+        // The incoming question takes only its own warnings: a made-up ID and one of the local
+        // question are refused, before anything is asked.
+        for id in ["incomingDelete-x", "massDelete-x"] {
+            let asked = std::sync::Mutex::new(Vec::new());
+            let error = tauri::async_runtime::block_on(resolve_incoming(
+                &shell,
+                &Fixed(true, &asked),
+                id.to_owned(),
+                MassDeleteDecision::Delete,
+            ))
+            .unwrap_err();
+            assert_eq!(error.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+            assert!(lock(&asked).is_empty(), "{id}");
+        }
         let snapshot = tauri::async_runtime::block_on(fresh_snapshot(&shell)).unwrap();
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap()["setup"],
@@ -2800,7 +3103,7 @@ mod tests {
         let no = Fixed(false, &asked);
         assert_eq!(
             tauri::async_runtime::block_on(reset(&shell, &no)).unwrap(),
-            Confirmation::Declined
+            ResetOutcome::Declined
         );
         assert_eq!(
             tauri::async_runtime::block_on(disconnect(&shell, &no)).unwrap(),
@@ -2817,6 +3120,64 @@ mod tests {
         let yes = Fixed(true, &asked);
         assert_eq!(
             tauri::async_runtime::block_on(reset(&shell, &yes)).unwrap(),
+            ResetOutcome::Confirmed
+        );
+        assert_eq!(setup_state(&shell), json!("needed"));
+    }
+
+    // Follow-up review LOW 7: during a pending recovery the plain reset asks nothing and tells
+    // the window; the engine's own refusal (a recovery that became pending in between) is the
+    // same outcome, and every other error stays an error.
+    #[test]
+    fn a_reset_during_a_pending_recovery_is_an_outcome() {
+        let pending = |warnings: Vec<Warning>| {
+            let (shell, _events) = engine_shell();
+            let mut snapshot = tauri::async_runtime::block_on(fresh_snapshot(&shell)).unwrap();
+            snapshot.warnings = warnings;
+            recovery_pending(&snapshot)
+        };
+        assert!(pending(vec![Warning::RecoveryPending {
+            id: "recoveryPending".into()
+        }]));
+        assert!(!pending(vec![Warning::NoRecoveryCode {
+            id: "noRecoveryCode".into()
+        }]));
+        assert!(!pending(vec![]));
+        assert_eq!(reset_outcome(Ok(())).unwrap(), ResetOutcome::Confirmed);
+        assert_eq!(
+            reset_outcome(Err(SyncError::RecoveryPending)).unwrap(),
+            ResetOutcome::RecoveryPending
+        );
+        assert_eq!(
+            reset_outcome(Err(SyncError::Invalid("device")))
+                .unwrap_err()
+                .kind,
+            hangar_drive_sync::error::ErrorKind::Invalid
+        );
+        assert_eq!(
+            serde_json::to_value(ResetOutcome::RecoveryPending).unwrap(),
+            json!("recoveryPending")
+        );
+    }
+
+    // Follow-up review LOW 7: the forced reset runs only after its own native question, which
+    // says the account may be lost; "no" changes nothing.
+    #[test]
+    fn the_forced_reset_runs_only_after_its_own_yes() {
+        let (shell, _events) = set_up_shell();
+        let asked = std::sync::Mutex::new(Vec::new());
+        assert_eq!(
+            tauri::async_runtime::block_on(reset_discarding(&shell, &Fixed(false, &asked)))
+                .unwrap(),
+            Confirmation::Declined
+        );
+        assert_eq!(setup_state(&shell), json!("done"));
+        assert_eq!(
+            lock(&asked).as_slice(),
+            &[crate::confirm::reset_discarding_recovery(shell.language())]
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(reset_discarding(&shell, &Fixed(true, &asked))).unwrap(),
             Confirmation::Confirmed
         );
         assert_eq!(setup_state(&shell), json!("needed"));
@@ -2956,6 +3317,156 @@ mod tests {
         assert_eq!(setup_state(&shell), json!("done"));
     }
 
+    // ADR 0001, "the engine on the recovery in one piece": the devices come without names
+    // before the join, the native question names them by the day they were added, a "no" there
+    // changes nothing, and the account comes into being only with the cleanup.
+    #[test]
+    fn a_recovery_joins_only_with_the_cleanup() {
+        let (shell, _events) = engine_shell();
+        let link = format!(
+            "http://localhost:8080/join#{}",
+            hangar_drive_protocol::ids::base64url(&[9; 16])
+        );
+        let ApiResult::Ok(view) = tauri::async_runtime::block_on(
+            shell.engine(move |core| core.begin_account(&link, "Laptop")),
+        )
+        .unwrap() else {
+            panic!("begin");
+        };
+        let group = view.groups[view.check_group as usize - 1].clone();
+        assert!(tauri::async_runtime::block_on(
+            shell.engine(move |core| core.confirm_recovery_group(&group))
+        )
+        .unwrap());
+        let asked = std::sync::Mutex::new(Vec::new());
+        assert_eq!(
+            tauri::async_runtime::block_on(reset(&shell, &Fixed(true, &asked))).unwrap(),
+            ResetOutcome::Confirmed
+        );
+        lock(&asked).clear();
+
+        // The lost laptop's sheet, on a fresh installation (the same server).
+        let sheet = view.sheet.link.clone();
+        let code = view.groups.join("-");
+        let recovered = tauri::async_runtime::block_on(
+            shell.engine(move |core| core.recover_account(&sheet, &code, "Neu")),
+        )
+        .unwrap();
+        assert_eq!(recovered, ApiResult::Ok(()));
+        assert_eq!(setup_state(&shell), json!("needed"));
+        let devices =
+            tauri::async_runtime::block_on(shell.engine(|core| core.recovery_devices())).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].name.is_empty());
+        let label = crate::confirm::recovery_device_label(
+            shell.language(),
+            "",
+            devices[0].added,
+            shell.tz_offset_minutes,
+        );
+        let lost = vec![devices[0].id.clone()];
+
+        let declined = tauri::async_runtime::block_on(cleanup_after_recovery(
+            &shell,
+            &Fixed(false, &asked),
+            lost.clone(),
+        ))
+        .unwrap();
+        assert_eq!(declined, ApiResult::Ok(None));
+        assert_eq!(setup_state(&shell), json!("needed"));
+        assert_eq!(
+            lock(&asked).as_slice(),
+            &[crate::confirm::recovery_cleanup(
+                shell.language(),
+                std::slice::from_ref(&label)
+            )]
+        );
+
+        let done = tauri::async_runtime::block_on(cleanup_after_recovery(
+            &shell,
+            &Fixed(true, &asked),
+            lost,
+        ))
+        .unwrap();
+        let ApiResult::Ok(Some(renewed)) = done else {
+            panic!("the cleanup did not finish: {done:?}");
+        };
+        assert_ne!(renewed.groups, view.groups);
+        assert_eq!(setup_state(&shell), json!("done"));
+        assert!(lock(&shell.shown).is_some());
+        let list =
+            tauri::async_runtime::block_on(shell.engine(|core| core.list_devices())).unwrap();
+        assert_eq!(list.devices.len(), 1);
+        assert!(list.devices[0].is_this);
+        // Once joined, an error is no end of the recovery: the window may try again.
+        let again = tauri::async_runtime::block_on(cleanup_after_recovery(
+            &shell,
+            &Fixed(true, &asked),
+            vec![],
+        ))
+        .unwrap_err();
+        assert_eq!(again.kind, hangar_drive_sync::error::ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn a_recovery_cleanup_names_the_engine_refusal() {
+        use hangar_drive_protocol::api::{ErrorBody, ErrorCode};
+        use hangar_drive_sync::ports::NetError;
+        let named = [
+            (
+                SyncError::RecoveryListChanged,
+                RecoveryCleanupError::ListChanged,
+            ),
+            (SyncError::RecoveryCodeUsed, RecoveryCleanupError::Used),
+            (
+                SyncError::RecoveryCodeUnknown,
+                RecoveryCleanupError::Unknown,
+            ),
+            (
+                SyncError::Net(NetError::PinMismatch),
+                RecoveryCleanupError::Insecure,
+            ),
+            (
+                SyncError::Net(NetError::Unreachable),
+                RecoveryCleanupError::Unreachable,
+            ),
+            (
+                SyncError::Net(NetError::Server(ErrorBody::new(ErrorCode::RateLimited))),
+                RecoveryCleanupError::Unreachable,
+            ),
+            (
+                SyncError::Net(NetError::Tls("certificate".into())),
+                RecoveryCleanupError::Insecure,
+            ),
+        ];
+        for (error, reason) in named {
+            assert_eq!(RecoveryCleanupError::of(&error), Some(reason), "{error}");
+        }
+        // A general error: the engine keeps the choice or the pending recovery.
+        for error in [
+            SyncError::Net(NetError::Server(ErrorBody::new(ErrorCode::LogEntryRefused))),
+            SyncError::Invalid("device"),
+            SyncError::Invalid("no recovery in progress"),
+            // The engine's former texts of the two refusals: a text never names a reason.
+            SyncError::Invalid("the recovery code was used before"),
+            SyncError::Invalid("the code does not belong to this account"),
+        ] {
+            assert_eq!(RecoveryCleanupError::of(&error), None, "{error}");
+        }
+        for (reason, wire) in [
+            (RecoveryCleanupError::ListChanged, "listChanged"),
+            (RecoveryCleanupError::Used, "used"),
+            (RecoveryCleanupError::Unknown, "unknown"),
+            (RecoveryCleanupError::Unreachable, "unreachable"),
+            (RecoveryCleanupError::Insecure, "insecure"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(ApiResult::<(), _>::Err(reason)).unwrap(),
+                json!({ "ok": false, "error": wire })
+            );
+        }
+    }
+
     #[test]
     fn a_set_up_device_does_not_pair() {
         let (shell, _events) = set_up_shell();
@@ -3049,6 +3560,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
+    // Security review MEDIUM 1: a folder name from the account (chosen on another device) never
+    // becomes a root name the Windows shell reads as a namespace junction, a reserved or short
+    // name, or a macOS bundle that `open` would run, on any platform.
+    #[test]
+    fn account_folder_names_become_plain_root_names() {
+        let base = PathBuf::from("base");
+        let place = |name: &str| proposed_place(&base, name, |_| false).unwrap();
+        assert_eq!(
+            place("Photos.{0AFACED1-E828-11D1-9187-B532F1E9575D}"),
+            base.join("Photos_{0AFACED1-E828-11D1-9187-B532F1E9575D}")
+        );
+        assert_eq!(place("Photos.app"), base.join("Photos_app"));
+        assert_eq!(place("Notes.APP"), base.join("Notes_APP"));
+        for bundle in [
+            "a.bundle",
+            "a.plugin",
+            "a.prefPane",
+            "a.saver",
+            "a.workflow",
+            "a.framework",
+            "a.kext",
+            "a.appex",
+        ] {
+            assert_eq!(root_dir_name(bundle), bundle.replace('.', "_"), "{bundle}");
+        }
+        assert_eq!(root_dir_name("CON"), "_CON");
+        assert_eq!(root_dir_name("nul.txt"), "_nul.txt");
+        assert_eq!(root_dir_name("HANGAR~1"), "HANGAR_1");
+        assert_eq!(root_dir_name("AB~1"), "AB_1");
+        assert_eq!(root_dir_name(".config"), "_config");
+        assert_eq!(root_dir_name("a/b:c"), "a_b_c");
+        // Ordinary names stay as they are, a dot inside included.
+        for plain in ["Photos", "Report 2026.final", "app", "x.apps", "Taxes.2026"] {
+            assert_eq!(root_dir_name(plain), plain);
+        }
+        let long = "x".repeat(300);
+        let cut = root_dir_name(&long);
+        assert!(
+            cut.encode_utf16().count() <= ROOT_NAME_UNITS,
+            "{}",
+            cut.len()
+        );
+        assert_eq!(
+            hangar_drive_protocol::name::windows_problem(&format!("{cut} (99)")),
+            None
+        );
+        for name in [
+            "Photos.{0AFACED1-E828-11D1-9187-B532F1E9575D}",
+            "CON",
+            "a~1.b",
+            "Photos.app",
+        ] {
+            let dir = root_dir_name(name);
+            assert_eq!(
+                hangar_drive_protocol::name::windows_problem(&dir),
+                None,
+                "{dir}"
+            );
+            assert!(!crate::platform::is_bundle_name(&dir), "{dir}");
+        }
+    }
+
     // Security review N8: a leading dot never reaches the file system.
     #[test]
     fn folder_names_lose_a_leading_dot() {
@@ -3113,6 +3686,11 @@ mod tests {
             ("remove_device", "remove_one_device", "core.remove_device("),
             ("reset_device", "reset", "core.reset_device()"),
             (
+                "reset_device_discarding_recovery",
+                "reset_discarding",
+                "core.reset_device_discarding_recovery()",
+            ),
+            (
                 "disconnect_this_device",
                 "disconnect",
                 "core.disconnect_this_device()",
@@ -3132,6 +3710,11 @@ mod tests {
                 "resolve_mass_delete",
                 "resolve_deletes",
                 "core.resolve_mass_delete(",
+            ),
+            (
+                "resolve_incoming_delete",
+                "resolve_incoming",
+                "core.resolve_incoming_delete(",
             ),
             (
                 "add_account_folder",

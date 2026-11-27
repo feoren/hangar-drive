@@ -4,6 +4,8 @@ import { act } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MOCK_INPUTS } from "../backend/mock/mockBackend";
+import { createTranslator, LANGUAGES } from "../i18n";
+import { deleteBody, deleteTitle, deviceLine, type DeleteWarning } from "./MassDeleteDialog";
 import {
   all,
   button,
@@ -18,7 +20,11 @@ import {
   text,
   type,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
 import { ARM_DELAY_MS } from "../ui/parts";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();
@@ -247,5 +253,47 @@ describe("suspected ransomware (UX 9.4)", () => {
     expect(maybeButton("Entfernen")).toBeUndefined();
     await click("Geräte ansehen");
     expect(dialogTitle()).toBe("Deine Geräte");
+  });
+});
+
+describe("incoming mass deletes in every language", () => {
+  const incoming = (device: string | null, count: number): DeleteWarning => ({
+    kind: "incomingDelete",
+    id: "w",
+    folderId: "f",
+    folderName: "Fotos",
+    device,
+    deviceAdded: device === null ? null : 0,
+    count,
+    sample: [],
+  });
+
+  it("fill every placeholder, with and without the device, in every plural form", () => {
+    for (const language of LANGUAGES) {
+      const t = createTranslator(language);
+      for (const count of [1, 2, 5, 22, 120, 1_000_000]) {
+        for (const device of ["Laptop", null]) {
+          const title = deleteTitle(incoming(device, count), t);
+          expect(title, `${language} ${String(count)}`).not.toMatch(/[{}]/);
+          expect(title).toContain("Fotos");
+          if (device !== null) expect(title).toContain(device);
+          for (const key of ["incoming.done", "incoming.restored"] as const) {
+            expect(t(key, { count }), `${language}:${key}`).not.toMatch(/[{}]/);
+          }
+        }
+      }
+      expect(deleteBody(incoming(null, 3), t)).toBe(t("incoming.body"));
+      const since = deviceLine(incoming("Laptop", 3), t, language, Date.now());
+      expect(since, language).toContain("Laptop");
+      expect(since, language).not.toMatch(/[{}]/);
+      expect(deviceLine(incoming(null, 3), t, language, Date.now())).toBeNull();
+    }
+  });
+
+  it("isolate a device name that could reorder the sentence", () => {
+    const t = createTranslator("de");
+    const title = deleteTitle(incoming("‮pot‬", 120), t);
+    expect(title).not.toContain("‮");
+    expect(title).toContain("⁨");
   });
 });

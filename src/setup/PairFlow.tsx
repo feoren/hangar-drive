@@ -5,6 +5,10 @@
 // account the link leads to and asks once (N2). After joining, it shows the account's devices:
 // a link that leads to a stranger's account shows strangers, and "No" disconnects this device
 // again before any file moves.
+//
+// The account comes into being when the other device says yes, before the devices check and the
+// folders: `onHold` keeps the setup on screen from the pairing request on, else the snapshot's
+// "done" would switch to the main window and skip both.
 
 import { useEffect, useId, useRef, useState } from "react";
 
@@ -63,11 +67,16 @@ export function linkErrorText(error: LinkError, notALink: string, t: Translate):
 
 type Stage = "pair" | "devices" | "folders";
 
+function noHold(): void {
+  // Inside the main window the device is set up already; nothing to hold.
+}
+
 export function PairFlow({
   titleId,
   initialLink = "",
   onSwitch,
   onBack,
+  onHold = noHold,
   onDone,
 }: {
   readonly titleId?: string;
@@ -75,6 +84,8 @@ export function PairFlow({
   readonly initialLink?: string;
   readonly onSwitch?: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
+  /** Keeps the setup on screen once the account exists; not needed inside the main window. */
+  readonly onHold?: (hold: boolean) => void;
   readonly onDone: () => void;
 }) {
   const ownTitle = useId();
@@ -98,6 +109,7 @@ export function PairFlow({
           setStage("folders");
         }}
         onAborted={() => {
+          onHold(false);
           setAborted(true);
           setStage("pair");
         }}
@@ -111,6 +123,7 @@ export function PairFlow({
       aborted={aborted}
       onSwitch={onSwitch}
       onBack={onBack}
+      onHold={onHold}
       onJoined={() => {
         setStage("devices");
       }}
@@ -124,6 +137,7 @@ function PairStep({
   aborted,
   onSwitch,
   onBack,
+  onHold,
   onJoined,
 }: {
   readonly titleId: string;
@@ -132,6 +146,7 @@ function PairStep({
   readonly aborted: boolean;
   readonly onSwitch: ((kind: LinkKind, link: string) => void) | undefined;
   readonly onBack: () => void;
+  readonly onHold: (hold: boolean) => void;
   readonly onJoined: () => void;
 }) {
   const t = useT();
@@ -165,6 +180,7 @@ function PairStep({
       setJoined(true);
       setTimeout(onJoined, 900);
     } else {
+      onHold(false);
       setWaiting(null);
       setTarget(null);
       setError(pairErrorText(event.result.error, t));
@@ -179,13 +195,22 @@ function PairStep({
       return;
     }
     pairing.current = true;
+    onHold(true);
     void action.run(async () => {
-      const result = await backend.startPairing(input, cleanName(deviceName));
+      let result: Awaited<ReturnType<typeof backend.startPairing>>;
+      try {
+        result = await backend.startPairing(input, cleanName(deviceName));
+      } catch (failure) {
+        pairing.current = false;
+        onHold(false);
+        throw failure;
+      }
       if (result.ok) {
         setWaiting((current) => current ?? result.value);
         return;
       }
       pairing.current = false;
+      onHold(false);
       setTarget(null);
       if (result.error === "blank" || result.error === "edgeWhitespace") setRefused(result.error);
       else setError(pairErrorText(result.error, t));
@@ -254,6 +279,7 @@ function PairStep({
               void action.run(async () => {
                 await backend.cancelPairing();
                 pairing.current = false;
+                onHold(false);
                 setWaiting(null);
                 setTarget(null);
               });

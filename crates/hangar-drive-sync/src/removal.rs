@@ -32,7 +32,7 @@
 
 use std::collections::BTreeSet;
 
-use hangar_drive_crypto::commit::{ChainError, DeltaCheck, RemovedHead};
+use hangar_drive_crypto::commit::{ChainError, RemovedHead};
 use hangar_drive_crypto::epoch::BarrierPermit;
 use hangar_drive_crypto::Entropy;
 use hangar_drive_protocol::ids::{CommitId, DeviceId};
@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::Account;
 use crate::error::SyncError;
-use crate::folder::{Ctx, FolderSettings, FolderState, FolderSync, StopReason};
+use crate::folder::{
+    Ctx, FolderSettings, FolderState, FolderSync, PullMode, PullVerdict, StopReason,
+};
 use crate::ports::{Clock, FileSystem, Keychain, ServerApi, Store};
 
 const JOB_KEY: &str = "removal-job";
@@ -253,28 +255,27 @@ fn write_barrier_if_due(
     mode: Mode<'_>,
     outcome: &mut RemovalOutcome,
 ) -> Result<bool, SyncError> {
-    let newest = jx
-        .account
+    // Without a key ring the folder has nothing to check.
+    jx.account
         .newest_generation(folder.id())
         .ok_or(SyncError::NotSetUp("no key ring for the folder"))?;
+    // The delta is read page by page each time (ADR 0001, amendment "delta pages in the
+    // engine"), never held as a whole; these checks keep no state between rounds.
+    let check = PullMode::Check { persist: false };
     for _ in 0..4 {
-        let delta = folder.fetch_delta(jx.server)?;
         let permit = match mode {
             Mode::Removing(permit) => *permit,
             Mode::Confirmed(_) => {
-                match folder
-                    .view()
-                    .check_delta(jx.account.state(), newest, &delta)?
-                {
-                    DeltaCheck::Accepted(normal) => {
+                let mut cx = ctx(jx, fs);
+                match folder.pull_delta(&mut cx, check)? {
+                    PullVerdict::Accepted(normal) => {
                         // Another device wrote the barrier meanwhile: take the delta in.
-                        let mut cx = ctx(jx, fs);
-                        folder.take_outcome(&mut cx, normal, &delta)?;
+                        folder.take_outcome(&mut cx, *normal)?;
                         folder.clear_removed_heads();
                         folder.save_state(cx.store)?;
                         return Ok(false);
                     }
-                    DeltaCheck::RemovedSigner(refusal) => {
+                    PullVerdict::RemovedSigner(refusal) => {
                         BarrierPermit::takeover(jx.account.state(), jx.account.device(), &refusal)
                             .ok_or(SyncError::Chain(ChainError::RemovedSigner))?
                     }
@@ -282,12 +283,15 @@ fn write_barrier_if_due(
             }
         };
         let removal = permit.removal_index();
-        let checked = folder.view().verify_delta_before_barrier(
-            jx.account.state(),
-            newest,
-            &delta,
-            &permit,
-        )?;
+        let checked = {
+            let mut cx = ctx(jx, fs);
+            match folder.pull_delta(&mut cx, PullMode::BeforeBarrier(&permit))? {
+                PullVerdict::Accepted(checked) => checked,
+                PullVerdict::RemovedSigner(_) => {
+                    return Err(SyncError::Chain(ChainError::RemovedSigner))
+                }
+            }
+        };
         if let Mode::Confirmed(confirmed) = mode {
             if checked
                 .removed_heads
@@ -300,8 +304,8 @@ fn write_barrier_if_due(
                 return Ok(false);
             }
         }
-        let view = checked.outcome.view.clone();
-        let (head, sequence) = match checked.outcome.heads.last() {
+        let view = checked.view.clone();
+        let (head, sequence) = match checked.last_head.as_ref() {
             Some(h) => (h.clone(), view.frontier().map_or(0, |f| f.sequence)),
             None => match (folder.frontier_commit(), folder.view().frontier()) {
                 (Some(h), Some(f)) => (h, f.sequence),
@@ -317,25 +321,21 @@ fn write_barrier_if_due(
             && head.commit.log_head.index >= removal;
         if covered {
             // The delta is already safe: take it with every rule.
-            let normal = folder
-                .view()
-                .verify_delta(jx.account.state(), newest, &delta)?;
             let mut cx = ctx(jx, fs);
-            folder.take_outcome(&mut cx, normal, &delta)?;
+            let normal = match folder.pull_delta(&mut cx, check)? {
+                PullVerdict::Accepted(normal) => normal,
+                PullVerdict::RemovedSigner(_) => {
+                    return Err(SyncError::Chain(ChainError::RemovedSigner))
+                }
+            };
+            folder.take_outcome(&mut cx, *normal)?;
             return Ok(false);
         }
+        let removed = checked.removed_heads.clone();
         let mut cx = ctx(jx, fs);
-        match folder.write_barrier(
-            &mut cx,
-            &head,
-            sequence,
-            view,
-            Some((&checked.outcome, &delta)),
-        ) {
+        match folder.write_barrier(&mut cx, &head, sequence, view, Some(checked.timeline)) {
             Ok(()) => {
-                outcome
-                    .removed_heads
-                    .extend(checked.removed_heads.iter().copied());
+                outcome.removed_heads.extend(removed.iter().copied());
                 folder.clear_removed_heads();
                 folder.save_state(cx.store)?;
                 return Ok(true);

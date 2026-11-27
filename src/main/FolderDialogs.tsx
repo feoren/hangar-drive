@@ -7,7 +7,7 @@ import { useEffect, useId, useRef, useState } from "react";
 
 import type { Folder, FolderId, FolderPlace } from "../backend/types";
 import { formatSize } from "../format";
-import { useLanguage, useT } from "../i18n";
+import { displayName, useLanguage, useT } from "../i18n";
 import { useBackend, useSnapshot } from "../ui/backendContext";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { Dialog } from "../ui/Dialog";
@@ -97,7 +97,7 @@ export function NotSyncedDialog({
         <ul className="plain-list">
           {loaded.data.map((entry) => (
             <li key={entry.path} className="plain-item">
-              <span className="plain-name">{entry.path}</span>
+              <span className="plain-name">{displayName(entry.path)}</span>
               <span className="plain-sub">
                 {entry.reason === "link" ? t("names.notSynced.link") : t("names.notSynced.system")}
               </span>

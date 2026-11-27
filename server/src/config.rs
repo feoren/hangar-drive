@@ -57,8 +57,13 @@ pub const CONNECTIONS_PER_IP_VAR: &str = "HANGAR_DRIVE_CONNECTIONS_PER_IP";
 /// The address devices reach the server under (`https://drive.example.org/`), for the invite
 /// links `invite` prints. Optional for serving, required for `invite`.
 pub const PUBLIC_URL_VAR: &str = "HANGAR_DRIVE_PUBLIC_URL";
+/// Address to listen on (IPv4 or IPv6). The image sets `0.0.0.0`; elsewhere the default is
+/// loopback, so a server started by hand on a host is not reachable from the network by accident.
+pub const BIND_VAR: &str = "HANGAR_DRIVE_BIND";
 
 pub const DEFAULT_PORT: u16 = 8080;
+/// Loopback: outside the container image a reverse proxy on the same host reaches it.
+pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Relative to the working directory; the container image sets `/data`, its volume.
 pub const DEFAULT_DATA_DIR: &str = "data";
 pub const DEFAULT_RETENTION_DAYS: u32 = 30;
@@ -233,6 +238,8 @@ pub struct TlsFiles {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub port: u16,
+    /// [`BIND_VAR`].
+    pub bind: IpAddr,
     pub data_dir: PathBuf,
     pub limits: Limits,
     pub trusted_proxies: Vec<IpNet>,
@@ -267,6 +274,20 @@ impl Default for Concurrency {
     }
 }
 
+impl Concurrency {
+    /// Connections per client network (IPv4 /24, IPv6 /48; server security review, LOW 1): four
+    /// times the address limit, as for the rate limits, and at most a quarter of
+    /// [`crate::MAX_CONNECTIONS`], so one network never takes every slot; never below the address
+    /// limit an operator raised above that.
+    pub fn connections_per_net(&self) -> u32 {
+        let quarter = u32::try_from(crate::MAX_CONNECTIONS / 4).unwrap_or(u32::MAX);
+        self.connections_per_ip
+            .saturating_mul(4)
+            .min(quarter)
+            .max(self.connections_per_ip)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("{PORT_VAR} must be a port number from 1 to 65535, not {0:?}")]
@@ -281,6 +302,12 @@ pub enum ConfigError {
     InvalidProxy(String),
     #[error("{TLS_CERT_VAR} and {TLS_KEY_VAR} must be set together")]
     TlsIncomplete,
+    #[error(
+        "{TRUSTED_PROXIES_VAR} must be empty when the server terminates TLS itself ({TLS_CERT_VAR}): \n         no reverse proxy sits in front of it then, so any client could set X-Forwarded-For and \n         choose its own rate limit key. Remove {TRUSTED_PROXIES_VAR}, or remove the TLS settings \n         and keep the proxy"
+    )]
+    TlsWithTrustedProxies,
+    #[error("{BIND_VAR} must be an IPv4 or IPv6 address such as 0.0.0.0 or ::, not {0:?}")]
+    InvalidBind(String),
     #[error("{DEVICE_BUDGET_VAR} must not exceed {ACCOUNT_BUDGET_VAR}")]
     DeviceBudgetAboveAccount,
     #[error(
@@ -398,6 +425,18 @@ impl Config {
             }),
             _ => return Err(ConfigError::TlsIncomplete),
         };
+        // Server security review, LOW 3: an operator who moves from a proxy to TLS in the server
+        // and binds the port to the network would otherwise keep trusting X-Forwarded-For from
+        // the old proxy address range, which clients can now reach directly.
+        if tls.is_some() && !trusted_proxies.is_empty() {
+            return Err(ConfigError::TlsWithTrustedProxies);
+        }
+        let bind = match text(BIND_VAR) {
+            None => DEFAULT_BIND,
+            Some(value) => value
+                .parse::<IpAddr>()
+                .map_err(|_| ConfigError::InvalidBind(value))?,
+        };
         let public_url = text(PUBLIC_URL_VAR)
             .map(|value| parse_public_url(&value).ok_or(ConfigError::InvalidPublicUrl(value)))
             .transpose()?;
@@ -405,6 +444,7 @@ impl Config {
         let grace = number(SHUTDOWN_GRACE_VAR, DEFAULT_SHUTDOWN_GRACE_SECS, 1, 600)?;
         Ok(Self {
             port,
+            bind,
             data_dir,
             limits,
             trusted_proxies,
@@ -416,15 +456,27 @@ impl Config {
         })
     }
 
-    /// Address to listen on: every IPv4 interface, as a container needs it. On a host, a reverse
-    /// proxy or the port mapping decides who can reach it.
+    /// Address to listen on: [`BIND_VAR`] (loopback by default, every IPv4 interface in the
+    /// container image, where the port mapping decides who can reach it) and the port.
     pub fn bind_addr(&self) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, self.port))
+        SocketAddr::new(self.bind, self.port)
     }
 
     /// The SQLite file.
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("drive.sqlite3")
+    }
+
+    /// The folder for SQLite's temporary files, relative to the data folder (server security
+    /// review, MEDIUM 3). The container's root file system is read-only and has no writable
+    /// temporary folder, and SQLite writes large temporary tables (the IDs of a large commit)
+    /// and sorts to files; the image points `SQLITE_TMPDIR` here. The server creates it (0700 on
+    /// Unix) and empties it at every start.
+    pub const SQLITE_TMP_DIR: &'static str = "tmp";
+
+    /// [`Config::SQLITE_TMP_DIR`] in the data folder.
+    pub fn sqlite_tmp_dir(&self) -> PathBuf {
+        self.data_dir.join(Self::SQLITE_TMP_DIR)
     }
 
     /// The object store's root.
@@ -581,8 +633,7 @@ mod tests {
             (DEVICE_BUDGET_VAR, "2GiB"),
             (DISK_RESERVE_VAR, "2G"),
             (TRUSTED_PROXIES_VAR, "127.0.0.1, 10.0.0.0/8,fd00::/8"),
-            (TLS_CERT_VAR, "/certs/c.pem"),
-            (TLS_KEY_VAR, "/certs/k.pem"),
+            (BIND_VAR, "0.0.0.0"),
             (GC_INTERVAL_VAR, "5"),
             (SHUTDOWN_GRACE_VAR, "3"),
         ])
@@ -599,7 +650,7 @@ mod tests {
         assert_eq!(l.device_budget, 2 * GIB);
         assert_eq!(l.disk_reserve, 2 * GIB);
         assert_eq!(config.trusted_proxies.len(), 3);
-        assert!(config.tls.is_some());
+        assert_eq!(config.bind, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(config.gc_interval, Duration::from_secs(300));
         assert_eq!(config.shutdown_grace, Duration::from_secs(3));
     }
@@ -684,8 +735,60 @@ mod tests {
     }
 
     #[test]
-    fn listens_on_every_ipv4_interface() {
+    fn listens_on_loopback_unless_told_otherwise() {
         let config = config(&[(PORT_VAR, "8123")]).unwrap();
+        assert_eq!(config.bind_addr(), "127.0.0.1:8123".parse().unwrap());
+        let config = config_of(&[(PORT_VAR, "8123"), (BIND_VAR, "0.0.0.0")]);
         assert_eq!(config.bind_addr(), "0.0.0.0:8123".parse().unwrap());
+        let config = config_of(&[(BIND_VAR, "::")]);
+        assert_eq!(config.bind_addr(), "[::]:8080".parse().unwrap());
+        assert_eq!(
+            super::Config::from_lookup(|n| (n == BIND_VAR).then(|| "localhost".into())),
+            Err(ConfigError::InvalidBind("localhost".into()))
+        );
+    }
+
+    fn config_of(vars: &[(&str, &str)]) -> Config {
+        config(vars).unwrap()
+    }
+
+    #[test]
+    fn tls_in_the_server_refuses_trusted_proxies() {
+        // LOW 3: with TLS in the server no proxy sits in front of it.
+        let tls = [(TLS_CERT_VAR, "/c.pem"), (TLS_KEY_VAR, "/k.pem")];
+        assert!(config(&tls).is_ok());
+        let with_proxy = [tls[0], tls[1], (TRUSTED_PROXIES_VAR, "172.30.250.1")];
+        let error = config(&with_proxy).unwrap_err();
+        assert_eq!(error, ConfigError::TlsWithTrustedProxies);
+        let text = error.to_string();
+        assert!(
+            text.contains(TRUSTED_PROXIES_VAR) && text.contains(TLS_CERT_VAR),
+            "{text}"
+        );
+        assert!(config(&[(TRUSTED_PROXIES_VAR, "172.30.250.1")]).is_ok());
+    }
+
+    #[test]
+    fn a_network_gets_four_times_the_connections_of_an_address() {
+        let c = Concurrency::default();
+        assert_eq!(c.connections_per_net(), 256);
+        let wide = Concurrency {
+            connections_per_ip: 2000,
+            ..c
+        };
+        assert_eq!(
+            wide.connections_per_net(),
+            2000,
+            "never below the address limit"
+        );
+        let mid = Concurrency {
+            connections_per_ip: 600,
+            ..c
+        };
+        assert_eq!(
+            mid.connections_per_net(),
+            1024,
+            "at most a quarter of all slots"
+        );
     }
 }

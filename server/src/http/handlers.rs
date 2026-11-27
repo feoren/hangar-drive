@@ -1,6 +1,7 @@
 //! The handlers: parse, call one service function, answer. No rule of the protocol lives here;
 //! rate limits run in the authorization layer before any handler (`http::ratelimit`).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -24,8 +25,8 @@ use tokio::io::AsyncWriteExt;
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::http::extract::{
-    read_limited, After, JsonBody, PathParams, PublicJsonBody, BODY_IDLE_TIMEOUT, BODY_TIMEOUT,
-    COMMIT_JSON, MISSING_JSON, RECORD_JSON, SMALL_JSON,
+    read_paced, After, JsonBody, PathParams, PublicJsonBody, BODY_IDLE_TIMEOUT, BODY_TIMEOUT,
+    COMMIT_JSON, HEAVY_PACE, MISSING_JSON, RECORD_JSON, SMALL_JSON,
 };
 use crate::service::objects::{self, Precheck, Staged};
 use crate::service::sessions::{self, Session};
@@ -73,12 +74,25 @@ async fn heavy_json<'a, T: serde::de::DeserializeOwned>(
         .heavy_accounts
         .take(account_pk, heavy_share(app.concurrency.heavy_requests))
         .ok_or_else(|| ApiError::new(ErrorCode::RateLimited))?;
-    let permit = tokio::time::timeout(HEAVY_WAIT, app.heavy.clone().acquire_owned())
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::RateLimited))?
-        .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
+    let permit = {
+        let _waiting = Waiting::enter(&app.heavy_waiting);
+        tokio::time::timeout(HEAVY_WAIT, app.heavy.clone().acquire_owned())
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::RateLimited))?
+            .map_err(|_| ApiError::new(ErrorCode::RateLimited))?
+    };
     let (parts, body) = request.into_parts();
-    let bytes = read_limited(&parts.headers, body, limit, BODY_TIMEOUT).await?;
+    // The slot is held while the body arrives: while another call waits for one, the body
+    // must keep a least pace (LOW 2, follow-up L3).
+    let contended = || app.heavy_waiting.load(Ordering::SeqCst) > 0;
+    let bytes = read_paced(
+        &parts.headers,
+        body,
+        limit,
+        BODY_TIMEOUT,
+        Some((HEAVY_PACE, &contended)),
+    )
+    .await?;
     let value = serde_json::from_slice(&bytes).map_err(|_| ApiError::new(ErrorCode::BadRequest))?;
     Ok((
         value,
@@ -87,6 +101,24 @@ async fn heavy_json<'a, T: serde::de::DeserializeOwned>(
             _permit: permit,
         },
     ))
+}
+
+/// One call counted in [`App::heavy_waiting`] while it waits for a heavy slot.
+///
+/// [`App::heavy_waiting`]: crate::app::App::heavy_waiting
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Heavy slots one account may hold: half of all, at least one.
@@ -373,10 +405,12 @@ pub async fn put_object(
     }
     // Without a length the upload may still write up to the largest blob.
     let expected = announced.unwrap_or(max as u64);
-    if let Precheck::Held = objects::precheck(&app, &s, &folder, &id, expected).await? {
+    // Claimed before the disk check (server security review, info): two uploads that both
+    // checked first and claimed after could each see room that only one of them has.
+    let mut claim = app.staging.claim(expected);
+    if let Precheck::Held = objects::precheck(&app, &s, &folder, &id).await? {
         return Ok(Json(UploadResponse { stored: false }).into_response());
     }
-    let mut claim = app.staging.claim(expected);
     let path = app.store.staging_path()?;
     let mut staged = Staged::new(path.clone(), 0, Vec::new());
     let receive = async {

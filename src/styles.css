@@ -336,6 +336,26 @@ button {
   background: var(--hover);
 }
 
+/* The main menu's button: a slightly raised square with a quiet border, as in Hangar's header;
+   a little stronger under the pointer and while its menu is open. */
+.menu-button {
+  color: var(--text);
+  background: var(--panel-raised);
+  border: var(--hairline) solid var(--border);
+}
+
+@media (hover: hover) {
+  .menu-button:hover {
+    background: var(--hover);
+    border-color: color-mix(in srgb, var(--muted) 45%, var(--border));
+  }
+}
+
+.menu-button[aria-expanded="true"] {
+  background: var(--hover);
+  border-color: color-mix(in srgb, var(--muted) 45%, var(--border));
+}
+
 .input,
 .select {
   min-height: 34px;
@@ -592,21 +612,64 @@ code.command {
   border-bottom: var(--hairline) solid var(--border);
 }
 
-.brand {
+.topbar-start {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
 }
 
+/* Laid out like Hangar's brand: the logo spans two lines, the name in bold above the version in
+   small muted text with the "beta" badge. Sizes are Hangar's, so both apps read the same. */
+.brand {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 1px 7px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .brand-mark {
-  flex: none;
+  grid-row: 1 / span 2;
   margin-left: 2px;
 }
 
 .brand-name {
+  line-height: 16px;
+}
+
+/* Always one line high, also before the version arrives, so the name never jumps. */
+.brand-version {
+  display: inline-flex;
+  grid-column: 2;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  height: 13px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 13px;
+  letter-spacing: 0;
+  color: var(--muted);
+}
+
+/* Not an exclamation, just a marker: the accent as a border instead of a fill. */
+.beta-badge {
+  flex: none;
+  padding: 0 4px;
+  border: var(--hairline) solid var(--accent);
+  border-radius: 999px;
+  font-size: 9.5px;
   font-weight: 600;
-  white-space: nowrap;
+  line-height: 11px;
+  letter-spacing: 0.02em;
+  color: var(--accent);
 }
 
 .topbar-actions {
@@ -1277,6 +1340,71 @@ code.command {
   height: 1px;
   margin: 4px 8px;
   background: var(--border);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* Main menu: File, View, Help with submenus, as in Hangar. Submenus open to the right of their
+   entry; the entries reuse the row menu's look. */
+
+.app-menu {
+  position: relative;
+}
+
+.menu-panel {
+  position: absolute;
+  top: -5px;
+  left: calc(100% + 2px);
+  z-index: 300;
+  min-width: 210px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--panel-raised);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-l);
+  box-shadow: 0 12px 32px var(--shadow);
+}
+
+.menu-root {
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 150px;
+  transform-origin: top left;
+  animation: menu-in 150ms var(--ease-out);
+}
+
+.menu-entry {
+  position: relative;
+}
+
+.menu-panel .menu-item {
+  gap: 24px;
+  white-space: nowrap;
+}
+
+.menu-item.open {
+  background: var(--hover);
+}
+
+.menu-item.current .menu-label {
+  font-weight: 600;
+}
+
+.menu-label {
+  flex: 1;
+}
+
+.menu-hint {
+  display: inline-flex;
+  align-items: center;
+  min-width: 16px;
+  justify-content: flex-end;
+  font-size: var(--text-s);
+  color: var(--muted);
+}
+
+.menu-item.current .menu-hint {
+  color: var(--accent);
 }
 
 /* ------------------------------------------------------------------------------------------ */
@@ -2483,6 +2611,7 @@ code.command {
   .banner,
   .dialog,
   .menu,
+  .menu-panel,
   .group-card,
   .code-groups,
   .number-rows {

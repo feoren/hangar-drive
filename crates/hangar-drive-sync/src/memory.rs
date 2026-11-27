@@ -661,6 +661,16 @@ impl MemStore {
     pub fn saves(&self) -> u64 {
         self.0.borrow().saves
     }
+
+    /// Rows of the caches (plaintexts, object IDs, chunk lists) of all folders.
+    pub fn cache_rows(&self) -> (usize, usize, usize) {
+        let inner = self.0.borrow();
+        (
+            inner.plaintexts.len(),
+            inner.objects.len(),
+            inner.chunks.len(),
+        )
+    }
 }
 
 fn apply_delta(rows: &mut BTreeMap<ItemId, Node>, delta: &TreeDelta) {
@@ -712,6 +722,11 @@ impl Store for MemStore {
         inner.chunks.retain(|(f, _), _| f != folder);
         inner.objects.retain(|(f, _), _| f != folder);
         inner.plaintexts.retain(|(f, _), _| f != folder);
+        // A pull of the folder stored between pages goes with it, as in the SQLite index.
+        let pull = format!("pull/{}", folder.to_hex());
+        inner
+            .account
+            .retain(|k, _| k != &pull && !k.starts_with(&format!("{pull}/")));
         Ok(())
     }
 
@@ -771,6 +786,27 @@ impl Store for MemStore {
         Ok(())
     }
 
+    fn retain_cache(
+        &mut self,
+        folder: &FolderId,
+        objects: &BTreeSet<ObjectId>,
+        contents: &BTreeSet<ContentKey>,
+    ) -> Result<u64, StoreError> {
+        let mut inner = self.0.borrow_mut();
+        let before = inner.plaintexts.len() + inner.objects.len() + inner.chunks.len();
+        inner
+            .plaintexts
+            .retain(|(f, id), _| f != folder || objects.contains(id));
+        inner
+            .objects
+            .retain(|(f, _), id| f != folder || objects.contains(id));
+        inner
+            .chunks
+            .retain(|(f, c), _| f != folder || contents.contains(c));
+        let after = inner.plaintexts.len() + inner.objects.len() + inner.chunks.len();
+        Ok((before - after) as u64)
+    }
+
     fn account_value(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.0.borrow().account.get(key).cloned())
     }
@@ -816,8 +852,20 @@ pub struct ServerState {
     pub online: bool,
     /// The next commit call is applied but its reply is lost.
     pub lose_next_commit_reply: bool,
+    /// The next log append is applied but its reply is lost.
+    pub lose_next_append_reply: bool,
+    /// The next log append is lost on its way: not applied, and the call fails as offline.
+    pub drop_next_append: bool,
+    /// The next log append is applied, then the server goes offline before it answers (the
+    /// app ends, or the connection drops, right after the append).
+    pub offline_after_next_append: bool,
     /// Commits per delta page (small pages test paging).
     pub page_size: usize,
+    /// Delta pages served so far, for the tests.
+    pub delta_pages: u64,
+    /// When set, this many more delta pages are served, then the connection fails (a pull
+    /// cut off midway).
+    pub delta_pages_left: Option<u64>,
     /// Answer "base expired" to every side commit.
     pub expire_bases: bool,
     /// While set, every commit is refused with this code (a used up upload budget, say).
@@ -850,11 +898,27 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// A record as stored (version and sealed bytes), for tests.
+    pub fn stored_record(&self, key: &RecordKey) -> Option<(u64, Vec<u8>)> {
+        self.records.get(key).cloned()
+    }
+
+    /// Puts a record back as it was stored earlier: a server that shows a device another
+    /// version than it keeps, or rewinds a record, for tests.
+    pub fn set_stored_record(&mut self, key: RecordKey, version: u64, data: Vec<u8>) {
+        self.records.insert(key, (version, data));
+    }
+
     fn new() -> Self {
         Self {
             online: true,
             lose_next_commit_reply: false,
+            lose_next_append_reply: false,
+            drop_next_append: false,
+            offline_after_next_append: false,
             page_size: hangar_drive_protocol::api::MAX_DELTA_PAGE,
+            delta_pages: 0,
+            delta_pages_left: None,
             expire_bases: false,
             refuse_commits: None,
             presented_pin: None,
@@ -1153,6 +1217,9 @@ impl ServerApi for MemServer {
 
     fn append_log(&mut self, request: &LogAppendRequest) -> Result<LogAppendResponse, NetError> {
         let mut s = self.enter()?;
+        if std::mem::take(&mut s.drop_next_append) {
+            return Err(NetError::Unreachable);
+        }
         request
             .validate()
             .map_err(|_| refuse(ErrorCode::BadRequest))?;
@@ -1172,22 +1239,35 @@ impl ServerApi for MemServer {
             return Err(refuse(ErrorCode::LogEntryRefused));
         }
         let epoch = batch.state.current_epoch().map(|e| e.epoch.0);
+        let recovery = matches!(
+            batch.shape,
+            hangar_drive_crypto::devicelog::BatchShape::Recovery { .. }
+        );
         for w in &request.wraps {
             if let Some(epoch) = epoch {
                 s.wraps.insert((epoch, w.device), w.data.0.clone());
             }
         }
-        if let (Some(w), Some(epoch)) = (&request.device_wrap, epoch) {
+        // The added device's wrap is of the epoch before the batch; a recovery rotates after
+        // the add, so its wrap belongs to the epoch the log had before it (as the server keeps
+        // it).
+        let device_epoch = if recovery {
+            state.current_epoch().map(|e| e.epoch.0)
+        } else {
+            epoch
+        };
+        if let (Some(w), Some(epoch)) = (&request.device_wrap, device_epoch) {
             s.wraps.insert((epoch, w.device), w.data.0.clone());
         }
         for e in &request.entries {
             s.log.push(e.0.clone());
         }
         let head = batch.state.head().ok_or(refuse(ErrorCode::Internal))?;
-        let rotated = matches!(
-            batch.shape,
-            hangar_drive_crypto::devicelog::BatchShape::Rotation { .. }
-        );
+        let rotated = recovery
+            || matches!(
+                batch.shape,
+                hangar_drive_crypto::devicelog::BatchShape::Rotation { .. }
+            );
         s.state = Some(batch.state);
         let length = s.log.len() as u64;
         s.push_feed(FeedChange::DeviceLog { length });
@@ -1195,6 +1275,13 @@ impl ServerApi for MemServer {
             s.push_feed(FeedChange::Epoch {
                 epoch: Epoch(epoch),
             });
+        }
+        if std::mem::take(&mut s.offline_after_next_append) {
+            s.online = false;
+            return Err(NetError::Unreachable);
+        }
+        if std::mem::take(&mut s.lose_next_append_reply) {
+            return Err(NetError::Unreachable);
         }
         Ok(LogAppendResponse { head })
     }
@@ -1517,7 +1604,13 @@ impl ServerApi for MemServer {
     }
 
     fn commits(&mut self, folder: &FolderId, after: u64) -> Result<DeltaPage, NetError> {
-        let s = self.enter()?;
+        let mut s = self.enter()?;
+        match s.delta_pages_left {
+            Some(0) => return Err(NetError::Unreachable),
+            Some(n) => s.delta_pages_left = Some(n - 1),
+            None => {}
+        }
+        s.delta_pages += 1;
         let page = s.page_size.max(1);
         let Some(f) = s.folders.get(folder) else {
             return Ok(DeltaPage {

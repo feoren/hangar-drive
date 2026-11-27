@@ -1,5 +1,5 @@
-// The tray icon of the current state, drawn large at the top of the main window and in the
-// setup. Same geometry as the tray (tray/icons.ts), so people learn one picture.
+// The status shape of the current state (tray/icons.ts), drawn large at the top of the main window
+// and in the setup: one shape per state, so the state never rests on color alone.
 
 import { useId } from "react";
 

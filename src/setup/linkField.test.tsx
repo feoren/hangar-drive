@@ -7,6 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MOCK_INPUTS } from "../backend/mock/mockBackend";
 import { cleanup, click, field, flush, renderApp, text, type } from "../test/harness";
+import { pinClock } from "../test/clock";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();

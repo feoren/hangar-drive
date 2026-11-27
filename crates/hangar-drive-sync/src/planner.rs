@@ -12,6 +12,12 @@
 //!   planner takes the item as present (its synced version) and never touches it on disk.
 //! - **Mass delete:** above the threshold the engine holds every local delete of the round the
 //!   same way, until the person decides; "restore" then recreates the items on disk.
+//!
+//! A third guard works on the remote input, for deletes another device made (ADR 0001,
+//! amendment "incoming mass deletes"): [`hold_deletes`] decides when the folder keeps them on
+//! this disk until the person decides, and the folder leaves those items to the executor's skip
+//! set. The same rule over the long window also guards this device's own deletes, so a slow
+//! delete below the per round threshold adds up.
 
 use std::collections::BTreeSet;
 
@@ -23,6 +29,28 @@ use crate::tree::{Tree, ROOT};
 /// The deletes of one round from which the engine asks the person first (ADR 0001, section 5;
 /// Nextcloud's default).
 pub const MASS_DELETE_THRESHOLD: usize = 100;
+
+/// Incoming file deletes within the window from which the person is always asked, whatever
+/// the share of the folder (ADR 0001, amendment "incoming mass deletes").
+pub const INCOMING_DELETE_ALWAYS: u64 = 1000;
+/// The fewest incoming file deletes within the window that ask at all: a folder of fewer files
+/// never asks, and tidying up a few files never interrupts.
+pub const INCOMING_DELETE_MIN: u64 = 100;
+/// From this share of the folder's files (in percent), at least [`INCOMING_DELETE_MIN`] of them,
+/// incoming deletes are held.
+pub const INCOMING_DELETE_PERCENT: u64 = 25;
+
+/// Whether `deleted` file deletes within a window, of a folder that held `files` files before
+/// it, wait for the person: at least [`INCOMING_DELETE_ALWAYS`], or at least
+/// [`INCOMING_DELETE_MIN`] and at least [`INCOMING_DELETE_PERCENT`] percent of the files. Moves,
+/// directories and files that only just arrived are not counted by the caller, and `files` is
+/// the fewest the folder held over the window, so files added before a delete do not dilute
+/// it (security review M3).
+pub fn hold_deletes(deleted: u64, files: u64) -> bool {
+    deleted >= INCOMING_DELETE_ALWAYS
+        || (deleted >= INCOMING_DELETE_MIN
+            && deleted.saturating_mul(100) >= files.saturating_mul(INCOMING_DELETE_PERCENT))
+}
 
 /// What the planner reads.
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +169,26 @@ mod tests {
         t.insert(id(2), Node::file(id(1), "a", file(2)));
         t.insert(id(3), Node::file(ROOT, "b", file(3)));
         t
+    }
+
+    #[test]
+    fn incoming_deletes_are_held_from_the_thresholds_on() {
+        // A folder of fewer than 100 files never asks, even when everything goes.
+        assert!(!hold_deletes(99, 99));
+        assert!(hold_deletes(100, 100));
+        // From 100 deletes, a quarter of the folder asks.
+        assert!(!hold_deletes(100, 401));
+        assert!(hold_deletes(100, 400));
+        assert!(!hold_deletes(249, 1000));
+        assert!(hold_deletes(250, 1000));
+        // From 1000 deletes, the share does not matter.
+        assert!(!hold_deletes(999, 100_000));
+        assert!(hold_deletes(1000, 100_000));
+        // Honest tidying up does not ask.
+        assert!(!hold_deletes(20, 400));
+        assert!(!hold_deletes(0, 0));
+        // No overflow at the edge.
+        assert!(hold_deletes(u64::MAX, u64::MAX));
     }
 
     #[test]

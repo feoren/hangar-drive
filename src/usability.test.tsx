@@ -23,8 +23,12 @@ import {
   text,
   type,
 } from "./test/harness";
+import { pinClock } from "./test/clock";
 import { ARM_DELAY_MS } from "./ui/parts";
 import { errorText } from "./ui/useAsync";
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();
@@ -99,7 +103,7 @@ describe("recovery: nothing to remove", () => {
     expect(document.querySelector("h1")?.textContent).toBe("Dein Wiederherstellungscode");
   });
 
-  it("stops loading and offers Next again when passing the empty step fails", async () => {
+  it("stops loading and offers the step again when passing the empty step fails", async () => {
     const mock = new MockBackend({ scenario: "setup" });
     await mock.setLanguage("de");
     mock.recoveryDevices = () => Promise.resolve([]);
@@ -113,7 +117,8 @@ describe("recovery: nothing to remove", () => {
     expect(document.querySelector("h1")?.textContent).toBe("Alte Geräte entfernen");
     expect(document.querySelector(".loading")).toBeNull();
     expect(document.querySelector(".feedback")).not.toBeNull();
-    expect(button("Weiter").getAttribute("aria-disabled")).toBe("false");
+    // The same step is tried again; the button says so.
+    expect(button("Erneut versuchen").getAttribute("aria-disabled")).toBe("false");
   });
 });
 

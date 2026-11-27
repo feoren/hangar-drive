@@ -146,6 +146,9 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     // (security review, information finding).
     .disable_drag_drop_handler()
     .on_navigation(|url| main_may_navigate(url, cfg!(debug_assertions)))
+    // `window.open` and links with a target would open a second WebView without the navigation
+    // guard; the page needs none (security review, hardening).
+    .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
     .build()
     .map(drop)
 }
@@ -267,15 +270,16 @@ pub fn run() -> tauri::Result<()> {
         .on_window_event(on_window_event)
         .invoke_handler(command_handler!())
         .build(context)?
-        .run(|_app, event| {
+        .run(|app, event| match event {
             // The tray keeps the app alive without a visible window; only `quit` (an exit
             // with a code) ends it.
-            if let tauri::RunEvent::ExitRequested {
+            tauri::RunEvent::ExitRequested {
                 code: None, api, ..
-            } = event
-            {
-                api.prevent_exit();
-            }
+            } => api.prevent_exit(),
+            // Every way out (the window's and the tray's Quit, the system ending the session)
+            // passes here; a copied code must not outlive the app (security review LOW 2).
+            tauri::RunEvent::Exit => commands::clear_copied_secret(app),
+            _ => {}
         });
     Ok(())
 }
@@ -348,6 +352,34 @@ mod tests {
             "{builder}"
         );
         assert!(builder.contains(".build()"));
+    }
+
+    // Hardening: neither window lets its page open another one, and the page's prototypes are
+    // frozen; the CSP names every source kind the page does not use.
+    #[test]
+    fn the_pages_open_no_windows_and_load_only_their_own_scripts() {
+        let deny = ".on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)";
+        assert!(main_window_builder().contains(deny));
+        let commands = include_str!("commands.rs");
+        let print = &commands[commands.find("crate::print::WINDOW,").unwrap()..];
+        assert!(print[..print.find(".build()").unwrap()].contains(deny));
+        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &conf["app"]["security"];
+        assert_eq!(security["freezePrototype"], Value::Bool(true));
+        let csp = security["csp"].as_str().unwrap();
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "frame-src 'none'",
+            "worker-src 'none'",
+            "object-src 'none'",
+            "form-action 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.split("; ").any(|d| d == directive), "{directive}");
+        }
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
     }
 
     // ADR 0001, section 8: the installer ships the notices of the MPL-2.0 and BSL-1.0 crates

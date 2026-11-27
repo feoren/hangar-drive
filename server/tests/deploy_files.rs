@@ -85,3 +85,77 @@ fn the_caddy_example_sends_hsts_and_times_out_slow_headers() {
     assert!(caddy.contains("read_header"));
     assert!(!doc.contains("172.16.0.0/12"));
 }
+
+#[test]
+fn the_image_gives_sqlite_a_writable_temporary_folder() {
+    // MEDIUM 3: the container's root file system is read-only (`read_only: true`) and has no
+    // writable temporary folder, so SQLite could not spill a large temporary table (the IDs of
+    // a large commit) or a sort to disk. The image points it into the data volume, at the
+    // folder the server creates and empties at start (`Config::SQLITE_TMP_DIR`).
+    let dockerfile = repo_file("server/Dockerfile");
+    let env = &dockerfile[dockerfile
+        .rfind("ENV HANGAR_DRIVE_DATA_DIR=/data")
+        .expect("ENV")..];
+    let env = &env[..env.find("\nVOLUME").unwrap_or(env.len())];
+    assert!(env.contains("SQLITE_TMPDIR=/data/tmp"), "{env}");
+    assert_eq!(hangar_drive_server::config::Config::SQLITE_TMP_DIR, "tmp");
+    assert!(dockerfile.contains("VOLUME [\"/data\"]"));
+    let compose = repo_file("docker-compose.yml");
+    let active = active_lines(&compose);
+    assert!(active.iter().any(|l| l.trim() == "read_only: true"));
+    assert!(
+        active.iter().any(|l| l.trim() == "- drive-data:/data"),
+        "the data folder is the volume, so the temporary folder is writable"
+    );
+    assert!(
+        !active
+            .iter()
+            .any(|l| l.contains("HANGAR_DRIVE_DATA_DIR") && !l.contains("/data")),
+        "the data folder stays /data, where SQLITE_TMPDIR points"
+    );
+}
+
+#[test]
+fn the_image_listens_on_every_interface_and_the_binary_on_loopback() {
+    // Info 2: outside the image the server listens on loopback unless told otherwise.
+    let dockerfile = repo_file("server/Dockerfile");
+    assert!(dockerfile.contains("HANGAR_DRIVE_BIND=0.0.0.0"));
+    let config = hangar_drive_server::config::Config::from_lookup(|_| None).unwrap();
+    assert!(config.bind_addr().ip().is_loopback());
+}
+
+#[test]
+fn the_backup_command_keeps_the_archive_private_and_pins_its_image() {
+    // LOW 4: the archive holds `server.secret`.
+    let doc = repo_file("docs/self-hosting.md");
+    let backup = &doc[doc.find("## Backups").expect("backups")..];
+    let command = block(backup, "sh");
+    assert!(command.contains("umask 077"), "{command}");
+    assert!(!command.contains(" alpine "), "no unpinned image");
+    let compose = repo_file("docker-compose.yml");
+    let pinned = compose
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("#   image: "))
+        .expect("the pinned proxy image");
+    assert!(pinned.contains("@sha256:"));
+    assert!(
+        command.contains(pinned),
+        "the command uses an image pinned elsewhere in the repository"
+    );
+}
+
+#[test]
+fn the_proxy_examples_send_hsts_like_the_server() {
+    // Info 3: the server sends no `includeSubDomains`; the examples match it. Info 4: the
+    // nginx example gives large commits and downloads time.
+    let doc = repo_file("docs/self-hosting.md");
+    assert!(
+        !doc.contains("includeSubDomains\""),
+        "no includeSubDomains in the examples"
+    );
+    let nginx = block(&doc, "nginx");
+    let folders = &nginx[nginx
+        .find("location /api/v1/folders/")
+        .expect("the folders location")..];
+    assert!(folders.contains("proxy_read_timeout 300s"));
+}

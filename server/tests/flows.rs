@@ -445,9 +445,12 @@ async fn a_recovery_session_reads_the_log_and_its_keys_and_adds_one_regular_devi
         rec.post(LOG_PATH, &no_wrap).await.code(),
         ErrorCode::Forbidden
     );
-    // One regular device, once.
+    // The added device alone, with its wrap (the former first step), is no recovery.
     let new = Device::new();
     let reply = account.add(&rec, &recovery, &new).await;
+    assert_eq!((reply.status, reply.code()), (403, ErrorCode::Forbidden));
+    // The recovery in one call: the new device removes the lost one and rotates. Once.
+    let reply = account.recover(&rec, &recovery, &new, &[owner.id]).await;
     assert_eq!(
         reply.status,
         200,
@@ -455,12 +458,13 @@ async fn a_recovery_session_reads_the_log_and_its_keys_and_adds_one_regular_devi
         String::from_utf8_lossy(&reply.body)
     );
     let second = Device::new();
-    let reply = account.add(&rec, &recovery, &second).await;
+    let reply = account.recover(&rec, &recovery, &second, &[new.id]).await;
     assert_eq!((reply.status, reply.code()), (403, ErrorCode::Forbidden));
     assert_eq!(rec.get(LOG_PATH).await.status, 200, "reading stays allowed");
-    // The new device has its key of the current epoch and full access.
+    // The new device has its keys of the epoch before and of its own rotation, and full access.
     let new_client = account.sign_in(&server, &new).await;
     assert_eq!(new_client.get(&epoch_key_path(Epoch(1))).await.status, 200);
+    assert_eq!(new_client.get(&epoch_key_path(Epoch(2))).await.status, 200);
     assert_eq!(new_client.get(FEED_PATH).await.status, 200);
     server.stop().await.unwrap();
 }
@@ -509,12 +513,14 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         )
         .await;
     assert_eq!(reply.code(), ErrorCode::LogEntryRefused);
-    // Wraps that do not cover the remaining devices are refused.
-    let rotation = hangar_drive_crypto::epoch::rotate(
+    // Wraps that do not cover the remaining devices are refused. A rotation comes only with a
+    // removal after the first epoch, so this is the removal with its rotation, without wraps.
+    let removal = hangar_drive_crypto::epoch::remove_devices(
         &account.state,
         &a.identity,
         a.id,
         START_MS,
+        &[b.id],
         &mut OsEntropy,
     )
     .unwrap();
@@ -522,7 +528,7 @@ async fn a_removed_device_loses_its_session_proof_and_commits_at_once() {
         .post(
             LOG_PATH,
             &LogAppendRequest {
-                entries: vec![Blob(rotation.entry)],
+                entries: removal.entries.into_iter().map(Blob).collect(),
                 wraps: vec![],
                 device_wrap: None,
             },

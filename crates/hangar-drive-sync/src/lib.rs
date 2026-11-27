@@ -31,7 +31,7 @@
 //! | `startPairing`, `cancelPairing` | same names; the outcome arrives as `pairResult`, `joined` with the account's devices (N2) |
 //! | `listAccountFolders`, `joinFolders`, `addAccountFolder` | `snapshot().remote_folders`, `add_account_folder` |
 //! | `finishSetup`, `addFolder` | `add_folder` |
-//! | `recoverAccount`, `recoveryDevices`, `finishRecoveryCleanup` | same names; `recover_account` takes the sheet's link (`hangar-drive://recover#...`), the code and the device name |
+//! | `recoverAccount`, `recoveryDevices`, `finishRecoveryCleanup` | same names; `recover_account` takes the sheet's link (`hangar-drive://recover#...`), the code and the device name; `finish_recovery_cleanup` answers `RecoveryListChanged` when the devices changed (list again), and a recovery pending after its append shows the `recoveryPending` warning |
 //! | `acceptRemovedHeads` | `accept_removed_heads`, after the `removedHeads` event or warning |
 //! | `pause`, `resume`, `pauseFolder`, `resumeFolder` | `pause`, `resume`, `set_folder_paused` |
 //! | `stopFolder`, `deleteFolderEverywhere`, `restoreDeletedFolder` | same names; deleted folders are `snapshot().deleted_folders` |
@@ -40,8 +40,10 @@
 //! | `getServerNumber`, `confirmServerNumber`, `fixServerWithOffer` | `server_number`, `confirm_server_number` (after the app's native confirmation), `fix_server_with_offer` |
 //! | `undo`, `cancelRestore` | same names; the tokens come with "keep this" and every restore, the job IDs with `waitBudget` |
 //! | `disconnectThisDevice` | `disconnect_this_device` |
+//! | `resetDevice`, `resetDeviceDiscardingRecovery` | `reset_device` (refused with `RecoveryPending` while a recovery is pending), `reset_device_discarding_recovery` |
 //! | `listNotSynced`, `getFolderNumber` | same names |
 //! | `listMassDelete`, `resolveMassDelete` | same names (folder ID from the warning) |
+//! | `listIncomingDelete`, `resolveIncomingDelete` | same names, with `incoming_delete_revision` read before the app's native confirmation |
 //! | `findMissingFolder` | the app's folder picker, then `check_folder` and `relocate_folder` |
 //! | `checkOlderState`, `reanchor` | same names |
 //! | `dismissSuspect` | `dismiss_warning` |
@@ -50,7 +52,7 @@
 //! | `getTimeline`, `getTreeAt`, `restoreFile`, `resetFolder`, `findBeforeDevice`, `getTrash`, `restoreTrash` | same names |
 //! | `listDevices`, `renameDevice`, `setDeviceName`, `getSafetyNumber`, `removeDevice` | `list_devices`, `rename_device`, `get_safety_number`, `remove_device` |
 //! | `createPairingOffer`, `answerPairRequest` | same names; requests arrive as `pairRequest` |
-//! | `renewRecoveryCode` | same name; the new code replaces the old one at `confirmRecoveryGroup` |
+//! | `renewRecoveryCode` | same name; the new code replaces the old one at `confirmRecoveryGroup`; also offered by the `noRecoveryCode` warning |
 //! | `pickFolder` | the app's folder picker, then `check_folder` |
 //! | `countLocalFiles` | [`roots::count_files`] |
 //! | clipboard, camera, printing, saving files, file dialogs, tray, window, autostart, language, updates, error report, QR drawing | the app shell, not the engine |

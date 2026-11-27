@@ -84,6 +84,26 @@ pub enum SyncError {
     /// The engine thread is gone.
     #[error("the sync engine stopped")]
     Stopped,
+    /// The account's devices changed between the list a recovery showed and its append
+    /// (security review "recovery" M1): nothing was written, and `recovery_devices` now lists
+    /// the new devices to choose from.
+    #[error("the account's devices changed since they were shown")]
+    RecoveryListChanged,
+    /// The recovery code was used before: the account's log no longer lists its recovery device
+    /// as current (another device removed it, or another recovery used the code). Nothing was
+    /// written.
+    #[error("the recovery code was used before")]
+    RecoveryCodeUsed,
+    /// The recovery code or its sheet does not belong to this account (its log does not list
+    /// the code's recovery device, or does not start with the sheet's genesis anchor). Nothing
+    /// was written.
+    #[error("the code does not belong to this account")]
+    RecoveryCodeUnknown,
+    /// A recovery sent its append and this device has not joined yet; resetting now would delete
+    /// what may be the account's only key (follow-up review LOW 7). Only the forced reset
+    /// (`EngineCore::reset_device_discarding_recovery`) goes on.
+    #[error("a recovery is not finished; its device key would be lost")]
+    RecoveryPending,
 }
 
 /// The closed list of codes the app shows its own text for.
@@ -116,6 +136,15 @@ pub enum ErrorKind {
     NotSetUp,
     /// An invalid request.
     Invalid,
+    /// The account's devices changed while the person chose which to remove in a recovery;
+    /// the window shows the new list ([`SyncError::RecoveryListChanged`]).
+    RecoveryListChanged,
+    /// The recovery code was used before ([`SyncError::RecoveryCodeUsed`]).
+    RecoveryCodeUsed,
+    /// The recovery code does not belong to this account ([`SyncError::RecoveryCodeUnknown`]).
+    RecoveryCodeUnknown,
+    /// A reset was refused because a recovery is pending ([`SyncError::RecoveryPending`]).
+    RecoveryPending,
     /// Anything else.
     Unexpected,
 }
@@ -136,12 +165,18 @@ impl SyncError {
                 _ => ErrorKind::Refused,
             },
             SyncError::Fs(FsError::Locked) => ErrorKind::Locked,
-            SyncError::Fs(FsError::DiskFull) => ErrorKind::DiskFull,
+            SyncError::Fs(FsError::DiskFull) | SyncError::Store(StoreError::DiskFull) => {
+                ErrorKind::DiskFull
+            }
             SyncError::Chain(ChainError::OlderState) => ErrorKind::OlderState,
             SyncError::NotSetUp(_) => ErrorKind::NotSetUp,
             SyncError::Invalid(_) | SyncError::Root(_) | SyncError::AlreadySetUp => {
                 ErrorKind::Invalid
             }
+            SyncError::RecoveryListChanged => ErrorKind::RecoveryListChanged,
+            SyncError::RecoveryCodeUsed => ErrorKind::RecoveryCodeUsed,
+            SyncError::RecoveryCodeUnknown => ErrorKind::RecoveryCodeUnknown,
+            SyncError::RecoveryPending => ErrorKind::RecoveryPending,
             _ => ErrorKind::Unexpected,
         }
     }
@@ -176,6 +211,30 @@ mod tests {
         assert_eq!(
             SyncError::Chain(ChainError::OlderState).code(),
             ErrorKind::OlderState
+        );
+        assert_eq!(
+            SyncError::RecoveryListChanged.code(),
+            ErrorKind::RecoveryListChanged
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::RecoveryListChanged).unwrap(),
+            "recoveryListChanged"
+        );
+        assert_eq!(
+            SyncError::RecoveryCodeUsed.code(),
+            ErrorKind::RecoveryCodeUsed
+        );
+        assert_eq!(
+            SyncError::RecoveryCodeUnknown.code(),
+            ErrorKind::RecoveryCodeUnknown
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::RecoveryCodeUsed).unwrap(),
+            "recoveryCodeUsed"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::RecoveryCodeUnknown).unwrap(),
+            "recoveryCodeUnknown"
         );
         assert!(SyncError::Net(NetError::Unreachable).is_offline());
         let removed = SyncError::Net(NetError::DeviceRemoved(None));

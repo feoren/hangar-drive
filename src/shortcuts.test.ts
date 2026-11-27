@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { createTranslator } from "./i18n";
 import {
+  ariaCombo,
   FIXED_KEYS,
   formatCombo,
   isReservedForText,
@@ -58,5 +59,11 @@ describe("shortcuts", () => {
     expect(formatCombo({ key: ",", ctrl: true }, en)).toBe("Ctrl+,");
     expect(formatCombo({ key: "Escape" }, de)).toBe("Esc");
     expect(formatCombo({ key: "F10", shift: true }, en)).toBe("Shift+F10");
+  });
+
+  it("name the keys for assistive technology in the aria-keyshortcuts form", () => {
+    expect(ariaCombo({ key: "D", ctrl: true, shift: true })).toBe("Control+Shift+D");
+    expect(ariaCombo({ key: ",", ctrl: true })).toBe("Control+,");
+    expect(ariaCombo({ key: "F1" })).toBe("F1");
   });
 });

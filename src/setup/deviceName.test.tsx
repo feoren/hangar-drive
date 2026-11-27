@@ -18,9 +18,13 @@ import {
   text,
   type,
 } from "../test/harness";
+import { pinClock } from "../test/clock";
 import { ARM_DELAY_MS } from "../ui/parts";
 
 const FILLER = String.fromCharCode(0x3164);
+
+// Relative times ("vor 1 Std.", "Heute") come from fixtures placed relative to now.
+pinClock();
 
 afterEach(() => {
   cleanup();

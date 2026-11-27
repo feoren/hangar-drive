@@ -1,5 +1,6 @@
 # Fuzz targets of the crypto and protocol crates (ADR 0001, Amendment, robustness), one per
-# decoder and one for the folder delta check. A package of its own outside the Cargo workspace:
+# decoder and two for the folder delta check (raw bytes, and commits built from the bytes and
+# signed with the fixture key). A package of its own outside the Cargo workspace:
 # it needs nightly and cargo-fuzz and is not part of the check suite or CI.
 #
 #   cargo install cargo-fuzz
@@ -127,6 +128,13 @@ bench = false
 [[bin]]
 name = "decode_api_json"
 path = "fuzz_targets/decode_api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_built_delta"
+path = "fuzz_targets/verify_built_delta.rs"
 test = false
 doc = false
 bench = false

@@ -9,6 +9,7 @@ import type {
   AcceptedHeads,
   BackendEvent,
   Confirmation,
+  ResetOutcome,
   ConflictGroup,
   DeleteOutcome,
   Device,
@@ -44,6 +45,7 @@ import {
   array,
   bool,
   DecodeError,
+  knownArray,
   literal,
   nothing,
   nullable,
@@ -97,8 +99,17 @@ const activityEntry = union("kind", {
   cameBack: { id: str, folderId: str, folderName: str, name: str, path: str, device: str, at: num },
 }) satisfies Decoder<ActivityEntry>;
 
-const warning = union("kind", {
+const warningVariants = {
   massDelete: { id: str, folderId: str, folderName: str, count: num, sample: array(str) },
+  incomingDelete: {
+    id: str,
+    folderId: str,
+    folderName: str,
+    device: nullable(str),
+    deviceAdded: nullable(num),
+    count: num,
+    sample: array(str),
+  },
   missingFolder: { id: str, folderId: str, folderName: str },
   serverIdentity: { id: str, hasOtherDevice: bool },
   quota: { id: str },
@@ -112,6 +123,9 @@ const warning = union("kind", {
   treeLimit: { id: str, folderId: str, folderName: str },
   updateRequired: { id: str },
   refused: { id: str },
+  noRecoveryCode: { id: str },
+  recoveryPending: { id: str },
+  foldersUnreadable: { id: str, folders: array(str), folderList: bool },
   suspect: {
     id: str,
     deviceId: str,
@@ -125,9 +139,15 @@ const warning = union("kind", {
   },
   conflicts: { id: str, count: num },
   names: { id: str, count: num },
-});
+};
 
-const notice = union("kind", {
+/**
+ * Banners and notices of a newer engine than this window knows are left out instead of failing
+ * the whole snapshot (an empty window). A known kind with a wrong shape still fails.
+ */
+const warnings = knownArray("kind", Object.keys(warningVariants), union("kind", warningVariants));
+
+const noticeVariants = {
   quota: {},
   retained: {},
   budgetDevice: { device: str },
@@ -135,7 +155,9 @@ const notice = union("kind", {
   serverDisk: {},
   minCount: { days: num },
   olderAccountState: {},
-});
+};
+
+const notices = knownArray("kind", Object.keys(noticeVariants), union("kind", noticeVariants));
 
 export const snapshot = object({
   setup: literal("needed", "done"),
@@ -161,8 +183,8 @@ export const snapshot = object({
     }),
   ),
   activity: array(activityEntry),
-  warnings: array(warning),
-  notices: array(notice),
+  warnings,
+  notices,
   storage: nullable(object({ used: num, quota: num })),
   account: nullable(object({ host: str, retentionDays: num, hasOtherDevices: bool })),
   remoteFolders: array(object({ id: str, name: str, size: num })),
@@ -407,6 +429,12 @@ export const serverConfirm: Decoder<ServerConfirm> = literal("confirmed", "decli
 
 /** The native questions of the overall security review (commands.rs `Confirmation` and kin). */
 export const confirmation: Decoder<Confirmation> = literal("confirmed", "declined");
+
+export const resetOutcome: Decoder<ResetOutcome> = literal(
+  "confirmed",
+  "declined",
+  "recoveryPending",
+);
 export const recoveryCheck: Decoder<RecoveryCheck> = literal("confirmed", "wrong", "declined");
 export const joinOutcome: Decoder<JoinOutcome> = literal("joined", "declined");
 export const massDeleteOutcome = union("kind", {

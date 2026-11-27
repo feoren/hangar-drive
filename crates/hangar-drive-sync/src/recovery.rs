@@ -23,19 +23,34 @@
 //!    removed device's sign-in, so a used code is mostly told by the sign-in itself: its proof,
 //!    made with the code's own key, is answered with `DeviceRemoved` (finding E2E-5), which
 //!    nobody without the code can get.
-//! 3. **Add:** the recovery device unwraps the current epoch's secret and appends one add
-//!    device entry for the new regular device with that secret wrapped to it (`device_wrap`).
-//!    While a rotation is due this is the one exception the log allows (finding M5).
-//! 4. **Join:** the new device signs in on its own, joins at the log head the append returned
-//!    (the anchor), and then removes the lost devices and the used recovery device and rotates,
-//!    as any removal (`crate::removal`), and adds a new recovery device for a new code.
+//! 3. **Choice:** the verified log names the account's devices ([`prepare`]); the person picks
+//!    which to remove before anything is written. Nothing is in the account yet, so stopping
+//!    here leaves the account and the code as they were.
+//! 4. **One append** ([`build_recovery`] and [`send_recovery`], ADR 0001, amendment "recovery
+//!    in one piece, adds per day, delta check on a growing log", H1): the log is read again and
+//!    must still end at the head the person chose from ([`RecoveryError::ListChanged`]
+//!    otherwise, security review "recovery" M1). The recovery device unwraps the current
+//!    epoch's secret, and one batch adds the new regular device (signed by the recovery
+//!    device), removes the chosen devices and every recovery device, the used one included, and
+//!    rotates (both signed by the new device), with the rotation's wraps and the new device's
+//!    wrap of the epoch before (`device_wrap`). Nobody can write between the add and the
+//!    rotation, so a hostile device cannot remove the new device first. The batch always
+//!    removes the used recovery device, so the code is spent exactly when the batch is in.
+//! 5. **Join:** the new device signs in on its own, joins at the log head after the batch (the
+//!    anchor), re-seals and writes the barriers with its own removal as any removal
+//!    (`crate::removal`, whose append finds the removals in the log already), and adds a new
+//!    recovery device for a new code. Between the send and the join the caller keeps the new
+//!    device's key and what the join needs (the engine's pending recovery, security review
+//!    "recovery" H1): whether the batch is in is told by the new device's own verified log, not
+//!    by the server's answer.
 
-use hangar_drive_crypto::devicelog::{AccountState, LogDevice, MAX_LOG_ENTRIES};
-use hangar_drive_crypto::epoch;
+use hangar_drive_crypto::devicelog::{AccountState, LogDevice, LogEntry, MAX_LOG_ENTRIES};
+use hangar_drive_crypto::epoch::{self, AccountSecret};
+use hangar_drive_crypto::identity::DeviceIdentity;
 use hangar_drive_crypto::recovery::{RecoveryCode, RecoverySheet};
 use hangar_drive_crypto::Entropy;
 use hangar_drive_protocol::api::{LogAppendRequest, WrappedKeyEntry};
-use hangar_drive_protocol::ids::{AccountId, Blob, LogHead};
+use hangar_drive_protocol::ids::{AccountId, Blob, DeviceId, LogHead};
 
 use crate::chunker::DynEntropy;
 use crate::error::SyncError;
@@ -55,6 +70,11 @@ pub enum RecoveryError {
     /// The recovery device was removed: the code was used before.
     #[error("the code was used before")]
     Used,
+    /// The account's log moved on since the person was shown its devices (security review
+    /// "recovery" M1): a device added in between would survive the recovery unseen. Nothing was
+    /// written; the person chooses again from the new list.
+    #[error("the account's devices changed since they were shown")]
+    ListChanged,
     /// The server or the log failed.
     #[error(transparent)]
     Sync(#[from] SyncError),
@@ -75,15 +95,24 @@ pub fn fetch_log(
     server: &mut dyn ServerApi,
     account: AccountId,
 ) -> Result<AccountState, SyncError> {
+    fetch_log_entries(server, account).map(|(state, _)| state)
+}
+
+/// [`fetch_log`] with the entries, for the issue times of the devices.
+pub fn fetch_log_entries(
+    server: &mut dyn ServerApi,
+    account: AccountId,
+) -> Result<(AccountState, Vec<Vec<u8>>), SyncError> {
     let protocol = |what: &str| SyncError::Net(NetError::Protocol(what.into()));
     let mut state = AccountState::new(account);
+    let mut log: Vec<Vec<u8>> = Vec::new();
     for _ in 0..MAX_LOG_ENTRIES {
         let page = server.log(state.len())?;
         if page.length > MAX_LOG_ENTRIES {
             return Err(protocol("the log is longer than any log can be"));
         }
         if page.entries.is_empty() {
-            return Ok(state);
+            return Ok((state, log));
         }
         if page.first_index != state.len() + 1 {
             return Err(protocol("log page out of order"));
@@ -94,42 +123,57 @@ pub fn fetch_log(
         }
         for entry in &page.entries {
             state.apply(entry.as_bytes())?;
+            log.push(entry.0.clone());
         }
         if state.len() >= page.length {
-            return Ok(state);
+            return Ok((state, log));
         }
     }
     Err(protocol("the log does not end"))
 }
 
-/// Steps 0 to 3 of the module docs: `server` is signed in as the recovery device of `code`.
-/// Adds `device` to the account of `sheet` and returns the log head after the append, the anchor
-/// the new device joins at. The sheet is checked against the code before anything is read.
-pub fn add_device_with_code(
+/// A device of the account the recovery can remove, as the verified log names it. The sealed
+/// device names are out of reach for the recovery session, so a device has no name here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogDeviceInfo {
+    /// The device.
+    pub id: DeviceId,
+    /// When the entry that added it was issued (its issuer's clock), milliseconds.
+    pub added_ms: u64,
+}
+
+/// What steps 0 to 2 found: the verified log, and the account's regular devices.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    /// The verified log.
+    pub state: AccountState,
+    /// The current regular devices, in log order.
+    pub devices: Vec<LogDeviceInfo>,
+}
+
+/// Steps 0 to 2 of the module docs: `server` is signed in as the recovery device of `code`.
+/// Checks the sheet against the code before anything is read, then the verified log against
+/// the sheet and the code. Writes nothing.
+pub fn prepare(
     server: &mut dyn ServerApi,
     sheet: &RecoverySheet,
     code: &RecoveryCode,
-    device: LogDevice,
-    now_ms: u64,
-    entropy: &mut dyn Entropy,
-) -> Result<LogHead, RecoveryError> {
+) -> Result<Prepared, RecoveryError> {
     if !sheet.is_for(code) {
         return Err(RecoveryError::WrongSheet);
     }
-    let account = sheet.account;
-    let genesis = &sheet.genesis;
     let identity = code
         .identity()
         .map_err(|_| SyncError::Invalid("the recovery identity"))?;
     let recovery = code
         .device_id()
         .map_err(|_| SyncError::Invalid("the recovery device ID"))?;
-    let state = match fetch_log(server, account) {
-        Ok(state) => state,
+    let (state, log) = match fetch_log_entries(server, sheet.account) {
+        Ok(found) => found,
         Err(SyncError::Net(NetError::DeviceRemoved(_))) => return Err(RecoveryError::Used),
         Err(e) => return Err(e.into()),
     };
-    if state.hash_at(1) != Some(genesis) {
+    if state.hash_at(1) != Some(&sheet.genesis) {
         return Err(RecoveryError::Unknown);
     }
     let record = state.device(&recovery).ok_or(RecoveryError::Unknown)?;
@@ -139,49 +183,180 @@ pub fn add_device_with_code(
     if !record.is_current() {
         return Err(RecoveryError::Used);
     }
-    let current = state
-        .current_epoch()
+    let devices = state
+        .current_devices()
+        .filter(|d| !d.recovery)
+        .map(|d| LogDeviceInfo {
+            id: d.id,
+            added_ms: usize::try_from(d.added_at.saturating_sub(1))
+                .ok()
+                .and_then(|at| log.get(at))
+                .and_then(|entry| LogEntry::decode(entry).ok())
+                .map_or(0, |entry| entry.issued_at_ms),
+        })
+        .collect();
+    Ok(Prepared { state, devices })
+}
+
+/// What the one append made.
+#[derive(Debug, Clone)]
+pub struct Recovered {
+    /// The log head after the batch, computed here: the anchor the new device joins at.
+    pub head: LogHead,
+    /// Every device the batch removed: the chosen ones and every recovery device.
+    pub removed: Vec<DeviceId>,
+}
+
+/// The one batch of step 4, built and not sent yet: the caller records what it needs to finish
+/// the recovery after any failure before it sends the batch (security review "recovery" H1).
+#[derive(Debug, Clone)]
+pub struct RecoveryBatch {
+    /// The append.
+    pub request: LogAppendRequest,
+    /// The log head after the batch, computed here (security review I1).
+    pub head: LogHead,
+    /// Every device the batch removes: the chosen ones and every recovery device.
+    pub removed: Vec<DeviceId>,
+}
+
+/// Step 4 of the module docs without the send: `server` is signed in as the recovery device of
+/// `code`. Reads the log again and refuses with [`RecoveryError::ListChanged`] when its head is
+/// not `shown`, the head of the log the person chose from (security review "recovery" M1).
+/// Otherwise it removes `remove` (those of them that are current regular devices besides
+/// `device`) and every current recovery device, adds `device` with the keys of `identity` and
+/// rotates, in one batch. Writes nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_recovery(
+    server: &mut dyn ServerApi,
+    sheet: &RecoverySheet,
+    code: &RecoveryCode,
+    identity: &DeviceIdentity,
+    device: LogDevice,
+    remove: &[DeviceId],
+    shown: &LogHead,
+    now_ms: u64,
+    entropy: &mut dyn Entropy,
+) -> Result<RecoveryBatch, RecoveryError> {
+    let prepared = prepare(server, sheet, code)?;
+    let state = prepared.state;
+    if state.head().as_ref() != Some(shown) {
+        return Err(RecoveryError::ListChanged);
+    }
+    let recovery_identity = code
+        .identity()
+        .map_err(|_| SyncError::Invalid("the recovery identity"))?;
+    let recovery = code
+        .device_id()
+        .map_err(|_| SyncError::Invalid("the recovery device ID"))?;
+    let secret: Option<AccountSecret> = match state.current_epoch().copied() {
+        None => None,
+        Some(current) => {
+            let wrapped = server.epoch_key(current.epoch)?;
+            Some(
+                epoch::unwrap(
+                    &recovery_identity,
+                    &sheet.account,
+                    current.epoch,
+                    &recovery,
+                    wrapped.data.as_bytes(),
+                    &current.commitment,
+                )
+                .map_err(SyncError::from)?,
+            )
+        }
+    };
+    // The chosen devices that are still current regular devices, then every recovery device:
+    // the used code stops working with the same batch.
+    let mut removed: Vec<DeviceId> = remove
+        .iter()
         .copied()
-        .ok_or(SyncError::NotSetUp("the account has no epoch"))?;
-    let wrapped = server.epoch_key(current.epoch)?;
-    let secret = epoch::unwrap(
-        &identity,
-        &account,
-        current.epoch,
-        &recovery,
-        wrapped.data.as_bytes(),
-        &current.commitment,
-    )
-    .map_err(SyncError::from)?;
-    let addition = epoch::add_device(
+        .filter(|id| *id != device.id)
+        .filter(|id| {
+            state
+                .device(id)
+                .is_some_and(|d| d.is_current() && !d.recovery)
+        })
+        .collect();
+    removed.sort();
+    removed.dedup();
+    removed.extend(state.current_devices().filter(|d| d.recovery).map(|d| d.id));
+    let batch = epoch::recover(
         &state,
-        &identity,
+        &recovery_identity,
         recovery,
-        now_ms,
+        identity,
         device,
-        Some(&secret),
+        &removed,
+        secret.as_ref(),
+        now_ms,
         &mut DynEntropy(entropy),
     )
     .map_err(SyncError::from)?;
-    // The head after the append, computed here (security review I1): the anchor the new device
+    // The head after the batch, computed here (security review I1): the anchor the new device
     // joins at must not be a value the server chose.
-    let mut after = state.clone();
-    let head = after.apply(&addition.entry).map_err(SyncError::from)?;
-    let response = server.append_log(&LogAppendRequest {
-        entries: vec![Blob(addition.entry.clone())],
-        wraps: Vec::new(),
-        device_wrap: addition.wrap.map(|data| WrappedKeyEntry {
+    let head = batch
+        .state
+        .head()
+        .ok_or(SyncError::Invalid("no log head after the batch"))?;
+    let request = LogAppendRequest {
+        entries: batch.entries.iter().cloned().map(Blob).collect(),
+        wraps: batch
+            .rotation
+            .wraps
+            .iter()
+            .map(|(id, data)| WrappedKeyEntry {
+                device: *id,
+                data: Blob(data.clone()),
+            })
+            .collect(),
+        device_wrap: batch.device_wrap.map(|data| WrappedKeyEntry {
             device: device.id,
             data: Blob(data),
         }),
-    })?;
-    if response.head != head {
+    };
+    Ok(RecoveryBatch {
+        request,
+        head,
+        removed,
+    })
+}
+
+/// Sends a batch of [`build_recovery`]. An error here does not tell whether the server took
+/// the batch: a lost answer and a head the server made up look the same as a refusal. The new
+/// device's own verified log tells (`crate::engine`, "pending recovery").
+pub fn send_recovery(
+    server: &mut dyn ServerApi,
+    batch: &RecoveryBatch,
+) -> Result<Recovered, SyncError> {
+    let response = server.append_log(&batch.request)?;
+    if response.head != batch.head {
         return Err(SyncError::Net(NetError::Protocol(
             "the server's log head after the append is not the one this device computed".into(),
-        ))
-        .into());
+        )));
     }
-    Ok(head)
+    Ok(Recovered {
+        head: batch.head,
+        removed: batch.removed.clone(),
+    })
+}
+
+/// Step 4 of the module docs in one call: [`build_recovery`], then [`send_recovery`].
+#[allow(clippy::too_many_arguments)]
+pub fn recover_with_code(
+    server: &mut dyn ServerApi,
+    sheet: &RecoverySheet,
+    code: &RecoveryCode,
+    identity: &DeviceIdentity,
+    device: LogDevice,
+    remove: &[DeviceId],
+    shown: &LogHead,
+    now_ms: u64,
+    entropy: &mut dyn Entropy,
+) -> Result<Recovered, RecoveryError> {
+    let batch = build_recovery(
+        server, sheet, code, identity, device, remove, shown, now_ms, entropy,
+    )?;
+    Ok(send_recovery(server, &batch)?)
 }
 
 #[cfg(test)]
@@ -289,20 +464,31 @@ mod tests {
         )
         .unwrap();
         let run = |code_answer: ErrorCode| {
-            add_device_with_code(
+            recover_with_code(
                 &mut Refusing(code_answer),
                 &sheet,
                 &code,
+                &identity,
                 device,
+                &[],
+                &LogHead {
+                    index: 1,
+                    hash: LogHash::from_bytes([3; 32]),
+                },
                 0,
                 &mut hangar_drive_crypto::OsEntropy,
             )
+            .map(|_| ())
         };
         assert_eq!(run(ErrorCode::DeviceRemoved), Err(RecoveryError::Used));
         assert!(matches!(
             run(ErrorCode::ProofInvalid),
             Err(RecoveryError::Sync(SyncError::Net(_)))
         ));
+        assert_eq!(
+            prepare(&mut Refusing(ErrorCode::DeviceRemoved), &sheet, &code).map(|_| ()),
+            Err(RecoveryError::Used)
+        );
     }
 
     // N4: a log longer than any log can be is refused before a single entry is read.

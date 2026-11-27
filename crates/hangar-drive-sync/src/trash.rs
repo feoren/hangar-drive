@@ -74,6 +74,14 @@ pub fn to_recycle_bin(path: &Path) -> Result<(), TrashError> {
     platform::to_recycle_bin(path)
 }
 
+/// Refuses `path` when the Windows shell resolves it, or its parent, to another file system path
+/// than these (the namespace check of the recycle bin, module docs). The app runs it before it
+/// hands a path to the file manager, which parses paths through the same namespace.
+#[cfg(windows)]
+pub fn check_shell_resolution(path: &Path) -> Result<(), TrashError> {
+    platform::check_shell_resolution(path)
+}
+
 /// The file system path the Windows shell resolves `path` to (tests of the shell namespace
 /// check, nothing is deleted).
 #[cfg(all(test, windows))]
@@ -342,6 +350,14 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn check_shell_resolution(path: &Path) -> Result<(), TrashError> {
+        let _com = Com::enter()?;
+        let plain = plain_path(path);
+        let wide: Vec<u16> = plain.as_os_str().encode_wide().chain(Some(0)).collect();
+        let item = parse(&wide)?;
+        check_resolution(&item, &plain)
+    }
+
     /// The file system path the shell resolves `path` to, for tests that show a namespace
     /// junction without deleting anything.
     #[cfg(test)]
@@ -396,6 +412,58 @@ mod platform {
     }
 }
 
+/// The checks of the Linux trash directories (security review, LOW 4), apart from the system
+/// calls so they are tested on every platform. `$topdir/.Trash-$uid`, `$topdir/.Trash/$uid` and
+/// their `files/` and `info/` lie on a volume other users may write to (a shared disk, a USB
+/// stick): one of them planted as a link, or as a directory of someone else, would take the
+/// deleted file to a place that user chose or can read. Every one is looked at without
+/// following links (lstat) and used only as a plain directory of this user that nobody else
+/// may write to; anything else sends the file to the quarantine of the sync root.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+pub(crate) mod xdg {
+    /// What lstat reports about one directory of the trash.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct DirFacts {
+        /// A directory (not followed: a link to one is a link).
+        pub is_dir: bool,
+        /// A symbolic link.
+        pub is_link: bool,
+        /// The owner's user ID.
+        pub owner: u32,
+        /// The mode bits.
+        pub mode: u32,
+    }
+
+    /// The verdict on one directory of the trash.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DirCheck {
+        /// Not there: this user creates it (mode 0700) and checks it again.
+        Missing,
+        /// A plain directory of this user that only this user may write to.
+        Usable,
+        /// Anything else: the quarantine takes the file.
+        Refused,
+    }
+
+    /// The verdict on a directory this user owns in the trash (`.Trash-$uid`, `.Trash/$uid`,
+    /// the home trash, `files/`, `info/`).
+    pub(crate) fn own_dir(facts: Option<DirFacts>, uid: u32) -> DirCheck {
+        match facts {
+            None => DirCheck::Missing,
+            Some(f) if f.is_link || !f.is_dir || f.owner != uid || f.mode & 0o022 != 0 => {
+                DirCheck::Refused
+            }
+            Some(_) => DirCheck::Usable,
+        }
+    }
+
+    /// Whether `$topdir/.Trash` may hold this user's `$uid` directory: a plain directory with
+    /// the sticky bit (Trash specification 1.0), so no other user can move this user's entry.
+    pub(crate) fn shared_dir(facts: Option<DirFacts>) -> bool {
+        facts.is_some_and(|f| f.is_dir && !f.is_link && f.mode & 0o1000 != 0)
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::path::Path;
@@ -420,10 +488,46 @@ mod platform {
 mod platform {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
 
+    use super::xdg::{self, DirCheck, DirFacts};
     use super::TrashError;
+
+    /// lstat of `path`; `None` when it does not exist.
+    fn facts(path: &Path) -> Result<Option<DirFacts>, TrashError> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => Ok(Some(DirFacts {
+                is_dir: m.file_type().is_dir(),
+                is_link: m.file_type().is_symlink(),
+                owner: m.uid(),
+                mode: m.mode(),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TrashError::Failed(e.to_string())),
+        }
+    }
+
+    /// Makes sure `path` is a directory of this user only ([`xdg::own_dir`]), creating it
+    /// (mode 0700, its parent must exist) when it is missing and checking it again after.
+    fn own_dir(path: &Path, uid: u32) -> Result<(), TrashError> {
+        use std::os::unix::fs::DirBuilderExt;
+        match xdg::own_dir(facts(path)?, uid) {
+            DirCheck::Usable => return Ok(()),
+            DirCheck::Refused => return Err(TrashError::NoRecycleBin),
+            DirCheck::Missing => {}
+        }
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            // Made meanwhile: the check below decides.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(TrashError::Failed(e.to_string())),
+        }
+        match xdg::own_dir(facts(path)?, uid) {
+            DirCheck::Usable => Ok(()),
+            _ => Err(TrashError::NoRecycleBin),
+        }
+    }
 
     fn home_trash() -> Option<PathBuf> {
         let data = std::env::var_os("XDG_DATA_HOME")
@@ -447,25 +551,33 @@ mod platform {
 
     fn trash_dir_for(path: &Path) -> Result<PathBuf, TrashError> {
         let meta = fs::symlink_metadata(path).map_err(|e| TrashError::Failed(e.to_string()))?;
+        // SAFETY: getuid has no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
         if let Some(home) = home_trash() {
             let home_dev = dirs::home_dir()
                 .and_then(|h| fs::metadata(h).ok())
                 .map(|m| m.dev());
             if home_dev == Some(meta.dev()) {
+                // The data directory above it is the person's own; the trash itself is checked.
+                if let Some(data) = home.parent() {
+                    fs::create_dir_all(data).map_err(|e| TrashError::Failed(e.to_string()))?;
+                }
+                own_dir(&home, uid)?;
                 return Ok(home);
             }
         }
-        // SAFETY: getuid has no arguments and cannot fail.
-        let uid = unsafe { libc::getuid() };
         let top = top_dir(path, meta.dev()).ok_or(TrashError::NoRecycleBin)?;
         // $topdir/.Trash/$uid only when .Trash is a real directory with the sticky bit.
         let shared = top.join(".Trash");
-        if let Ok(m) = fs::symlink_metadata(&shared) {
-            if m.is_dir() && !m.file_type().is_symlink() && m.permissions().mode() & 0o1000 != 0 {
-                return Ok(shared.join(uid.to_string()));
+        if xdg::shared_dir(facts(&shared)?) {
+            let mine = shared.join(uid.to_string());
+            if own_dir(&mine, uid).is_ok() {
+                return Ok(mine);
             }
         }
-        Ok(top.join(format!(".Trash-{uid}")))
+        let mine = top.join(format!(".Trash-{uid}"));
+        own_dir(&mine, uid)?;
+        Ok(mine)
     }
 
     fn encode(path: &Path) -> String {
@@ -503,9 +615,10 @@ mod platform {
         let trash = trash_dir_for(path)?;
         let files = trash.join("files");
         let info = trash.join("info");
+        // SAFETY: getuid has no arguments and cannot fail.
+        let uid = unsafe { libc::getuid() };
         for dir in [&files, &info] {
-            fs::create_dir_all(dir).map_err(failed)?;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            own_dir(dir, uid)?;
         }
         let name = path
             .file_name()
@@ -584,6 +697,62 @@ mod tests {
             PathBuf::from(r"\\srv\share\x")
         );
         assert_eq!(plain_path(Path::new("/x/y")), PathBuf::from("/x/y"));
+    }
+
+    /// Security review, LOW 4: a trash directory is used only as a plain directory of this user
+    /// that nobody else may write to; a link, a file, a directory of another user or one others
+    /// may write to sends the file to the quarantine.
+    #[test]
+    fn trash_directories_must_be_plain_and_private() {
+        use xdg::{own_dir, shared_dir, DirCheck, DirFacts};
+        let mine = DirFacts {
+            is_dir: true,
+            is_link: false,
+            owner: 1000,
+            mode: 0o040700,
+        };
+        assert_eq!(own_dir(None, 1000), DirCheck::Missing);
+        assert_eq!(own_dir(Some(mine), 1000), DirCheck::Usable);
+        let link = DirFacts {
+            is_dir: false,
+            is_link: true,
+            ..mine
+        };
+        assert_eq!(own_dir(Some(link), 1000), DirCheck::Refused);
+        let file = DirFacts {
+            is_dir: false,
+            mode: 0o100600,
+            ..mine
+        };
+        assert_eq!(own_dir(Some(file), 1000), DirCheck::Refused);
+        assert_eq!(
+            own_dir(Some(mine), 1001),
+            DirCheck::Refused,
+            "another owner"
+        );
+        for mode in [0o040720, 0o040702, 0o041777] {
+            assert_eq!(
+                own_dir(Some(DirFacts { mode, ..mine }), 1000),
+                DirCheck::Refused,
+                "{mode:o}"
+            );
+        }
+        let sticky = DirFacts {
+            owner: 0,
+            mode: 0o041777,
+            ..mine
+        };
+        assert!(shared_dir(Some(sticky)));
+        assert!(!shared_dir(Some(DirFacts {
+            mode: 0o040777,
+            ..sticky
+        })));
+        assert!(!shared_dir(Some(DirFacts {
+            is_link: true,
+            is_dir: false,
+            ..sticky
+        })));
+        assert!(!shared_dir(None));
     }
 
     #[test]

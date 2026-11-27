@@ -13,9 +13,10 @@ export type ShownWarning =
 export type ShownWarningKind = ShownWarning["kind"];
 
 /** Most urgent first. Data at risk, then blocked sync, then storage, then the quiet ones. */
-const PRIORITY: readonly ShownWarningKind[] = [
+const PRIORITY = [
   "suspect",
   "massDelete",
+  "incomingDelete",
   "removedHeads",
   "removed",
   "removalReported",
@@ -25,20 +26,44 @@ const PRIORITY: readonly ShownWarningKind[] = [
   "olderState",
   "treeLimit",
   "missingFolder",
+  "noRecoveryCode",
   "quotaFull",
   "quota",
   "serverDisk",
   "diskFull",
   "serverLong",
+  "recoveryPending",
+  "foldersUnreadable",
   "conflicts",
   "names",
-];
+] as const satisfies readonly ShownWarningKind[];
 
-/** Informational banners: nothing is lost, the tray stays calm (UX 7.1, 7.2). */
-const QUIET: ReadonlySet<ShownWarningKind> = new Set(["conflicts", "names"]);
+/**
+ * Every kind has a place: a new warning kind without one is a type error here, not a banner that
+ * silently jumps to the front (indexOf -1).
+ */
+function everyKind<const T extends readonly ShownWarningKind[]>(
+  list: T & (Exclude<ShownWarningKind, T[number]> extends never ? unknown : never),
+): readonly ShownWarningKind[] {
+  return list;
+}
+
+const ORDER = everyKind(PRIORITY);
+
+/**
+ * Informational banners: nothing is lost, the tray stays calm (UX 7.1, 7.2). A pending recovery
+ * finishes by itself, and folders that could not be opened after a recovery come back by
+ * themselves, so neither asks for the person.
+ */
+const QUIET: ReadonlySet<ShownWarningKind> = new Set([
+  "conflicts",
+  "names",
+  "recoveryPending",
+  "foldersUnreadable",
+]);
 
 export function rank(kind: ShownWarningKind): number {
-  return PRIORITY.indexOf(kind);
+  return ORDER.indexOf(kind);
 }
 
 export function needsAttention(warning: ShownWarning): boolean {
@@ -54,7 +79,9 @@ export function tone(warning: ShownWarning): "danger" | "attention" | "info" {
 /** Warnings to show, most urgent first; equal kinds keep the backend's order. */
 export function shownWarnings(snapshot: Snapshot, now: Millis): ShownWarning[] {
   const list: ShownWarning[] = snapshot.warnings.filter(
-    (warning) => !("count" in warning) || warning.count > 0,
+    (warning) =>
+      (!("count" in warning) || warning.count > 0) &&
+      (warning.kind !== "foldersUnreadable" || warning.folders.length > 0 || warning.folderList),
   );
   const connection = snapshot.sync.connection;
   if (connection.kind === "serverSilent" && now - connection.since >= SERVER_SILENT_PROBLEM_MS) {

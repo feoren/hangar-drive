@@ -123,12 +123,16 @@ pub const MAX_MISSING_QUERY: usize = 4096;
 /// Object IDs one reference delta may list, added and dropped together.
 pub const MAX_REFERENCE_DELTA_IDS: usize = 1 << 20;
 /// Log entries one append call may carry: removals and the rotation that must follow them in
-/// the same call, or one added device.
-pub const MAX_APPEND_ENTRIES: usize = 16;
+/// the same call, one added device, or a recovery. Enough for the largest recovery: the added
+/// device, the removal of every other device of a full account (64 devices plus the one a
+/// recovery device may add beyond them, `hangar-drive-crypto`, `devicelog::MAX_CURRENT_DEVICES`)
+/// and the rotation. The crypto crate checks this at compile time.
+pub const MAX_APPEND_ENTRIES: usize = 66;
 /// Bytes of one wrapped epoch secret (`hangar-drive-crypto`, `epoch`).
 pub const WRAPPED_KEY_LEN: usize = 81;
-/// Wrapped keys one append call may carry: one per device of the account.
-pub const MAX_WRAPPED_KEYS: usize = 64;
+/// Wrapped keys one append call may carry: one per current device of the account, up to
+/// `devicelog::MAX_CURRENT_DEVICES` of `hangar-drive-crypto` (checked there at compile time).
+pub const MAX_WRAPPED_KEYS: usize = 65;
 /// Log entries one log page holds.
 pub const MAX_LOG_PAGE: usize = 512;
 /// Commits one delta page holds.
@@ -270,14 +274,19 @@ pub struct WrappedKeyEntry {
 }
 
 /// Appends entries to the device log in one transaction. The server admits the entries as one
-/// batch (`hangar-drive-crypto`, `AccountState::admit_batch`), which allows exactly two shapes:
+/// batch (`hangar-drive-crypto`, `AccountState::admit_batch`), which allows exactly three
+/// shapes:
 ///
 /// - **Rotation:** zero or more removals, then one rotate entry, with a wrapped key in `wraps`
 ///   for every device that is current after the batch, recovery devices included. A removal
 ///   therefore always comes with its rotation in the same call.
 /// - **Added device:** one add device entry with `device_wrap`, the wrapped secret of the
 ///   current epoch for the new device (none while the account has no epoch yet). Adding a
-///   device does not rotate.
+///   device does not rotate. Only a regular device adds this way.
+/// - **Recovery** (the only append of a recovery session): the recovery device's add device
+///   entry for the person's new device, then that device's removals and its rotation, signed by
+///   the new device; `wraps` for every device current after the batch and `device_wrap`, the new
+///   device's wrapped secret of the epoch before the batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogAppendRequest {
@@ -286,13 +295,14 @@ pub struct LogAppendRequest {
     /// Wrapped keys of the rotation among `entries`, if any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wraps: Vec<WrappedKeyEntry>,
-    /// The new device's wrapped key of the current epoch, with an add device entry.
+    /// The new device's wrapped key of the current epoch, with an add device entry (in a
+    /// recovery: of the epoch before the batch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_wrap: Option<WrappedKeyEntry>,
 }
 
 impl LogAppendRequest {
-    /// Counts, wrapped key sizes, duplicate recipients, and never both kinds of wrapped keys.
+    /// Counts, wrapped key sizes and duplicate recipients.
     /// Which entries the batch holds and whether the wrapped keys fit them is checked by the
     /// device log verifier and `hangar-drive-crypto::epoch::append_wraps_fit`.
     pub fn validate(&self) -> Result<(), RequestError> {
@@ -301,9 +311,6 @@ impl LogAppendRequest {
         }
         if self.entries.len() > MAX_APPEND_ENTRIES || self.wraps.len() > MAX_WRAPPED_KEYS {
             return Err(RequestError::TooMany);
-        }
-        if !self.wraps.is_empty() && self.device_wrap.is_some() {
-            return Err(RequestError::Invalid);
         }
         if self
             .wraps
@@ -410,16 +417,14 @@ impl SessionScope {
     }
 
     /// Checks an append of this session before the device log verifier sees it: a recovery
-    /// session appends once, exactly one entry with the new device's wrapped key.
+    /// session appends once, a recovery (the added device, its removals and its rotation, with
+    /// the rotation's wraps; the verifier checks the rest).
     pub fn check_append(self, request: &LogAppendRequest) -> Result<(), ScopeError> {
         match self {
             SessionScope::Device => Ok(()),
             SessionScope::Recovery { appended: true } => Err(ScopeError::AppendUsed),
             SessionScope::Recovery { appended: false } => {
-                if request.entries.len() != 1
-                    || !request.wraps.is_empty()
-                    || request.device_wrap.is_none()
-                {
+                if request.entries.len() < 2 || request.wraps.is_empty() {
                     return Err(ScopeError::AppendShape);
                 }
                 Ok(())
@@ -491,15 +496,46 @@ impl RecordKind {
     }
 }
 
-/// Which record: a kind and, for per-folder kinds, the folder.
+/// Which record: a kind and, for per-folder kinds, the folder. Deserializing checks the same
+/// rule as [`RecordKey::new`] (security review, info), so a key read from JSON, a feed entry or
+/// a stored state never pairs a kind with the wrong folder form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RecordKeyWire")]
 pub struct RecordKey {
     /// The kind.
     pub kind: RecordKind,
     /// The folder, exactly for per-folder kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<FolderId>,
+}
+
+/// The JSON form of a [`RecordKey`] before its check.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordKeyWire {
+    kind: RecordKind,
+    #[serde(default)]
+    folder: Option<FolderId>,
+}
+
+/// A record key whose folder does not fit its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidRecordKey;
+
+impl std::fmt::Display for InvalidRecordKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a record key needs a folder exactly for per-folder kinds")
+    }
+}
+
+impl std::error::Error for InvalidRecordKey {}
+
+impl TryFrom<RecordKeyWire> for RecordKey {
+    type Error = InvalidRecordKey;
+
+    fn try_from(wire: RecordKeyWire) -> Result<Self, Self::Error> {
+        RecordKey::new(wire.kind, wire.folder).ok_or(InvalidRecordKey)
+    }
 }
 
 impl RecordKey {
@@ -1092,6 +1128,45 @@ mod tests {
         );
     }
 
+    // Security review, info: reading a record key checks the rule of `RecordKey::new`.
+    #[test]
+    fn record_keys_are_checked_when_read() {
+        let ring: RecordKey =
+            serde_json::from_value(json!({ "kind": "folder-keys", "folder": F })).unwrap();
+        assert_eq!(
+            ring,
+            RecordKey::new(RecordKind::FolderKeys, Some(folder())).unwrap()
+        );
+        let list: RecordKey = serde_json::from_value(json!({ "kind": "folders" })).unwrap();
+        assert_eq!(list, RecordKey::new(RecordKind::Folders, None).unwrap());
+        for bad in [
+            json!({ "kind": "folder-keys" }),
+            json!({ "kind": "folder-keys", "folder": null }),
+            json!({ "kind": "folders", "folder": F }),
+            json!({ "kind": "device-names", "folder": F }),
+            json!({ "kind": "folders", "other": 1 }),
+        ] {
+            assert!(
+                serde_json::from_value::<RecordKey>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        // Inside a larger message too.
+        let response =
+            json!({ "key": { "kind": "folders", "folder": F }, "version": 1, "data": "" });
+        assert!(serde_json::from_value::<RecordResponse>(response).is_err());
+        // Every valid key reads back as written.
+        for key in [
+            ring,
+            list,
+            RecordKey::new(RecordKind::DeviceNames, None).unwrap(),
+        ] {
+            let again: RecordKey =
+                serde_json::from_value(serde_json::to_value(key).unwrap()).unwrap();
+            assert_eq!(again, key);
+        }
+    }
+
     #[test]
     fn commit_request_json_and_validation() {
         let id = ObjectId::from_bytes([1; 32]);
@@ -1227,8 +1302,9 @@ mod tests {
         let parsed: LogAppendRequest =
             serde_json::from_value(json!({ "entries": ["AQ"] })).unwrap();
         assert!(parsed.wraps.is_empty() && parsed.device_wrap.is_none());
-        // An added device carries one wrapped key of the current epoch, never with rotation
-        // wraps, and every wrapped key has the exact size.
+        // An added device carries one wrapped key of the current epoch, a recovery both kinds
+        // (which kind fits which batch is the verifier's check), and every wrapped key has the
+        // exact size.
         let add = LogAppendRequest {
             entries: vec![Blob(vec![1])],
             wraps: vec![],
@@ -1239,7 +1315,7 @@ mod tests {
             wraps: vec![wrap(1)],
             ..add.clone()
         };
-        assert_eq!(both.validate(), Err(RequestError::Invalid));
+        assert_eq!(both.validate(), Ok(()));
         let short = LogAppendRequest {
             device_wrap: Some(WrappedKeyEntry {
                 device: DeviceId::from_bytes([3; 16]),
@@ -1286,30 +1362,35 @@ mod tests {
             device: DeviceId::from_bytes([3; 16]),
             data: Blob(vec![0; WRAPPED_KEY_LEN]),
         };
+        // The one append is a recovery: the added device, at least its rotation, and the
+        // rotation's wraps. A lone added device (the former two-step recovery) is refused.
+        let recovery = LogAppendRequest {
+            entries: vec![Blob(vec![1]), Blob(vec![2]), Blob(vec![3])],
+            wraps: vec![wrap.clone()],
+            device_wrap: Some(wrap.clone()),
+        };
+        assert_eq!(scope.check_append(&recovery), Ok(()));
         let add = LogAppendRequest {
             entries: vec![Blob(vec![1])],
             wraps: vec![],
             device_wrap: Some(wrap.clone()),
         };
-        assert_eq!(scope.check_append(&add), Ok(()));
-        let two = LogAppendRequest {
-            entries: vec![Blob(vec![1]), Blob(vec![2])],
-            ..add.clone()
+        assert_eq!(scope.check_append(&add), Err(ScopeError::AppendShape));
+        let without_wraps = LogAppendRequest {
+            wraps: vec![],
+            ..recovery.clone()
         };
-        assert_eq!(scope.check_append(&two), Err(ScopeError::AppendShape));
-        let rotation = LogAppendRequest {
-            wraps: vec![wrap],
-            device_wrap: None,
-            ..add.clone()
-        };
-        assert_eq!(scope.check_append(&rotation), Err(ScopeError::AppendShape));
+        assert_eq!(
+            scope.check_append(&without_wraps),
+            Err(ScopeError::AppendShape)
+        );
         scope.record_append();
         assert!(!scope.allows(ApiCall::AppendLog));
         assert!(scope.allows(ApiCall::GetLog));
-        assert_eq!(scope.check_append(&add), Err(ScopeError::AppendUsed));
+        assert_eq!(scope.check_append(&recovery), Err(ScopeError::AppendUsed));
         let mut device = SessionScope::Device;
         device.record_append();
-        assert_eq!(device.check_append(&two), Ok(()));
+        assert_eq!(device.check_append(&add), Ok(()));
     }
 
     #[test]

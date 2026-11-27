@@ -44,7 +44,12 @@
 //!   the device was removed. Signing keys must be valid points of large order, X25519 keys
 //!   canonical and of large order, and every listed device carries its proof of possession.
 //! - At most [`MAX_DEVICES`] current devices, recovery devices included, so every rotation
-//!   wraps to a bounded set.
+//!   wraps to a bounded set. A recovery device's added regular device may exceed it by exactly
+//!   one, to [`MAX_CURRENT_DEVICES`] (security review follow-up): otherwise a stolen device could
+//!   remove the person's devices, fill the account with devices of its own and keep the
+//!   recovery sheet from ever getting back in. A regular device adds nothing at
+//!   [`MAX_DEVICES`] or more, so only the person's recovery device reaches the extra place, and
+//!   the device it adds can then remove every other one.
 //! - **Rotation is immediate:** a removal makes a rotation due, and while one is due the log
 //!   accepts only further removals and the rotate epoch entry (ADR 0001, section 4: "rotate
 //!   immediately after every removal"). No epoch is skipped meanwhile, and no device is added,
@@ -52,15 +57,40 @@
 //!   is due. A log in which every regular device was lost with a rotation due would otherwise be
 //!   stuck, because a recovery device may not rotate. The rotation stays due, and the new device
 //!   makes it.
+//! - **Only due rotations** (security review, medium): a rotate epoch entry is accepted only
+//!   while a rotation is due, or for the account's first epoch. A rotation on its own changes
+//!   nothing a removal did not already ask for, and the app never makes one; it was only a
+//!   way to fill the log one entry per call, down to the reserve below and through it. So the
+//!   epochs of a log are at most its removals plus one.
+//! - **Recovery in one piece** (security review follow-up, high): a regular device added by a
+//!   recovery device is followed in the log only by its own removals and its own rotation,
+//!   until that rotation; no other device may write in between ([`LogError::RecoveryOpen`]).
+//!   A recovery device adds only where the log still has room for the new device's removal and
+//!   rotation after it. Otherwise a hostile device that stays online would remove the new device
+//!   with its rotation before it could act, as often as it likes, and fill the log meanwhile.
 //! - **Atomic appends (server):** the server admits one append call as a batch
-//!   ([`AccountState::admit_batch`]) of exactly one of two shapes: removals followed by their
-//!   rotation, or one added device. The state after the batch must have no rotation due, except
-//!   after the recovery device's one added device above. A removal therefore never reaches the
-//!   server's log without its rotation.
+//!   ([`AccountState::admit_batch`]) of exactly one of three shapes: removals followed by their
+//!   rotation, one added device of a regular device, or a recovery: the recovery device's added
+//!   device followed by that device's removals and its rotation ([`BatchShape::Recovery`], the
+//!   only batch with two signers, sent only by a recovery device). The state after the batch
+//!   must have no rotation due and no recovery open. A removal therefore never reaches the
+//!   server's log without its rotation, and a recovery never without the new device's rotation.
 //! - Epochs count from 1 without gaps.
-//! - A log has at most [`MAX_LOG_ENTRIES`] entries; the last [`RESERVED_LOG_ENTRIES`] places take
-//!   only removals and rotate epoch entries, the very last only a rotate epoch entry, so a stolen
-//!   device can always still be removed and the key changed.
+//! - A log has at most [`MAX_LOG_ENTRIES`] entries. The last [`RESERVED_LOG_ENTRIES`] places take
+//!   only removals, the due rotation, and one regular device added by a recovery device per
+//!   epoch; the very last place takes only the due rotation. So a stolen device can always still
+//!   be removed and the key changed (security review, medium), whatever a device of the account
+//!   did before: no device is added in the reserve except by a recovery device, each removal
+//!   there takes one of the current devices away, and each rotation needs a removal before it.
+//!   After every complete batch an account has at most [`MAX_DEVICES`] current devices: the
+//!   one place above the limit is taken only inside a recovery batch, which removes or rotates
+//!   in the same call. An attacker with regular devices only uses at most two places per device
+//!   it removes (it keeps itself and the recovery device), plus one for a rotation due when the
+//!   reserve began; the person then needs one recovery batch in one piece: the added device,
+//!   one removal per remaining device and the rotation. With `c` current devices when the
+//!   reserve began and `d` (0 or 1) for a due rotation, that is at most `2c + d` places; a due
+//!   rotation follows a removal, so `c + d` is at most [`MAX_DEVICES`], and at most 128 places
+//!   are needed. The reserve, `2 * MAX_CURRENT_DEVICES + 2`, leaves four to spare.
 //! - `issued_at` is the issuer's clock, informational only; the order is the log's.
 //!
 //! A refused entry changes nothing (fail closed): [`AccountState::apply`] checks everything
@@ -86,13 +116,22 @@ const LABEL_CHAIN: &[u8] = b"hangar-drive/v1/device-log";
 pub const ENTRY_VERSION: u8 = 1;
 /// Current devices an account may have, recovery devices included.
 pub const MAX_DEVICES: usize = 64;
+/// The most current devices a log can hold: [`MAX_DEVICES`] plus the one regular device a
+/// recovery device may add beyond it (module docs). Rotations wrap to at most this many.
+pub const MAX_CURRENT_DEVICES: usize = MAX_DEVICES + 1;
+// An append call carries a recovery: the added device, the removal of every other current
+// device and the rotation, and the rotation's wraps to every device that stays.
+const _: () = assert!(hangar_drive_protocol::api::MAX_APPEND_ENTRIES > MAX_CURRENT_DEVICES);
+const _: () = assert!(hangar_drive_protocol::api::MAX_WRAPPED_KEYS >= MAX_CURRENT_DEVICES);
 /// Devices the create entry may list.
 pub const MAX_DEVICES_PER_ENTRY: usize = 8;
 /// The most entries an account's log may have. Every device verifies the whole log; 8192
 /// entries are a few thousand device lifecycles.
 pub const MAX_LOG_ENTRIES: u64 = 8_192;
-/// The last places of [`MAX_LOG_ENTRIES`], which only removals and rotations take.
-pub const RESERVED_LOG_ENTRIES: u64 = 64;
+/// The last places of [`MAX_LOG_ENTRIES`], which take only removals, the due rotation and a
+/// recovery device's added device (module docs): enough to remove every current device one by
+/// one, each with its rotation.
+pub const RESERVED_LOG_ENTRIES: u64 = 2 * MAX_CURRENT_DEVICES as u64 + 2;
 const SIGNATURE_LEN: usize = 64;
 
 const TAG_CREATE: u8 = 1;
@@ -160,10 +199,14 @@ pub enum LogError {
     /// The rotation does not name the next epoch.
     #[error("the rotation does not name the next epoch")]
     EpochGap,
+    /// A rotation although no removal waits for one and the account has its first epoch.
+    #[error("no removal waits for a rotation")]
+    NoRotationDue,
     /// The log reached [`MAX_LOG_ENTRIES`].
     #[error("the device log is full")]
     LogFull,
-    /// The reserved last places take only removals and rotations.
+    /// The reserved last places take only removals, the due rotation and a recovery device's
+    /// added device.
     #[error("the last places of the device log are reserved for removals and rotations")]
     Reserved,
     /// The log does not contain the pinned anchor.
@@ -175,6 +218,10 @@ pub enum LogError {
     /// Server side: the append would leave a rotation due.
     #[error("the append leaves a rotation due")]
     RotationLeftDue,
+    /// A recovery is open: until the device the recovery device added has rotated, only that
+    /// device may write, and only removals and its rotation (module docs).
+    #[error("a recovery is open; only the recovered device's removals and rotation may follow")]
+    RecoveryOpen,
 }
 
 /// A device as an entry lists it.
@@ -445,6 +492,18 @@ pub enum BatchShape {
         /// The new device.
         device: DeviceId,
     },
+    /// A recovery (module docs): the recovery device `by` added `device`, which removed
+    /// `removed` and rotated to `epoch`.
+    Recovery {
+        /// The recovery device that sent the batch.
+        by: DeviceId,
+        /// The new regular device.
+        device: DeviceId,
+        /// The devices it removed, in order.
+        removed: Vec<DeviceId>,
+        /// The new epoch.
+        epoch: Epoch,
+    },
 }
 
 /// An append the server may store: the state after it and its shape.
@@ -466,6 +525,10 @@ pub struct AccountState {
     rotation_due: bool,
     /// A recovery device added its one device while the rotation is due.
     recovery_added_while_due: bool,
+    /// A recovery device added a device since the last rotation (the reserve's limit).
+    recovery_added_since_rotation: bool,
+    /// The device a recovery device added, until its rotation (module docs).
+    recovery_open: Option<DeviceId>,
     last_removal: u64,
     last_removal_issuer: Option<DeviceId>,
     used_keys: BTreeSet<[u8; 32]>,
@@ -481,6 +544,8 @@ impl AccountState {
             epochs: Vec::new(),
             rotation_due: false,
             recovery_added_while_due: false,
+            recovery_added_since_rotation: false,
+            recovery_open: None,
             last_removal: 0,
             last_removal_issuer: None,
             used_keys: BTreeSet::new(),
@@ -583,6 +648,26 @@ impl AccountState {
         self.last_removal
     }
 
+    /// The device a recovery device added and that has not rotated yet (module docs).
+    pub fn recovery_open(&self) -> Option<&DeviceId> {
+        self.recovery_open.as_ref()
+    }
+
+    /// The index of the newest remove device entry at or before log index `len`, 0 if there is
+    /// none: the last removal of the log as it was at that length. Every remove device entry
+    /// removes one device, so it is the newest removal index up to `len`.
+    pub fn last_removal_index_at(&self, len: u64) -> u64 {
+        if self.last_removal <= len {
+            return self.last_removal;
+        }
+        self.devices
+            .values()
+            .filter_map(|d| d.removed_at)
+            .filter(|r| *r <= len)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The device that issued the newest remove device entry, `None` if the log has none.
     pub fn last_removal_issuer(&self) -> Option<&DeviceId> {
         self.last_removal_issuer.as_ref()
@@ -655,33 +740,61 @@ impl AccountState {
             .iter()
             .map(|e| LogEntry::decode(e).map(|entry| entry.kind))
             .collect::<Result<Vec<_>, _>>()?;
+        let removals_of = |kinds: &[EntryKind]| {
+            kinds
+                .iter()
+                .map(|kind| match kind {
+                    EntryKind::RemoveDevice(id) => Ok(*id),
+                    _ => Err(LogError::BatchShape),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
         let shape = match kinds.as_slice() {
             [EntryKind::AddDevice(device)] => BatchShape::AddDevice { device: device.id },
-            [removals @ .., EntryKind::Rotate { epoch, .. }] => {
-                let removed = removals
-                    .iter()
-                    .map(|kind| match kind {
-                        EntryKind::RemoveDevice(id) => Ok(*id),
-                        _ => Err(LogError::BatchShape),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                BatchShape::Rotation {
-                    removed,
+            [EntryKind::AddDevice(device), removals @ .., EntryKind::Rotate { epoch, .. }] => {
+                BatchShape::Recovery {
+                    by: *sender,
+                    device: device.id,
+                    removed: removals_of(removals)?,
                     epoch: *epoch,
                 }
             }
+            [removals @ .., EntryKind::Rotate { epoch, .. }] => BatchShape::Rotation {
+                removed: removals_of(removals)?,
+                epoch: *epoch,
+            },
             _ => return Err(LogError::BatchShape),
         };
         if self.is_empty() {
             return Err(LogError::NotCreated);
         }
         let mut state = self.clone();
-        for entry in &entries {
-            state.apply_checked(entry, Some(sender))?;
+        match &shape {
+            BatchShape::Recovery { device, .. } => {
+                // The only batch with two signers, and only from a recovery device: its added
+                // device, then that device's removals and rotation.
+                if !self
+                    .device(sender)
+                    .is_some_and(|d| d.is_current() && d.recovery)
+                {
+                    return Err(LogError::BatchShape);
+                }
+                let (first, rest) = entries.split_first().ok_or(LogError::BatchShape)?;
+                state.apply_checked(first, Some(sender))?;
+                for entry in rest {
+                    state.apply_checked(entry, Some(device))?;
+                }
+            }
+            _ => {
+                for entry in &entries {
+                    state.apply_checked(entry, Some(sender))?;
+                }
+            }
         }
-        // Only the recovery device's one added device may leave the rotation due that it found.
-        let recovery_add = matches!(shape, BatchShape::AddDevice { .. }) && self.rotation_due;
-        if state.rotation_due && !recovery_add {
+        if state.recovery_open.is_some() {
+            return Err(LogError::RecoveryOpen);
+        }
+        if state.rotation_due {
             return Err(LogError::RotationLeftDue);
         }
         Ok(AdmittedBatch { state, shape })
@@ -812,7 +925,11 @@ impl AccountState {
         if !verify(&issuer.keys.sign, body, entry.signature.as_bytes()) {
             return Err(LogError::Signature);
         }
-        Ok(Change::Add(devices.clone(), false))
+        Ok(Change::Add {
+            devices: devices.clone(),
+            by_recovery: false,
+            while_due: false,
+        })
     }
 
     fn check_later(
@@ -832,10 +949,22 @@ impl AccountState {
         }
         let is_rotation = matches!(entry.kind, EntryKind::Rotate { .. });
         let is_removal = matches!(entry.kind, EntryKind::RemoveDevice(_));
-        if index == MAX_LOG_ENTRIES && !is_rotation {
+        // An open recovery: only the new device, and only its removals and rotation.
+        if let Some(added) = &self.recovery_open {
+            if entry.issuer != *added || !(is_removal || is_rotation) {
+                return Err(LogError::RecoveryOpen);
+            }
+        }
+        let due_rotation = is_rotation && self.rotation_due;
+        if index == MAX_LOG_ENTRIES && !due_rotation {
             return Err(LogError::Reserved);
         }
-        if reserved && !is_rotation && !is_removal {
+        // The reserve (module docs): no device is added there except by a recovery device, once
+        // per epoch, so a person who has only the recovery device left can still get in.
+        let reserve_add = issuer.recovery
+            && !self.recovery_added_since_rotation
+            && matches!(&entry.kind, EntryKind::AddDevice(d) if !d.recovery);
+        if reserved && !is_removal && !due_rotation && !reserve_add {
             return Err(LogError::Reserved);
         }
         // The one exception while a rotation is due (module docs): the recovery device adds one
@@ -852,14 +981,27 @@ impl AccountState {
                 if issuer.recovery && device.recovery {
                     return Err(LogError::Forbidden);
                 }
-                if self.current_devices().count() >= MAX_DEVICES {
+                // Room for the new device's rotation after it, and for one removal before that
+                // unless a rotation is already due (module docs, "Recovery in one piece").
+                let after = if self.rotation_due { 1 } else { 2 };
+                if issuer.recovery && index.saturating_add(after) > MAX_LOG_ENTRIES {
+                    return Err(LogError::Reserved);
+                }
+                // A recovery device's regular device may take the one place above the limit.
+                let limit = if issuer.recovery {
+                    MAX_CURRENT_DEVICES
+                } else {
+                    MAX_DEVICES
+                };
+                if self.current_devices().count() >= limit {
                     return Err(LogError::TooManyDevices);
                 }
                 self.check_new_device(device, &BTreeSet::new())?;
-                Ok(Change::Add(
-                    vec![*device],
-                    self.rotation_due && issuer.recovery,
-                ))
+                Ok(Change::Add {
+                    devices: vec![*device],
+                    by_recovery: issuer.recovery,
+                    while_due: self.rotation_due && issuer.recovery,
+                })
             }
             EntryKind::RemoveDevice(target) => {
                 if issuer.recovery || *target == entry.issuer {
@@ -878,6 +1020,9 @@ impl AccountState {
                 if issuer.recovery {
                     return Err(LogError::Forbidden);
                 }
+                if !self.rotation_due && !self.epochs.is_empty() {
+                    return Err(LogError::NoRotationDue);
+                }
                 let next = u32::try_from(self.epochs.len())
                     .ok()
                     .and_then(|n| n.checked_add(1))
@@ -892,8 +1037,16 @@ impl AccountState {
 
     fn record(&mut self, change: Change, index: u64, hash: LogHash) {
         match change {
-            Change::Add(devices, recovery_while_due) => {
-                self.recovery_added_while_due |= recovery_while_due;
+            Change::Add {
+                devices,
+                by_recovery,
+                while_due,
+            } => {
+                self.recovery_added_while_due |= while_due;
+                self.recovery_added_since_rotation |= by_recovery;
+                if by_recovery {
+                    self.recovery_open = devices.first().map(|d| d.id);
+                }
                 for device in devices {
                     self.used_keys.insert(*device.keys.sign.as_bytes());
                     self.used_keys.insert(*device.keys.kem.as_bytes());
@@ -926,6 +1079,8 @@ impl AccountState {
                 });
                 self.rotation_due = false;
                 self.recovery_added_while_due = false;
+                self.recovery_added_since_rotation = false;
+                self.recovery_open = None;
             }
         }
         self.hashes.push(hash);
@@ -934,8 +1089,15 @@ impl AccountState {
 
 /// What a checked entry changes.
 enum Change {
-    /// The devices, and whether a recovery device added them while a rotation is due.
-    Add(Vec<LogDevice>, bool),
+    /// Added devices.
+    Add {
+        /// The devices.
+        devices: Vec<LogDevice>,
+        /// A recovery device added them.
+        by_recovery: bool,
+        /// A recovery device added them while a rotation is due.
+        while_due: bool,
+    },
     Remove(DeviceId, DeviceId),
     Rotate(Epoch, EpochCommitment),
 }
@@ -1445,31 +1607,42 @@ pub(crate) mod tests {
             Err(LogError::RotationDue),
             "the exception covers only a regular device"
         );
-        let add_n = batch(
-            &state,
-            &[(
-                &r,
-                EntryKind::AddDevice(LogDevice::of(&n.identity, &ACCOUNT, n.id, false)),
-            )],
-        );
-        let admitted = state.admit_batch(slices(&add_n), &r.id).unwrap();
-        assert!(admitted.state.rotation_due(), "the rotation stays due");
-        let mut state = admitted.state;
-        // Exactly one.
+        // The added device alone is no batch the server takes (security review follow-up,
+        // H1): the recovery is one append call.
+        let add_n = EntryKind::AddDevice(LogDevice::of(&n.identity, &ACCOUNT, n.id, false));
+        let alone = batch(&state, &[(&r, add_n.clone())]);
         assert_eq!(
-            add(&mut state.clone(), &r, &m, false),
-            Err(LogError::RotationDue)
+            state.admit_batch(slices(&alone), &r.id).unwrap_err(),
+            LogError::RecoveryOpen
         );
-        // The new device removes the lost device and the recovery device and rotates.
+        // Entry by entry, the recovery stays open: only the new device may write next.
+        let mut open = state.clone();
+        open.apply(&alone[0]).unwrap();
+        assert_eq!(open.recovery_open(), Some(&n.id));
+        assert_eq!(
+            add(&mut open.clone(), &r, &m, false),
+            Err(LogError::RecoveryOpen)
+        );
+        // The new device removes the lost device and the recovery device and rotates, in the
+        // recovery device's one append call.
+        let mut scratch = state.clone();
+        scratch.apply(&alone[0]).unwrap();
         let steps = [
             (&n, EntryKind::RemoveDevice(a.id)),
             (&n, EntryKind::RemoveDevice(r.id)),
-            (&n, next_rotation(&state)),
+            (&n, next_rotation(&scratch)),
         ];
-        let entries = batch(&state, &steps);
-        let admitted = state.admit_batch(slices(&entries), &n.id).unwrap();
+        let mut entries = alone.clone();
+        entries.extend(batch(&scratch, &steps));
+        let admitted = state.admit_batch(slices(&entries), &r.id).unwrap();
         assert!(!admitted.state.rotation_due());
-        state = admitted.state;
+        assert!(admitted.state.recovery_open().is_none());
+        assert!(matches!(
+            admitted.shape,
+            BatchShape::Recovery { by, device, ref removed, .. }
+                if by == r.id && device == n.id && *removed == vec![a.id, r.id]
+        ));
+        let mut state = admitted.state;
         assert_eq!(state.current_devices().count(), 1);
         // A recovery device added after the rotation may add again when nothing is due.
         let r2 = dev(6);
@@ -1598,6 +1771,7 @@ pub(crate) mod tests {
     #[test]
     fn epochs_have_no_gaps() {
         let a = dev(1);
+        let b = dev(2);
         let mut state = created(&a);
         let entry = state.next_entry(
             &a.identity,
@@ -1610,8 +1784,37 @@ pub(crate) mod tests {
         );
         assert_eq!(entry, Err(LogError::EpochGap));
         rotate(&mut state, &a).unwrap();
+        add(&mut state, &a, &b, false).unwrap();
+        remove(&mut state, &a, b.id).unwrap();
         let again = sign_raw(&a.identity, raw_entry(&state, a.id, rotate_kind()));
         assert_eq!(state.clone().apply(&again), Err(LogError::EpochGap));
+    }
+
+    // Security review, medium: a rotation is accepted only when a removal waits for it, or for
+    // the first epoch. Rotations on their own were the cheapest way to fill the log.
+    #[test]
+    fn only_the_first_rotation_needs_no_removal() {
+        let a = dev(1);
+        let b = dev(2);
+        let mut state = created(&a);
+        rotate(&mut state, &a).unwrap();
+        assert_eq!(rotate(&mut state.clone(), &a), Err(LogError::NoRotationDue));
+        add(&mut state, &a, &b, false).unwrap();
+        assert_eq!(
+            rotate(&mut state.clone(), &a),
+            Err(LogError::NoRotationDue),
+            "an added device asks for no rotation"
+        );
+        // The server refuses the plain rotation batch as well.
+        let plain = sign_raw(&a.identity, raw_entry(&state, a.id, next_rotation(&state)));
+        assert_eq!(
+            state.admit_batch([plain.as_slice()], &a.id).unwrap_err(),
+            LogError::NoRotationDue
+        );
+        remove(&mut state, &a, b.id).unwrap();
+        rotate(&mut state, &a).unwrap();
+        assert_eq!(state.current_epoch().unwrap().epoch, Epoch(2));
+        assert_eq!(rotate(&mut state.clone(), &a), Err(LogError::NoRotationDue));
     }
 
     #[test]
@@ -1628,31 +1831,426 @@ pub(crate) mod tests {
         );
     }
 
+    // Security review follow-up: a stolen device removes the person's device, fills the account
+    // up to the limit with devices of its own and so used to keep the recovery sheet out
+    // (`TooManyDevices`). The recovery device's regular device takes the one place above the
+    // limit, and that device removes every other one with its rotation, in one append call.
+    #[test]
+    fn a_full_account_still_lets_the_recovery_device_in() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let fresh = dev(200);
+        let mut state = created(&owner);
+        rotate(&mut state, &owner).unwrap();
+        add(&mut state, &owner, &attacker, false).unwrap();
+        add(&mut state, &owner, &recovery, true).unwrap();
+        // The attack: the owner's device removed, the account filled with the attacker's.
+        remove(&mut state, &attacker, owner.id).unwrap();
+        rotate(&mut state, &attacker).unwrap();
+        for other in devices(10, MAX_DEVICES - 2) {
+            add(&mut state, &attacker, &other, false).unwrap();
+        }
+        assert_eq!(state.current_devices().count(), MAX_DEVICES);
+        assert_eq!(
+            add(&mut state.clone(), &attacker, &dev(201), false),
+            Err(LogError::TooManyDevices)
+        );
+        // The recovery device gets the person's new device in, over the limit by one, and only
+        // by one, and that device removes every other device, the recovery device included, and
+        // rotates, all in one batch the server admits.
+        let others: Vec<DeviceId> = state.current_devices().map(|d| d.id).collect();
+        let mut open = state.clone();
+        add(&mut open, &recovery, &fresh, false).unwrap();
+        assert_eq!(open.current_devices().count(), MAX_CURRENT_DEVICES);
+        assert_eq!(
+            add(&mut open.clone(), &recovery, &dev(202), false),
+            Err(LogError::RecoveryOpen)
+        );
+        let entries = recovery_batch(&state, &recovery, &fresh, &others);
+        assert_eq!(entries.len(), MAX_CURRENT_DEVICES + 1);
+        assert!(entries.len() <= hangar_drive_protocol::api::MAX_APPEND_ENTRIES);
+        let admitted = state.admit_batch(slices(&entries), &recovery.id).unwrap();
+        assert!(!admitted.state.rotation_due());
+        assert_eq!(
+            admitted
+                .state
+                .current_devices()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+    }
+
+    /// The recovery batch: `recovery` adds `fresh`, which removes `targets` and rotates.
+    fn recovery_batch(
+        state: &AccountState,
+        recovery: &Dev,
+        fresh: &Dev,
+        targets: &[DeviceId],
+    ) -> Vec<Vec<u8>> {
+        let add = EntryKind::AddDevice(LogDevice::of(&fresh.identity, &ACCOUNT, fresh.id, false));
+        let mut entries = batch(state, &[(recovery, add)]);
+        let mut scratch = state.clone();
+        scratch.apply(&entries[0]).unwrap();
+        let mut steps: Vec<(&Dev, EntryKind)> = targets
+            .iter()
+            .map(|t| (fresh, EntryKind::RemoveDevice(*t)))
+            .collect();
+        steps.push((fresh, next_rotation(&scratch)));
+        entries.extend(batch(&scratch, &steps));
+        entries
+    }
+
+    /// Moves the log forward to `len` entries without real entries in between: the checks of
+    /// the next entry read only the length and the newest hash, so the reserve can be tested
+    /// without thousands of signed entries.
+    fn fast_forward(state: &mut AccountState, len: u64) {
+        let filler = LogHash::from_bytes([0x5a; 32]);
+        state.hashes.resize(usize::try_from(len).unwrap(), filler);
+    }
+
+    /// Devices `first..first + count`.
+    fn devices(first: u8, count: usize) -> Vec<Dev> {
+        (0..count).map(|n| dev(first + n as u8)).collect()
+    }
+
+    /// The first place of the reserve.
+    const FIRST_RESERVED: u64 = MAX_LOG_ENTRIES - RESERVED_LOG_ENTRIES + 1;
+
     #[test]
     fn the_last_places_are_reserved() {
         let a = dev(1);
         let b = dev(2);
+        let c = dev(3);
+        let r = dev(4);
         let mut state = created(&a);
+        rotate(&mut state, &a).unwrap();
         add(&mut state, &a, &b, false).unwrap();
-        while state.len() < MAX_LOG_ENTRIES - RESERVED_LOG_ENTRIES {
-            rotate(&mut state, &a).unwrap();
-        }
+        add(&mut state, &a, &c, false).unwrap();
+        add(&mut state, &a, &r, true).unwrap();
+        fast_forward(&mut state, FIRST_RESERVED - 1);
+        // A regular device adds nothing in the reserve, and no rotation without a removal.
         assert_eq!(
-            add(&mut state.clone(), &a, &dev(3), false),
+            add(&mut state.clone(), &a, &dev(5), false),
             Err(LogError::Reserved)
         );
-        remove(&mut state, &a, b.id).unwrap();
-        while state.len() < MAX_LOG_ENTRIES - 1 {
-            rotate(&mut state, &a).unwrap();
-        }
-        let c_entry = sign_raw(
-            &a.identity,
-            raw_entry(&state, a.id, EntryKind::RemoveDevice(b.id)),
+        assert_eq!(rotate(&mut state.clone(), &a), Err(LogError::Reserved));
+        // A recovery device adds a regular device, never a recovery device, and nothing else
+        // follows but the new device's removals and rotation.
+        let mut recovered = state.clone();
+        add(&mut recovered, &r, &dev(6), false).unwrap();
+        assert_eq!(
+            add(&mut recovered.clone(), &r, &dev(7), false),
+            Err(LogError::RecoveryOpen)
         );
-        assert_eq!(state.clone().apply(&c_entry), Err(LogError::Reserved));
+        assert_eq!(
+            add(&mut state.clone(), &r, &dev(7), true),
+            Err(LogError::Reserved)
+        );
+        // Removals and their rotation.
+        remove(&mut state, &a, b.id).unwrap();
+        rotate(&mut state, &a).unwrap();
+        assert_eq!(state.len(), FIRST_RESERVED + 1);
+        // The last place: only the due rotation.
+        fast_forward(&mut state, MAX_LOG_ENTRIES - 2);
+        remove(&mut state, &a, c.id).unwrap();
+        let removal = sign_raw(
+            &a.identity,
+            raw_entry(&state, a.id, EntryKind::RemoveDevice(r.id)),
+        );
+        assert_eq!(state.clone().apply(&removal), Err(LogError::Reserved));
         rotate(&mut state, &a).unwrap();
         assert_eq!(state.len(), MAX_LOG_ENTRIES);
-        assert_eq!(rotate(&mut state, &a), Err(LogError::LogFull));
+        assert_eq!(remove(&mut state, &a, r.id), Err(LogError::LogFull));
+        // At the last place a rotation that is not due is refused as well.
+        let mut idle = created(&a);
+        rotate(&mut idle, &a).unwrap();
+        fast_forward(&mut idle, MAX_LOG_ENTRIES - 1);
+        assert_eq!(rotate(&mut idle, &a), Err(LogError::Reserved));
+    }
+
+    /// The attacker's best use of the reserve with regular devices only: every entry it may
+    /// write, removing every device but `keep`, each removal with its rotation, and trying a
+    /// plain rotation and an added device in between.
+    fn abuse_the_reserve(state: &mut AccountState, attacker: &Dev, keep: &[DeviceId]) {
+        if state.rotation_due() {
+            rotate(state, attacker).unwrap();
+        }
+        let targets: Vec<DeviceId> = state
+            .current_devices()
+            .map(|d| d.id)
+            .filter(|id| *id != attacker.id && !keep.contains(id))
+            .collect();
+        for target in targets {
+            assert_eq!(
+                rotate(&mut state.clone(), attacker),
+                Err(LogError::Reserved)
+            );
+            assert_eq!(
+                add(&mut state.clone(), attacker, &dev(250), false),
+                Err(LogError::Reserved)
+            );
+            remove(state, attacker, target).unwrap();
+            rotate(state, attacker).unwrap();
+        }
+        assert_eq!(
+            rotate(&mut state.clone(), attacker),
+            Err(LogError::Reserved)
+        );
+    }
+
+    /// An account with `owner`, `attacker`, `recovery` and regular devices up to
+    /// [`MAX_DEVICES`], at the first place of the reserve.
+    fn full_account_at_the_reserve(owner: &Dev, attacker: &Dev, recovery: &Dev) -> AccountState {
+        let mut state = created(owner);
+        rotate(&mut state, owner).unwrap();
+        add(&mut state, owner, attacker, false).unwrap();
+        add(&mut state, owner, recovery, true).unwrap();
+        for other in devices(10, MAX_DEVICES - 3) {
+            add(&mut state, attacker, &other, false).unwrap();
+        }
+        assert_eq!(state.current_devices().count(), MAX_DEVICES);
+        fast_forward(&mut state, FIRST_RESERVED - 1);
+        state
+    }
+
+    // Security review, medium: a stolen device that fills the log as far as the rules let it
+    // can still be removed, and the key changed, by the person's device.
+    #[test]
+    fn after_the_worst_abuse_the_owner_still_removes_the_attacker() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let mut state = full_account_at_the_reserve(&owner, &attacker, &recovery);
+        abuse_the_reserve(&mut state, &attacker, &[owner.id]);
+        assert_eq!(state.current_devices().count(), 2);
+        remove(&mut state, &owner, attacker.id).unwrap();
+        rotate(&mut state, &owner).unwrap();
+        assert!(state.len() <= MAX_LOG_ENTRIES);
+        assert!(!state.rotation_due());
+        assert_eq!(
+            state.current_devices().map(|d| d.id).collect::<Vec<_>>(),
+            vec![owner.id]
+        );
+    }
+
+    // The same when the attacker removed every regular device of the person and only the
+    // recovery device is left, and with a rotation due when the reserve began.
+    #[test]
+    fn after_the_worst_abuse_the_recovery_device_still_gets_the_account_back() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let fresh = dev(200);
+        let mut state = full_account_at_the_reserve(&owner, &attacker, &recovery);
+        // One removal right before the reserve, its rotation the reserve's first entry.
+        state.hashes.pop();
+        remove(&mut state, &attacker, DeviceId::from_bytes([10; 16])).unwrap();
+        assert!(state.rotation_due());
+        abuse_the_reserve(&mut state, &attacker, &[recovery.id]);
+        assert_eq!(state.current_devices().count(), 2);
+        // The recovery device adds the person's new device, which removes the attacker and the
+        // used recovery device and changes the key.
+        add(&mut state, &recovery, &fresh, false).unwrap();
+        remove(&mut state, &fresh, attacker.id).unwrap();
+        remove(&mut state, &fresh, recovery.id).unwrap();
+        rotate(&mut state, &fresh).unwrap();
+        assert!(state.len() <= MAX_LOG_ENTRIES);
+        assert!(!state.rotation_due());
+        assert_eq!(
+            state.current_devices().map(|d| d.id).collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+    }
+
+    // Security review follow-up, H1: the recovery is one piece. Once the recovery device added
+    // the person's new device, the attacker cannot remove it before it acts: nothing but the new
+    // device's removals and rotation follows in the log, and the server takes the recovery only
+    // as one batch, so the attacker is out before it can react.
+    #[test]
+    fn nobody_writes_between_a_recovery_and_its_rotation() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let fresh = dev(200);
+        let mut state = created(&owner);
+        rotate(&mut state, &owner).unwrap();
+        add(&mut state, &owner, &attacker, false).unwrap();
+        add(&mut state, &owner, &recovery, true).unwrap();
+        remove(&mut state, &attacker, owner.id).unwrap();
+        rotate(&mut state, &attacker).unwrap();
+        // Entry by entry: the attacker's removal of the new device, its rotation, an added
+        // device and the recovery device's second add are all refused while it is open.
+        let mut open = state.clone();
+        add(&mut open, &recovery, &fresh, false).unwrap();
+        for result in [
+            remove(&mut open.clone(), &attacker, fresh.id),
+            remove(&mut open.clone(), &attacker, recovery.id),
+            add(&mut open.clone(), &attacker, &dev(9), false),
+            add(&mut open.clone(), &fresh, &dev(9), false),
+            add(&mut open.clone(), &recovery, &dev(9), false),
+        ] {
+            assert_eq!(result, Err(LogError::RecoveryOpen));
+        }
+        // The new device's own removals and rotation close it.
+        remove(&mut open, &fresh, attacker.id).unwrap();
+        rotate(&mut open, &fresh).unwrap();
+        assert!(open.recovery_open().is_none());
+
+        // The server: the recovery as one batch, sent by the recovery device.
+        let entries = recovery_batch(&state, &recovery, &fresh, &[attacker.id, recovery.id]);
+        let admitted = state.admit_batch(slices(&entries), &recovery.id).unwrap();
+        assert_eq!(
+            admitted
+                .state
+                .current_devices()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+        // Not in parts: the add alone, or the rest alone, sent by anyone.
+        assert_eq!(
+            state
+                .admit_batch(slices(&entries[..1]), &recovery.id)
+                .unwrap_err(),
+            LogError::RecoveryOpen
+        );
+        assert!(state.admit_batch(slices(&entries[1..]), &fresh.id).is_err());
+        // Not without its rotation.
+        assert_eq!(
+            state
+                .admit_batch(slices(&entries[..entries.len() - 1]), &recovery.id)
+                .unwrap_err(),
+            LogError::BatchShape
+        );
+    }
+
+    // The recovery shape is the recovery device's only: a regular device may not add a device
+    // and let it remove and rotate in the same call, and the entries after the add must come
+    // from the added device.
+    #[test]
+    fn the_recovery_batch_cannot_be_used_by_a_regular_device() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let throwaway = dev(4);
+        let mut state = created(&owner);
+        rotate(&mut state, &owner).unwrap();
+        add(&mut state, &owner, &attacker, false).unwrap();
+        add(&mut state, &owner, &recovery, true).unwrap();
+        // A regular device adds its own device, which removes the owner and rotates.
+        let add_throwaway = EntryKind::AddDevice(LogDevice::of(
+            &throwaway.identity,
+            &ACCOUNT,
+            throwaway.id,
+            false,
+        ));
+        let mut entries = batch(&state, &[(&attacker, add_throwaway)]);
+        let mut scratch = state.clone();
+        scratch.apply(&entries[0]).unwrap();
+        let steps = [
+            (&throwaway, EntryKind::RemoveDevice(owner.id)),
+            (&throwaway, next_rotation(&scratch)),
+        ];
+        entries.extend(batch(&scratch, &steps));
+        assert_eq!(
+            state
+                .admit_batch(slices(&entries), &attacker.id)
+                .unwrap_err(),
+            LogError::BatchShape
+        );
+        // The recovery device's batch with a removal signed by another device than the one it
+        // added.
+        let fresh = dev(200);
+        let mut forged = recovery_batch(&state, &recovery, &fresh, &[attacker.id]);
+        let mut scratch = state.clone();
+        scratch.apply(&forged[0]).unwrap();
+        let mut other = scratch.clone();
+        other.recovery_open = None;
+        let by_owner = batch(&other, &[(&owner, EntryKind::RemoveDevice(attacker.id))]);
+        forged[1] = by_owner[0].clone();
+        assert!(state.admit_batch(slices(&forged), &recovery.id).is_err());
+        // Sent by another device than the recovery device that signed the add.
+        let entries = recovery_batch(&state, &recovery, &fresh, &[attacker.id]);
+        assert_eq!(
+            state.admit_batch(slices(&entries), &owner.id).unwrap_err(),
+            LogError::BatchShape
+        );
+    }
+
+    // The end of the log: a recovery device adds only where the new device can still remove
+    // and rotate (two places after the add, one when a rotation is already due), and the worst
+    // use of the reserve still leaves room for the whole recovery batch.
+    #[test]
+    fn a_recovery_fits_at_the_end_of_the_log() {
+        let owner = dev(1);
+        let attacker = dev(2);
+        let recovery = dev(3);
+        let fresh = dev(200);
+        let mut state = created(&owner);
+        rotate(&mut state, &owner).unwrap();
+        add(&mut state, &owner, &attacker, false).unwrap();
+        add(&mut state, &owner, &recovery, true).unwrap();
+        let mut late = state.clone();
+        fast_forward(&mut late, MAX_LOG_ENTRIES - 2);
+        assert_eq!(
+            add(&mut late.clone(), &recovery, &fresh, false),
+            Err(LogError::Reserved),
+            "an add at the second-to-last place leaves no room to remove and rotate"
+        );
+        let mut late = state.clone();
+        fast_forward(&mut late, MAX_LOG_ENTRIES - 3);
+        let entries = recovery_batch(&late, &recovery, &fresh, &[attacker.id]);
+        let admitted = late.admit_batch(slices(&entries), &recovery.id).unwrap();
+        assert_eq!(admitted.state.len(), MAX_LOG_ENTRIES);
+        // With a rotation due, the add and the rotation fit the last two places.
+        let mut due = state.clone();
+        fast_forward(&mut due, MAX_LOG_ENTRIES - 3);
+        remove(&mut due, &owner, attacker.id).unwrap();
+        assert!(due.rotation_due());
+        let entries = recovery_batch(&due, &recovery, &fresh, &[]);
+        let admitted = due.admit_batch(slices(&entries), &recovery.id).unwrap();
+        assert_eq!(admitted.state.len(), MAX_LOG_ENTRIES);
+
+        // The worst use of the reserve, then the recovery of the whole account in one batch.
+        let mut state = full_account_at_the_reserve(&owner, &attacker, &recovery);
+        abuse_the_reserve(&mut state, &attacker, &[recovery.id]);
+        let entries = recovery_batch(&state, &recovery, &fresh, &[attacker.id, recovery.id]);
+        let admitted = state.admit_batch(slices(&entries), &recovery.id).unwrap();
+        assert!(admitted.state.len() <= MAX_LOG_ENTRIES);
+        assert_eq!(
+            admitted
+                .state
+                .current_devices()
+                .map(|d| d.id)
+                .collect::<Vec<_>>(),
+            vec![fresh.id]
+        );
+    }
+
+    // The old reserve of 64 places, reached with plain rotations: the attacker reached the end
+    // of the log without a removal and could never be removed. Now the reserve holds every
+    // device, and no plain rotation gets the log there.
+    #[test]
+    fn the_reserve_holds_a_removal_of_every_device() {
+        assert_eq!(RESERVED_LOG_ENTRIES, 2 * MAX_CURRENT_DEVICES as u64 + 2);
+        let owner = dev(1);
+        let attacker = dev(2);
+        let mut state = created(&owner);
+        rotate(&mut state, &owner).unwrap();
+        add(&mut state, &owner, &attacker, false).unwrap();
+        assert_eq!(
+            rotate(&mut state.clone(), &attacker),
+            Err(LogError::NoRotationDue)
+        );
+        fast_forward(&mut state, FIRST_RESERVED - 1);
+        assert_eq!(
+            rotate(&mut state.clone(), &attacker),
+            Err(LogError::Reserved)
+        );
+        remove(&mut state, &owner, attacker.id).unwrap();
+        rotate(&mut state, &owner).unwrap();
     }
 
     #[test]

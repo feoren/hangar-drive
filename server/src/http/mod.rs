@@ -152,7 +152,6 @@ async fn authorize_inner(
     let keys = ratelimit::RateKeys {
         ip: &ip_key,
         net: &net_key,
-        account: None,
     };
     let now_s = app.now_ms() / 1000;
     match access {
@@ -171,11 +170,22 @@ async fn authorize_inner(
             next.run(request).await
         }
         Some((Access::Call(call), handler)) => {
-            // The address limits come before the token is looked up (overall review, info).
-            if !ratelimit::check_address(&app.limiter, handler, &keys, true, now_s) {
+            // Limits before the token is looked up (overall review, info): a token this server
+            // issued counts per token, any other token or none against the address limits, so
+            // made-up tokens never use up the calls of real sessions behind the same address
+            // (follow-up review M2). The tag check decides only which limit applies; whether
+            // the session exists is decided by `authenticate` alone.
+            let token = extract::bearer(request.headers());
+            let allowed = match &token {
+                Some(token) if sessions::issued_here(&app, token) => {
+                    ratelimit::check_issued_token(&app.limiter, token.expose(), now_s)
+                }
+                _ => ratelimit::check_address(&app.limiter, handler, &keys, true, now_s),
+            };
+            if !allowed {
                 return ApiError::new(ErrorCode::RateLimited).into_response();
             }
-            let Some(token) = extract::bearer(request.headers()) else {
+            let Some(token) = token else {
                 return ApiError::new(ErrorCode::Unauthorized).into_response();
             };
             let session = match sessions::authenticate(&app, &token).await {
@@ -185,10 +195,11 @@ async fn authorize_inner(
             if session.scope.require(call).is_err() {
                 return ApiError::new(ErrorCode::Forbidden).into_response();
             }
-            if !ratelimit::check_account(
+            if !ratelimit::check_session(
                 &app.limiter,
                 handler,
                 session.account.as_bytes().as_slice(),
+                session.device.as_bytes().as_slice(),
                 now_s,
             ) {
                 return ApiError::new(ErrorCode::RateLimited).into_response();

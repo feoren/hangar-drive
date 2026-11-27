@@ -59,6 +59,31 @@ export function array<T>(inner: Decoder<T>): Decoder<T[]> {
   };
 }
 
+/**
+ * A list of tagged items where a newer backend may add kinds: an item whose `tag` is a string
+ * outside `known` is left out, so one new kind does not fail the whole answer. Everything else
+ * (an item that is no object, has no string tag, or a known kind of the wrong shape) is still
+ * checked by `inner`.
+ */
+export function knownArray<T>(
+  tag: string,
+  known: readonly string[],
+  inner: Decoder<T>,
+): Decoder<T[]> {
+  return (value, path) => {
+    if (!Array.isArray(value)) throw new DecodeError(path, "array");
+    const out: T[] = [];
+    value.forEach((item: unknown, index) => {
+      if (isRecord(item)) {
+        const kind = item[tag];
+        if (typeof kind === "string" && !known.includes(kind)) return;
+      }
+      out.push(inner(item, `${path}[${String(index)}]`));
+    });
+    return out;
+  };
+}
+
 type Shape = Record<string, Decoder<unknown>>;
 type Decoded<S extends Shape> = { [K in keyof S]: ReturnType<S[K]> };
 

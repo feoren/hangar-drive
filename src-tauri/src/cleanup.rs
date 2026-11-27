@@ -187,6 +187,16 @@ mod tests {
                 open.pop().expect("${EndIf} closes an ${If}");
             } else if line.starts_with("!insertmacro CheckIfAppIsRunning ") {
                 // Closes a running app first; it decides nothing.
+            } else if line.starts_with("DeleteRegValue HKCU ")
+                && line.ends_with("\\StartupApproved\\Run\" \"${PRODUCTNAME}\"")
+            {
+                // The autostart's on/off value: removed on an uninstall, kept by an update.
+                let runs = open.iter().all(|(held, in_else)| held != in_else);
+                let update = vars.iter().any(|(n, v)| *n == "UpdateMode" && *v == "1");
+                assert_eq!(
+                    runs, !update,
+                    "the autostart value outside update mode only"
+                );
             } else if line.starts_with("ExecWait ") && line.contains(ARG) {
                 reached |= open.iter().all(|(held, in_else)| held != in_else);
             } else {

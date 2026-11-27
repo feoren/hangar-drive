@@ -77,6 +77,9 @@ pub struct Shell {
     pub dialog_open: AtomicBool,
     /// Counts clipboard writes, so a delayed clear never removes what was copied after it.
     pub clipboard_writes: Arc<AtomicU64>,
+    /// The code or link last copied, cleared from the clipboard before the app ends (security
+    /// review LOW 2).
+    pub clipboard_secret: crate::clipboard::HeldSecret,
     /// Folder places behind tokens (security review L2).
     pub places: Places,
 }
@@ -107,6 +110,7 @@ impl Shell {
             policy: Mutex::new(Policy::default()),
             dialog_open: AtomicBool::new(false),
             clipboard_writes: Arc::new(AtomicU64::new(0)),
+            clipboard_secret: crate::clipboard::HeldSecret::default(),
             places: Places::default(),
         }
     }
