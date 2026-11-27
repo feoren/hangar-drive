@@ -12,6 +12,10 @@ on:
       - "docs/**"
       - "LICENSE"
   pull_request:
+  # Weekly, so a newly published advisory for a locked dependency (cargo audit, cargo deny,
+  # pnpm audit) shows up even in a week without a push.
+  schedule:
+    - cron: "17 5 * * 1"
 
 # The check suite only reads, so a pull request from a fork gets no write access.
 permissions:
@@ -43,9 +47,11 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # The exact toolchain of rust-toolchain.toml, so CI checks with the compiler and lints of
+      # a local build.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
           components: rustfmt, clippy
 
       # Per the Tauri prerequisites for Linux: WebKitGTK 4.1 and companion libraries.
@@ -103,7 +109,7 @@ jobs:
       # job needs Cargo, but no build.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
 
       - name: Python tools and third-party notices
         run: |
@@ -169,7 +175,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
@@ -178,9 +184,10 @@ jobs:
       - name: Rust dependencies
         run: cargo audit
 
-      # Reads pnpm-lock.yaml only; nothing is installed or run.
+      # Reads pnpm-lock.yaml only; nothing is installed or run. The development dependencies are
+      # audited too: the build tools run on the machine that builds the release.
       - name: npm dependencies
-        run: pnpm audit --prod
+        run: pnpm audit
 
   # The license policy of ADR 0001 section 8 (deny.toml), the allowed crate sources and the RustSec
   # advisories with the reasoned exceptions of deny.toml (security review I2). cargo-deny is
@@ -195,7 +202,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: 1.100.0
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
