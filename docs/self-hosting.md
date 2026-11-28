@@ -9,7 +9,8 @@ backups, updates and the server key number.
 
 ## Requirements
 
-- A Linux host with Docker and Docker Compose 2.24 or newer.
+- A Linux host (x86-64 or ARM64) with Docker and Docker Compose 2.24 or newer, or a NAS with a
+  container app ([On a NAS](#on-a-nas-bind-mount-and-your-own-user)).
 - A domain name pointing to the host, for TLS with a public certificate (recommended), or a
   self-signed certificate that devices pin when they pair.
 - Disk space: see [Disk sizing](#disk-sizing). Retention keeps old versions, so plan for more
@@ -40,7 +41,8 @@ backups, updates and the server key number.
 
    The port is bound to `127.0.0.1` only. Devices never talk to it directly.
 
-3. Put a reverse proxy with TLS in front of it ([Caddy](#caddy) or [nginx](#nginx)).
+3. Put a reverse proxy with TLS in front of it ([Caddy](#caddy), [nginx](#nginx) or
+   [Nginx Proxy Manager](#nginx-proxy-manager)).
 
 4. Create the first invite (with the address of step 1 in `HANGAR_DRIVE_PUBLIC_URL`; after
    changing it, restart with `docker compose up -d`):
@@ -234,11 +236,14 @@ so with this setting only the proxy may reach the published port: keep it bound 
 
 ### Nginx Proxy Manager
 
-Nginx Proxy Manager (NPM) runs in a container of its own, so it cannot reach the server's port,
-which `docker-compose.yml` publishes on the host's `127.0.0.1` only. Attach the NPM container
-to the server's Compose network with a fixed address instead, and let it talk to the server
-directly. The network is named after the folder of `docker-compose.yml`, usually
-`hangar-drive_drive`; `docker network ls` shows it. In NPM's own compose file:
+Nginx Proxy Manager (NPM) runs in a container of its own. It can reach the server in two ways;
+choose one and trust exactly the address the server sees for it.
+
+**A. A shared network (recommended when you can edit NPM's compose file).** The port stays
+unpublished or bound to `127.0.0.1`, and NPM talks to the server directly. Attach the NPM
+container to the server's Compose network with a fixed address. The network is named after the
+folder of `docker-compose.yml`, usually `hangar-drive_drive`; `docker network ls` shows it. In
+NPM's own compose file:
 
 ```yaml
 services:
@@ -257,25 +262,81 @@ networks:
 ```
 
 Then set `HANGAR_DRIVE_TRUSTED_PROXIES: 172.30.250.20` in the `server` service and run
-`docker compose up -d` there. If NPM runs with `network_mode: host` instead and forwards to
-`127.0.0.1:8080`, it arrives from the network's gateway like an nginx on the host: trust
-`172.30.250.1`. Not sure which address NPM arrives from? Leave the setting empty, make one
-request through NPM and look for the `operator warning` in `docker compose logs server`: it
-names the local address that sent `X-Forwarded-For` without being trusted. Trust that exact
-address, never a range.
+`docker compose up -d` there. Forward host in NPM: `server`, port `8080`.
+
+**B. The published port (a NAS whose container app cannot change NPM's network).** Publish the
+port on the host (`ports: ["8095:8095"]` with `HANGAR_DRIVE_PORT: "8095"`) and let NPM forward to
+the host's LAN address on that port. Docker passes such a connection from NPM's network into the
+server's network and rewrites its source to the gateway of the server's network, so the server
+sees every request from NPM (and from any other container or process on the host) as coming from
+that gateway, while devices in the LAN that open the port directly keep their own addresses.
+Give the server's network a fixed range, so its gateway stays the same when the project is
+deployed again, and trust that gateway:
+
+```yaml
+services:
+  server:
+    environment:
+      HANGAR_DRIVE_TRUSTED_PROXIES: 172.22.0.1
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+          gateway: 172.22.0.1
+```
+
+The same holds when NPM runs with host networking. Be clear about what this trusts: **every
+process of the host and every container on it** arrives from that gateway and may then set
+`X-Forwarded-For`, that is, choose its own rate limit key; a trusted address also gets a
+connection limit of its own, half of the server's 4096 slots, instead of the per client limit.
+Run nothing on the host you would not trust with that.
+
+Bind the published port to one IPv4 address instead of every interface, for example
+`"0.0.0.0:8095:8095"` rather than `"8095:8095"`. The short form also listens on IPv6 (`[::]`),
+and depending on Docker's configuration such connections pass through `docker-proxy` and may
+reach the server from the gateway address as well, trusted like NPM. Stricter still is
+`"172.22.0.1:8095:8095"`, the gateway itself, with `172.22.0.1` as NPM's forward host: the
+port is then no longer open in the LAN at all.
+
+Check it once from another machine in the LAN, over IPv4 and over IPv6 if the host has an IPv6
+address:
+
+```sh
+curl -4 -H 'X-Forwarded-For: 203.0.113.9' http://<host LAN address>:8095/api/v1/health
+curl -6 -H 'X-Forwarded-For: 203.0.113.9' 'http://[<host IPv6 address>]:8095/api/v1/health'
+```
+
+Each answered request from a device of the LAN must leave an `operator warning: a local address
+sends X-Forwarded-For` in the server's log (once per address); if it does not, that connection
+arrived as the gateway and can forge its client address, so bind the port more narrowly. A
+refused connection is fine.
+
+The port is reachable as plain HTTP wherever it is bound. Never use it from a device: only the
+sign-in proof is signed and bound to the public URL; every call after it carries a bearer token,
+which plain HTTP would expose to anyone on the way. The app therefore allows `http` only for
+`localhost`.
+
+Not sure which address NPM arrives from? Leave the setting empty, make one request through NPM
+and look for the `operator warning` in the server's log: it names the local address that sent
+`X-Forwarded-For` without being trusted. Trust that exact address, never a range.
 
 The proxy host in NPM:
 
-- **Details:** scheme `http`, forward host `server` (or `127.0.0.1` with host networking), port
-  `8080`. Turn on *Websockets Support* (it sets HTTP/1.1 towards the server); leave *Cache
-  Assets* off.
-- **SSL:** a Let's Encrypt certificate, *Force SSL*, *HTTP/2 Support* and *HSTS Enabled*.
+- **Details:** domain `drive.example.org`, scheme `http`, forward host as above (`server`, or
+  the host's LAN address for B), port `8080` (or the published port). Turn on *Websockets
+  Support*; leave *Cache Assets* off.
+- **SSL:** a Let's Encrypt certificate, *Force SSL*, *HTTP/2 Support* and *HSTS Enabled*;
+  leave *HSTS Subdomains* off unless every host under your domain is served over HTTPS, since
+  it binds all of them. Behind a proxy the server sends no HSTS of its own (only when it
+  terminates TLS itself), so NPM's setting is the one that counts.
 - **Advanced:** the following custom configuration. NPM puts it into the proxy host's `server`
-  block next to its own `location /`, so it adds limits for every route and one `location` for
-  the event stream; use the same forward host and port as in *Details*.
+  block next to its own `location /`, which inherits every line, so it needs no `location` and
+  no forward address of its own.
 
 ```nginx
-# 5 MiB at least for chunks; 100 MiB for large directory nodes and commits.
+# The largest request is a commit of 80 MiB (objects are at most about 34 MiB): above the
+# server's limits, so the server and not the proxy refuses and names the reason.
 client_max_body_size 100m;
 # Slow clients: headers within 10 s, no pause longer than 30 s in a body.
 client_header_timeout 10s;
@@ -283,36 +344,62 @@ client_body_timeout 30s;
 # Uploads go to the server as they arrive. With buffering, NPM first writes every upload to
 # its own disk and only then sends it on: twice the disk writes and a stalled sync.
 proxy_request_buffering off;
-# A large commit is checked set by set before it answers, and a download of a large object
-# waits on the disk: more than nginx's default of 60 s.
+# Replies stay buffered in memory but are never spooled to a temporary file on the proxy's
+# disk (every 4 MiB chunk would be). Buffering in memory keeps downloads fast; the event
+# stream is never buffered, since the server sends `X-Accel-Buffering: no` with it.
+proxy_max_temp_file_size 0;
+# NPM's default timeouts are 90 s; a large commit is checked before it answers, a download
+# waits on the disk, and the event stream sends a keepalive every 25 s.
 proxy_read_timeout 300s;
 proxy_send_timeout 300s;
-
-location /api/v1/account/events {
-    proxy_pass http://server:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header Connection "";
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    # Server-sent events: no buffering, and longer than the 25 s keepalive.
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_read_timeout 1h;
-}
+proxy_connect_timeout 10s;
+# Encrypted objects do not compress, and the server compresses nothing either.
+gzip off;
+# No access log: it would keep every client address with the request paths.
+access_log off;
 ```
 
-NPM's generated `location /` appends the client address to `X-Forwarded-For` itself; the
-generated files in `/data/nginx/proxy_host/` inside the NPM container show what your version
-does. NPM has no setting for connections per client address; as with Caddy, put a firewall
-rule in front of port 443 if you expect abuse.
+Do not add `proxy_http_version` here: it is NPM's default already, and with *Websockets
+Support* NPM sets it in the same `server` block, so nginx would refuse the duplicate and NPM
+would take the host offline. NPM's generated `location /` sets `Host` and appends the client
+address to `X-Forwarded-For` itself; the generated files in `/data/nginx/proxy_host/` inside the
+NPM container show what your version does. NPM has no setting for connections per client
+address; as with Caddy, put a firewall rule in front of port 443 if you expect abuse.
 
 **Slow uploads?** Every request leaves one log line with the route and the time the server
 spent on it in milliseconds, for example
 `docker compose logs server | grep 'PUT' | grep 'objects/{id}'`. If these `ms` values stay
 small while a device uploads slowly, the time goes elsewhere: request buffering in the proxy,
 the network, or the device. If they are large, the server waits on its disk: every stored
-object is flushed to disk before it is confirmed, so keep the data folder (the `drive-data`
-volume) on an SSD, not on a network share or a spinning disk.
+object is flushed to disk before it is confirmed (the file, its directory and the database
+entry), so each small upload costs three disk flushes. An SSD does that in a few
+milliseconds; a spinning disk needs about 10 to 20 ms per flush, so there a single upload takes
+30 ms or more, and uploads in parallel help only partly. Writes to the database take turns in
+the order they arrive, so no upload waits longer than the ones before it.
+
+### On a NAS (bind mount and your own user)
+
+NAS container apps (UGOS, DSM, QNAP and others) usually take a Compose file pasted into the web
+interface and keep the data in a shared folder, not in a Docker volume. Three things differ from
+the default `docker-compose.yml`:
+
+- **Data folder:** mount the folder instead of the volume, for example
+  `- /volume1/drive:/data`. Create the folder in the NAS's file manager first.
+- **User:** the image runs as user `65532` by default. A folder made in the file manager belongs
+  to a NAS user instead, so run the container as that user with `user: "<uid>:<gid>"` (for
+  example `user: "1000:100"`), or give the folder to `65532`. If the two do not match, the server
+  stops at once and its log says whose the folder is and which user it runs as. Do not combine
+  `user:` with a named volume: Docker gives a new volume to the image's user, and the server
+  could not write to it.
+- **No terminal:** the first invite link appears in the container log
+  ([Install](#install-in-five-steps), step 4), and so does what the server runs with: right after
+  `server ready` (public URL, trusted proxies, limits) a line `data` with the number of accounts
+  and the free disk space.
+
+Everything else stays as in `docker-compose.yml`: `read_only: true`, `cap_drop: [ALL]`,
+`no-new-privileges`, the memory and process limits, the log rotation and
+`stop_grace_period`. For a reverse proxy on the same NAS see
+[Nginx Proxy Manager](#nginx-proxy-manager), variant B.
 
 ### TLS in the server instead of a proxy
 
@@ -367,15 +454,16 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | `HANGAR_DRIVE_DISK_RESERVE` | `1GiB` | Below this much free disk space, uploads are refused |
 | `HANGAR_DRIVE_TRUSTED_PROXIES` | empty | Comma-separated addresses of reverse proxies (CIDR ranges are accepted; prefer the exact address); must be empty with TLS in the server |
 | `HANGAR_DRIVE_RECORD_CAP` | `64MiB` | Bytes of encrypted account records (folder keys, folder list, device names) per account (R) |
-| `HANGAR_DRIVE_HEAVY_REQUESTS` | `4` | Commits and record writes worked on at once; their bodies are held in memory |
+| `HANGAR_DRIVE_HEAVY_REQUESTS` | `4` | Commits and record writes worked on at once, from `1` to `4`; their bodies are held in memory, and a waiting commit holds one of the server's 8 database connections, so at most half of them go to commits |
 | `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` | `8` | Uploads one account may have in flight at once |
 | `HANGAR_DRIVE_UPLOADS_PER_MINUTE` | `1200` | Uploads one account may start per minute, over all its devices, from `60` to `12000`. Every file is at least two uploads, so the default allows about 10 small files a second; raise it if a first sync of many small files is too slow and the disk keeps up. A device's limit for all its calls grows with it. High values only make sense with few accounts you trust: every upload goes through the one database write path, so one account at a high rate can slow the uploads of all others |
-| `HANGAR_DRIVE_CONNECTIONS_PER_IP` | `64` | Open connections per client address; while the server's connection slots run short, a client network (IPv4 /24, IPv6 /48) gets four times as many, at most 1024; trusted proxies are exempt |
+| `HANGAR_DRIVE_CONNECTIONS_PER_IP` | `64` | Open connections per client address; while the server's connection slots run short, a client network (IPv4 /24, IPv6 /48) gets four times as many, at most 1024; a trusted proxy may hold 2048 (half of the server's 4096 slots) and has no network cap |
 | `HANGAR_DRIVE_TLS_CERT`, `HANGAR_DRIVE_TLS_KEY` | empty | PEM files for TLS in the server |
 | `HANGAR_DRIVE_GC_INTERVAL_MINUTES` | `60` | Minutes between two garbage collection steps |
 | `HANGAR_DRIVE_SHUTDOWN_GRACE_SECS` | `10` | How long a shutdown waits for open requests |
 | `HANGAR_DRIVE_ANOMALY_MIN_OBJECTS` | `500` | Replaced or dropped file objects within an hour that always count as a burst; a smaller folder needs `HANGAR_DRIVE_ANOMALY_PERCENT` of its file objects, at least 20 |
 | `HANGAR_DRIVE_ANOMALY_PERCENT` | `30` | Share of a folder's data (and of its file objects) a burst must replace or drop; retiring a folder counts as dropping all of it |
+| `TOKIO_WORKER_THREADS` | one per CPU the container may use | Threads that serve requests; the default follows a CPU limit (`cpus:` in Compose). File work runs on at most 64 further threads, well within the process limit of `docker-compose.yml` |
 | `RUST_LOG` | `info` | Log level |
 | `SQLITE_TMPDIR` | `/data/tmp` in the image | Where SQLite writes large temporary tables and sorts; the image's root file system is read-only, so it points into the data volume. The server creates `tmp` in the data folder and empties it at every start |
 
@@ -544,6 +632,20 @@ Changes made after the backup survive on the devices that had them.
 git pull
 docker compose up -d --build
 ```
+
+To build the image for another machine, for example an ARM64 NAS, from an x86-64 one (both
+platforms are cross-compiled, nothing runs under emulation):
+
+```sh
+docker buildx build -f server/Dockerfile --platform linux/amd64,linux/arm64 \
+  --build-arg VERSION=<version> --build-arg REVISION=$(git rev-parse HEAD) \
+  --build-arg SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+  -t <registry>/hangar-drive-server:<version> --push .
+```
+
+`VERSION` and `REVISION` go into the image's labels; `SOURCE_DATE_EPOCH` makes BuildKit date
+the image by the last commit instead of the build time, so the same commit gives the same image
+metadata.
 
 Database migrations run at the start. Keep a backup from before the update. App and server
 are released together; the health endpoint reports the protocol version.

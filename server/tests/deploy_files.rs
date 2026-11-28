@@ -178,6 +178,8 @@ fn compose_rotates_its_logs_and_names_the_upload_rate() {
 
 #[test]
 fn the_nginx_proxy_manager_example_streams_uploads_and_events() {
+    // Throughput review of the server image: NPM's generated `location /` inherits the custom
+    // configuration, so the example needs no location and no forward address of its own.
     let doc = repo_file("docs/self-hosting.md");
     let npm = &doc[doc
         .find("### Nginx Proxy Manager")
@@ -188,25 +190,46 @@ fn the_nginx_proxy_manager_example_streams_uploads_and_events() {
         "client_header_timeout 10s;",
         "client_body_timeout 30s;",
         "proxy_request_buffering off;",
+        "proxy_max_temp_file_size 0;",
         "proxy_read_timeout 300s;",
+        "proxy_send_timeout 300s;",
+        "gzip off;",
+        "access_log off;",
     ] {
         assert!(advanced.contains(setting), "{setting}");
     }
-    let sse = &advanced[advanced
-        .find("location /api/v1/account/events")
-        .expect("the SSE location")..];
-    for setting in [
-        "proxy_buffering off;",
-        "proxy_set_header Host $host;",
-        "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-    ] {
-        assert!(sse.contains(setting), "{setting}");
-    }
     assert!(
-        !advanced.contains("location / "),
-        "NPM generates its own `location /`"
+        !advanced.contains("location"),
+        "NPM generates its own `location /`, which inherits these lines"
     );
-    // One exact address is trusted, never a range.
+    // NPM sets it in the same `server` block with Websockets Support: nginx refuses a duplicate
+    // and NPM takes the host offline.
+    assert!(!advanced.contains("proxy_http_version"));
+    // Replies stay buffered in memory (faster downloads, measured); the event stream is not
+    // buffered because the server says so on it.
+    assert!(!advanced.contains("proxy_buffering off"));
+    // The server's largest body (a commit) fits below the proxy's limit.
+    const { assert!(hangar_drive_server::http::extract::COMMIT_JSON < 100 << 20) };
+    // One exact address is trusted, never a range: NPM's fixed address on a shared network, or
+    // the gateway of the server's own network behind a published port.
     assert!(npm.contains("ipv4_address: 172.30.250.20"));
     assert!(npm.contains("HANGAR_DRIVE_TRUSTED_PROXIES: 172.30.250.20"));
+    assert!(npm.contains("HANGAR_DRIVE_TRUSTED_PROXIES: 172.22.0.1"));
+    assert!(npm.contains("gateway: 172.22.0.1"));
+}
+
+#[test]
+fn the_process_limit_leaves_room_for_every_thread_the_server_starts() {
+    // The blocking pool is capped below `pids_limit`, beside the database's connection threads
+    // and the request workers of a host with many cores.
+    let compose = repo_file("docker-compose.yml");
+    let limit: usize = active_lines(&compose)
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("pids_limit: "))
+        .expect("pids_limit")
+        .parse()
+        .unwrap();
+    let workers = 64;
+    let database = hangar_drive_server::db::MAX_CONNECTIONS as usize;
+    assert!(hangar_drive_server::MAX_BLOCKING_THREADS + database + workers + 16 <= limit);
 }

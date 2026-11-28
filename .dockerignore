@@ -1,10 +1,17 @@
 # Allowlist: only what the server image is built from enters the build context. Everything else
-# (local configuration, build output, node_modules, documentation) stays out.
+# (local configuration, build output, node_modules, documentation) stays out. Of the app and the
+# sync crate only the manifests come in, which Cargo needs to read the workspace: a change to
+# their code does not touch the image's build cache (server/Dockerfile).
 *
 !Cargo.toml
 !Cargo.lock
-!crates/
-!server/
+!crates/hangar-drive-protocol/Cargo.toml
+!crates/hangar-drive-protocol/src/
+!crates/hangar-drive-crypto/Cargo.toml
+!crates/hangar-drive-crypto/src/
+!crates/hangar-drive-sync/Cargo.toml
+!server/Cargo.toml
+!server/src/
+!server/migrations/
 !src-tauri/Cargo.toml
-!src-tauri/src/
 **/target/

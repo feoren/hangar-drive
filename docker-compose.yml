@@ -34,8 +34,8 @@ services:
       HANGAR_DRIVE_DEVICE_BUDGET: ${HANGAR_DRIVE_DEVICE_BUDGET:-}
       HANGAR_DRIVE_DISK_RESERVE: ${HANGAR_DRIVE_DISK_RESERVE:-1GiB}
       HANGAR_DRIVE_RECORD_CAP: ${HANGAR_DRIVE_RECORD_CAP:-}
-      # Commits and record writes worked on at once; their bodies are held in memory (up to
-      # 80 MiB each), so this and mem_limit below go together.
+      # Commits and record writes worked on at once, 1 to 4; their bodies are held in memory
+      # (up to 80 MiB each), so this and mem_limit below go together.
       HANGAR_DRIVE_HEAVY_REQUESTS: ${HANGAR_DRIVE_HEAVY_REQUESTS:-4}
       # Uploads per account and minute (60 to 12000). Each file is at least two uploads, so
       # 1200 is about 10 small files a second; raise it for a faster first sync of many small
@@ -49,6 +49,10 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - drive-data:/data
+      # On a NAS, a folder instead of the volume, together with the folder owner's user and
+      # group (docs/self-hosting.md, "On a NAS"):
+      # - /volume1/drive:/data
+    # user: "1000:100"
     ports:
       - "127.0.0.1:${HANGAR_DRIVE_HOST_PORT:-8080}:8080"
     networks: [drive]
@@ -61,6 +65,7 @@ services:
     # 1 GiB covers HANGAR_DRIVE_HEAVY_REQUESTS (4) commits of the largest size, the database
     # page cache (16 MiB per connection, 8 connections: 128 MiB at most), a 256 KiB write
     # buffer per upload in flight and the rest. Raise it together with the heavy requests.
+    # The server runs about a dozen threads plus one per CPU and at most 64 for file work.
     mem_limit: 1g
     pids_limit: 256
     # docker stop sends SIGTERM; the server ends its event streams, finishes open requests
