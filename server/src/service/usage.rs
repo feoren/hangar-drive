@@ -328,6 +328,33 @@ pub async fn shift_account_live(
     Ok(())
 }
 
+/// Raises the account's count of folder removals (migration 0006), in the transaction that
+/// deletes folders of the account. An upload in flight compares it before and after putting its
+/// file in place (`service::objects::store`).
+pub async fn count_folder_removal(
+    conn: &mut sqlx::SqliteConnection,
+    account_pk: i64,
+) -> ApiResult<()> {
+    sqlx::query("UPDATE accounts SET folder_removals = folder_removals + 1 WHERE pk = ?")
+        .bind(account_pk)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The account's count of folder removals; `None` once the account is gone.
+pub async fn folder_removals(
+    conn: &mut sqlx::SqliteConnection,
+    account_pk: i64,
+) -> ApiResult<Option<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT folder_removals FROM accounts WHERE pk = ?")
+            .bind(account_pk)
+            .fetch_optional(&mut *conn)
+            .await?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

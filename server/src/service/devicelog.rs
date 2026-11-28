@@ -103,8 +103,13 @@ pub async fn append(
         hangar_drive_protocol::api::SessionScope::Recovery { .. }
     );
     let throttled = Throttle::of(&batch.shape, state.rotation_due(), recovery);
-    if !throttled.admit(&app.limiter, &account.id, app.now_ms() / 1000) {
-        return Err(ErrorCode::RateLimited.into());
+    let now_s = app.now_ms() / 1000;
+    if !throttled.admit(&app.limiter, &account.id, now_s) {
+        return Err(ApiError::rate_limited(throttled.wait_s(
+            &app.limiter,
+            &account.id,
+            now_s,
+        )));
     }
     if recovery {
         // The one append of a recovery session, recorded in the same transaction.
@@ -229,6 +234,26 @@ impl Throttle {
         }
     }
 
+    /// After a refused [`Throttle::admit`]: seconds until every limit that refused it has room
+    /// again, for `Retry-After`.
+    fn wait_s(self, limiter: &RateLimiter, account: &AccountId, now_s: u64) -> Option<u64> {
+        let key = account.as_bytes().as_slice();
+        let wait = |scope| {
+            limiter
+                .blocked(scope, key, now_s)
+                .err()
+                .map(|d| d.retry_after_s)
+        };
+        match self {
+            Throttle::Free => None,
+            Throttle::Append => {
+                let day = day_adds().wait_s(account, now_s);
+                day.max(wait(Scope::LogAppendAccount))
+            }
+            Throttle::Rotation => wait(Scope::LogAppendAccount).max(wait(Scope::LogRotateAccount)),
+        }
+    }
+
     /// Counts the append; `false` when a limit is used up. Nothing is counted then, so a
     /// refused rotation does not use up the account's appends.
     fn admit(self, limiter: &RateLimiter, account: &AccountId, now_s: u64) -> bool {
@@ -285,6 +310,15 @@ impl DayAdds {
 
     fn exceeded(&mut self, account: &AccountId, now_s: u64) -> bool {
         self.recent(account, now_s) >= ADDS_PER_DAY
+    }
+
+    /// Seconds until the oldest add of a full day leaves it.
+    fn wait_s(&mut self, account: &AccountId, now_s: u64) -> Option<u64> {
+        if !self.exceeded(account, now_s) {
+            return None;
+        }
+        let oldest = self.0.get(account)?.front()?;
+        Some(oldest.saturating_add(DAY_S).saturating_sub(now_s).max(1))
     }
 
     fn record(&mut self, account: AccountId, now_s: u64) {
@@ -398,6 +432,7 @@ mod tests {
         let account = AccountId::from_bytes([0x71; 16]);
         assert!(Throttle::Rotation.admit(&limiter, &account, 0));
         assert!(!Throttle::Rotation.admit(&limiter, &account, 1));
+        assert_eq!(Throttle::Rotation.wait_s(&limiter, &account, 1), Some(3599));
         let other = AccountId::from_bytes([0x72; 16]);
         assert!(Throttle::Rotation.admit(&limiter, &other, 1), "per account");
         // Adds: the day budget binds before the hourly appends do.
@@ -426,6 +461,11 @@ mod tests {
         let late = (ADDS_PER_DAY as u64) * 3600;
         assert!(!Throttle::Append.admit(&limiter, &account, late));
         assert!(!Throttle::Append.admit(&limiter, &account, late + 1));
+        assert_eq!(
+            Throttle::Append.wait_s(&limiter, &account, late + 1),
+            Some(DAY_S - late - 1),
+            "until the first add of the day leaves it"
+        );
         // The first add of the day leaves the window a day after it.
         assert!(Throttle::Append.admit(&limiter, &account, DAY_S));
         assert!(!Throttle::Append.admit(&limiter, &account, DAY_S + 1));

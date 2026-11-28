@@ -164,8 +164,8 @@ async fn authorize_inner(
         .into_response(),
         None => ApiError::new(ErrorCode::Forbidden).into_response(),
         Some((Access::Public, handler)) => {
-            if !ratelimit::check_route(&app.limiter, handler, &keys, now_s) {
-                return ApiError::new(ErrorCode::RateLimited).into_response();
+            if let Err(denied) = ratelimit::check_route(&app.limiter, handler, &keys, now_s) {
+                return ApiError::from(denied).into_response();
             }
             next.run(request).await
         }
@@ -182,8 +182,8 @@ async fn authorize_inner(
                 }
                 _ => ratelimit::check_address(&app.limiter, handler, &keys, true, now_s),
             };
-            if !allowed {
-                return ApiError::new(ErrorCode::RateLimited).into_response();
+            if let Err(denied) = allowed {
+                return ApiError::from(denied).into_response();
             }
             let Some(token) = token else {
                 return ApiError::new(ErrorCode::Unauthorized).into_response();
@@ -195,14 +195,14 @@ async fn authorize_inner(
             if session.scope.require(call).is_err() {
                 return ApiError::new(ErrorCode::Forbidden).into_response();
             }
-            if !ratelimit::check_session(
+            if let Err(denied) = ratelimit::check_session(
                 &app.limiter,
                 handler,
                 session.account.as_bytes().as_slice(),
                 session.device.as_bytes().as_slice(),
                 now_s,
             ) {
-                return ApiError::new(ErrorCode::RateLimited).into_response();
+                return ApiError::from(denied).into_response();
             }
             request.extensions_mut().insert(session);
             next.run(request).await

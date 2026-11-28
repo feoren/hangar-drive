@@ -232,6 +232,88 @@ comes from the gateway of the Compose network `drive`, `172.30.250.1`. Uncomment
 so with this setting only the proxy may reach the published port: keep it bound to
 `127.0.0.1` and do not run other services on the host that connect to it.
 
+### Nginx Proxy Manager
+
+Nginx Proxy Manager (NPM) runs in a container of its own, so it cannot reach the server's port,
+which `docker-compose.yml` publishes on the host's `127.0.0.1` only. Attach the NPM container
+to the server's Compose network with a fixed address instead, and let it talk to the server
+directly. The network is named after the folder of `docker-compose.yml`, usually
+`hangar-drive_drive`; `docker network ls` shows it. In NPM's own compose file:
+
+```yaml
+services:
+  npm:
+    # ... your existing NPM service ...
+    networks:
+      default:
+      drive:
+        # One fixed address on the server's network: the only one the server trusts.
+        ipv4_address: 172.30.250.20
+
+networks:
+  drive:
+    external: true
+    name: hangar-drive_drive
+```
+
+Then set `HANGAR_DRIVE_TRUSTED_PROXIES: 172.30.250.20` in the `server` service and run
+`docker compose up -d` there. If NPM runs with `network_mode: host` instead and forwards to
+`127.0.0.1:8080`, it arrives from the network's gateway like an nginx on the host: trust
+`172.30.250.1`. Not sure which address NPM arrives from? Leave the setting empty, make one
+request through NPM and look for the `operator warning` in `docker compose logs server`: it
+names the local address that sent `X-Forwarded-For` without being trusted. Trust that exact
+address, never a range.
+
+The proxy host in NPM:
+
+- **Details:** scheme `http`, forward host `server` (or `127.0.0.1` with host networking), port
+  `8080`. Turn on *Websockets Support* (it sets HTTP/1.1 towards the server); leave *Cache
+  Assets* off.
+- **SSL:** a Let's Encrypt certificate, *Force SSL*, *HTTP/2 Support* and *HSTS Enabled*.
+- **Advanced:** the following custom configuration. NPM puts it into the proxy host's `server`
+  block next to its own `location /`, so it adds limits for every route and one `location` for
+  the event stream; use the same forward host and port as in *Details*.
+
+```nginx
+# 5 MiB at least for chunks; 100 MiB for large directory nodes and commits.
+client_max_body_size 100m;
+# Slow clients: headers within 10 s, no pause longer than 30 s in a body.
+client_header_timeout 10s;
+client_body_timeout 30s;
+# Uploads go to the server as they arrive. With buffering, NPM first writes every upload to
+# its own disk and only then sends it on: twice the disk writes and a stalled sync.
+proxy_request_buffering off;
+# A large commit is checked set by set before it answers, and a download of a large object
+# waits on the disk: more than nginx's default of 60 s.
+proxy_read_timeout 300s;
+proxy_send_timeout 300s;
+
+location /api/v1/account/events {
+    proxy_pass http://server:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # Server-sent events: no buffering, and longer than the 25 s keepalive.
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+NPM's generated `location /` appends the client address to `X-Forwarded-For` itself; the
+generated files in `/data/nginx/proxy_host/` inside the NPM container show what your version
+does. NPM has no setting for connections per client address; as with Caddy, put a firewall
+rule in front of port 443 if you expect abuse.
+
+**Slow uploads?** Every request leaves one log line with the route and the time the server
+spent on it in milliseconds, for example
+`docker compose logs server | grep 'PUT' | grep 'objects/{id}'`. If these `ms` values stay
+small while a device uploads slowly, the time goes elsewhere: request buffering in the proxy,
+the network, or the device. If they are large, the server waits on its disk: every stored
+object is flushed to disk before it is confirmed, so keep the data folder (the `drive-data`
+volume) on an SSD, not on a network share or a spinning disk.
+
 ### TLS in the server instead of a proxy
 
 The server can terminate TLS 1.3 itself. Mount the certificate chain and key (PEM) into the
@@ -287,6 +369,7 @@ Every setting is an environment variable. Sizes take bytes or a binary suffix (`
 | `HANGAR_DRIVE_RECORD_CAP` | `64MiB` | Bytes of encrypted account records (folder keys, folder list, device names) per account (R) |
 | `HANGAR_DRIVE_HEAVY_REQUESTS` | `4` | Commits and record writes worked on at once; their bodies are held in memory |
 | `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` | `8` | Uploads one account may have in flight at once |
+| `HANGAR_DRIVE_UPLOADS_PER_MINUTE` | `1200` | Uploads one account may start per minute, over all its devices, from `60` to `12000`. Every file is at least two uploads, so the default allows about 10 small files a second; raise it if a first sync of many small files is too slow and the disk keeps up. A device's limit for all its calls grows with it. High values only make sense with few accounts you trust: every upload goes through the one database write path, so one account at a high rate can slow the uploads of all others |
 | `HANGAR_DRIVE_CONNECTIONS_PER_IP` | `64` | Open connections per client address; while the server's connection slots run short, a client network (IPv4 /24, IPv6 /48) gets four times as many, at most 1024; trusted proxies are exempt |
 | `HANGAR_DRIVE_TLS_CERT`, `HANGAR_DRIVE_TLS_KEY` | empty | PEM files for TLS in the server |
 | `HANGAR_DRIVE_GC_INTERVAL_MINUTES` | `60` | Minutes between two garbage collection steps |
@@ -329,6 +412,9 @@ the database busy for the others with commits that never pass. While another com
 write waits for one of the `HANGAR_DRIVE_HEAVY_REQUESTS` slots, a large body that arrives slower
 than 64 KiB/s on average is cut off and its device tries again; without such a wait a slow
 connection only has to finish within two minutes.
+
+A refused call answers `429` with `Retry-After` set to the seconds until the limit that refused
+it has room again, so devices wait exactly as long as needed.
 
 ## Disk sizing
 
@@ -465,5 +551,10 @@ are released together; the health endpoint reports the protocol version.
 ## Logs
 
 `docker compose logs server` shows one line per request with the route pattern, the status and
-the time, never a path with IDs, a token or any content. Lines with `operator warning` need your
-attention: a quota, a budget, a pin or the disk reserve.
+the time in milliseconds (`ms`), never a path with IDs, a token or any content. Lines with
+`operator warning` need your attention: a quota, a budget, a pin, the disk reserve or an
+untrusted proxy. The logging settings in `docker-compose.yml` keep at most five log files of
+10 MB each.
+
+An hour after every start, and then once a day, the server removes object files that no
+database entry names (left by a crash between storing a file and recording it).

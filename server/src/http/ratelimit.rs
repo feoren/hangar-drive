@@ -36,6 +36,13 @@
 //! **Limits outside the authorization layer:** refused commits ([`commit_refused`]) and device
 //! log appends ([`Scope::LogAppendAccount`], [`Scope::LogRotateAccount`]) are counted by their
 //! services, which know the outcome or the shape of the call.
+//!
+//! **Uploads per minute** are the operator's choice (`HANGAR_DRIVE_UPLOADS_PER_MINUTE`,
+//! [`RateLimiter::with_uploads_per_minute`]); the per token and per device call limits grow with
+//! them, so one device can use the configured upload rate and still make its other calls.
+//!
+//! **Retry-After:** a refusal carries the seconds until the window that refused it ends
+//! ([`Denied`]), so a client waits exactly as long as needed instead of a flat minute.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -43,7 +50,37 @@ use std::sync::Mutex;
 use hangar_drive_crypto::{Entropy, OsEntropy};
 use sha2::{Digest, Sha256};
 
+use crate::config::DEFAULT_UPLOADS_PER_MINUTE;
+use crate::error::ApiError;
 use crate::http::access::Handler;
+
+/// Calls per minute a token or device has beyond its uploads: the `missing` queries, commits,
+/// feed pages and record calls around them. With the default upload limit this gives the
+/// 3000 calls a minute the limits always had.
+const CALLS_BESIDE_UPLOADS: u32 = 1800;
+
+/// A refused hit: the seconds until the window that refused it ends (at least 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Denied {
+    pub retry_after_s: u64,
+}
+
+impl Denied {
+    fn until(end_s: u64, now_s: u64) -> Self {
+        Self {
+            retry_after_s: end_s.saturating_sub(now_s).max(1),
+        }
+    }
+}
+
+impl From<Denied> for ApiError {
+    fn from(denied: Denied) -> Self {
+        ApiError::rate_limited(Some(denied.retry_after_s))
+    }
+}
+
+/// The outcome of a limit check.
+pub type Verdict = Result<(), Denied>;
 
 /// Keys remembered per scope.
 const MAX_KEYS: usize = 100_000;
@@ -142,9 +179,10 @@ impl Scope {
                 limit: 240,
                 window_s: 60,
             },
-            // A first upload of many small files: 20 objects a second, sustained.
+            // A first upload of many small files: 20 objects a second, sustained, by default;
+            // the operator may change it ([`RateLimiter::with_uploads_per_minute`]).
             Scope::UploadAccount => Rule {
-                limit: 1200,
+                limit: DEFAULT_UPLOADS_PER_MINUTE,
                 window_s: 60,
             },
             // Above the upload limit with room for the calls around the uploads (missing,
@@ -158,9 +196,10 @@ impl Scope {
                 limit: 12000,
                 window_s: 60,
             },
-            // One token of an honest device stays below its device's limit.
+            // One token of an honest device stays below its device's limit. Uploads plus the
+            // calls around them; a higher upload limit raises it ([`RateLimiter::rule`]).
             Scope::CallToken | Scope::CallDevice => Rule {
-                limit: 3000,
+                limit: DEFAULT_UPLOADS_PER_MINUTE + CALLS_BESIDE_UPLOADS,
                 window_s: 60,
             },
             // A device commits after a batch of changes, a few times a minute at most.
@@ -279,11 +318,22 @@ pub struct RateLimiter {
     scopes: Mutex<HashMap<Scope, Table>>,
     /// Factor on every limit (tests lower it).
     scale_down: u32,
+    /// [`Scope::UploadAccount`]'s limit per minute, before `scale_down`.
+    uploads_per_minute: u32,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
         Self::with(MAX_KEYS, 1)
+    }
+
+    /// The operator's upload limit (`HANGAR_DRIVE_UPLOADS_PER_MINUTE`, at least 1). The call
+    /// limits per token and device become at least the uploads plus
+    /// [`CALLS_BESIDE_UPLOADS`]; they never drop below their default, so a lower upload limit
+    /// does not starve the other calls.
+    pub fn with_uploads_per_minute(mut self, uploads_per_minute: u32) -> Self {
+        self.uploads_per_minute = uploads_per_minute.max(1);
+        self
     }
 
     /// Limits divided by `scale_down` (at least 1), for tests that hit them quickly.
@@ -301,11 +351,23 @@ impl RateLimiter {
             max_keys,
             scopes: Mutex::new(HashMap::new()),
             scale_down,
+            uploads_per_minute: DEFAULT_UPLOADS_PER_MINUTE,
         }
     }
 
-    fn rule(&self, scope: Scope) -> Rule {
+    /// The rule this limiter applies to `scope`: [`Scope::rule`] with the operator's upload
+    /// limit, divided by the test factor.
+    pub fn rule(&self, scope: Scope) -> Rule {
         let mut rule = scope.rule();
+        match scope {
+            Scope::UploadAccount => rule.limit = self.uploads_per_minute,
+            Scope::CallToken | Scope::CallDevice => {
+                rule.limit = rule
+                    .limit
+                    .max(self.uploads_per_minute.saturating_add(CALLS_BESIDE_UPLOADS));
+            }
+            _ => {}
+        }
         rule.limit = (rule.limit / self.scale_down).max(1);
         rule
     }
@@ -320,18 +382,25 @@ impl RateLimiter {
 
     /// Counts one attempt. `false`: the limit is reached.
     pub fn hit(&self, scope: Scope, key: &[u8], now_s: u64) -> bool {
-        self.hit_in(scope, key, None, now_s)
+        self.check(scope, key, None, now_s).is_ok()
     }
 
     /// [`RateLimiter::hit`] for an address `key` of the network `net` (module docs): a network
     /// with [`MAX_ADDRESSES_PER_NET`] keys in the scope adds no further ones, and the call
     /// passes on the network's limit alone.
     pub fn hit_in(&self, scope: Scope, key: &[u8], net: Option<&[u8]>, now_s: u64) -> bool {
+        self.check(scope, key, net, now_s).is_ok()
+    }
+
+    /// [`RateLimiter::hit_in`] with the time until the refusing window ends. A key refused
+    /// because the table is full waits for the oldest window of the table, the first that frees
+    /// a place.
+    pub fn check(&self, scope: Scope, key: &[u8], net: Option<&[u8]>, now_s: u64) -> Verdict {
         let rule = self.rule(scope);
         let id = self.id(key);
         let group = net.map(|n| self.id(n));
         let Ok(mut scopes) = self.scopes.lock() else {
-            return false;
+            return Err(Denied::until(now_s.saturating_add(rule.window_s), now_s));
         };
         let table = scopes.entry(scope).or_default();
         if !table.buckets.contains_key(&id) {
@@ -339,10 +408,17 @@ impl RateLimiter {
             if group.is_some_and(|g| {
                 table.groups.get(&g).copied().unwrap_or(0) >= MAX_ADDRESSES_PER_NET
             }) {
-                return true;
+                return Ok(());
             }
             if table.buckets.len() >= self.max_keys {
-                return scope.fails_open();
+                if scope.fails_open() {
+                    return Ok(());
+                }
+                let end = table
+                    .ends
+                    .front()
+                    .map_or(now_s.saturating_add(rule.window_s), |(end, _)| *end);
+                return Err(Denied::until(end, now_s));
             }
             if let Some(g) = group {
                 *table.groups.entry(g).or_insert(0) += 1;
@@ -365,7 +441,10 @@ impl RateLimiter {
             fresh = true;
         }
         if entry.count >= rule.limit {
-            return false;
+            return Err(Denied::until(
+                entry.start.saturating_add(entry.window),
+                now_s,
+            ));
         }
         entry.count += 1;
         if fresh {
@@ -374,20 +453,27 @@ impl RateLimiter {
                 .push_back((now_s.saturating_add(rule.window_s), id));
             table.compact(self.max_keys);
         }
-        true
+        Ok(())
     }
 
     /// Whether the key has used up its limit, without counting anything.
     pub fn exceeded(&self, scope: Scope, key: &[u8], now_s: u64) -> bool {
+        self.blocked(scope, key, now_s).is_err()
+    }
+
+    /// [`RateLimiter::exceeded`] with the time until the key's window ends.
+    pub fn blocked(&self, scope: Scope, key: &[u8], now_s: u64) -> Verdict {
         let rule = self.rule(scope);
         let id = self.id(key);
         let Ok(scopes) = self.scopes.lock() else {
-            return true;
+            return Err(Denied::until(now_s.saturating_add(rule.window_s), now_s));
         };
-        scopes
-            .get(&scope)
-            .and_then(|t| t.buckets.get(&id))
-            .is_some_and(|b| now_s.saturating_sub(b.start) < b.window && b.count >= rule.limit)
+        match scopes.get(&scope).and_then(|t| t.buckets.get(&id)) {
+            Some(b) if now_s.saturating_sub(b.start) < b.window && b.count >= rule.limit => {
+                Err(Denied::until(b.start.saturating_add(b.window), now_s))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Keys a scope remembers (tests).
@@ -432,7 +518,7 @@ pub fn check_address(
     keys: &RateKeys<'_>,
     unknown_token: bool,
     now_s: u64,
-) -> bool {
+) -> Verdict {
     // `true`: an address scope, whose keys are grouped by the network key.
     let route: &[(Scope, bool)] = match handler {
         Handler::CreateAccount => &[(Scope::InviteNet, false), (Scope::InviteIp, true)],
@@ -446,19 +532,21 @@ pub fn check_address(
     } else {
         &[]
     };
-    calls.iter().chain(route).all(|&(scope, address)| {
+    // In order, stopping at the first refusal, so a refused network adds no address keys.
+    for &(scope, address) in calls.iter().chain(route) {
         if address {
-            limiter.hit_in(scope, keys.ip, Some(keys.net), now_s)
+            limiter.check(scope, keys.ip, Some(keys.net), now_s)?;
         } else {
-            limiter.hit(scope, keys.net, now_s)
+            limiter.check(scope, keys.net, None, now_s)?;
         }
-    })
+    }
+    Ok(())
 }
 
 /// The limit of one issued token before it is looked up: it bounds the database reads an
 /// expired or revoked token can still cause, without touching anyone else's limits.
-pub fn check_issued_token(limiter: &RateLimiter, token: &[u8], now_s: u64) -> bool {
-    limiter.hit(Scope::CallToken, token, now_s)
+pub fn check_issued_token(limiter: &RateLimiter, token: &[u8], now_s: u64) -> Verdict {
+    limiter.check(Scope::CallToken, token, None, now_s)
 }
 
 /// The key of one device of one account.
@@ -476,27 +564,25 @@ pub fn check_session(
     account: &[u8],
     device: &[u8],
     now_s: u64,
-) -> bool {
+) -> Verdict {
     let both = device_key(account, device);
-    if !limiter.hit(Scope::CallDevice, &both, now_s) {
-        return false;
-    }
+    limiter.check(Scope::CallDevice, &both, None, now_s)?;
     match handler {
         // With a session the account is the key; the address limit is for the public post.
         Handler::GetPairing | Handler::ReservePairing => {
-            limiter.hit(Scope::PairingAccount, account, now_s)
+            limiter.check(Scope::PairingAccount, account, None, now_s)
         }
-        Handler::PutObject => limiter.hit(Scope::UploadAccount, account, now_s),
+        Handler::PutObject => limiter.check(Scope::UploadAccount, account, None, now_s),
         // A device, or an account, whose commits keep failing waits before it may send the
         // next large body.
         Handler::Commit => {
-            !limiter.exceeded(Scope::CommitRefusedDevice, &both, now_s)
-                && !limiter.exceeded(Scope::CommitRefusedAccount, account, now_s)
-                && !limiter.exceeded(Scope::CommitAccount, account, now_s)
-                && limiter.hit(Scope::CommitDevice, &both, now_s)
-                && limiter.hit(Scope::CommitAccount, account, now_s)
+            limiter.blocked(Scope::CommitRefusedDevice, &both, now_s)?;
+            limiter.blocked(Scope::CommitRefusedAccount, account, now_s)?;
+            limiter.blocked(Scope::CommitAccount, account, now_s)?;
+            limiter.check(Scope::CommitDevice, &both, None, now_s)?;
+            limiter.check(Scope::CommitAccount, account, None, now_s)
         }
-        _ => true,
+        _ => Ok(()),
     }
 }
 
@@ -518,12 +604,16 @@ pub fn check_route(
     handler: Handler,
     keys: &RateKeys<'_>,
     now_s: u64,
-) -> bool {
-    check_address(limiter, handler, keys, false, now_s)
-        && !matches!(
-            handler,
-            Handler::GetPairing | Handler::ReservePairing | Handler::PutObject | Handler::Commit
-        )
+) -> Verdict {
+    check_address(limiter, handler, keys, false, now_s)?;
+    if matches!(
+        handler,
+        Handler::GetPairing | Handler::ReservePairing | Handler::PutObject | Handler::Commit
+    ) {
+        // Not a limit that ends: such a call needs a session. A minute, as before.
+        return Err(Denied { retry_after_s: 60 });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -609,7 +699,7 @@ mod tests {
                 ip: &ip,
                 net: b"net",
             };
-            if check_route(&rl, Handler::Challenge, &keys, 0) {
+            if check_route(&rl, Handler::Challenge, &keys, 0).is_ok() {
                 ok += 1;
             }
         }
@@ -622,9 +712,9 @@ mod tests {
             ip: b"x",
             net: b"other",
         };
-        assert!(check_route(&rl, Handler::Health, &keys, 0));
+        assert!(check_route(&rl, Handler::Health, &keys, 0).is_ok());
         assert!(
-            !check_route(&rl, Handler::PutObject, &keys, 0),
+            check_route(&rl, Handler::PutObject, &keys, 0).is_err(),
             "an upload without a session account is refused"
         );
     }
@@ -633,7 +723,7 @@ mod tests {
     /// address check.
     fn call(rl: &RateLimiter, ip: &[u8], net: &[u8], now_s: u64) -> bool {
         let keys = RateKeys { ip, net };
-        check_address(rl, Handler::Feed, &keys, true, now_s)
+        check_address(rl, Handler::Feed, &keys, true, now_s).is_ok()
     }
 
     #[test]
@@ -729,7 +819,7 @@ mod tests {
     }
 
     fn commit(rl: &RateLimiter, account: &[u8], device: &[u8], now_s: u64) -> bool {
-        check_session(rl, Handler::Commit, account, device, now_s)
+        check_session(rl, Handler::Commit, account, device, now_s).is_ok()
     }
 
     #[test]
@@ -793,21 +883,87 @@ mod tests {
             !call(&rl, b"home", b"n-home", 0),
             "unknown tokens are limited"
         );
-        assert!(check_issued_token(&rl, b"token-of-the-honest-device", 0));
-        assert!(check_session(&rl, Handler::Feed, b"acct", b"honest", 0));
+        assert!(check_issued_token(&rl, b"token-of-the-honest-device", 0).is_ok());
+        assert!(check_session(&rl, Handler::Feed, b"acct", b"honest", 0).is_ok());
         // A flooding device with a valid session uses up only its own limits.
         let device_limit = Scope::CallDevice.rule().limit;
         let passed = (0..device_limit + 10)
-            .filter(|_| check_session(&rl, Handler::Feed, b"acct", b"thief", 0))
+            .filter(|_| check_session(&rl, Handler::Feed, b"acct", b"thief", 0).is_ok())
             .count();
         assert_eq!(passed, device_limit as usize);
-        assert!(check_session(
-            &rl,
-            Handler::AppendLog,
-            b"acct",
-            b"honest",
-            0
-        ));
+        assert!(check_session(&rl, Handler::AppendLog, b"acct", b"honest", 0).is_ok());
+    }
+
+    #[test]
+    fn a_refusal_names_the_rest_of_its_window() {
+        let rl = RateLimiter::new();
+        let limit = Scope::InviteIp.rule().limit;
+        for _ in 0..limit {
+            assert!(rl.hit(Scope::InviteIp, b"x", 100));
+        }
+        assert_eq!(
+            rl.check(Scope::InviteIp, b"x", None, 100),
+            Err(Denied {
+                retry_after_s: 3600
+            })
+        );
+        assert_eq!(
+            rl.check(Scope::InviteIp, b"x", None, 1000),
+            Err(Denied {
+                retry_after_s: 2700
+            })
+        );
+        assert_eq!(
+            rl.blocked(Scope::InviteIp, b"x", 3699),
+            Err(Denied { retry_after_s: 1 }),
+            "never below a second"
+        );
+        assert_eq!(rl.blocked(Scope::InviteIp, b"x", 3700), Ok(()));
+        // A key refused by a full table waits for the oldest window of the table.
+        let rl = RateLimiter::with(2, 1);
+        assert!(rl.hit(Scope::ProofIp, b"a", 0));
+        assert!(rl.hit(Scope::ProofIp, b"b", 20));
+        assert_eq!(
+            rl.check(Scope::ProofIp, b"c", None, 30),
+            Err(Denied { retry_after_s: 30 })
+        );
+        // Through the authorization layer's checks, too.
+        let rl = RateLimiter::scaled(u32::MAX);
+        assert!(check_session(&rl, Handler::PutObject, b"acct", b"dev", 10).is_ok());
+        assert_eq!(
+            check_session(&rl, Handler::PutObject, b"acct", b"dev2", 25),
+            Err(Denied { retry_after_s: 45 })
+        );
+    }
+
+    #[test]
+    fn the_upload_limit_is_the_operators_and_the_call_limits_follow_it() {
+        let rl = RateLimiter::new();
+        assert_eq!(rl.rule(Scope::UploadAccount).limit, 1200);
+        assert_eq!(rl.rule(Scope::CallDevice).limit, 3000, "unchanged default");
+        let rl = RateLimiter::new().with_uploads_per_minute(4000);
+        assert_eq!(rl.rule(Scope::UploadAccount).limit, 4000);
+        assert_eq!(rl.rule(Scope::CallDevice).limit, 5800);
+        assert_eq!(rl.rule(Scope::CallToken).limit, 5800);
+        assert_eq!(
+            rl.rule(Scope::CallIp).limit,
+            3000,
+            "unknown tokens keep their limit"
+        );
+        let rl = RateLimiter::new().with_uploads_per_minute(60);
+        assert_eq!(rl.rule(Scope::UploadAccount).limit, 60);
+        assert_eq!(
+            rl.rule(Scope::CallDevice).limit,
+            3000,
+            "a lower upload limit leaves the other calls alone"
+        );
+        let passed = (0..70)
+            .filter(|_| check_session(&rl, Handler::PutObject, b"a", b"d", 0).is_ok())
+            .count();
+        assert_eq!(passed, 60);
+        // The test factor still divides the configured limit.
+        let rl = RateLimiter::scaled(10).with_uploads_per_minute(100);
+        assert_eq!(rl.rule(Scope::UploadAccount).limit, 10);
     }
 
     #[test]

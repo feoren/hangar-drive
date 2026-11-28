@@ -203,8 +203,8 @@ pub async fn proof(app: &App, request: &ProofRequest) -> ApiResult<SessionRespon
         if state.device(&request.device).is_none() {
             return ApiError::from(ErrorCode::ProofInvalid);
         }
-        if app.limiter.exceeded(Scope::ProofFailures, &key, now / 1000) {
-            return ErrorCode::RateLimited.into();
+        if let Err(denied) = app.limiter.blocked(Scope::ProofFailures, &key, now / 1000) {
+            return denied.into();
         }
         app.limiter.hit(Scope::ProofFailures, &key, now / 1000);
         ErrorCode::ProofInvalid.into()

@@ -161,6 +161,19 @@ pub async fn purge_folder(app: &App, account: &AccountId, folder: &FolderId) -> 
         .bind(folder_pk)
         .execute(&mut *tx)
         .await?;
+    // Until the directory is gone, no upload may make the folder again or put a file into it,
+    // and an upload that put its file in place before this commit refuses at its own
+    // (`service::objects::store`). The garbage collection removes a tombstone left by a failed
+    // removal below.
+    sqlx::query(
+        "INSERT OR IGNORE INTO folder_tombstones (account_pk, folder_id, created_ms) VALUES (?, ?, ?)",
+    )
+    .bind(pk)
+    .bind(folder.as_bytes().as_slice())
+    .bind(i64_of(app.now_ms()))
+    .execute(&mut *tx)
+    .await?;
+    usage::count_folder_removal(&mut tx, pk).await?;
     usage::recount_pending(&mut tx, pk).await?;
     let pushed = feed::push(&mut tx, pk, &FeedChange::FolderRetired { folder: *folder }).await?;
     tx.commit().await?;
@@ -170,6 +183,11 @@ pub async fn purge_folder(app: &App, account: &AccountId, folder: &FolderId) -> 
     tokio::task::spawn_blocking(move || store.delete_folder(&account, &folder))
         .await
         .map_err(|e| ApiError::internal(&e))??;
+    sqlx::query("DELETE FROM folder_tombstones WHERE account_pk = ? AND folder_id = ?")
+        .bind(pk)
+        .bind(folder.as_bytes().as_slice())
+        .execute(&app.db)
+        .await?;
     Ok(())
 }
 

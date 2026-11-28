@@ -22,7 +22,7 @@ use hangar_drive_protocol::ids::{FolderId, ObjectId, PairingId};
 use hangar_drive_protocol::ServerInfo;
 use tokio::io::AsyncWriteExt;
 
-use crate::app::AppState;
+use crate::app::{AppState, OwnedUploadSlot};
 use crate::error::{ApiError, ApiResult};
 use crate::http::extract::{
     read_paced, After, JsonBody, PathParams, PublicJsonBody, BODY_IDLE_TIMEOUT, BODY_TIMEOUT,
@@ -379,6 +379,11 @@ pub async fn missing(
 /// to a staging file with a size limit and an idle timeout.
 /// Bytes of an upload kept for the header check: header, tag and the length prefix.
 const HEAD_KEEP: usize = OBJECT_HEADER_LEN + 16 + 8;
+/// Write buffer of an upload's staging file. Body frames arrive in pieces of a few KiB; one
+/// write per frame meant one blocking-pool round trip each. 256 KiB per upload in flight
+/// (at most `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` per account) keeps the memory small beside the
+/// container's limit while cutting the writes by one to two orders of magnitude.
+const STAGING_BUFFER: usize = 256 * 1024;
 
 pub async fn put_object(
     State(app): State<AppState>,
@@ -389,10 +394,10 @@ pub async fn put_object(
     let folder = folder_of(&params)?;
     let id = params.get("id", |v| ObjectId::from_hex(v).ok())?;
     // At most a few uploads per account at once (finding M5), taken before the body is read.
-    let _slot = app
-        .uploads
-        .take(s.account_pk, app.concurrency.uploads_per_account)
-        .ok_or(ErrorCode::RateLimited)?;
+    // Owned, so it moves into the task that stores the upload and is held until that task ends,
+    // also when the client goes away meanwhile.
+    let slot = OwnedUploadSlot::take(&app, s.account_pk, app.concurrency.uploads_per_account)
+        .ok_or_else(|| ApiError::rate_limited(Some(1)))?;
     let max = objects::max_blob_len();
     let (parts, body) = request.into_parts();
     let announced = parts
@@ -414,7 +419,10 @@ pub async fn put_object(
     let path = app.store.staging_path()?;
     let mut staged = Staged::new(path.clone(), 0, Vec::new());
     let receive = async {
-        let mut file = tokio::fs::File::create(&path).await?;
+        let mut file = tokio::io::BufWriter::with_capacity(
+            STAGING_BUFFER,
+            tokio::fs::File::create(&path).await?,
+        );
         let mut stream = body.into_data_stream();
         loop {
             let next = tokio::time::timeout(BODY_IDLE_TIMEOUT, stream.next())
@@ -443,7 +451,7 @@ pub async fn put_object(
         file.flush().await?;
         // On disk before the write transaction starts (finding M4): the flush must not run
         // while the database's write lock is held.
-        file.sync_all().await?;
+        file.get_mut().sync_all().await?;
         Ok::<(), ApiError>(())
     };
     tokio::time::timeout(Duration::from_secs(600), receive)
@@ -453,7 +461,7 @@ pub async fn put_object(
             ..ApiError::new(ErrorCode::BadRequest)
         })??;
     drop(claim);
-    let reply = objects::store(&app, &s, folder, id, staged).await?;
+    let reply = objects::store(&app, &s, folder, id, staged, slot).await?;
     let status = if reply.stored {
         StatusCode::CREATED
     } else {

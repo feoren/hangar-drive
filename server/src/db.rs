@@ -19,6 +19,13 @@ pub enum DbError {
     Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
+/// Connections of the pool.
+pub const MAX_CONNECTIONS: u32 = 8;
+/// `PRAGMA cache_size`: negative is KiB, so 16 MiB per connection.
+const CACHE_SIZE_KIB: &str = "-16384";
+/// `PRAGMA journal_size_limit`: 64 MiB.
+const JOURNAL_SIZE_LIMIT: &str = "67108864";
+
 /// Opens (and creates) the database at `path` and applies the embedded migrations.
 pub async fn connect(path: &Path) -> Result<Db, DbError> {
     let options = SqliteConnectOptions::new()
@@ -35,9 +42,17 @@ pub async fn connect(path: &Path) -> Result<Db, DbError> {
         // where a copy of the database file would still hold them (overall review, info). The
         // WAL keeps a deleted page only until the next checkpoint.
         .pragma("secure_delete", "ON")
+        // Page cache per connection, in KiB when negative: 16 MiB instead of SQLite's 2 MiB, so
+        // the object and reference indexes of a large account stay in memory. The pool has at
+        // most `MAX_CONNECTIONS` connections, 128 MiB together at worst, which the container's
+        // 1 GiB `mem_limit` holds beside the heavy slots' bodies (docker-compose.yml).
+        .pragma("cache_size", CACHE_SIZE_KIB)
+        // The WAL file is cut back to this after a checkpoint instead of keeping its largest
+        // size: one large commit no longer leaves a WAL of gigabytes on disk for good.
+        .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT)
         .busy_timeout(Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(MAX_CONNECTIONS)
         .min_connections(1)
         .connect_with(options)
         .await?;
@@ -85,6 +100,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on, 1, "every connection of the pool deletes securely");
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn every_connection_has_the_cache_and_wal_limits() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/.tmp/server-unit/db-pragmas");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = super::connect(&dir.join("meta.db")).await.unwrap();
+        // Several connections at once, so not only the first one is looked at.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let mut conn = db.acquire().await.unwrap();
+            let cache: i64 = sqlx::query_scalar("PRAGMA cache_size")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            assert_eq!(cache, -16384);
+            assert_eq!(limit, 64 << 20);
+            assert_eq!(sync, 2, "FULL stays");
+            assert_eq!(mode, "wal");
+            held.push(conn);
+        }
+        drop(held);
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -52,6 +52,8 @@ pub const RECORD_CAP_VAR: &str = "HANGAR_DRIVE_RECORD_CAP";
 pub const HEAVY_REQUESTS_VAR: &str = "HANGAR_DRIVE_HEAVY_REQUESTS";
 /// Uploads one account may have in flight at once.
 pub const UPLOADS_PER_ACCOUNT_VAR: &str = "HANGAR_DRIVE_UPLOADS_PER_ACCOUNT";
+/// Uploads (object PUTs) one account may start per minute, over all its devices.
+pub const UPLOADS_PER_MINUTE_VAR: &str = "HANGAR_DRIVE_UPLOADS_PER_MINUTE";
 /// Open connections per client address (not counted for trusted proxies).
 pub const CONNECTIONS_PER_IP_VAR: &str = "HANGAR_DRIVE_CONNECTIONS_PER_IP";
 /// The address devices reach the server under (`https://drive.example.org/`), for the invite
@@ -83,6 +85,15 @@ pub const MIN_BURST_OBJECTS: u64 = 20;
 pub const DEFAULT_RECORD_CAP: u64 = 64 * MIB;
 pub const DEFAULT_HEAVY_REQUESTS: u32 = 4;
 pub const DEFAULT_UPLOADS_PER_ACCOUNT: u32 = 8;
+/// 20 objects a second: every file is at least a manifest and a chunk, so 10 small files a
+/// second, sustained.
+pub const DEFAULT_UPLOADS_PER_MINUTE: u32 = 1200;
+/// One upload a second: below that a first sync of a few thousand files takes hours.
+pub const MIN_UPLOADS_PER_MINUTE: u32 = 60;
+/// 200 uploads a second. Each stored upload costs about three flushes to disk (the staged
+/// file, its directory, the database commit), so more than this is beyond what one disk
+/// sustains and would only let one account queue work in front of every other account.
+pub const MAX_UPLOADS_PER_MINUTE: u32 = 12_000;
 pub const DEFAULT_CONNECTIONS_PER_IP: u32 = 64;
 /// How long an anomaly pin holds its tree (ADR 0001, section 5).
 pub const PIN_DAYS: u64 = 90;
@@ -251,6 +262,8 @@ pub struct Config {
     /// [`PUBLIC_URL_VAR`] in the serialization of the client's URL parser, always with a
     /// trailing `/`: exactly the base URL a device parses out of an invite link.
     pub public_url: Option<String>,
+    /// [`UPLOADS_PER_MINUTE_VAR`]: the rate limit of uploads per account.
+    pub uploads_per_minute: u32,
 }
 
 /// How much the server works on at once.
@@ -440,6 +453,12 @@ impl Config {
         let public_url = text(PUBLIC_URL_VAR)
             .map(|value| parse_public_url(&value).ok_or(ConfigError::InvalidPublicUrl(value)))
             .transpose()?;
+        let uploads_per_minute = number(
+            UPLOADS_PER_MINUTE_VAR,
+            DEFAULT_UPLOADS_PER_MINUTE,
+            MIN_UPLOADS_PER_MINUTE,
+            MAX_UPLOADS_PER_MINUTE,
+        )?;
         let gc_minutes = number(GC_INTERVAL_VAR, DEFAULT_GC_INTERVAL_MINUTES, 1, 7 * 24 * 60)?;
         let grace = number(SHUTDOWN_GRACE_VAR, DEFAULT_SHUTDOWN_GRACE_SECS, 1, 600)?;
         Ok(Self {
@@ -453,6 +472,7 @@ impl Config {
             shutdown_grace: Duration::from_secs(u64::from(grace)),
             concurrency,
             public_url,
+            uploads_per_minute,
         })
     }
 
@@ -611,6 +631,32 @@ mod tests {
             Err(ConfigError::InvalidNumber(HEAVY_REQUESTS_VAR, _))
         ));
         assert_eq!(config(&[]).unwrap().limits.record_cap, 64 * MIB);
+    }
+
+    #[test]
+    fn the_upload_rate_is_bounded() {
+        assert_eq!(config(&[]).unwrap().uploads_per_minute, 1200);
+        for (given, expected) in [("60", 60), (" 3000 ", 3000), ("12000", 12_000)] {
+            let c = config(&[(UPLOADS_PER_MINUTE_VAR, given)]).unwrap();
+            assert_eq!(c.uploads_per_minute, expected, "{given}");
+        }
+        assert_eq!(
+            config(&[(UPLOADS_PER_MINUTE_VAR, "")])
+                .unwrap()
+                .uploads_per_minute,
+            1200,
+            "empty takes the default"
+        );
+        for bad in ["0", "59", "12001", "-5", "1e3", "fast"] {
+            assert_eq!(
+                config(&[(UPLOADS_PER_MINUTE_VAR, bad)]),
+                Err(ConfigError::InvalidNumber(
+                    UPLOADS_PER_MINUTE_VAR,
+                    bad.to_owned()
+                )),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

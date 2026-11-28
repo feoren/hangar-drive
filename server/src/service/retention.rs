@@ -24,7 +24,8 @@
 //! **Sweep:** after the transaction the files of the deleted objects are removed, each under the
 //! object's stripe lock and only if no row came back in between (a new upload of the same
 //! object). Rarely, files the database does not know (a crash between file and row) are removed
-//! once they are older than an hour.
+//! once they are older than an hour, by a sweep that runs an hour after the start and then once
+//! a day.
 //!
 //! The reference intervals (`refs`) make every tree a range query, so the step needs no walk
 //! over directory nodes, which the server cannot read anyway.
@@ -48,6 +49,12 @@ use crate::store::ObjectKey;
 pub const PENDING_MS: u64 = 86_400_000;
 /// A file without a database row is removed by the sweep once it is this old.
 const ORPHAN_FILE_AGE: Duration = Duration::from_secs(3600);
+/// The first file sweep after a start waits this long (throughput review 2026-11-28): the
+/// sweep walks every object directory, and right after a (re)start that walk competed for the
+/// disk with the first uploads of a new server, which gain nothing from it.
+pub const FIRST_SWEEP_DELAY_MS: u64 = 3_600_000;
+/// Later file sweeps run once a day.
+pub const SWEEP_INTERVAL_MS: u64 = 86_400_000;
 
 /// What a step did (logged, and checked by the tests).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -185,6 +192,9 @@ pub async fn account_step(app: &App, account_pk: i64, mode: Mode) -> ApiResult<O
         .execute(&mut *tx)
         .await?;
         outcome.deleted_folders += 1;
+    }
+    if outcome.deleted_folders > 0 {
+        usage::count_folder_removal(&mut tx, account_pk).await?;
     }
 
     reset_temp_tables(&mut tx).await?;
@@ -674,13 +684,24 @@ pub async fn sweep_orphan_files(app: &App) -> ApiResult<u64> {
     Ok(removed)
 }
 
-/// The background job: a step every `interval`, the file sweep once a day, until shutdown.
-/// Steps never overlap (one task), and a failed step is logged and retried at the next tick.
+/// Whether the file sweep is due at `now_ms`: [`FIRST_SWEEP_DELAY_MS`] after the job started,
+/// then every [`SWEEP_INTERVAL_MS`] after the last sweep. Times from the server's clock.
+pub fn sweep_due(started_ms: u64, last_sweep_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_sweep_ms {
+        None => now_ms.saturating_sub(started_ms) >= FIRST_SWEEP_DELAY_MS,
+        Some(last) => now_ms.saturating_sub(last) >= SWEEP_INTERVAL_MS,
+    }
+}
+
+/// The background job: a step every `interval`, the file sweep an hour after the start and
+/// then once a day ([`sweep_due`]), until shutdown. Steps never overlap (one task), and a
+/// failed step is logged and retried at the next tick.
 pub async fn run_job(app: std::sync::Arc<App>, interval: Duration) {
     let mut shutdown = app.shutdown.clone();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_sweep: Option<std::time::Instant> = None;
+    let started_ms = app.now_ms();
+    let mut last_sweep_ms: Option<u64> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -694,11 +715,32 @@ pub async fn run_job(app: std::sync::Arc<App>, interval: Duration) {
             ),
             Err(error) => tracing::error!(?error, "garbage collection step failed"),
         }
-        if last_sweep.is_none_or(|t| t.elapsed() >= Duration::from_secs(86_400)) {
-            last_sweep = Some(std::time::Instant::now());
+        let now_ms = app.now_ms();
+        if sweep_due(started_ms, last_sweep_ms, now_ms) {
+            last_sweep_ms = Some(now_ms);
             if let Err(error) = sweep_orphan_files(&app).await {
                 tracing::error!(?error, "file sweep failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_sweep_waits_an_hour_and_then_runs_daily() {
+        let start = 1_000_000;
+        assert!(!sweep_due(start, None, start), "not at the start");
+        assert!(!sweep_due(start, None, start + FIRST_SWEEP_DELAY_MS - 1));
+        assert!(sweep_due(start, None, start + FIRST_SWEEP_DELAY_MS));
+        let last = start + FIRST_SWEEP_DELAY_MS;
+        assert!(!sweep_due(start, Some(last), last + SWEEP_INTERVAL_MS - 1));
+        assert!(sweep_due(start, Some(last), last + SWEEP_INTERVAL_MS));
+        assert!(
+            !sweep_due(start, None, start - 5),
+            "a clock that steps back delays it, never runs it early"
+        );
     }
 }

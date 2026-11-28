@@ -5,13 +5,17 @@
 //! levels of 256 fan-out keep directories small (a million objects of a folder give about 16
 //! per directory). An upload is written to a staging file on the same file system, flushed to
 //! disk, renamed into place and the directory flushed, so a stored object is either complete or
-//! absent, even after a power failure.
+//! absent, even after a power failure. A directory the install creates (account, folder, the
+//! two fan-out levels) is flushed into its parent once, when it is made: otherwise the rename
+//! would be durable inside a directory whose own entry a power failure could still lose.
 //!
 //! The trait is synchronous; the server calls it through `spawn_blocking`.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use hangar_drive_crypto::{Entropy, OsEntropy};
@@ -52,6 +56,12 @@ pub trait ObjectStore: Send + Sync + 'static {
 pub struct FsStore {
     root: PathBuf,
     staging: PathBuf,
+    /// Held while an install looks for missing directories, makes them and flushes their
+    /// parents. An install that finds its directory present therefore never renames into it
+    /// before the install that made it has flushed its entry.
+    mkdir: Arc<Mutex<()>>,
+    /// Directory flushes so far (tests count them; Windows skips the flush itself).
+    dir_syncs: Arc<AtomicU64>,
 }
 
 impl FsStore {
@@ -66,7 +76,52 @@ impl FsStore {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        Ok(Self { root, staging })
+        Ok(Self {
+            root,
+            staging,
+            mkdir: Arc::new(Mutex::new(())),
+            dir_syncs: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Directory flushes so far.
+    pub fn dir_syncs(&self) -> u64 {
+        self.dir_syncs.load(Ordering::Relaxed)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        self.dir_syncs.fetch_add(1, Ordering::Relaxed);
+        sync_dir(dir)
+    }
+
+    /// Makes `dir` and every missing parent below the root, and flushes each new directory's
+    /// entry into its parent (module docs). Nothing to do when `dir` exists.
+    fn create_dirs_durably(&self, dir: &Path) -> io::Result<()> {
+        let _making = self
+            .mkdir
+            .lock()
+            .map_err(|_| io::Error::other("directory lock poisoned"))?;
+        let mut missing = Vec::new();
+        let mut current = dir;
+        while current != self.root && !current.is_dir() {
+            missing.push(current);
+            current = match current.parent() {
+                Some(parent) => parent,
+                None => break,
+            };
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(dir)?;
+        // Deepest first; each new entry is flushed into its parent, ending at an existing one.
+        for made in missing {
+            let parent = made
+                .parent()
+                .ok_or_else(|| io::Error::other("object directory without parent"))?;
+            self.sync_dir(parent)?;
+        }
+        Ok(())
     }
 
     fn folder_dir(&self, account: &AccountId, folder: &FolderId) -> PathBuf {
@@ -118,9 +173,9 @@ impl ObjectStore for FsStore {
         let dir = target
             .parent()
             .ok_or_else(|| io::Error::other("object path without parent"))?;
-        fs::create_dir_all(dir)?;
+        self.create_dirs_durably(dir)?;
         fs::rename(staged, &target)?;
-        sync_dir(dir)
+        self.sync_dir(dir)
     }
 
     fn open(&self, key: &ObjectKey) -> io::Result<fs::File> {
@@ -238,6 +293,43 @@ mod tests {
         assert!(store.open(&key).is_err());
         store.delete_folder(&key.account, &key.folder).unwrap();
         store.delete_account(&key.account).unwrap();
+    }
+
+    #[test]
+    fn new_directories_are_flushed_into_their_parents_once() {
+        let root = temp_root("dir-sync");
+        let store = FsStore::open(root.join("objects"), root.join("staging")).unwrap();
+        let account = AccountId::from_bytes([1; 16]);
+        let folder = FolderId::from_bytes([2; 16]);
+        let install = |id: [u8; 32]| {
+            let key = ObjectKey {
+                account,
+                folder,
+                id: ObjectId::from_bytes(id),
+            };
+            let staged = store.staging_path().unwrap();
+            fs::write(&staged, b"blob").unwrap();
+            let before = store.dir_syncs();
+            store.install(&staged, &key).unwrap();
+            assert!(store.path(&key).is_file());
+            store.dir_syncs() - before
+        };
+        // Account, folder and both fan-out levels are new: four parents, then the directory
+        // that received the rename.
+        assert_eq!(install([0xab; 32]), 5);
+        // Same directory: only the rename's flush.
+        let mut id = [0xab; 32];
+        id[31] = 0x01;
+        assert_eq!(install(id), 1);
+        // A new second level under a known first level: its parent, then the rename's flush.
+        let mut id = [0xab; 32];
+        id[1] = 0xcd;
+        assert_eq!(install(id), 2);
+        // After the folder's directory was removed (the folder was deleted), it is made and
+        // flushed again: folder and both levels, then the rename's flush.
+        store.delete_folder(&account, &folder).unwrap();
+        assert_eq!(install([0xab; 32]), 4);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

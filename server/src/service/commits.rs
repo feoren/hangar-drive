@@ -137,7 +137,7 @@ async fn load_ids(
 const ID_PAGE: usize = 4096;
 
 /// Appends `bytes` as lowercase hex.
-fn push_hex(out: &mut String, bytes: &[u8]) {
+pub(crate) fn push_hex(out: &mut String, bytes: &[u8]) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     for b in bytes {
         out.push(char::from(DIGITS[usize::from(b >> 4)]));

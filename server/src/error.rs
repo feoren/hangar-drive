@@ -23,7 +23,18 @@ pub struct ApiError {
     pub removal_log: Option<LogPage>,
     /// HTTP status other than the code's own (only 405 for a known path with another method).
     pub status: Option<StatusCode>,
+    /// With `rate_limited`: seconds until the refusal clears, for `Retry-After` (the rest of a
+    /// rate limit's window, 1 for a busy upload slot, [`RETRY_SOON_S`] for a folder removal).
+    /// `None` for refusals without an end in sight (a busy heavy slot), which answer
+    /// [`DEFAULT_RETRY_AFTER_S`].
+    pub retry_after_s: Option<u64>,
 }
+
+/// `Retry-After` of a `rate_limited` reply whose cause has no window that ends.
+pub const DEFAULT_RETRY_AFTER_S: u64 = 60;
+/// `Retry-After` of a refusal that clears within moments: a folder whose directory is being
+/// removed, an upload that raced a folder removal.
+pub const RETRY_SOON_S: u64 = 2;
 
 impl ApiError {
     pub const fn new(code: ErrorCode) -> Self {
@@ -33,6 +44,16 @@ impl ApiError {
             missing: Vec::new(),
             removal_log: None,
             status: None,
+            retry_after_s: None,
+        }
+    }
+
+    /// `rate_limited`, to be tried again after `retry_after_s` seconds (at least 1), or after
+    /// [`DEFAULT_RETRY_AFTER_S`] without a window.
+    pub fn rate_limited(retry_after_s: Option<u64>) -> Self {
+        Self {
+            retry_after_s: retry_after_s.map(|s| s.max(1)),
+            ..Self::new(ErrorCode::RateLimited)
         }
     }
 
@@ -107,9 +128,10 @@ impl IntoResponse for ApiError {
         };
         let mut response = (status, Json(body)).into_response();
         if self.code == ErrorCode::RateLimited {
+            let seconds = self.retry_after_s.unwrap_or(DEFAULT_RETRY_AFTER_S).max(1);
             response
                 .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("60"));
+                .insert("retry-after", HeaderValue::from(seconds));
         }
         response
     }

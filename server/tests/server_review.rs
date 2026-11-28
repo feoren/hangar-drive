@@ -58,6 +58,7 @@ async fn gated_server(name: &str, gate: &Gate) -> TestServer {
         Options {
             hooks: Hooks {
                 commit_prepared: Some(gate.hook()),
+                ..Hooks::default()
             },
             ..Options::default()
         },

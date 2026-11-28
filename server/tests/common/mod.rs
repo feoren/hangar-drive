@@ -73,6 +73,8 @@ pub struct Options {
     pub store_layer: Option<hangar_drive_server::StoreLayer>,
     /// Test hooks (`Deps::hooks`).
     pub hooks: hangar_drive_server::app::Hooks,
+    /// `HANGAR_DRIVE_UPLOADS_PER_MINUTE`, if set.
+    pub uploads_per_minute: Option<u32>,
 }
 
 impl Default for Options {
@@ -89,6 +91,7 @@ impl Default for Options {
             public_url: TEST_URL,
             store_layer: None,
             hooks: Default::default(),
+            uploads_per_minute: None,
         }
     }
 }
@@ -126,6 +129,9 @@ impl TestServer {
             ));
         }
         vars.push(("HANGAR_DRIVE_SHUTDOWN_GRACE_SECS", "3".into()));
+        if let Some(uploads) = options.uploads_per_minute {
+            vars.push(("HANGAR_DRIVE_UPLOADS_PER_MINUTE", uploads.to_string()));
+        }
         vars.push(("HANGAR_DRIVE_PUBLIC_URL", options.public_url.to_owned()));
         let mut config = Config::from_lookup(|name| {
             vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.into())

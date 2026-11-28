@@ -159,3 +159,54 @@ fn the_proxy_examples_send_hsts_like_the_server() {
         .expect("the folders location")..];
     assert!(folders.contains("proxy_read_timeout 300s"));
 }
+
+#[test]
+fn compose_rotates_its_logs_and_names_the_upload_rate() {
+    // Throughput review 2026-11-28: one log line per request must not fill the data disk, and
+    // the new setting is where operators look for it.
+    let compose = repo_file("docker-compose.yml");
+    let active = active_lines(&compose);
+    assert!(active.iter().any(|l| l.trim() == "max-size: \"10m\""));
+    assert!(active.iter().any(|l| l.trim() == "max-file: \"5\""));
+    assert!(active.iter().any(|l| l
+        .trim()
+        .starts_with("HANGAR_DRIVE_UPLOADS_PER_MINUTE: ${HANGAR_DRIVE_UPLOADS_PER_MINUTE:-1200}")));
+    assert!(repo_file(".env.example").contains("HANGAR_DRIVE_UPLOADS_PER_MINUTE"));
+    assert!(repo_file("docs/self-hosting.md")
+        .contains("| `HANGAR_DRIVE_UPLOADS_PER_MINUTE` | `1200` |"));
+}
+
+#[test]
+fn the_nginx_proxy_manager_example_streams_uploads_and_events() {
+    let doc = repo_file("docs/self-hosting.md");
+    let npm = &doc[doc
+        .find("### Nginx Proxy Manager")
+        .expect("the NPM section")..];
+    let advanced = block(npm, "nginx");
+    for setting in [
+        "client_max_body_size 100m;",
+        "client_header_timeout 10s;",
+        "client_body_timeout 30s;",
+        "proxy_request_buffering off;",
+        "proxy_read_timeout 300s;",
+    ] {
+        assert!(advanced.contains(setting), "{setting}");
+    }
+    let sse = &advanced[advanced
+        .find("location /api/v1/account/events")
+        .expect("the SSE location")..];
+    for setting in [
+        "proxy_buffering off;",
+        "proxy_set_header Host $host;",
+        "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    ] {
+        assert!(sse.contains(setting), "{setting}");
+    }
+    assert!(
+        !advanced.contains("location / "),
+        "NPM generates its own `location /`"
+    );
+    // One exact address is trusted, never a range.
+    assert!(npm.contains("ipv4_address: 172.30.250.20"));
+    assert!(npm.contains("HANGAR_DRIVE_TRUSTED_PROXIES: 172.30.250.20"));
+}

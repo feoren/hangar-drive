@@ -67,6 +67,9 @@ pub struct Hooks {
     /// Awaited by a commit call after it loaded its IDs and checked that the objects exist,
     /// right before it takes the write lock (server security review, MEDIUM 2).
     pub commit_prepared: Option<Hook>,
+    /// Awaited by an upload after its file went in place and before its write transaction,
+    /// while it holds the object's stripe lock (`service::objects::store`).
+    pub upload_installed: Option<Hook>,
 }
 
 pub type AppState = Arc<App>;
@@ -186,9 +189,11 @@ pub async fn account_by_id(
     }))
 }
 
-/// Striped locks over object keys. An upload holds its stripe from the existence check to the
-/// database row; the garbage collection holds it while it removes a file whose row it deleted,
-/// so it can never remove the file of an upload that arrived in between.
+/// Striped locks over object keys. An upload holds its stripe from the existence check through
+/// putting its file in place to the committed database row (or the removal of its file when
+/// the row is refused); the garbage collection and the orphan sweep hold it while they remove a
+/// file without a row, so neither can remove the file of an upload in between, and no upload
+/// can put a file over an object that has a row.
 pub struct ObjectLocks {
     stripes: Vec<tokio::sync::Mutex<()>>,
 }
@@ -303,19 +308,61 @@ pub struct UploadSlot<'a> {
     account_pk: i64,
 }
 
+/// An upload's slot in [`App::uploads`] that owns its app, so it can move into the task that
+/// stores the upload and live until that task ends, even when the request is dropped
+/// (`service::objects::store`).
+pub struct OwnedUploadSlot {
+    app: AppState,
+    account_pk: i64,
+}
+
+impl OwnedUploadSlot {
+    /// A slot of [`App::uploads`] for the account, or `None` if it already has `max` uploads in
+    /// flight.
+    pub fn take(app: &AppState, account_pk: i64, max: u32) -> Option<Self> {
+        app.uploads.acquire(account_pk, max).then(|| Self {
+            app: app.clone(),
+            account_pk,
+        })
+    }
+}
+
+impl Drop for OwnedUploadSlot {
+    fn drop(&mut self) {
+        self.app.uploads.release(self.account_pk);
+    }
+}
+
 impl UploadSlots {
     /// A slot for the account, or `None` if it already has `max` uploads in flight.
     pub fn take(&self, account_pk: i64, max: u32) -> Option<UploadSlot<'_>> {
-        let mut open = self.open.lock().ok()?;
-        let count = open.entry(account_pk).or_insert(0);
-        if *count >= max {
-            return None;
-        }
-        *count += 1;
-        Some(UploadSlot {
+        self.acquire(account_pk, max).then(|| UploadSlot {
             slots: self,
             account_pk,
         })
+    }
+
+    fn acquire(&self, account_pk: i64, max: u32) -> bool {
+        let Ok(mut open) = self.open.lock() else {
+            return false;
+        };
+        let count = open.entry(account_pk).or_insert(0);
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    fn release(&self, account_pk: i64) {
+        if let Ok(mut open) = self.open.lock() {
+            if let Some(count) = open.get_mut(&account_pk) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    open.remove(&account_pk);
+                }
+            }
+        }
     }
 
     /// Uploads in flight of the account.
@@ -330,14 +377,7 @@ impl UploadSlots {
 
 impl Drop for UploadSlot<'_> {
     fn drop(&mut self) {
-        if let Ok(mut open) = self.slots.open.lock() {
-            if let Some(count) = open.get_mut(&self.account_pk) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    open.remove(&self.account_pk);
-                }
-            }
-        }
+        self.slots.release(self.account_pk);
     }
 }
 

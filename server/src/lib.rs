@@ -190,7 +190,9 @@ pub async fn open_app(
         public_url: config.public_url.clone(),
         trusted_proxies: config.trusted_proxies.clone(),
         forwarder_warnings: Default::default(),
-        limiter: deps.limiter,
+        limiter: deps
+            .limiter
+            .with_uploads_per_minute(config.uploads_per_minute),
         events: EventHub::new(),
         states: StateCache::default(),
         object_locks: ObjectLocks::default(),

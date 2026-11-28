@@ -12,7 +12,7 @@ use hangar_drive_protocol::ids::{CommitId, FolderId};
 
 use crate::app::App;
 use crate::db::{begin_write, i64_of, u64_of};
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult, RETRY_SOON_S};
 use crate::service::commits::{self, Burst, Drops};
 use crate::service::feed;
 use crate::service::notices;
@@ -93,7 +93,7 @@ pub async fn find_or_create(
     .fetch_optional(&mut *conn)
     .await?;
     if removing.is_some() {
-        return Err(ErrorCode::RateLimited.into());
+        return Err(ApiError::rate_limited(Some(RETRY_SOON_S)));
     }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE account_pk = ?")
         .bind(account_pk)
