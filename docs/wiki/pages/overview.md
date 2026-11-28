@@ -2,9 +2,9 @@
 title: Overview
 type: overview
 tags: []
-sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]", "[[tauri-nsis-uninstall-code-reading]]"]
+sources: ["[[llm-wiki-pattern]]", "[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[version-number-wikipedia]]", "[[tauri-version-handling-code-reading]]", "[[tauri-nsis-uninstall-code-reading]]", "[[transfer-responsiveness-measurement]]"]
 created: 2026-11-25
-updated: 2026-11-26
+updated: 2026-11-28
 ---
 
 # Overview
@@ -24,6 +24,10 @@ that only the operator sets, and an account quota that counts only live data.
   [[version-number-wikipedia]], [[tauri-version-handling-code-reading]].
 - Windows installer on upgrade and uninstall: the device keys go only with the ticked "delete app
   data" box, [[tauri-nsis-uninstall-code-reading]] and the amendment in [[0001-foundation]].
+- Responsiveness under load: transfers on detached lanes, commands that interrupt a pass,
+  parallel downloads in parts with a check before they land, live progress, the HTTP client's
+  limits and the server's writer queue: amendment "transfers that never hold the engine thread"
+  in [[0001-foundation]], measured in [[transfer-responsiveness-measurement]].
 
 ## Open risks
 - The protocol is built by hand and not reviewed externally; the review blocks the first release.
@@ -35,6 +39,8 @@ that only the operator sets, and an account quota that counts only live data.
 - The installer flow (upgrade, downgrade, uninstall with and without the tick) is verified only
   in a makensis harness, not with a real installer; it is a manual check of the release checklist
   in [[0002-version-scheme]].
+- Transfer speed is measured only against the in-memory server with simulated delays; uploads
+  and downloads per second against a real server over a network are not measured yet.
 
 ## Open questions
 > [!question] Unverified

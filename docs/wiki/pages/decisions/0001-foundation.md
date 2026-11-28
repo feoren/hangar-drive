@@ -1,8 +1,8 @@
 ---
 title: "ADR 0001: Foundation: scope, sync model, server and encryption"
 type: decision
-tags: [scope, sync, server, backup, e2e, crypto, architecture, merge, restore, quota]
-sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[unix-inode-reuse-measurement]]", "[[tauri-nsis-uninstall-code-reading]]", "[[merge-collision-benchmark]]"]
+tags: [scope, sync, server, backup, e2e, crypto, architecture, merge, restore, quota, performance]
+sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "[[unix-inode-reuse-measurement]]", "[[tauri-nsis-uninstall-code-reading]]", "[[merge-collision-benchmark]]", "[[transfer-responsiveness-measurement]]"]
 status: accepted
 superseded_by:
 created: 2026-11-26
@@ -3926,7 +3926,9 @@ the transfer on.
   offline phase or an end of the app in between. Stages of a publish too large for one commit
   are whole commits each, as before.
 - **Downloads:** checked before each file but the first, next to the existing bound of 1 GiB per
-  round; a file is written atomically and is not split.
+  round; a file is written atomically and is not split. *Superseded the same day:* a file of
+  several chunks now arrives in parts across rounds (amendment "transfers that never hold the
+  engine thread").
 - **The loop:** when the last pass reports more work it does not pause, runs every waiting
   command (not one per pass) and starts the next pass. The thread sends the stored state as a
   first `BackendEvent::Snapshot` before the first pass (`EngineCore::first_snapshot`).
@@ -3947,13 +3949,16 @@ first scan, like `bytes`, which now counts the waiting files' bytes as well.
 **Network calls.** Every request of `HttpServer` has a connect timeout of 15 s and a request
 timeout of 60 s (head and every read of the body; reqwest 0.13 blocking), with at most four
 attempts and a bounded backoff; the event stream uses its own read timeout of 75 s. No single
-call blocks without bound.
+call blocks without bound. *Superseded the same day:* connect timeout 10 s, no retry after a
+timeout, pool idle limit 5 s (amendment "transfers that never hold the engine thread").
 
 **Not split yet.** The pull of a folder's delta and of the head's tree (the tree check walks the
 tree's objects; the plaintext cache makes a repeated walk cheap, but a cut needs the paged pull
 state to keep it, which today only a lost connection does), re-anchoring after an older state,
 and a person's restores (`publish_tree`) still run to their end within one pass. A single file of
-several GiB is hashed, sealed or written whole. These are follow-up work.
+several GiB is hashed, sealed or written whole. These are follow-up work. *Partly superseded the
+same day:* hashing and downloading a large file are split (amendment "transfers that never hold
+the engine thread"); pull, re-anchoring and restores are still whole.
 
 **Follow-up review of the budget (security review, same day).**
 - **H1 (high): a waiting new file and a server item at its path ended in "cannot sync" for good.**
@@ -4274,7 +4279,11 @@ account at once. Code in `crates/hangar-drive-sync/src/upload.rs` and `folder.rs
   are booked on the engine thread exactly as before (`sent`, `sent_round`, `known_present`, bytes
   left, stage counters), and the loop returns only once nothing is in flight, so the next
   round's check of what was sent, the final missing query before the commit and the
-  intermediate commits work as before. Without an uploader (test doubles, `upload_workers` 1,
+  intermediate commits work as before. *Superseded the same day* (amendment "transfers that
+  never hold the engine thread"): the sending workers are no longer scoped to the round, and
+  the loop returns at its deadline or for a waiting command with objects still in flight; they
+  stay in the job's lane and are booked by the next round. A commit (final or intermediate)
+  still happens only once nothing of its upload is in flight. Without an uploader (test doubles, `upload_workers` 1,
   a queue of one object) the same loop runs inline through `ServerApi::put_object`.
 - **Cap.** `FolderSettings::upload_workers`, default `UPLOAD_WORKERS` = 4, clamped to
   `MAX_UPLOAD_WORKERS` = 8 (the server's default per account): 4 keep the line busy across
@@ -4286,7 +4295,9 @@ account at once. Code in `crates/hangar-drive-sync/src/upload.rs` and `folder.rs
   failure stop dispatching; objects in flight finish and are booked, then the loop reports
   `Yielded`, `StageDue` or the error as before. A chunk that no longer seals marks its content
   for a new hash (`mark_rehash`) as before. Engine commands wait at most for the objects in
-  flight (bounded by the request timeout), not for the rest of the queue.
+  flight (bounded by the request timeout), not for the rest of the queue. *Superseded the same
+  day:* commands no longer wait for objects in flight at all (amendment "transfers that never
+  hold the engine thread").
 - **Busy slots and sessions.** The HTTP client retries `429` with `Retry-After` inside the
   request (at most `RetryPolicy::max`, 8 s; the server says 1 s for a busy slot), on the worker
   thread only. Still refused, the object is queued again and the upload goes on with one object
@@ -4306,3 +4317,166 @@ account at once. Code in `crates/hangar-drive-sync/src/upload.rs` and `folder.rs
 - **Measured** (`parallel_uploads_take_less_wall_time`, debug build, Windows, in-memory
   server with 5 ms per upload, 126 objects, whole round including scan and hashing): one at a
   time 3.4 s, four workers 1.4 s. Not measured against a real server over a network yet.
+
+## Amendment 2026-11-28: transfers that never hold the engine thread
+
+**Goal (owner).** The app works smoothly under any load: no hang, no stutter, no frozen window.
+The work budget of the amendment "the engine stays responsive during long work" bounded a pass
+to about a second, but within that second the engine thread still waited for the server: for
+every object in flight before a round could end, for `Retry-After` and backoff waits, for a
+renewed sign-in, for one download at a time, and for a whole large file to be hashed or
+written. A command sent during such a wait sat behind it. Code in
+`crates/hangar-drive-sync/src/` (`interrupt.rs`, `download.rs`, `progress.rs`, `upload.rs`,
+`folder.rs`, `chunker.rs`, `http.rs`, `localfs.rs`, `engine.rs`); tests in
+`tests/engine_budget.rs`, `tests/large_transfers.rs`, `tests/http.rs` and unit tests in the
+named modules. Measurements in [[transfer-responsiveness-measurement]].
+
+### Lanes detached from the round, commands interrupt
+
+- **Waiting commands.** `interrupt::Interrupt` counts the commands sent to the engine thread
+  and not started yet (`EngineHandle::call` raises it until the command runs; dropping the last
+  handle raises it for the stop). A round with a budget treats a waiting command like a spent
+  budget (`FolderSync::spent`, `FsDisk::spent`): it stops at its next clean point (between hash
+  batches and chunks of a large file, between downloaded files and chunks, between uploaded
+  objects), and the pass breaks off before the next folder's round. A round without a budget (a
+  person's action, tests that expect whole rounds) never looks at it.
+- **Upload lanes outlive the round.** The sending workers of `upload::Lane` are plain threads
+  that own what they send; only the sealing threads (`Sealers`, which borrow the disk and the
+  keys) are scoped to the round. `FolderSync::dispatch` waits for answers in slices of 50 ms
+  (`UPLOAD_WAIT_SLICE`) and returns at its deadline or for a waiting command with objects still
+  in flight; they stay in the job's lane (`UploadJob::flight`) and the next round books them
+  first. Nothing is committed while objects of the upload are in flight: `finish` reports
+  `Done` or `StageDue` only once the lane is empty (`Next::Empty`); a deadline while answers are
+  out turns either into `Yielded`. A dropped lane (job evicted, folder gone, sign-out) sets a
+  flag, so its workers send nothing they still find queued, and its answers are never booked.
+- **No idle threads.** A folder that does not run a round (paused, stopped, nothing to do) and
+  a paused engine close their lanes (`FolderSync::release_transfers`): the workers end once
+  their request is answered, the answers stay for the next round. Uploads of other plans of the
+  same folder are closed while another one runs (review fix), so at most one lane per folder
+  keeps threads waiting. A paused folder starts no new upload; what was in flight finishes.
+- **Feed reads during long work.** A pass that only carries on the last one's work
+  (`EngineCore::note_continuation`: no command, no change on disk) reads the account's feed
+  only every `CONTINUATION_REFRESH_MS` (5 s), not once per one-second slice; a command, a wake
+  or a pull asked for after an error reads it at once.
+- **Calls that yield.** `HttpServer` gets the engine's interrupt (`ServerApi::set_interrupt`):
+  waits for `Retry-After` and backoff run in slices of 50 ms, and a sign-in after an expired
+  session is not started while a command waits. Such a call ends with `NetError::Interrupted`
+  (transient); the pass then asks for the next pass without the full pull of a lost connection.
+  Worker threads never see the interrupt: they are not on the engine thread.
+
+### Parallel downloads in parts, checked before they land
+
+- **Lanes.** `download::FetchLane`: up to `DOWNLOAD_WORKERS` (4, at most 8) threads per folder
+  fetch sealed chunks through `ServerApi::fetcher` (`HttpFetcher`: the client's pool, token and
+  traffic counter, 4 fetch slots per account connection), ahead of the executor in the order it
+  writes the files (item ID), while the round's thread opens each chunk and writes the files one
+  at a time as before. The plan for the lane names at most four windows of chunks. A worker
+  never signs in; a chunk fetched with an expired token is fetched again on the round's thread.
+  A `rate_limited` answer narrows the lane by one. A failure belongs to the run that asked: a
+  new plan asks again (review fix).
+- **Memory.** One lane holds at most `FETCH_WINDOW_BYTES` ahead (8 chunks, 32 MiB), counted by
+  the expected size of every object in flight or fetched and not taken; all lanes of one engine
+  share one `FetchBudget` (`FETCH_ACCOUNT_BYTES`, 64 MiB). The chunk the executor needs now is
+  fetched beyond both, so a lane never waits for room that only it could free. A new plan drops
+  what it no longer names. A cut run keeps its lane for the next round; a finished one drops it.
+- **Large files in parts.** A file of more than one chunk (4 MiB) is written chunk by chunk into
+  a part file `dl-<content key in hex>.dl` in the root's reserved `tmp` directory
+  (`FileSystem::partial_write`), and a round stops between two chunks at its budget or for a
+  waiting command; the next round goes on from there. An append is refused unless the part file
+  is the one created then (file ID, one link, length equal to the offset). At most two part
+  files per folder (`MAX_PARTIAL_DOWNLOADS`); the free space check counts only what is left.
+- **Check before it lands (security review M1).** `partial_finish` opens the part file, checks
+  file ID and link count, reads the whole content back through that handle and compares the
+  SHA-256 of every chunk with what was written, then syncs that same handle, sets time and
+  execute flag and puts it in place by one rename (the same end as `write_atomic`). A changed
+  part file never lands; the download starts over. Only a waiting command stops the check, not
+  the budget (a large file would always outlast it); it runs again in full next time.
+- **Plaintext does not stay behind (security review N1).** Part files of contents the plan no
+  longer brings in go at the next apply; a stopped or removed folder, a new root and a sign-out
+  remove all of a folder's part files; opening a root empties its `tmp` directory.
+- **Fixed in the review:** the link count on Windows was not checked (`single_link` returned
+  true); it now reads `nNumberOfLinks` of the handle as Unix reads `st_nlink`, with a test that
+  fails on the old behavior (`localfs::tests::a_part_file_with_another_name_is_refused`).
+
+### Hashing large files in steps (security review M3)
+
+A pausable hash (a file the scan may leave for later) stops between two chunks once the stop
+condition holds and comes back as `ChunkError::Paused` with the chunk IDs so far
+(`chunker::PartialHash`); the next scan goes on from there only while the file is provably the
+same: same size, modification time and file ID, the same change stamp
+(`FileSystem::change_stamp`: `ctime` on Unix, NTFS `ChangeTime` on Windows, both moved by a
+write that keeps size and modification time), the same generation, and within `RESUME_WITHIN`
+(10 minutes). A file without a file ID or a change stamp is hashed from the start; a folder that
+stops running drops its partial hashes. The change stamp is read only for files of more than one
+chunk, so a scan of many small files pays no extra open per file (review fix).
+
+### Live progress
+
+`progress::Live` turns the bytes a round moves (an object the server confirmed, a chunk written
+to the disk) into snapshots between passes, at most one per `LIVE_EVERY` (200 ms, five per
+second), whose `sync.bytesLeft` counts down from the snapshot the window shows. The app forwards
+them like any snapshot (`src-tauri/src/events.rs`, `events::forward`, cache `shell.snapshot`).
+Review fix: the base is renewed with every snapshot sent (after commands, at start, at the end
+of a pass), so progress reported by a command outside a pass never sends an older snapshot whose
+warnings would come back for a moment and notify again.
+
+### HTTP client
+
+- Connect timeout 10 s (`http::CONNECT_TIMEOUT`, was 15 s; the operating system's own limit on
+  Windows is about 21 s, as stated in the code).
+- A request that timed out is not sent again: every retry would hold the calling thread for
+  another full limit; the next pass tries again. Other transient failures keep their bounded
+  retries.
+- Idle connections leave the pool after 5 s (`http::POOL_IDLE_TIMEOUT`; reqwest keeps one 90 s
+  by default), below the server's idle limit (10 s) and the proxy's, so no request goes out on a
+  connection the other side closed meanwhile.
+- Upload bodies are streamed from the shared buffer (`SentBody`) and count their bytes for the
+  traffic line as they go out.
+- HTTP/2 is not active: reqwest 0.13 is built with `blocking`, `json` and `rustls-no-provider`
+  only, and `h2` is not in the lock file, so the client speaks HTTP/1.1 with a keep-alive pool;
+  parallelism comes from the lanes' threads and their connections.
+- The app does not wait for detached workers on exit: it never joins the engine's threads, and
+  they end with the process.
+
+### Server: writer queue, bounded threads and proxy connections, image
+
+Committed in `9e7a405` and `54e92f4`; code in `server/src/db.rs`, `config.rs`, `lib.rs`,
+`main.rs` and `server/Dockerfile`, guide in `docs/self-hosting.md`.
+
+- **Writers take turns.** SQLite lets a waiting writer sleep and retry (1, 2, 5, 10 up to
+  100 ms between tries), so with several uploads at once a writer often slept on after the lock
+  was free; the code records single uploads of over a second at the tail on a fast disk. Writers
+  of one database now queue in arrival order inside the process before `BEGIN IMMEDIATE`
+  (`db::begin_write`), taking the turn before a pool connection, with a fallback to SQLite's own
+  lock after 10 s (`BUSY_TIMEOUT`), so nested write transactions cannot wait for themselves.
+- **Commits hold connections.** A commit waits for its turn with its connection, so heavy
+  requests are capped at half the pool (`MAX_HEAVY_REQUESTS` = 4 of 8 connections).
+- **Threads.** Tokio's blocking pool is capped at 64 threads (`MAX_BLOCKING_THREADS`), below the
+  Compose process limit (`pids_limit: 256`).
+- **Proxy connection limit.** A trusted proxy gets half of the 4,096 connection slots
+  (`TRUSTED_PROXY_CONNECTIONS` = 2,048), not all of them: behind a published port every process
+  of the host arrives from the trusted gateway address.
+- **Image.** Cross-compiled with `tonistiigi/xx` 1.9.0 from `rust:1.100.0-alpine` instead of
+  emulated (the Dockerfile states minutes instead of about an hour for arm64; not measured
+  here), dependencies in their own layer, full LTO with one codegen unit (7 % smaller than thin
+  LTO, as stated there), remapped paths, OCI labels, distroless `static-debian13:nonroot` base.
+- **Not measured yet:** the load test `server/tests/load.rs` (ignored, runs against a running
+  image) has no recorded result in this wiki; uploads per second against a real server over a
+  network remain open, as in the amendment "upload throughput of the server".
+
+### Evidence
+
+- Windows 11, debug build: `cargo test --workspace` green; the three integration test files
+  above three times in a row without a failure. Linux: `cargo clippy -p hangar-drive-sync
+  --all-targets -- -D warnings` and `cargo test -p hangar-drive-sync` green in `rust:1.100.0`
+  (Debian), with `tests/.tmp` on a Linux file system ([[transfer-responsiveness-measurement]]).
+- Tests that pin the behavior: `a_command_is_taken_at_once_while_uploads_hang_on_a_slow_server`,
+  `a_pass_yields_to_a_waiting_command_before_a_round`,
+  `passes_that_carry_on_an_upload_read_the_feed_only_now_and_then`,
+  `progress_arrives_several_times_per_second_within_a_round` (`tests/engine_budget.rs`);
+  `many_small_files_download_in_parallel`, `a_large_download_goes_on_where_it_stopped`,
+  `a_stopped_download_run_ends_at_once` (`tests/large_transfers.rs`); the timeout,
+  `Retry-After` and pool tests in `tests/http.rs`; `download::tests`, `chunker::tests`,
+  `interrupt::tests` and the part file tests in `localfs::tests`.
+- The timing bounds of the tests are about ten times what a desktop measured, so a slow CI
+  runner passes while the old behavior (a command behind a one-second upload) still fails.
