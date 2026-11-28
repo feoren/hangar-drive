@@ -220,35 +220,18 @@ describe("status", () => {
     expect(mock.calls).toContain("quit");
   });
 
-  it("shows the version below the name with the beta badge, keeping its line before it loads", async () => {
-    const { mock } = await renderApp();
+  it("shows the version below the name with the beta badge from the first paint", async () => {
+    // The version comes from the build, so a backend that never answers getAbout (as seen in an
+    // installed build) still gets it. The build number may or may not be there (vite define).
+    const silent = new MockBackend({ scenario: "upToDate" });
+    await silent.setLanguage("de");
+    silent.getAbout = () => new Promise(() => undefined);
+    await renderWith(silent);
     const version = document.querySelector(".topbar .brand-version");
     expect(document.querySelector(".topbar .brand-name")?.textContent).toBe("Hangar Drive");
-    // The build number comes from the build (vite define), so it may or may not be there.
     expect(version?.textContent).toMatch(/^0\.1\.0(-\d+)?beta$/);
     expect(version?.querySelector(".beta-badge")?.textContent).toBe("beta");
-    expect(mock.calls).toContain("getAbout");
-    // Before the answer the line is there but empty, so the name does not move when it arrives.
-    let release: () => void = () => undefined;
-    const slow = new MockBackend({ scenario: "upToDate" });
-    await slow.setLanguage("de");
-    const original = slow.getAbout.bind(slow);
-    slow.getAbout = async () => {
-      await new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      return original();
-    };
-    await renderWith(slow);
-    const waiting = document.querySelector(".topbar .brand-version");
-    expect(waiting).not.toBeNull();
-    expect(waiting?.textContent).toBe("");
-    expect(waiting?.getAttribute("aria-hidden")).toBe("true");
-    release();
-    await flush();
-    expect(document.querySelector(".topbar .brand-version")?.textContent).toMatch(
-      /^0\.1\.0(-\d+)?beta$/,
-    );
+    expect(version?.getAttribute("aria-hidden")).toBeNull();
   });
 
   it("announces only changes of the state, not every file count", async () => {
@@ -625,12 +608,12 @@ describe("folders", () => {
     expect(button("Fotos, D:\\Fotos, 117 Dateien werden hochgeladen")).toBeTruthy();
   });
 
-  it("shows the size of each folder on this disk, also in the accessible name", async () => {
+  it("shows the files and the size of each folder, also in the accessible name", async () => {
     await renderApp();
     // Intl puts a no-break space between number and unit.
     const sizes = all(".folder-row .row-size").map((size) => size.textContent.replace(/\s/g, " "));
-    expect(sizes).toEqual(["2,4 GB", "86,3 GB"]);
-    expect(button(/^Fotos, D:\\Fotos, Aktuell, 86,3\sGB$/)).toBeTruthy();
+    expect(sizes).toEqual(["1.234 Dateien · 2,4 GB", "18.406 Dateien · 86,3 GB"]);
+    expect(button(/^Fotos, D:\\Fotos, Aktuell, 18\.406 Dateien · 86,3\sGB$/)).toBeTruthy();
   });
 
   it.each<[ScenarioId, string, string[]]>([
@@ -662,7 +645,9 @@ describe("folders", () => {
     // The cards keep everything: name, status, size, the menu and the dashed "add" card.
     const cards = all(".folder-list.is-grid .folder-row");
     expect(cards).toHaveLength(2);
-    expect(cards[1]?.querySelector(".row-size")?.textContent.replace(/\s/g, " ")).toBe("86,3 GB");
+    expect(cards[1]?.querySelector(".row-size")?.textContent.replace(/\s/g, " ")).toBe(
+      "18.406 Dateien · 86,3 GB",
+    );
     expect(button("Fotos, D:\\Fotos, Aktuell").getAttribute("title")).toBe("D:\\Fotos");
     expect(button("Aktionen für „Fotos“")).toBeTruthy();
     expect(document.querySelector(".is-grid .add-row")).not.toBeNull();

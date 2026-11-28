@@ -1,24 +1,24 @@
 // The header's brand, laid out like Hangar's: the logo over two lines, the name in bold and below it
 // the version in small muted text with a "beta" badge while the major version is 0. The version
-// line keeps its height before the version arrives (or if it never does), so nothing moves.
+// comes from the build (vite define), not from a backend call: it is there with the first paint
+// and cannot stay empty when a call at start goes unanswered, as it did in an installed build.
+// The line keeps its height even without a version, so nothing moves.
 
-import { HANGAR_DRIVE_BUILD } from "../buildInfo";
+import { HANGAR_DRIVE_BUILD, HANGAR_DRIVE_VERSION } from "../buildInfo";
 import { useT } from "../i18n";
-import { useBackend } from "../ui/backendContext";
 import { AppLogo } from "../ui/StatusMark";
-import { useLoad } from "../ui/useAsync";
 import { formatVersion, versionParts, withBuild } from "../version";
+
+export function brandVersion(
+  version: string | null,
+  build: number | null,
+): { number: string; beta: boolean } | null {
+  return version === null ? null : versionParts(formatVersion(withBuild(version, build)));
+}
 
 export function Brand() {
   const t = useT();
-  const backend = useBackend();
-  const [about] = useLoad(() => backend.getAbout(), [backend]);
-  const parts =
-    about.status === "ready"
-      ? versionParts(
-          formatVersion(withBuild(about.data.version, about.data.build ?? HANGAR_DRIVE_BUILD)),
-        )
-      : null;
+  const parts = brandVersion(HANGAR_DRIVE_VERSION, HANGAR_DRIVE_BUILD);
   return (
     <span className="brand">
       <AppLogo size={26} className="brand-mark" />

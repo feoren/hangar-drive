@@ -60,6 +60,7 @@ export function folders(): Folder[] {
       freezeDays: null,
       notSyncedCount: 0,
       bytes: 2_412_000_000,
+      fileCount: 1_234,
     },
     {
       id: "f-photos",
@@ -69,6 +70,7 @@ export function folders(): Folder[] {
       freezeDays: null,
       notSyncedCount: 0,
       bytes: 86_300_000_000,
+      fileCount: 18_406,
     },
   ];
 }

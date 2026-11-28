@@ -2,13 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import { MockBackend } from "../mock/mockBackend";
 import { BackendError } from "../errors";
-import type { BackendEvent } from "../types";
+import type { BackendEvent, TrafficSample } from "../types";
 import { backendChoice, insideTauri } from "../index";
 import {
   codeOf,
   commandName,
   EVENT_CHANNEL,
   isMissingCommand,
+  TRAFFIC_CHANNEL,
   TauriBackend,
   type Invoke,
   type Listen,
@@ -182,6 +183,65 @@ describe("tauri backend", () => {
     await expect(backendWith({ get_snapshot: wrong }).backend.getSnapshot()).rejects.toMatchObject({
       code: "badResponse",
     });
+  });
+
+  it("decodes a folder's file count, null before the first scan and from an older shell", async () => {
+    const snapshot = await new MockBackend({ scenario: "upToDate" }).getSnapshot();
+    const decoded = await backendWith({ get_snapshot: snapshot }).backend.getSnapshot();
+    expect(decoded.folders.map((folder) => folder.fileCount)).toEqual([1_234, 18_406]);
+    const older = {
+      ...snapshot,
+      folders: snapshot.folders.map((folder) =>
+        Object.fromEntries(Object.entries(folder).filter(([name]) => name !== "fileCount")),
+      ),
+    };
+    const fromOlder = await backendWith({ get_snapshot: older }).backend.getSnapshot();
+    expect(fromOlder.folders.map((folder) => folder.fileCount)).toEqual([null, null]);
+    const unscanned = {
+      ...snapshot,
+      folders: snapshot.folders.map((folder) => ({ ...folder, fileCount: null })),
+    };
+    const fromUnscanned = await backendWith({ get_snapshot: unscanned }).backend.getSnapshot();
+    expect(fromUnscanned.folders.map((folder) => folder.fileCount)).toEqual([null, null]);
+    const wrong = {
+      ...snapshot,
+      folders: snapshot.folders.map((folder) => ({ ...folder, fileCount: "1.234" })),
+    };
+    await expect(backendWith({ get_snapshot: wrong }).backend.getSnapshot()).rejects.toMatchObject({
+      code: "badResponse",
+    });
+  });
+
+  it("reads the traffic history and the readings on their own channel", async () => {
+    const history = { tick: 3, up: [0, 5, 7], down: [1, 2, 3], sent: 12, received: 6 };
+    const { backend, calls } = backendWith({ get_traffic: history });
+    await expect(backend.getTraffic()).resolves.toEqual(history);
+    expect(calls).toEqual([{ command: "get_traffic", args: {} }]);
+    await expect(
+      backendWith({ get_traffic: { ...history, up: "fast" } }).backend.getTraffic(),
+    ).rejects.toMatchObject({ code: "badResponse" });
+
+    const box: { channel: string; handler: ((payload: unknown) => void) | null } = {
+      channel: "",
+      handler: null,
+    };
+    const listen: Listen = (channel, next) => {
+      box.channel = channel;
+      box.handler = next;
+      return Promise.resolve(() => undefined);
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const samples: TrafficSample[] = [];
+    const stop = backendWith({}, listen).backend.subscribeTraffic((sample) => samples.push(sample));
+    await Promise.resolve();
+    expect(box.channel).toBe(TRAFFIC_CHANNEL);
+    const sample = { tick: 4, up: 5_200_000, down: 0, sent: 9, received: 1 };
+    box.handler?.(sample);
+    box.handler?.({ tick: 5, up: -1 });
+    expect(samples).toEqual([sample]);
+    expect(warn).toHaveBeenCalled();
+    stop();
+    warn.mockRestore();
   });
 
   it("decodes results with their error codes", async () => {

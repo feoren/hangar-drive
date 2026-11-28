@@ -65,6 +65,22 @@ describe("App", () => {
     expect(mock.tray?.icon).toBe("upToDate");
   });
 
+  it("sends the tray model only when it changed", async () => {
+    const { mock } = await renderApp("upToDate");
+    const sent = mock.trayUpdates;
+    expect(sent).toBeGreaterThan(0);
+    // A snapshot that changes nothing the tray shows (the camera is not in the tray).
+    mock.setCamera(true);
+    await flush();
+    mock.setCamera(false);
+    await flush();
+    expect(mock.trayUpdates).toBe(sent);
+    mock.clickTray("pause:hour");
+    await flush();
+    expect(mock.tray?.icon).toBe("paused");
+    expect(mock.trayUpdates).toBe(sent + 1);
+  });
+
   it("runs the actions chosen in the tray menu", async () => {
     const { mock } = await renderApp("upToDate");
     mock.clickTray("pause:hour");

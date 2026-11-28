@@ -62,6 +62,8 @@ import type {
   Settings,
   Snapshot,
   Timeline,
+  TrafficHistory,
+  TrafficSample,
   TrashItem,
   Unsubscribe,
   UpdateOutcome,
@@ -160,6 +162,8 @@ export class MockBackend implements Backend {
   readonly calls: string[] = [];
   /** The last tray model the window sent. */
   tray: TrayModel | null = null;
+  /** How many tray models the window sent. */
+  trayUpdates = 0;
   /** The last recovery sheet the window printed or saved. */
   sheet: RecoverySheetDocument | null = null;
 
@@ -188,6 +192,9 @@ export class MockBackend implements Backend {
   private counter = 0;
   /** Events sent before the window listened, delivered when it subscribes (like the shell). */
   private held: BackendEvent[] = [];
+  private readonly trafficListeners = new Set<(sample: TrafficSample) => void>();
+  private trafficTicker: ReturnType<typeof setInterval> | null = null;
+  private traffic: TrafficHistory = { tick: 0, up: [], down: [], sent: 0, received: 0 };
 
   constructor(options: MockOptions = {}) {
     this.latency = options.latency ?? 0;
@@ -260,12 +267,45 @@ export class MockBackend implements Backend {
     });
   }
 
+  /**
+   * Takes one traffic reading of `up` and `down` bytes per second, as the shell's sampler does
+   * once a second, and sends it to the traffic line.
+   */
+  pushTraffic(up: number, down: number): TrafficSample {
+    const last = (values: readonly number[], value: number) => [...values, value].slice(-60);
+    const t = this.traffic;
+    this.traffic = {
+      tick: t.tick + 1,
+      up: last(t.up, up),
+      down: last(t.down, down),
+      sent: t.sent + up,
+      received: t.received + down,
+    };
+    const sample = { ...this.traffic, up, down };
+    for (const listener of this.trafficListeners) listener(sample);
+    return sample;
+  }
+
+  /** Simulated rates while files sync: a few MB/s in the direction the folders move. */
+  private simulatedRates(): [number, number] {
+    const sync = this.state.sync;
+    if (sync.pendingFiles === 0 || sync.pause || sync.connection.kind !== "online") return [0, 0];
+    const kinds = new Set(this.state.folders.map((folder) => folder.status.kind));
+    const rate = () => Math.round(1_500_000 + this.random() * 4_000_000);
+    const down = kinds.has("downloading") ? rate() : 0;
+    const up = kinds.has("uploading") || down === 0 ? rate() : 0;
+    return [up, down];
+  }
+
   dispose(): void {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
     if (this.ticker) clearInterval(this.ticker);
     this.ticker = null;
+    if (this.trafficTicker) clearInterval(this.trafficTicker);
+    this.trafficTicker = null;
     this.listeners.clear();
+    this.trafficListeners.clear();
   }
 
   // -------------------------------------------------------------------------------------------
@@ -324,6 +364,10 @@ export class MockBackend implements Backend {
 
   private startTicker(): void {
     if (!this.animate) return;
+    this.trafficTicker = setInterval(() => {
+      const [up, down] = this.simulatedRates();
+      this.pushTraffic(up, down);
+    }, 1000);
     this.ticker = setInterval(() => {
       const sync = this.state.sync;
       if (sync.pendingFiles === 0 || sync.pause || sync.connection.kind !== "online") return;
@@ -418,6 +462,19 @@ export class MockBackend implements Backend {
     }
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  // Not through `call`: the traffic line asks on its own when it mounts, and must neither take
+  // a failure a test set up for an action (`failNext`) nor show up in the recorded calls.
+  getTraffic(): Promise<TrafficHistory> {
+    return Promise.resolve({ ...this.traffic });
+  }
+
+  subscribeTraffic(listener: (sample: TrafficSample) => void): Unsubscribe {
+    this.trafficListeners.add(listener);
+    return () => {
+      this.trafficListeners.delete(listener);
     };
   }
 
@@ -591,6 +648,7 @@ export class MockBackend implements Backend {
           freezeDays: null,
           notSyncedCount: 0,
           bytes: 48_200_000,
+          fileCount: 312,
         },
       ],
       activity: [],
@@ -688,6 +746,7 @@ export class MockBackend implements Backend {
         freezeDays: null,
         notSyncedCount: 0,
         bytes: null,
+        fileCount: null,
       })),
       activity: [],
       conflicts: [],
@@ -882,6 +941,7 @@ export class MockBackend implements Backend {
         freezeDays: null,
         notSyncedCount: 0,
         bytes: null,
+        fileCount: null,
       },
     ];
     this.emitSnapshot();
@@ -906,6 +966,7 @@ export class MockBackend implements Backend {
         freezeDays: null,
         notSyncedCount: 0,
         bytes: null,
+        fileCount: null,
       },
     ];
     this.emitSnapshot();
@@ -1563,6 +1624,7 @@ export class MockBackend implements Backend {
 
   async updateTray(model: TrayModel): Promise<void> {
     this.tray = model;
+    this.trayUpdates += 1;
     await Promise.resolve();
   }
 

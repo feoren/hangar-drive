@@ -1,6 +1,7 @@
 // The bridge to the Rust backend. Every method calls one Tauri command of the same name in
 // snake_case (`getSnapshot` -> `get_snapshot`) with camelCase arguments, and checks the answer
-// with a decoder. Events arrive on one channel, `hangar-drive://event`, as `BackendEvent` JSON.
+// with a decoder. Events arrive on one channel, `hangar-drive://event`, as `BackendEvent` JSON;
+// the traffic readings come once a second on their own, `hangar-drive://traffic`.
 //
 // The Rust side is still being built. A command it does not have yet rejects with a
 // BackendError "notImplemented" that names the command, so the window shows "this version cannot
@@ -27,12 +28,14 @@ import type {
   PickPurpose,
   RecoverySheetDocument,
   ServerConfirm,
+  TrafficSample,
   Unsubscribe,
 } from "../types";
 import type { Decoder } from "./decode";
 import * as d from "./decoders";
 
 export const EVENT_CHANNEL = "hangar-drive://event";
+export const TRAFFIC_CHANNEL = "hangar-drive://traffic";
 
 export type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 export type Listen = (channel: string, handler: (payload: unknown) => void) => Promise<() => void>;
@@ -100,15 +103,34 @@ export class TauriBackend implements Backend {
   }
 
   subscribe(listener: (event: BackendEvent) => void): Unsubscribe {
-    let stop: (() => void) | null = null;
-    let stopped = false;
-    this.listenFn(EVENT_CHANNEL, (payload) => {
+    return this.listenTo(EVENT_CHANNEL, (payload) => {
       try {
         listener(d.event(payload, "event"));
       } catch (error) {
         console.warn("Hangar Drive: unreadable backend event", error);
       }
-    }).then(
+    });
+  }
+
+  getTraffic() {
+    return this.call("getTraffic", {}, d.trafficHistory);
+  }
+
+  subscribeTraffic(listener: (sample: TrafficSample) => void): Unsubscribe {
+    return this.listenTo(TRAFFIC_CHANNEL, (payload) => {
+      try {
+        listener(d.trafficSample(payload, "traffic"));
+      } catch (error) {
+        console.warn("Hangar Drive: unreadable traffic reading", error);
+      }
+    });
+  }
+
+  /** Listens on `channel` until the returned function is called, also before listening began. */
+  private listenTo(channel: string, handler: (payload: unknown) => void): Unsubscribe {
+    let stop: (() => void) | null = null;
+    let stopped = false;
+    this.listenFn(channel, handler).then(
       (unlisten) => {
         if (stopped) unlisten();
         else stop = unlisten;

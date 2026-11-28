@@ -27,6 +27,16 @@ describe("format", () => {
     expect(calendarDaysBetween(NOW - 2 * HOUR, NOW)).toBe(0);
   });
 
+  // The formatters are kept per language and options: a cached one never answers for another.
+  it("keeps one formatter per language and options", () => {
+    expect(plain(formatSize("de", 6_200_000_000))).toBe("6,2 GB");
+    expect(plain(formatSize("en", 6_200_000_000))).toBe("6.2 GB");
+    expect(plain(formatSize("de", 6_200_000_000))).toBe("6,2 GB");
+    expect(plain(formatSize("de", 620_000_000_000))).toBe("620 GB");
+    expect(plain(formatRelative("en", NOW - DAY, NOW))).toBe("yesterday");
+    expect(plain(formatSince("de", NOW - DAY, NOW))).toBe("gestern");
+  });
+
   it("formats times and dates for the language", () => {
     expect(plain(formatTime("de", NOW))).toBe("14:31");
     expect(plain(formatDate("de", NOW, NOW))).toBe("26. Nov.");

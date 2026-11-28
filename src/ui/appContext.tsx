@@ -56,7 +56,26 @@ export function useComputedTrayState(snapshot: Snapshot): TrayState {
     };
   }, [hasWork, tick, hysteresis, snapshot]);
 
-  return trayState(snapshot, view.now, view.shown);
+  // The same state keeps the same object, so the context's consumers and the tray effect do
+  // not run again for every snapshot that changes nothing they show.
+  const next = trayState(snapshot, view.now, view.shown);
+  const [stable, setStable] = useState(next);
+  if (!sameTrayState(stable, next)) {
+    setStable(next);
+    return next;
+  }
+  return stable;
+}
+
+/** Whether two tray states say the same (every state is a flat record of primitives). */
+export function sameTrayState(a: TrayState, b: TrayState): boolean {
+  if (a === b) return true;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  return (
+    keysA.length === keysB.length &&
+    keysA.every((key) => Object.is(Reflect.get(a, key), Reflect.get(b, key)))
+  );
 }
 
 /** Subscribes to backend events for the lifetime of the component. */

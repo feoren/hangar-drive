@@ -18,6 +18,10 @@
   --on-warn: #1a1d21;
   --error: #ff9491;
   --brand-mark: #f2e3c6;
+  /* The traffic line (src/main/TrafficBar.tsx): upload in the app's green, download in the blue
+     of the sister app's accent, both told apart by their arrows as well. */
+  --traffic-up: #4fd1a5;
+  --traffic-down: #5aa9ff;
   /* The logo's own colors (src-tauri/app-icon.svg), the same in both themes. */
   --logo-tile: #141a24;
   --logo-fold: #4fd1a5;
@@ -94,6 +98,8 @@
   --on-warn: #ffffff;
   --error: #bb022a;
   --brand-mark: #b8892e;
+  --traffic-up: #097559;
+  --traffic-down: #0969da;
   --primary: #097559;
   --primary-hover: #04684f;
   --on-primary: #ffffff;
@@ -692,6 +698,88 @@ code.command {
   padding: var(--space-3) var(--space-4) 40px;
 }
 
+/* Traffic: upload and download as two small tiles in the header, each with the sparkline of the
+   last minute as its background and the arrow and the current rate on top, after the system bar
+   of the sister app. Minimum widths, so the header does not shift with every reading. */
+.traffic {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 28px;
+  margin-right: 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  cursor: default;
+}
+
+.traffic-gauge {
+  --gauge-color: var(--traffic-up);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* A floor, not a width: the rate of every language fits it except Greek ("kB/δευτ."), whose
+     tile grows rather than cutting the unit off. */
+  min-width: 6.9rem;
+  height: 100%;
+  padding: 0 6px;
+  overflow: hidden;
+  border-radius: var(--radius-s);
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--gauge-color) 7%, transparent);
+}
+
+.traffic-down {
+  --gauge-color: var(--traffic-down);
+}
+
+.traffic-spark {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.traffic-scroll {
+  animation: traffic-scroll 1000ms linear;
+}
+
+/* One unit of the sparkline is one reading (traffic.ts SPARK_WIDTH): the new reading slides in
+   from the right over the second until the next. */
+@keyframes traffic-scroll {
+  from {
+    transform: translateX(1px);
+  }
+  to {
+    transform: none;
+  }
+}
+
+.traffic-area {
+  fill: color-mix(in srgb, var(--gauge-color) 20%, transparent);
+}
+
+.traffic-line {
+  fill: none;
+  stroke: color-mix(in srgb, var(--gauge-color) 75%, transparent);
+  stroke-width: 1;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.traffic-arrow,
+.traffic-rate {
+  position: relative;
+}
+
+.traffic-arrow {
+  font-weight: 700;
+  color: var(--gauge-color);
+}
+
 /* Status: the tray's state as one compact item in the header, before the buttons; its details
    open in a small panel below it. */
 .status {
@@ -1028,7 +1116,8 @@ code.command {
   align-items: flex-start;
 }
 
-.is-grid .row-status {
+.is-grid .row-status,
+.is-grid .row-size {
   text-align: left;
   white-space: normal;
 }
@@ -2524,6 +2613,16 @@ code.command {
 
   .activity-when {
     grid-column: 4;
+  }
+
+  /* Narrower traffic tiles, so the brand and the status keep their words at the smallest
+     window (640 px). */
+  .traffic {
+    margin-right: 4px;
+  }
+
+  .traffic-gauge {
+    min-width: 6rem;
   }
 
   /* Wraps instead of cutting off: the status is the one word that must stay whole (UX 12). */

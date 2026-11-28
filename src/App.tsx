@@ -1,7 +1,7 @@
 // The root: loads the first snapshot, keeps it current from the backend's events, applies the
 // language, keeps the tray in step and shows either the setup or the main window.
 
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { loadMockPanel } from "./backend";
 import type { Backend, Snapshot } from "./backend/types";
@@ -145,9 +145,18 @@ function Shell({
   const [route, setRoute] = useState<{ link: IncomingLink; setup: boolean } | null>(null);
   if (link && link.at !== route?.link.at) setRoute({ link, setup: inSetup });
 
-  // The tray shows what the window computed (UX 6.1, 6.2).
+  // The tray shows what the window computed (UX 6.1, 6.2). Most snapshots leave the model as it
+  // was; only a changed one crosses to the shell, which redraws the native menu for it.
+  const sentTray = useRef<string | null>(null);
   useEffect(() => {
-    backend.updateTray(trayModel(snapshot, state, t, language, Date.now())).catch(() => undefined);
+    const model = trayModel(snapshot, state, t, language, Date.now());
+    const key = JSON.stringify(model);
+    if (key === sentTray.current) return;
+    sentTray.current = key;
+    backend.updateTray(model).catch(() => {
+      // Sent again with the next snapshot.
+      if (sentTray.current === key) sentTray.current = null;
+    });
   }, [backend, snapshot, state, t, language]);
 
   const showProblem = useCallback(

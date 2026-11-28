@@ -1,5 +1,6 @@
 // The main window (UX 6.3): the one banner, the folders and the quiet lines at the bottom, below a
-// header with the main menu (File, View, Help), the logo with name and version, and the status.
+// header with the main menu (File, View, Help), the logo with name and version, the network
+// traffic while there is any, and the status.
 // The header comes last in the tab order (UX 12), so it follows the content in the document and
 // is placed on top by the layout; the status sentence still opens the content as its heading.
 
@@ -40,6 +41,7 @@ import {
 import { FolderList, FolderViewSwitch, useFolderView } from "./FolderList";
 import type { OpenDialog } from "./openDialog";
 import { StatusHeader, StatusHeading } from "./StatusHeader";
+import { TrafficBar } from "./TrafficBar";
 
 /** The storage line appears only above this share of the quota (UX 6.3). */
 export const STORAGE_LINE_SHARE = 0.8;
@@ -296,6 +298,7 @@ export function MainWindow({
           <Brand />
         </div>
         <div className="topbar-actions">
+          <TrafficBar />
           <StatusHeader danger={danger} />
         </div>
       </header>
@@ -405,17 +408,14 @@ function RepairDialog({
   readonly initialLink: string | undefined;
   readonly onClose: () => void;
 }) {
-  const backend = useBackend();
   return (
     <Dialog labelledBy="repair-title" size="large" onClose={onClose} closeOnOutside={false}>
       <PairFlow
         titleId="repair-title"
         initialLink={initialLink ?? ""}
         onBack={onClose}
-        onDone={() => {
-          backend.getSnapshot().catch(() => undefined);
-          onClose();
-        }}
+        // The new state arrives as a snapshot event; the answer of a request here was dropped.
+        onDone={onClose}
       />
     </Dialog>
   );

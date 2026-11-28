@@ -90,6 +90,8 @@ export interface Folder {
   readonly notSyncedCount: number;
   /** The bytes of its files on this disk; null before the first scan, then nothing is shown. */
   readonly bytes: Bytes | null;
+  /** The number of its files; null before the first scan (and from an older shell). */
+  readonly fileCount: number | null;
 }
 
 export type FileAction =
@@ -804,6 +806,33 @@ export type BackendEvent =
 
 export type Unsubscribe = () => void;
 
+/**
+ * One reading of the network traffic to the server, once a second while the main window is on
+ * screen and the last minute had traffic. Payload bytes only, never contents or paths.
+ */
+export interface TrafficSample {
+  /** Readings taken so far; a gap means readings were missed (fetch `getTraffic`). */
+  readonly tick: number;
+  /** Bytes per second sent. */
+  readonly up: number;
+  /** Bytes per second received. */
+  readonly down: number;
+  /** Bytes sent since the app started. */
+  readonly sent: Bytes;
+  /** Bytes received since the app started. */
+  readonly received: Bytes;
+}
+
+/** The last minute of readings, oldest first, at most 60 per direction. */
+export interface TrafficHistory {
+  /** The tick of the newest reading, 0 before the first. */
+  readonly tick: number;
+  readonly up: readonly number[];
+  readonly down: readonly number[];
+  readonly sent: Bytes;
+  readonly received: Bytes;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The interface
 
@@ -813,6 +842,11 @@ export interface Backend {
 
   getSnapshot(): Promise<Snapshot>;
   subscribe(listener: (event: BackendEvent) => void): Unsubscribe;
+
+  /** The last minute of network traffic, for the traffic line when it missed readings. */
+  getTraffic(): Promise<TrafficHistory>;
+  /** Traffic readings, on their own channel so only the traffic line renders for them. */
+  subscribeTraffic(listener: (sample: TrafficSample) => void): Unsubscribe;
 
   /**
    * Reads text from the clipboard, only when the person clicked "Paste" (UX 4.2 step 1). Only a

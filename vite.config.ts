@@ -42,11 +42,28 @@ export function backendFor(mode: string, env: string | undefined): string {
   return mode === APP_MODE ? "tauri" : (env ?? "auto");
 }
 
+// The app's version from package.json (kept equal to tauri.conf.json and Cargo.toml by the
+// release script), so the window shows it without asking the backend first.
+function appVersion(): string | null {
+  try {
+    const pkg: unknown = JSON.parse(readFileSync("package.json", "utf8"));
+    return typeof pkg === "object" &&
+      pkg !== null &&
+      "version" in pkg &&
+      typeof pkg.version === "string"
+      ? pkg.version
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 // Fixed values that Tauri expects (devUrl in src-tauri/tauri.conf.json).
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
   define: {
     __HANGAR_DRIVE_BUILD__: JSON.stringify(buildNumber()),
+    __HANGAR_DRIVE_VERSION__: JSON.stringify(appVersion()),
     __HANGAR_DRIVE_BACKEND__: JSON.stringify(backendFor(mode, process.env.HANGAR_DRIVE_BACKEND)),
   },
   clearScreen: false,

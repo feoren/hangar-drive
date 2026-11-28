@@ -1,13 +1,21 @@
 // The folder rows (UX 6.3): name, full path truncated in the middle, status in words with the
-// size on this disk below it, row menu. As a grid, the same rows are cards (the path is the
-// tooltip), and "Add folder" is a dashed card; the choice is kept in the shell's settings.
+// number of files and the size on this disk below it, row menu. As a grid, the same rows are
+// cards (the path is the tooltip), and "Add folder" is a dashed card; the choice is kept in the
+// shell's settings.
 // One tab stop for the list; arrow keys move, Enter opens the folder, Shift+F10 the menu.
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 
 import type { Folder, FolderView, StopReason } from "../backend/types";
 import { formatSize } from "../format";
-import { displayName, useLanguage, useT, type MessageKey, type Translate } from "../i18n";
+import {
+  displayName,
+  useLanguage,
+  useT,
+  type Language,
+  type MessageKey,
+  type Translate,
+} from "../i18n";
 import { useBackend } from "../ui/backendContext";
 import { FolderIcon, GridIcon, ListIcon, PlusIcon } from "../ui/icons";
 import { RowMenu, type MenuItem } from "../ui/Menu";
@@ -41,6 +49,18 @@ export function folderStatusText(folder: Folder, t: Translate): string {
         reason: t(STOP_REASON_TEXT[status.reason]),
       });
   }
+}
+
+/**
+ * What the row says about the folder's content: "1.234 Dateien · 6,2 GB". A part that is not
+ * known yet (before the first scan, or from an older shell) is left out rather than shown as 0,
+ * which would read as empty; null when neither is known.
+ */
+export function folderContentText(folder: Folder, language: Language, t: Translate): string | null {
+  const parts: string[] = [];
+  if (folder.fileCount !== null) parts.push(t("folder.files", { count: folder.fileCount }));
+  if (folder.bytes !== null) parts.push(formatSize(language, folder.bytes));
+  return parts.length === 0 ? null : parts.join(" · ");
 }
 
 /**
@@ -154,10 +174,9 @@ export function FolderList({
           online={online}
           open={open}
           onDeleted={onDeleted}
+          index={index}
           tabIndex={roving.tabIndex(index)}
-          onFocus={() => {
-            roving.onItemFocus(index);
-          }}
+          onItemFocus={roving.onItemFocus}
         />
       ))}
       <div role="listitem" className="row add-row">
@@ -183,21 +202,46 @@ export function FolderList({
   );
 }
 
-function FolderRow({
-  folder,
-  online,
-  open,
-  onDeleted,
-  tabIndex,
-  onFocus,
-}: {
+interface FolderRowProps {
   readonly folder: Folder;
   readonly online: boolean;
   readonly open: Open;
   readonly onDeleted: (name: string) => void;
+  readonly index: number;
   readonly tabIndex: 0 | -1;
-  readonly onFocus: () => void;
-}) {
+  /** Stable (the roving list's state setter), so a row's props compare equal. */
+  readonly onItemFocus: (index: number) => void;
+}
+
+/**
+ * Whether a row would draw the same: every snapshot brings new folder objects, so the folder is
+ * compared by its content (a few short fields), the rest by identity.
+ */
+export function sameRowProps(a: FolderRowProps, b: FolderRowProps): boolean {
+  return (
+    a.online === b.online &&
+    a.open === b.open &&
+    a.onDeleted === b.onDeleted &&
+    a.index === b.index &&
+    a.tabIndex === b.tabIndex &&
+    a.onItemFocus === b.onItemFocus &&
+    (a.folder === b.folder || JSON.stringify(a.folder) === JSON.stringify(b.folder))
+  );
+}
+
+// A snapshot arrives for every slice of the engine's work; only the rows whose folder changed
+// draw again.
+const FolderRow = memo(FolderRowView, sameRowProps);
+
+function FolderRowView({
+  folder,
+  online,
+  open,
+  onDeleted,
+  index,
+  tabIndex,
+  onItemFocus,
+}: FolderRowProps) {
   const t = useT();
   const language = useLanguage();
   const backend = useBackend();
@@ -205,8 +249,7 @@ function FolderRow({
   const [menuOpen, setMenuOpen] = useState(false);
   const main = useRef<HTMLButtonElement>(null);
   const status = folderStatusText(folder, t);
-  // Unknown before the first scan: nothing rather than a "0 B" that would read as empty.
-  const size = folder.bytes === null ? null : formatSize(language, folder.bytes);
+  const size = folderContentText(folder, language, t);
   const paused = folder.status.kind === "paused";
 
   const openInExplorer = () => {
@@ -281,7 +324,9 @@ function FolderRow({
             .filter(Boolean)
             .join(", ")}
           title={displayName(folder.path)}
-          onFocus={onFocus}
+          onFocus={() => {
+            onItemFocus(index);
+          }}
           onDoubleClick={openInExplorer}
           onClick={(event) => {
             // A single click only selects; Enter and a double click open (Explorer habit).

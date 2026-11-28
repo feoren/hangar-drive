@@ -36,6 +36,8 @@ import type {
   Settings,
   Snapshot,
   Timeline,
+  TrafficHistory,
+  TrafficSample,
   TrashItem,
   UpdateOutcome,
   VersionTree,
@@ -180,6 +182,7 @@ export const snapshot = object({
       freezeDays: nullable(num),
       notSyncedCount: num,
       bytes: nullable(num),
+      fileCount: nullable(num),
     }),
   ),
   activity: array(activityEntry),
@@ -478,6 +481,22 @@ export const event = union("type", {
   },
   openLink: { link: str },
 }) satisfies Decoder<BackendEvent>;
+
+export const trafficSample = object({
+  tick: num,
+  up: num,
+  down: num,
+  sent: num,
+  received: num,
+}) satisfies Decoder<TrafficSample>;
+
+export const trafficHistory = object({
+  tick: num,
+  up: array(num),
+  down: array(num),
+  sent: num,
+  received: num,
+}) satisfies Decoder<TrafficHistory>;
 
 export const acceptedHeads = object({
   count: num,
