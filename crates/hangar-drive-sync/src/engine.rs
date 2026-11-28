@@ -53,8 +53,10 @@ use crate::chunker::DynEntropy;
 use crate::error::SyncError;
 use crate::folder::{Ctx, FolderSettings, FolderState, FolderSync, StopReason, UndoState};
 use crate::http::{HttpServer, ServerConfig, SessionIdentity};
+use crate::interrupt::Interrupt;
 use crate::names::LabelWords;
 use crate::ports::{Clock, FileSystem, FsError, Keychain, NetError, ServerApi, Store};
+use crate::progress::Live;
 use crate::removal::{accept_removed_heads, complete_pending, remove_devices, JobCtx};
 use crate::traffic::TrafficCounter;
 use crate::tree::{NodeKind, Tree, ROOT};
@@ -99,6 +101,12 @@ pub const SERVER_NUMBER_COMMAND: &str = "hangar-drive-server server-key-number";
 /// downloads stop at a clean point once it is spent, and the next pass carries on right after
 /// the commands that came in meanwhile, so the window never waits long for an answer.
 pub const WORK_BUDGET_MS: i64 = 1000;
+/// A pass that only carries on the work of the last one ([`EngineCore::note_continuation`])
+/// reads the account's feed again only after this long: during a long upload the loop runs its
+/// passes back to back, and a feed request per pass added a server round trip on the engine
+/// thread to every slice of work. 5 s is the app's pause between passes when idle, so other
+/// devices' changes are seen as soon as then; a command or a change on disk reads it at once.
+pub const CONTINUATION_REFRESH_MS: i64 = 5_000;
 /// The least budget one folder's round gets when several folders share a pass.
 const MIN_FOLDER_BUDGET_MS: i64 = 250;
 /// How long the loop waits after a watcher event before its pass, so a burst of events (a file
@@ -510,6 +518,12 @@ pub struct EngineCore {
     work_budget_ms: Option<i64>,
     /// The last pass stopped a round at its budget: the loop runs the next one right away.
     more_work: bool,
+    /// The next pass only carries on the work of the last one ([`Self::note_continuation`]).
+    continuation: bool,
+    /// When the account's feed was last read with success, in clock time.
+    last_refresh_ms: Option<i64>,
+    /// Live snapshots while a pass works ([`crate::progress`]).
+    live: Live,
     /// Rung by the folders' watchers to wake the engine thread ([`Engine::spawn`]).
     waker: Option<Waker>,
     /// Every folder pulls in the next pass that reaches the server: at start and after a pass
@@ -606,9 +620,11 @@ impl EngineCore {
             None => Persisted::default(),
         };
         let account = Account::load(&*ports.store, &*ports.keychain)?;
+        let live = Live::default();
         let folder_settings = FolderSettings {
             words: settings.words.clone(),
             tz_offset_minutes: settings.tz_offset_minutes,
+            progress: live.progress(),
             ..FolderSettings::default()
         };
         let now = ports.clock.now_ms();
@@ -643,6 +659,9 @@ impl EngineCore {
             recovery_retry_at: 0,
             work_budget_ms: Some(WORK_BUDGET_MS),
             more_work: false,
+            continuation: false,
+            last_refresh_ms: None,
+            live,
             waker: None,
             pull_all: true,
             commit_times: VecDeque::new(),
@@ -774,6 +793,7 @@ impl EngineCore {
             return None;
         }
         self.last_snapshot = Some(snapshot.clone());
+        self.live.start(self.last_snapshot.clone());
         Some(BackendEvent::Snapshot {
             snapshot: Box::new(snapshot),
         })
@@ -784,6 +804,7 @@ impl EngineCore {
     pub fn first_snapshot(&mut self) -> BackendEvent {
         let snapshot = self.snapshot();
         self.last_snapshot = Some(snapshot.clone());
+        self.live.start(self.last_snapshot.clone());
         BackendEvent::Snapshot {
             snapshot: Box::new(snapshot),
         }
@@ -806,6 +827,9 @@ impl EngineCore {
     /// One pass of the control loop (module docs). Returns the events for the window.
     pub fn tick(&mut self) -> Vec<BackendEvent> {
         self.more_work = false;
+        let continuation = std::mem::take(&mut self.continuation);
+        // The window shows the last snapshot; live progress counts down from it.
+        self.live.start(self.last_snapshot.clone());
         self.tick_recovery();
         // While the server reports this device as removed, sync stays stopped and the device
         // only signs in again now and then (security review H2).
@@ -817,7 +841,7 @@ impl EngineCore {
             !(0..REMOVAL_PROBE_MS).contains(&since)
         });
         if probe_due {
-            match self.tick_inner() {
+            match self.tick_inner(continuation) {
                 Ok(()) => {}
                 // The server answered this device's own proof with "removed" (finding E2E-3).
                 // A server can say that of any device, so the device forgets the account only
@@ -831,6 +855,9 @@ impl EngineCore {
                         None => self.note_removal_report(),
                     }
                 }
+                // A call that gave way to a waiting command: the next pass carries on, without
+                // the full pull of a lost connection.
+                Err(SyncError::Net(NetError::Interrupted)) => self.more_work = true,
                 Err(e) => {
                     self.pull_all = true;
                     self.note_net(&e);
@@ -849,6 +876,10 @@ impl EngineCore {
                 snapshot: Box::new(snapshot),
             });
         }
+        // Progress reported outside a pass (a command that uploads, such as a restore) counts
+        // down from what the window shows now, never from an older snapshot whose warnings or
+        // states would come back for a moment.
+        self.live.start(self.last_snapshot.clone());
         self.take_events()
     }
 
@@ -969,13 +1000,15 @@ impl EngineCore {
         }
     }
 
-    fn tick_inner(&mut self) -> Result<(), SyncError> {
+    fn tick_inner(&mut self, continuation: bool) -> Result<(), SyncError> {
         let now = self.now();
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
             return Ok(());
         };
         // Named in the next sign-in proof, so a "removed" answer brings the log from here (H2).
         server.set_known_log_length(account.state().len());
+        // Waits between attempts and a renewed sign-in give way to waiting commands.
+        server.set_interrupt(self.folder_settings.interrupt.clone());
         // A new account whose first epoch or device names did not make it yet (finding E2E-1):
         // carried on here, also after a restart, before anything else uses the account.
         if account.setup_pending() {
@@ -987,18 +1020,28 @@ impl EngineCore {
                 u64::try_from(now).unwrap_or(0),
             )?;
         }
-        let refresh = account.refresh(
-            server.as_mut(),
-            &mut *self.ports.keychain,
-            &mut *self.ports.store,
-        );
-        let refresh = refresh?;
-        // The server accepted this device's proof again: whatever it said before was not a
-        // removal (security review H2).
-        self.persisted.removal_report = None;
-        self.last_ok_ms = now;
-        self.connection = Connection::Online;
-        self.pin_mismatch = false;
+        // A pass that only carries on the last one's work skips the feed while it is fresh
+        // ([`CONTINUATION_REFRESH_MS`]); a pull the last failure asked for reads it at once.
+        let fresh = self
+            .last_refresh_ms
+            .is_some_and(|at| (0..CONTINUATION_REFRESH_MS).contains(&(now - at)));
+        let refresh = if continuation && fresh && !self.pull_all {
+            crate::account::Refresh::default()
+        } else {
+            let refresh = account.refresh(
+                server.as_mut(),
+                &mut *self.ports.keychain,
+                &mut *self.ports.store,
+            )?;
+            // The server accepted this device's proof again: whatever it said before was not a
+            // removal (security review H2).
+            self.persisted.removal_report = None;
+            self.last_ok_ms = now;
+            self.last_refresh_ms = Some(now);
+            self.connection = Connection::Online;
+            self.pin_mismatch = false;
+            refresh
+        };
         if refresh.removed {
             let by = account
                 .state()
@@ -1082,6 +1125,10 @@ impl EngineCore {
             }
         }
         if self.paused() {
+            // Nothing runs while paused: no transfer thread waits idle meanwhile.
+            for folder in self.folders.values_mut() {
+                folder.sync.release_transfers();
+            }
             return Ok(());
         }
         let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut()) else {
@@ -1136,6 +1183,8 @@ impl EngineCore {
             if folder.sync.wants_round(&*folder.fs, now) {
                 running.push(*id);
             } else {
+                // A paused, stopped or idle folder keeps no transfer thread waiting.
+                folder.sync.release_transfers();
                 // Nothing to do: no scan, no pull, no save (finding F of the second
                 // performance review). A paused or stopped folder is not in sync.
                 all_in_sync &= folder.sync.quiet();
@@ -1149,6 +1198,13 @@ impl EngineCore {
             .work_budget_ms
             .map(|b| (b / sharing).max(b.min(MIN_FOLDER_BUDGET_MS)));
         for id in running {
+            // A command waits: the rest of the pass yields to it and the next pass goes on
+            // (a pass without a budget, as in tests that expect whole rounds, runs every round).
+            if self.work_budget_ms.is_some() && self.folder_settings.interrupt.pending() {
+                self.more_work = true;
+                all_in_sync = false;
+                break;
+            }
             let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut())
             else {
                 return Ok(());
@@ -2966,6 +3022,10 @@ impl EngineCore {
         }
         self.account = None;
         self.server = None;
+        // No plaintext of a download in parts stays behind (security review N1).
+        for folder in self.folders.values_mut() {
+            folder.sync.discard_partials(&*folder.fs);
+        }
         self.folders.clear();
         self.activity.clear();
         self.notices.clear();
@@ -3161,7 +3221,9 @@ impl EngineCore {
     /// Stops syncing a folder on this device; its files stay (`stopFolder`).
     pub fn stop_folder(&mut self, folder: &str) -> Result<(), SyncError> {
         let id = parse_folder(folder)?;
-        self.folders.remove(&id);
+        if let Some(mut gone) = self.folders.remove(&id) {
+            gone.sync.discard_partials(&*gone.fs);
+        }
         self.ports.store.delete_folder(&id)?;
         self.persisted.folders.retain(|(f, _)| *f != id);
         self.save()
@@ -3301,7 +3363,7 @@ impl EngineCore {
     /// is never an outdated frontier; `None` without a connection.
     pub fn get_folder_number(&mut self, folder: &str) -> Result<Option<NumberRows>, SyncError> {
         let id = parse_folder(folder)?;
-        if let Err(e) = self.tick_inner() {
+        if let Err(e) = self.tick_inner(false) {
             if e.is_offline() {
                 return Ok(None);
             }
@@ -3341,6 +3403,7 @@ impl EngineCore {
             .folders
             .get_mut(&id)
             .ok_or(SyncError::Invalid("unknown folder"))?;
+        f.sync.discard_partials(&*f.fs);
         f.fs = fs;
         f.watcher = watcher;
         f.path = path.to_owned();
@@ -3568,7 +3631,7 @@ impl EngineCore {
         let mut seen = self.server.as_ref().and_then(|s| s.seen_pin());
         if seen.is_none() {
             // One more attempt shows the server's key again.
-            if let Err(e) = self.tick_inner() {
+            if let Err(e) = self.tick_inner(false) {
                 self.note_net(&e);
             }
             seen = self.server.as_ref().and_then(|s| s.seen_pin());
@@ -4549,6 +4612,35 @@ impl EngineCore {
         self.work_budget_ms = budget_ms;
     }
 
+    /// Live snapshots during a pass ([`crate::progress`]) go to `events`, the channel of the
+    /// window; the engine thread sets it.
+    pub fn send_live_events(&mut self, events: Sender<BackendEvent>) {
+        self.live.send_to(events);
+    }
+
+    /// The next pass only carries on the work of the last one: no command ran and no change on
+    /// disk came in since. It reads the account's feed only when the last read is older than
+    /// [`CONTINUATION_REFRESH_MS`]. The engine thread calls it; a direct caller of
+    /// [`Self::tick`] gets a full pass.
+    pub fn note_continuation(&mut self) {
+        self.continuation = true;
+    }
+
+    /// Transfer lanes of every folder whose worker threads still take work, for tests that
+    /// check a paused or idle folder keeps none waiting.
+    pub fn open_transfer_lanes(&self) -> usize {
+        self.folders
+            .values()
+            .map(|f| f.sync.open_transfer_lanes())
+            .sum()
+    }
+
+    /// The count of commands waiting for this core's thread ([`crate::interrupt`]), shared with
+    /// the handles that send them.
+    pub fn interrupt(&self) -> Interrupt {
+        self.folder_settings.interrupt.clone()
+    }
+
     /// Whether the last pass stopped a round at its budget, so the next pass should follow
     /// right away instead of after the loop's pause.
     pub fn has_more_work(&self) -> bool {
@@ -4905,11 +4997,17 @@ enum Msg {
 /// ends the thread with [`Msg::Stop`] instead.
 struct HandleInner {
     jobs: Sender<Msg>,
+    /// Counts the commands sent and not started yet, so a running pass yields to them.
+    interrupt: Interrupt,
 }
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
+        // The stop waits behind the pass like a command, so it ends the pass early as well.
+        let waiting = self.interrupt.raise();
         let _ = self.jobs.send(Msg::Stop);
+        // Kept raised: the thread ends, and nothing runs a pass after the stop.
+        std::mem::forget(waiting);
     }
 }
 
@@ -4932,9 +5030,13 @@ impl EngineHandle {
         command: impl FnOnce(&mut EngineCore) -> T + Send + 'static,
     ) -> Result<T, SyncError> {
         let (tx, rx) = channel();
+        // Raised until the command starts, so a pass with a budget stops at its next clean
+        // point instead of at the end of its budget; a command that is not sent drops it.
+        let waiting = self.inner.interrupt.raise();
         self.inner
             .jobs
             .send(Msg::Job(Box::new(move |core| {
+                drop(waiting);
                 let _ = tx.send(command(core));
             })))
             .map_err(|_| SyncError::Stopped)?;
@@ -4964,7 +5066,7 @@ impl Engine {
             .spawn(move || {
                 let mut core = match make() {
                     Ok(core) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(core.interrupt()));
                         core
                     }
                     Err(e) => {
@@ -4981,6 +5083,7 @@ impl Engine {
                 if event_tx.send(core.first_snapshot()).is_err() {
                     return;
                 }
+                core.send_live_events(event_tx.clone());
                 let debounce = Duration::from_millis(WAKE_DEBOUNCE_MS);
                 // When a pass is due for a watcher event, counted from the first event of a
                 // burst, so a long burst cannot hold the pass back.
@@ -5028,11 +5131,14 @@ impl Engine {
                         }
                     }
                     // A command runs a pass at once; a wake waits for its debounce.
-                    pass |= ran
-                        || core.has_more_work()
-                        || wake_at.is_some_and(|at| Instant::now() >= at);
+                    let continuing = core.has_more_work();
+                    let wake_due = wake_at.is_some_and(|at| Instant::now() >= at);
+                    pass |= ran || continuing || wake_due;
                     if !pass {
                         continue;
+                    }
+                    if continuing && !ran && !wake_due {
+                        core.note_continuation();
                     }
                     wake_at = None;
                     for event in core.tick() {
@@ -5043,10 +5149,10 @@ impl Engine {
                 }
             })
             .map_err(|_| SyncError::Stopped)?;
-        ready_rx.recv().map_err(|_| SyncError::Stopped)??;
+        let interrupt = ready_rx.recv().map_err(|_| SyncError::Stopped)??;
         Ok((
             EngineHandle {
-                inner: Arc::new(HandleInner { jobs }),
+                inner: Arc::new(HandleInner { jobs, interrupt }),
             },
             events,
         ))

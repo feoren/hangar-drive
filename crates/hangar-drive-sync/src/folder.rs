@@ -41,18 +41,22 @@ pub(crate) use pull::{PullMode, PullVerdict, Pulled};
 
 use crate::account::Account;
 use crate::apply::{apply, ActionError, DiskActions};
-use crate::chunker::{hash_many, ChunkError, HashJob};
+use crate::chunker::{hash_many, ChunkError, HashJob, PartialHash};
 use crate::codec::{self, CodecError, Encoded, FolderCrypto};
+use crate::download::{FetchLane, Fetched, DOWNLOAD_WORKERS, FETCH_WINDOW_BYTES};
 use crate::error::SyncError;
+use crate::interrupt::Interrupt;
 use crate::merge::{ConflictCopy, ItemIds, MergeLabels};
 use crate::names::{date_label, LabelWords};
 use crate::planner::{hold_deletes, plan, Plan, PlanInput, MASS_DELETE_THRESHOLD};
 use crate::ports::{
     random_item_id, ChunkList, Clock, EntryType, Expect, FileSystem, FsError, Keychain, NetError,
-    SaveBatch, ServerApi, Stat, Store,
+    PartialFile, SaveBatch, ServerApi, Stat, Store,
 };
 use crate::tree::{ContentKey, FileVersion, NameIndex, Node, NodeKind, Tree, ROOT};
-use crate::upload::{draw_nonce, Done, Lane, Outcome, Payload, Work, UPLOAD_WORKERS};
+use crate::upload::{
+    draw_nonce, Done, Lane, Next, Outcome, Payload, Sealers, Work, UPLOAD_WORKERS,
+};
 use bytes::Bytes;
 
 /// Name of the root marker inside the reserved directory.
@@ -166,6 +170,16 @@ pub struct FolderSettings {
     /// Objects one upload sends at once ([`UPLOAD_WORKERS`]; at most
     /// [`crate::upload::MAX_UPLOAD_WORKERS`], 1 sends one at a time on the round's thread).
     pub upload_workers: usize,
+    /// Commands waiting for the engine thread ([`Interrupt`]): a round with a work budget stops
+    /// at its next clean point once one waits, as at the end of its budget. A round without a
+    /// budget never looks at it.
+    pub interrupt: Interrupt,
+    /// Where the round reports the bytes it moved, for live progress in the window
+    /// ([`crate::progress`]); the engine sets it.
+    pub progress: crate::progress::Progress,
+    /// The bytes the download lanes of every folder hold ahead together
+    /// ([`crate::download::FETCH_ACCOUNT_BYTES`]); the engine's folders share it.
+    pub fetch_budget: crate::download::FetchBudget,
 }
 
 impl Default for FolderSettings {
@@ -189,6 +203,9 @@ impl Default for FolderSettings {
             commit_allowance: None,
             pull_on_demand: false,
             upload_workers: UPLOAD_WORKERS,
+            interrupt: Interrupt::default(),
+            progress: crate::progress::Progress::default(),
+            fetch_budget: crate::download::FetchBudget::default(),
         }
     }
 }
@@ -665,8 +682,17 @@ pub struct FolderSync {
     /// Known files a scan left unhashed when the budget was spent: they keep their known
     /// version, and the next scan lists their directories again. Not stored.
     recheck: BTreeSet<Vec<String>>,
+    /// Large files whose hashing stopped part way ([`ChunkError::Paused`]), by path: the next
+    /// scan goes on from there while the file is unchanged. Not stored.
+    partial_hashes: BTreeMap<Vec<String>, PartialHash>,
     /// Uploads under way, kept across rounds ([`UploadJob`]), newest last. Not stored.
     jobs: Vec<UploadJob>,
+    /// The download lane of a round that stopped with chunks in flight or fetched and not
+    /// written yet ([`crate::download`]); the next round takes them from it. Not stored.
+    fetch: Option<FetchLane>,
+    /// Downloads in parts under way: chunks in the part file of each content
+    /// ([`FileSystem::partial_write`]). Not stored: the part files go when the root is opened.
+    partial_downloads: BTreeMap<ContentKey, PartialDownload>,
     /// Objects the server held or received during the uploads under way: a new upload (the plan
     /// changed while the last one ran) asks only for the others, and asks for every candidate
     /// again before its commit. Cleared with every finished publish. Not stored.
@@ -748,6 +774,10 @@ struct UploadJob {
     /// ask for an immediate next round, so the loop keeps its pause (security review of the
     /// budget, L2).
     stalled: bool,
+    /// The lane of objects a round left in flight when it ended (at its budget or for a
+    /// waiting command), so the next round books their results; `None` once nothing is in
+    /// flight, which ends its workers.
+    flight: Option<Lane>,
 }
 
 /// How a staged upload stopped.
@@ -925,6 +955,11 @@ const ROUND_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const HASH_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_BATCH_FILES: usize = 32;
 
+/// How long an upload waits for an answer of the workers before it looks at its deadline and at
+/// waiting commands again ([`FolderSettings::interrupt`]): a command is taken within about this
+/// long even while every upload hangs on a slow server.
+const UPLOAD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Plaintext a write keeps of chunks its manifest names again later, so a repeated chunk ID is
 /// fetched and opened once while memory stays bounded (16 chunks of 4 MiB); beyond it, the chunk
 /// is fetched again.
@@ -944,8 +979,16 @@ struct FsDisk<'a> {
     clock: &'a dyn Clock,
     /// When this apply run stops starting new downloads (the round's work budget).
     until: Option<i64>,
+    /// Commands waiting for the engine thread: with a budget, no new download starts then.
+    interrupt: &'a Interrupt,
     /// A download was left for the next round, by the byte bound or the budget.
     cut: bool,
+    /// Where the chunks come from ([`crate::download`]).
+    lane: &'a mut FetchLane,
+    /// Downloads in parts under way: chunks in the part file of each content.
+    partials: &'a mut BTreeMap<ContentKey, PartialDownload>,
+    /// Where written bytes are reported, for live progress.
+    progress: &'a crate::progress::Progress,
 }
 
 impl FsDisk<'_> {
@@ -963,7 +1006,263 @@ impl FsDisk<'_> {
             .fs
             .create_dir(&[RESERVED_ROOT_DIR.to_owned(), PARK_DIR.to_owned()]);
     }
+
+    /// Whether the round's budget is spent or a command waits ([`FolderSync::spent`]).
+    fn spent(&self) -> bool {
+        self.until
+            .is_some_and(|u| self.clock.now_ms() >= u || self.interrupt.pending())
+    }
+
+    /// Chunk `id` of `expected` plaintext bytes, fetched through the lane and opened. With
+    /// `may_stop`, the wait for it gives way to the budget and to waiting commands: the fetch
+    /// goes on in the lane and the file waits for the next round ([`Self::cut`]).
+    fn fetch_plain(
+        &mut self,
+        id: &ObjectId,
+        expected: u64,
+        may_stop: bool,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ActionError> {
+        let (until, clock, interrupt) = (self.until, self.clock, self.interrupt);
+        let stop =
+            move || may_stop && until.is_some_and(|u| clock.now_ms() >= u || interrupt.pending());
+        let blob = match self.lane.take(id, expected, &mut *self.server, &stop) {
+            Fetched::Blob(blob) => blob,
+            Fetched::Stopped => {
+                self.cut = true;
+                return Err(ActionError::Unavailable);
+            }
+            Fetched::Failed => return Err(ActionError::Unavailable),
+        };
+        self.downloaded = self.downloaded.saturating_add(blob.len() as u64);
+        let plain = self
+            .crypto
+            .open(id, ObjectType::Chunk, &blob)
+            .map_err(|_| ActionError::Unavailable)?;
+        if plain.len() as u64 != expected {
+            return Err(ActionError::Unavailable);
+        }
+        Ok(plain)
+    }
+
+    /// Keeps `state` as the download in parts of `content`, giving up the oldest other one
+    /// beyond [`MAX_PARTIAL_DOWNLOADS`] (its part file goes as well).
+    fn note_partial(&mut self, content: ContentKey, state: PartialDownload) {
+        self.partials.insert(content, state);
+        while self.partials.len() > MAX_PARTIAL_DOWNLOADS {
+            let Some(other) = self.partials.keys().find(|k| **k != content).copied() else {
+                break;
+            };
+            if let Some(gone) = self.partials.remove(&other) {
+                let _ = self.fs.partial_remove(&gone.part.name);
+            }
+        }
+    }
+
+    /// Gives up the download in parts of `content`: its part file goes, the next attempt starts
+    /// from the first chunk.
+    fn drop_partial(&mut self, content: &ContentKey, part: &PartialFile) {
+        self.partials.remove(content);
+        let _ = self.fs.partial_remove(&part.name);
+    }
+
+    /// Writes a file of several chunks into its part file from the chunk its state reached on,
+    /// chunk by chunk, and puts it in place once whole. It stops between two chunks once the
+    /// budget is spent or a command waits, keeping what is written for the next round. Before
+    /// the file lands, its whole content is read back through the handle it lands with and
+    /// compared with the digests of what was written (security review M1): a part file that
+    /// another program or the disk changed meanwhile is dropped and the download starts over,
+    /// and nothing lands. The file itself appears only whole, by one rename, as with
+    /// [`FileSystem::write_atomic`].
+    fn write_in_parts(
+        &mut self,
+        item: &ItemId,
+        path: &[String],
+        version: &FileVersion,
+        expect: Option<&FileVersion>,
+        chunks: &[ObjectId],
+    ) -> Result<(), ActionError> {
+        let size = version.size;
+        let content = version.content;
+        let count = chunks.len() as u64;
+        let mut state = self
+            .partials
+            .remove(&content)
+            .filter(|s| s.chunks <= count && s.digests.len() as u64 == s.chunks)
+            .unwrap_or_else(|| PartialDownload::new(&content));
+        let done = state.chunks;
+        // How often each chunk is still to come, so a repeated one is kept until its last use.
+        let mut left: BTreeMap<ObjectId, u64> = BTreeMap::new();
+        for id in chunks
+            .iter()
+            .skip(usize::try_from(done).unwrap_or(usize::MAX))
+        {
+            *left.entry(*id).or_default() += 1;
+        }
+        let mut cache: BTreeMap<ObjectId, zeroize::Zeroizing<Vec<u8>>> = BTreeMap::new();
+        let mut cached = 0u64;
+        for index in done..count {
+            if index > done && self.spent() {
+                self.note_partial(content, state);
+                self.cut = true;
+                return Err(ActionError::Unavailable);
+            }
+            let Some(id) = chunks.get(usize::try_from(index).unwrap_or(usize::MAX)) else {
+                return Err(ActionError::Unavailable);
+            };
+            let remaining = left.get_mut(id).map_or(0, |n| {
+                *n = n.saturating_sub(1);
+                *n
+            });
+            let plain = match cache.remove(id) {
+                Some(p) => {
+                    cached = cached.saturating_sub(p.len() as u64);
+                    p
+                }
+                None => match self.fetch_plain(id, chunk_len(size, index), true) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.note_partial(content, state);
+                        return Err(e);
+                    }
+                },
+            };
+            let offset = index.saturating_mul(hangar_drive_protocol::object::CHUNK_SIZE);
+            match self.fs.partial_write(&mut state.part, offset, &plain) {
+                Ok(()) => {}
+                // The part file is not what was written (it went missing or was replaced):
+                // from the start.
+                Err(FsError::Changed) => {
+                    self.drop_partial(&content, &state.part);
+                    return Err(ActionError::Unavailable);
+                }
+                Err(e) => {
+                    self.note_partial(content, state);
+                    return Err(action_error(e));
+                }
+            }
+            state.digests.push(digest(&plain));
+            state.chunks = index + 1;
+            self.progress.moved(plain.len() as u64);
+            if remaining > 0 && cached.saturating_add(plain.len() as u64) <= CHUNK_CACHE_BYTES {
+                cached += plain.len() as u64;
+                cache.insert(*id, plain);
+            }
+        }
+        // The check reads the whole file once more. Only a waiting command stops it (not the
+        // round's budget, which a large file would always outlast); it runs again in full next
+        // time, since the file may change while nobody looks.
+        let interrupt = self.interrupt;
+        let budgeted = self.until.is_some();
+        let mut stopped = false;
+        let mut mismatch = false;
+        let known = self.file_ids.get(item).copied();
+        let result = {
+            let digests = &state.digests;
+            let mut check = |reader: &mut dyn std::io::Read| -> Result<(), FsError> {
+                let mut buf = vec![0u8; hangar_drive_protocol::object::CHUNK_SIZE as usize];
+                for (index, want) in digests.iter().enumerate() {
+                    if budgeted && index > 0 && interrupt.pending() {
+                        stopped = true;
+                        return Err(FsError::Io("the check gave way to a command".into()));
+                    }
+                    let len = usize::try_from(chunk_len(size, index as u64)).unwrap_or(0);
+                    let part = buf.get_mut(..len).ok_or(FsError::Changed)?;
+                    if reader.read_exact(part).is_err() || digest(part) != *want {
+                        mismatch = true;
+                        return Err(FsError::Changed);
+                    }
+                }
+                let mut extra = [0u8; 1];
+                if digests.len() as u64 != count || reader.read(&mut extra).unwrap_or(1) != 0 {
+                    mismatch = true;
+                    return Err(FsError::Changed);
+                }
+                Ok(())
+            };
+            self.fs.partial_finish(
+                &state.part,
+                path,
+                version.mtime_ms,
+                version.executable,
+                expect.map(|e| expect_of(e, known)),
+                &mut check,
+            )
+        };
+        match result {
+            Ok(stat) => {
+                if let Some(id) = stat.file_id {
+                    self.file_ids.insert(*item, id);
+                    self.dirty.insert(*item, Some(id));
+                }
+                Ok(())
+            }
+            Err(_) if stopped => {
+                self.note_partial(content, state);
+                self.cut = true;
+                Err(ActionError::Unavailable)
+            }
+            // Not what was written, gone, or not the file created then: nothing lands, the
+            // download starts over.
+            Err(_) if mismatch => {
+                self.drop_partial(&content, &state.part);
+                Err(ActionError::Unavailable)
+            }
+            Err(FsError::Io(e)) => {
+                self.drop_partial(&content, &state.part);
+                Err(ActionError::Io(e))
+            }
+            // The target changed or is locked: the whole content stays in the part file, and
+            // the next attempt checks it again and puts it in place.
+            Err(e) => {
+                self.note_partial(content, state);
+                Err(action_error(e))
+            }
+        }
+    }
 }
+
+/// A download in parts under way ([`FileSystem::partial_write`]): its part file, the chunks
+/// written into it and the digest of each, which the finish checks the whole file against.
+#[derive(Debug, Clone)]
+struct PartialDownload {
+    part: PartialFile,
+    chunks: u64,
+    digests: Vec<[u8; 32]>,
+}
+
+impl PartialDownload {
+    fn new(content: &ContentKey) -> Self {
+        Self {
+            part: PartialFile {
+                name: partial_name(content),
+                file_id: None,
+            },
+            chunks: 0,
+            digests: Vec::new(),
+        }
+    }
+}
+
+/// SHA-256 of a chunk's plaintext as it went into a part file.
+fn digest(plain: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(plain).into()
+}
+
+/// The plaintext length of chunk `index` of a file of `size` bytes.
+fn chunk_len(size: u64, index: u64) -> u64 {
+    size.saturating_sub(index.saturating_mul(hangar_drive_protocol::object::CHUNK_SIZE))
+        .min(hangar_drive_protocol::object::CHUNK_SIZE)
+}
+
+/// The name of the part file of a download in parts: its content key in hex.
+fn partial_name(content: &ContentKey) -> String {
+    content.0.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Downloads in parts a folder keeps at once; the executor writes one file at a time, so one
+/// more covers a file it went past and comes back to.
+const MAX_PARTIAL_DOWNLOADS: usize = 2;
 
 impl DiskActions for FsDisk<'_> {
     fn create_dir(&mut self, path: &[String]) -> Result<(), ActionError> {
@@ -977,6 +1276,11 @@ impl DiskActions for FsDisk<'_> {
         version: &FileVersion,
         expect: Option<&FileVersion>,
     ) -> Result<(), ActionError> {
+        // The run was cut (budget, a waiting command): no other download starts in it, so the
+        // files still to come do not each wait for their content.
+        if self.cut {
+            return Err(ActionError::Unavailable);
+        }
         let folder = *self.crypto.folder();
         let list = self
             .store
@@ -991,30 +1295,59 @@ impl DiskActions for FsDisk<'_> {
             return Err(ActionError::Unavailable);
         }
         let size = version.size;
+        let count = list.chunks.len() as u64;
+        // A file of more than one chunk arrives in parts where the root keeps them, so a large
+        // file goes on where it stopped instead of holding the round for its whole length.
+        let in_parts = count > 1 && self.fs.partial_supported();
+        let done = if in_parts {
+            self.partials
+                .get(&version.content)
+                .map_or(0, |s| s.chunks)
+                .min(count)
+        } else {
+            0
+        };
+        let written = done.saturating_mul(hangar_drive_protocol::object::CHUNK_SIZE);
         // Checked before anything is fetched: a manifest may name the same chunk up to its
         // limit, so the file can be far larger than what the server stores and the quota
         // counts. Without room the file waits (the caller backs off) and nothing is written.
-        if !room_for(size, self.fs.free_bytes(), self.fs.volume_bytes()) {
+        if !room_for(
+            size.saturating_sub(written),
+            self.fs.free_bytes(),
+            self.fs.volume_bytes(),
+        ) {
             return Err(ActionError::DiskFull);
         }
-        // At least one file per run, so every round moves the download on; a single file is
-        // not split (it is written atomically), so it may run past the budget.
+        // At least one file per run, so every round moves the download on.
         let over_bytes = self.downloaded.saturating_add(size) > ROUND_DOWNLOAD_BYTES;
-        let over_time = self.until.is_some_and(|u| self.clock.now_ms() >= u);
-        if self.downloaded > 0 && (over_bytes || over_time) {
+        if self.downloaded > 0 && (over_bytes || self.spent()) {
             self.cut = true;
             return Err(ActionError::Unavailable);
         }
+        if in_parts {
+            return self.write_in_parts(item, path, version, expect, &list.chunks);
+        }
+        // A file of one chunk: fetched first, so the wait for it gives way to the budget and to
+        // waiting commands, then written in one go.
+        let single = match list.chunks.first() {
+            Some(id) if count == 1 => Some(self.fetch_plain(id, size, true)?),
+            _ => None,
+        };
         // How often each chunk is still to come, so a repeated one is kept until its last use.
         let mut left: BTreeMap<ObjectId, u64> = BTreeMap::new();
         for id in &list.chunks {
             *left.entry(*id).or_default() += 1;
         }
         let mut failure: Option<ActionError> = None;
-        let crypto = self.crypto;
-        let server = &mut *self.server;
-        let downloaded = &mut self.downloaded;
+        let known = self.file_ids.get(item).copied();
+        let fs = self.fs;
         let mut fill = |out: &mut dyn std::io::Write| -> Result<(), FsError> {
+            if let Some(plain) = &single {
+                out.write_all(plain)
+                    .map_err(|e| FsError::Io(e.to_string()))?;
+                return Ok(());
+            }
+            // Several chunks on a root without parts: the whole file within this write.
             let mut written = 0u64;
             let mut cache: BTreeMap<ObjectId, zeroize::Zeroizing<Vec<u8>>> = BTreeMap::new();
             let mut cached = 0u64;
@@ -1023,35 +1356,20 @@ impl DiskActions for FsDisk<'_> {
                     *n = n.saturating_sub(1);
                     *n
                 });
+                let expected = chunk_len(size, index as u64);
                 let plain = match cache.remove(id) {
                     Some(p) => {
                         cached = cached.saturating_sub(p.len() as u64);
                         p
                     }
-                    None => {
-                        let blob = match server.get_object(&folder, id) {
-                            Ok(b) => b,
-                            Err(_) => {
-                                failure = Some(ActionError::Unavailable);
-                                return Err(FsError::Io("content unavailable".into()));
-                            }
-                        };
-                        *downloaded = downloaded.saturating_add(blob.len() as u64);
-                        match crypto.open(id, ObjectType::Chunk, &blob) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                failure = Some(ActionError::Unavailable);
-                                return Err(FsError::Io("content does not open".into()));
-                            }
+                    None => match self.fetch_plain(id, expected, false) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            failure = Some(e);
+                            return Err(FsError::Io("content unavailable".into()));
                         }
-                    }
+                    },
                 };
-                let expected = (size - index as u64 * hangar_drive_protocol::object::CHUNK_SIZE)
-                    .min(hangar_drive_protocol::object::CHUNK_SIZE);
-                if plain.len() as u64 != expected {
-                    failure = Some(ActionError::Unavailable);
-                    return Err(FsError::Io("chunk length".into()));
-                }
                 out.write_all(&plain)
                     .map_err(|e| FsError::Io(e.to_string()))?;
                 written += plain.len() as u64;
@@ -1066,8 +1384,7 @@ impl DiskActions for FsDisk<'_> {
             }
             Ok(())
         };
-        let known = self.file_ids.get(item).copied();
-        let result = self.fs.write_atomic(
+        let result = fs.write_atomic(
             path,
             &mut fill,
             version.mtime_ms,
@@ -1079,6 +1396,9 @@ impl DiskActions for FsDisk<'_> {
                 if let Some(id) = stat.file_id {
                     self.file_ids.insert(*item, id);
                     self.dirty.insert(*item, Some(id));
+                }
+                if single.is_some() {
+                    self.progress.moved(size);
                 }
                 Ok(())
             }
@@ -1205,8 +1525,11 @@ impl FolderSync {
             budget: None,
             upload_left: None,
             deferred: BTreeMap::new(),
+            partial_hashes: BTreeMap::new(),
             recheck: BTreeSet::new(),
             jobs: Vec::new(),
+            fetch: None,
+            partial_downloads: BTreeMap::new(),
             known_present: BTreeSet::new(),
             pending: None,
             round_seq: 0,
@@ -1266,8 +1589,11 @@ impl FolderSync {
             budget: None,
             upload_left: None,
             deferred: BTreeMap::new(),
+            partial_hashes: BTreeMap::new(),
             recheck: BTreeSet::new(),
             jobs: Vec::new(),
+            fetch: None,
+            partial_downloads: BTreeMap::new(),
             known_present: BTreeSet::new(),
             pending: None,
             round_seq: 0,
@@ -1785,9 +2111,10 @@ impl FolderSync {
         (self.deferred.len() as u64, bytes)
     }
 
-    /// Whether the round's budget is spent at `until` (no budget: never).
+    /// Whether the round's budget is spent at `until`, or a command waits for the engine
+    /// thread ([`FolderSettings::interrupt`]); a round without a budget never is.
     fn spent(cx: &Ctx<'_>, until: Option<i64>) -> bool {
-        until.is_some_and(|u| cx.clock.now_ms() >= u)
+        until.is_some_and(|u| cx.clock.now_ms() >= u || cx.settings.interrupt.pending())
     }
 
     fn round_inner(&mut self, cx: &mut Ctx<'_>) -> Result<RoundReport, SyncError> {
@@ -2543,6 +2870,8 @@ impl FolderSync {
                     jobs.push(HashJob {
                         path: path.clone(),
                         generation: newest,
+                        pausable: may_wait,
+                        resume: self.partial_hashes.get(path).cloned(),
                     });
                     job_items.push((*item, prev, *stat));
                     deferrable.push(may_wait);
@@ -2568,6 +2897,8 @@ impl FolderSync {
             jobs.push(HashJob {
                 path: path.clone(),
                 generation,
+                pausable: may_wait,
+                resume: self.partial_hashes.get(path).cloned(),
             });
             job_items.push((*item, prev, *stat));
             deferrable.push(may_wait);
@@ -2589,6 +2920,19 @@ impl FolderSync {
         // checked between them. `None`: left for the next scan.
         let until = self.budget.map(|b| b.phase_until(cx.clock.now_ms()));
         let threads = cx.settings.hash_threads;
+        // A large file stops between two chunks at the budget or for a waiting command, checked
+        // by the hashing threads themselves in wall time ([`ChunkError::Paused`]).
+        let stop = {
+            let interrupt = cx.settings.interrupt.clone();
+            let deadline = until.map(|u| {
+                let left = u.saturating_sub(cx.clock.now_ms()).max(0);
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(u64::try_from(left).unwrap_or(0))
+            });
+            move || deadline.is_some_and(|d| std::time::Instant::now() >= d || interrupt.pending())
+        };
+        let paths: BTreeSet<&Vec<String>> = jobs.iter().map(|j| &j.path).collect();
+        self.partial_hashes.retain(|path, _| paths.contains(path));
         let mut results: Vec<Option<Result<crate::chunker::Hashed, ChunkError>>> =
             Vec::with_capacity(jobs.len());
         let mut start = 0;
@@ -2601,15 +2945,40 @@ impl FolderSync {
                 bytes = bytes.saturating_add(job_items[end].2.size);
                 end += 1;
             }
-            let batch = hash_many(cx.fs, &jobs[start..end], reader.all_keys(), threads);
-            results.extend(batch.into_iter().map(Some));
+            let batch = hash_many(cx.fs, &jobs[start..end], reader.all_keys(), threads, &stop);
+            let mut paused = false;
+            for (index, result) in (start..end).zip(batch) {
+                let path = &jobs[index].path;
+                match result {
+                    // Left for the next scan, which goes on from these chunks.
+                    Err(ChunkError::Paused(partial)) => {
+                        paused = true;
+                        let (_, prev, stat) = &job_items[index];
+                        if prev.is_some() {
+                            self.recheck.insert(path.clone());
+                        } else {
+                            self.deferred.insert(path.clone(), stat.size);
+                        }
+                        self.partial_hashes.insert(path.clone(), *partial);
+                        results.push(None);
+                    }
+                    other => {
+                        self.partial_hashes.remove(path);
+                        results.push(Some(other));
+                    }
+                }
+            }
             start = end;
-            if start < jobs.len() && Self::spent(cx, until) {
+            if paused && start == jobs.len() {
+                self.cut = true;
+            }
+            if start < jobs.len() && (paused || Self::spent(cx, until)) {
                 let must: Vec<HashJob> = (start..jobs.len())
                     .filter(|i| !deferrable[*i])
                     .map(|i| jobs[i].clone())
                     .collect();
-                let mut hashed = hash_many(cx.fs, &must, reader.all_keys(), threads).into_iter();
+                let mut hashed =
+                    hash_many(cx.fs, &must, reader.all_keys(), threads, &|| false).into_iter();
                 for (index, (job, may_wait)) in
                     jobs[start..].iter().zip(&deferrable[start..]).enumerate()
                 {
@@ -2710,11 +3079,10 @@ impl FolderSync {
         // its chunks can be sealed for upload.
         for index in rehash {
             let (item, _, _) = &job_items[index];
-            let job = HashJob {
-                path: jobs[index].path.clone(),
-                generation: newest,
-            };
-            if let Some(Ok(hashed)) = hash_many(cx.fs, &[job], reader.all_keys(), 1).pop() {
+            let job = HashJob::whole(jobs[index].path.clone(), newest);
+            if let Some(Ok(hashed)) =
+                hash_many(cx.fs, &[job], reader.all_keys(), 1, &|| false).pop()
+            {
                 let content = ContentKey::of_chunks(&hashed.chunks);
                 if cx.store.chunk_list(&self.folder, &content)?.is_none() {
                     cx.store.put_chunk_list(
@@ -3211,6 +3579,45 @@ impl FolderSync {
         }
     }
 
+    /// Ends the transfer threads of a folder that does not run a round now (paused, stopped,
+    /// nothing to do): upload lanes take nothing new and their workers end once their request
+    /// is answered, while the answers stay for the next round to book. Nothing is lost.
+    pub fn release_transfers(&mut self) {
+        for job in &mut self.jobs {
+            if let Some(lane) = &mut job.flight {
+                lane.close();
+            }
+        }
+        // Fetched chunks not written yet are fetched again when the folder runs.
+        self.fetch = None;
+        // A hash in parts goes on only within a run of the folder (security review M3).
+        self.partial_hashes.clear();
+    }
+
+    /// Removes every part file of a download in parts of this folder from `fs` (security
+    /// review N1): the engine calls it before it lets the folder go (stopped, removed, the
+    /// device signed out) or gives it another root.
+    pub fn discard_partials(&mut self, fs: &dyn FileSystem) {
+        for (_, gone) in std::mem::take(&mut self.partial_downloads) {
+            let _ = fs.partial_remove(&gone.part.name);
+        }
+        self.fetch = None;
+    }
+
+    /// Part files of downloads in parts this folder keeps, for tests.
+    pub fn partial_download_count(&self) -> usize {
+        self.partial_downloads.len()
+    }
+
+    /// Worker threads of this folder's upload lanes that still take objects, for tests.
+    pub fn open_transfer_lanes(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|j| j.flight.as_ref().is_some_and(|l| !l.closed()))
+            .count()
+            + usize::from(self.fetch.as_ref().is_some_and(FetchLane::parallel))
+    }
+
     /// Keeps a job for later rounds; the oldest beyond [`MAX_UPLOAD_JOBS`] goes.
     fn store_job(&mut self, job: UploadJob) {
         self.jobs.push(job);
@@ -3263,9 +3670,12 @@ impl FolderSync {
                     // more is on the server already, and a new candidate is found by the ask
                     // before the upload reports done.
                     job.queue.retain(|id| candidates.contains(id));
+                    // Objects still in flight are booked when they land, so they stay counted.
+                    let in_flight = job.flight.as_ref().map_or(&[][..], |l| l.in_flight_ids());
                     job.left = job
                         .queue
                         .iter()
+                        .chain(in_flight)
                         .map(|id| job.sizes.get(id).copied().unwrap_or(0))
                         .fold(0u64, u64::saturating_add);
                     job.candidates = digest;
@@ -3300,9 +3710,18 @@ impl FolderSync {
                     since_stage: (0, 0),
                     asked_round: if carried { 0 } else { self.round_seq },
                     stalled: false,
+                    flight: None,
                 }
             }
         };
+        // Uploads of other plans take nothing new while this one runs: their workers end once
+        // their request is answered, and the answers stay for a round that takes that job up
+        // again, so at most one lane per folder keeps threads waiting.
+        for other in &mut self.jobs {
+            if let Some(lane) = &mut other.flight {
+                lane.close();
+            }
+        }
         let result = self.run_job(cx, crypto, encoded, candidates, disk, stage, &mut job);
         match &result {
             // The disk changed: the next scan and plan start a new upload.
@@ -3341,31 +3760,75 @@ impl FolderSync {
             .settings
             .upload_workers
             .clamp(1, crate::upload::MAX_UPLOAD_WORKERS);
+        let folder = self.folder;
+        // Objects a former round left in flight are booked by this one; otherwise a new lane.
         // Worker threads pay off only with more than one object to send.
-        let uploader = if width > 1 && job.queue.len() > 1 {
-            cx.server.uploader()?
-        } else {
-            None
+        let carried = match job.flight.take() {
+            // A lane closed while the folder did not run: its last answers are booked first,
+            // then a new lane with workers of its own takes over.
+            Some(mut closed) if closed.closed() => {
+                let mut stop: Option<Stop> = None;
+                let mut unsealable: Vec<ObjectId> = Vec::new();
+                loop {
+                    match closed.next(Some(UPLOAD_WAIT_SLICE)) {
+                        Next::Done(done) => {
+                            self.collect(cx, job, &mut closed, done, &mut stop, &mut unsealable)
+                        }
+                        Next::Waiting if Self::spent(cx, until) => {
+                            job.flight = Some(closed);
+                            Stop::halt(&mut stop, Stop::Yield);
+                            let stop = stop.unwrap_or(Stop::Yield);
+                            return self.finish(cx, crypto, job, stop, &unsealable);
+                        }
+                        Next::Waiting => {}
+                        Next::Empty => break,
+                    }
+                }
+                if let Some(stop) = stop {
+                    return self.finish(cx, crypto, job, stop, &unsealable);
+                }
+                None
+            }
+            other => other,
+        };
+        let mut lane = match carried {
+            Some(lane) => lane,
+            None => {
+                let uploader = if width > 1 && job.queue.len() > 1 {
+                    cx.server.uploader()?
+                } else {
+                    None
+                };
+                match uploader {
+                    // No more workers than objects to send: a small upload starts few threads.
+                    Some(uploader) => Lane::workers(width.min(job.queue.len()), uploader, folder),
+                    None => Lane::inline(folder),
+                }
+            }
         };
         let fs: &dyn FileSystem = cx.fs;
         let keys = crypto.writable().ok();
-        let folder = self.folder;
         let result = std::thread::scope(|scope| {
-            let mut lane = match uploader {
-                // No more workers than objects to send: a small upload starts few threads.
-                Some(uploader) => {
-                    let workers = width.min(job.queue.len());
-                    Lane::workers(scope, workers, uploader, fs, keys, folder)
-                }
-                None => Lane::inline(fs, keys, folder),
-            };
-            let result = self.dispatch(
-                cx, crypto, encoded, candidates, disk, stage, job, until, &mut lane,
-            );
-            // Nothing is in flight once `dispatch` returns: the workers end and the scope joins.
-            lane.close();
-            result
+            // The round's sealing threads borrow the disk and the keys; they end with the scope,
+            // once what was handed to them is sealed. The workers that send are not scoped.
+            let sealers = lane.sealers(scope, fs, keys);
+            self.dispatch(
+                cx,
+                crypto,
+                encoded,
+                candidates,
+                disk,
+                stage,
+                job,
+                until,
+                &mut lane,
+                sealers.as_ref(),
+            )
         });
+        // What is still in flight stays with the job; an empty lane drops and ends its workers.
+        if lane.in_flight() > 0 {
+            job.flight = Some(lane);
+        }
         cx.server.settle_uploads();
         result
     }
@@ -3373,9 +3836,11 @@ impl FolderSync {
     /// The upload loop of [`Self::run_job`] (module [`crate::upload`]): dispatches objects in
     /// the queue's order while the lane has room, books every result as it comes, and stops
     /// dispatching at the first reason to stop (done, a stage due, the deadline, a changed disk,
-    /// an error). It returns only once nothing is in flight, so what went up is booked exactly
-    /// as by one upload at a time: `sent` for the next round's check, `known_present`, the bytes
-    /// left and the stage counters.
+    /// an error). It waits for the answers in flight in slices of [`UPLOAD_WAIT_SLICE`] and
+    /// books each as one upload at a time did (`sent` for the next round's check,
+    /// `known_present`, the bytes left and the stage counters); once the deadline passes or a
+    /// command waits, it returns without the answers still out, which stay in the lane for the
+    /// next round, so a slow server never holds the engine thread.
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &mut self,
@@ -3387,7 +3852,8 @@ impl FolderSync {
         stage: bool,
         job: &mut UploadJob,
         until: Option<i64>,
-        lane: &mut Lane<'_>,
+        lane: &mut Lane,
+        sealers: Option<&Sealers>,
     ) -> Result<UploadStep, PublishFailure> {
         let mut dispatched = 0usize;
         let mut stop: Option<Stop> = None;
@@ -3404,18 +3870,30 @@ impl FolderSync {
                     job,
                     until,
                     lane,
+                    sealers,
                     &mut dispatched,
                 );
             }
-            let Some(done) = lane.next() else {
-                // `fill` either dispatched or named a reason to stop; nothing else empties the
-                // lane, so a missing reason is a broken invariant, reported as an error.
-                let stop = stop.unwrap_or(Stop::Error(PublishFailure::Error(SyncError::Invalid(
-                    "the upload stopped without a reason",
-                ))));
-                return self.finish(cx, crypto, job, stop, &unsealable);
-            };
-            self.collect(cx, job, lane, done, &mut stop, &mut unsealable);
+            match lane.next(Some(UPLOAD_WAIT_SLICE)) {
+                Next::Done(done) => self.collect(cx, job, lane, done, &mut stop, &mut unsealable),
+                Next::Waiting => {
+                    if Self::spent(cx, until) {
+                        // The answers still out stay in the lane; a stage waits for them in a
+                        // later round, a failure or changed disk is reported now.
+                        Stop::halt(&mut stop, Stop::Yield);
+                        let stop = stop.unwrap_or(Stop::Yield);
+                        return self.finish(cx, crypto, job, stop, &unsealable);
+                    }
+                }
+                Next::Empty => {
+                    // `fill` either dispatched or named a reason to stop; nothing else empties
+                    // the lane, so a missing reason is a broken invariant, reported as an error.
+                    let stop = stop.unwrap_or(Stop::Error(PublishFailure::Error(
+                        SyncError::Invalid("the upload stopped without a reason"),
+                    )));
+                    return self.finish(cx, crypto, job, stop, &unsealable);
+                }
+            }
         }
     }
 
@@ -3432,7 +3910,8 @@ impl FolderSync {
         stage: bool,
         job: &mut UploadJob,
         until: Option<i64>,
-        lane: &mut Lane<'_>,
+        lane: &mut Lane,
+        sealers: Option<&Sealers>,
         dispatched: &mut usize,
     ) -> Option<Stop> {
         while lane.in_flight() < lane.width() {
@@ -3492,7 +3971,13 @@ impl FolderSync {
                     nonce,
                 }
             };
-            lane.submit(Work { id, payload }, &mut *cx.server);
+            lane.submit(
+                Work { id, payload },
+                sealers,
+                cx.fs,
+                crypto.writable().ok(),
+                &mut *cx.server,
+            );
             *dispatched += 1;
         }
         None
@@ -3503,7 +3988,7 @@ impl FolderSync {
         &mut self,
         cx: &mut Ctx<'_>,
         job: &mut UploadJob,
-        lane: &mut Lane<'_>,
+        lane: &mut Lane,
         done: Done,
         stop: &mut Option<Stop>,
         unsealable: &mut Vec<ObjectId>,
@@ -3511,7 +3996,7 @@ impl FolderSync {
         let id = done.id;
         let (blob, mut error) = match done.outcome {
             Outcome::Sent => {
-                self.book_sent(job, id);
+                self.book_sent(cx, job, id);
                 return;
             }
             Outcome::Unsealable => {
@@ -3526,7 +4011,7 @@ impl FolderSync {
             // in again, which renews the token for the workers as well.
             match cx.server.put_object(&self.folder, &id, &blob) {
                 Ok(_) => {
-                    self.book_sent(job, id);
+                    self.book_sent(cx, job, id);
                     return;
                 }
                 Err(e) => error = e,
@@ -3544,8 +4029,9 @@ impl FolderSync {
     }
 
     /// Books an object the server now holds, as one upload at a time did.
-    fn book_sent(&mut self, job: &mut UploadJob, id: ObjectId) {
+    fn book_sent(&mut self, cx: &Ctx<'_>, job: &mut UploadJob, id: ObjectId) {
         let size = job.sizes.get(&id).copied().unwrap_or(0);
+        cx.settings.progress.moved(size);
         job.left = job.left.saturating_sub(size);
         job.since_stage.0 = job.since_stage.0.saturating_add(size);
         job.since_stage.1 = job.since_stage.1.saturating_add(1);
@@ -4087,6 +4573,82 @@ impl FolderSync {
             Vec::new()
         };
         let mut work = p.disk;
+        // What the executor will write, in its order (item ID), for the lane to fetch ahead:
+        // the chunks of files whose content the disk lacks, up to a few windows ahead.
+        let mut ahead: Vec<(ObjectId, u64)> = Vec::new();
+        let mut planned = 0u64;
+        for (id, node) in p.merged.iter() {
+            if planned >= 4 * FETCH_WINDOW_BYTES {
+                break;
+            }
+            let Some(v) = node.kind.file() else {
+                continue;
+            };
+            if skip.contains(id)
+                || work
+                    .get(id)
+                    .and_then(|n| n.kind.file())
+                    .is_some_and(|w| w.content == v.content)
+            {
+                continue;
+            }
+            let Ok(Some(list)) = cx.store.chunk_list(&self.folder, &v.content) else {
+                continue;
+            };
+            let first = self
+                .partial_downloads
+                .get(&v.content)
+                .map_or(0, |s| s.chunks);
+            // The bound holds per chunk, so one large file cannot plan far past it.
+            for (index, chunk) in list.chunks.iter().enumerate() {
+                if planned >= 4 * FETCH_WINDOW_BYTES {
+                    break;
+                }
+                if (index as u64) < first {
+                    continue;
+                }
+                let bytes = chunk_len(v.size, index as u64);
+                ahead.push((*chunk, bytes));
+                planned = planned.saturating_add(bytes);
+            }
+        }
+        // Part files of contents the plan no longer brings in go (security review N1): the
+        // plaintext of a file another device replaced or deleted stays on no disk.
+        let wanted: BTreeSet<ContentKey> = p
+            .merged
+            .iter()
+            .filter_map(|(id, node)| {
+                let v = node.kind.file()?;
+                let on_disk = work.get(id).and_then(|n| n.kind.file()).map(|w| w.content);
+                (on_disk != Some(v.content)).then_some(v.content)
+            })
+            .collect();
+        let stale: Vec<ContentKey> = self
+            .partial_downloads
+            .keys()
+            .filter(|k| !wanted.contains(k))
+            .copied()
+            .collect();
+        for content in stale {
+            if let Some(gone) = self.partial_downloads.remove(&content) {
+                let _ = cx.fs.partial_remove(&gone.part.name);
+            }
+        }
+        // Worker threads pay off only with more than one object to fetch.
+        let mut lane = match self.fetch.take() {
+            Some(lane) => lane,
+            None if ahead.len() > 1 => match cx.server.fetcher()? {
+                Some(fetcher) => FetchLane::workers(
+                    DOWNLOAD_WORKERS,
+                    fetcher,
+                    self.folder,
+                    cx.settings.fetch_budget.clone(),
+                ),
+                None => FetchLane::inline(self.folder),
+            },
+            None => FetchLane::inline(self.folder),
+        };
+        lane.ahead(ahead);
         let mut disk = FsDisk {
             fs: cx.fs,
             server: &mut *cx.server,
@@ -4097,11 +4659,21 @@ impl FolderSync {
             downloaded: 0,
             clock: cx.clock,
             until: self.budget.map(|b| b.phase_until(now)),
+            interrupt: &cx.settings.interrupt,
             cut: false,
+            lane: &mut lane,
+            partials: &mut self.partial_downloads,
+            progress: &cx.settings.progress,
         };
         let result = apply(&p.merged, &mut work, &mut self.synced, &skip, &mut disk);
-        if disk.cut {
+        let cut = disk.cut;
+        if cut {
             report.more = true;
+        }
+        // Chunks in flight or fetched ahead stay for the next round of a cut run; a finished
+        // run drops the lane, which ends its workers.
+        if cut && !lane.idle() {
+            self.fetch = Some(lane);
         }
         report.applied = result.done.len();
         // Incoming file deletes carried out, for the window of the incoming guard.

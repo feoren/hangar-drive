@@ -68,7 +68,9 @@ use hangar_drive_protocol::ids::ItemId;
 use hangar_drive_protocol::name::check_name;
 
 use crate::names::{conflict_copy_name, date_label, LabelWords};
-use crate::ports::{EntryType, Expect, FileSystem, FsError, ListEntry, Stat};
+use crate::ports::{
+    EntryType, Expect, FileSystem, FsError, ListEntry, PartialCheck, PartialFile, Stat,
+};
 use crate::trash::{Trashed, QUARANTINE_DIR};
 
 #[cfg(unix)]
@@ -93,6 +95,12 @@ pub const TEMP_DIR: &str = "tmp";
 /// settled (security review L3). The cleaning at start recovers such files into
 /// [`RECOVERED_DIR`] instead of deleting them, so a crash in between loses no edit.
 const BACKUP_SUFFIX: &str = ".bak";
+/// The ending of the part file of a download in parts in [`TEMP_DIR`] (`dl-<name>.dl`,
+/// [`FileSystem::partial_write`]). Opening the root empties the directory, so the part file of
+/// an earlier run never stays; within a run the engine removes the ones it gives up.
+const PARTIAL_SUFFIX: &str = ".dl";
+/// The longest name of a download in parts: a hex content key.
+const PARTIAL_NAME_MAX: usize = 128;
 /// The directory in the quarantine that takes the backups a crash left in [`TEMP_DIR`]; it
 /// expires like every quarantine entry (30 days after the last file moved in).
 const RECOVERED_DIR: &str = "recovered";
@@ -325,6 +333,53 @@ impl LocalFs {
             }
         }
         Err(FsError::Io("no free temporary name".into()))
+    }
+
+    /// The part file of download `name` in [`TEMP_DIR`]; `name` must be lowercase hex, so it
+    /// can never name another place.
+    fn partial_spot(&self, name: &str) -> Result<plat::Spot, FsError> {
+        let hex = !name.is_empty()
+            && name.len() <= PARTIAL_NAME_MAX
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hex {
+            return Err(FsError::Io("not a name of a download in parts".into()));
+        }
+        let dir = self.reserved_dir(&[TEMP_DIR])?;
+        Ok(dir.child(OsStr::new(&format!("dl-{name}{PARTIAL_SUFFIX}"))))
+    }
+
+    /// Puts the written file `temp` at `target`: synced to the disk, with its modification time
+    /// and execute flag, then renamed over the target (which must still match `replace`) or
+    /// onto a free name. The common end of [`FileSystem::write_atomic`] and
+    /// [`FileSystem::partial_finish`].
+    fn commit_file(
+        &self,
+        temp: &plat::Spot,
+        file: File,
+        target: &plat::Spot,
+        mtime_ms: i64,
+        executable: bool,
+        replace: Option<Expect>,
+    ) -> Result<Stat, FsError> {
+        file.sync_all().map_err(|e| io_error(&e))?;
+        file.set_modified(system_time(mtime_ms))
+            .map_err(|e| io_error(&e))?;
+        set_executable(&file, executable).map_err(|e| io_error(&e))?;
+        drop(file);
+        match replace {
+            Some(expect) => {
+                if !self.matches(target, expect)? {
+                    return Err(FsError::Changed);
+                }
+                self.replace_checked(temp, target, expect)?;
+            }
+            // No placeholder: the rename itself claims the name or reports it taken
+            // (security review N3, L2).
+            None => with_lock_retry(|| temp.rename_noreplace(target))?,
+        }
+        target.stat()?.ok_or(FsError::NotFound)
     }
 
     fn stat_matches(&self, s: &Stat, expect: Expect) -> bool {
@@ -720,23 +775,7 @@ impl FileSystem for LocalFs {
             let mut writer = io::BufWriter::new(file);
             fill(&mut writer)?;
             let file = writer.into_inner().map_err(|e| io_error(e.error()))?;
-            file.sync_all().map_err(|e| io_error(&e))?;
-            file.set_modified(system_time(mtime_ms))
-                .map_err(|e| io_error(&e))?;
-            set_executable(&file, executable).map_err(|e| io_error(&e))?;
-            drop(file);
-            match replace {
-                Some(expect) => {
-                    if !self.matches(&target, expect)? {
-                        return Err(FsError::Changed);
-                    }
-                    self.replace_checked(&temp, &target, expect)?;
-                }
-                // No placeholder: the rename itself claims the name or reports it taken
-                // (security review N3, L2).
-                None => with_lock_retry(|| temp.rename_noreplace(&target))?,
-            }
-            target.stat()?.ok_or(FsError::NotFound)
+            self.commit_file(&temp, file, &target, mtime_ms, executable, replace)
         })();
         if result.is_err() {
             let _ = temp.remove_file();
@@ -882,6 +921,92 @@ impl FileSystem for LocalFs {
         // Through handles, as when the root is opened.
         plat::clean_quarantine(&self.root, system_time(now_ms));
     }
+
+    fn partial_supported(&self) -> bool {
+        true
+    }
+
+    fn partial_write(
+        &self,
+        part: &mut PartialFile,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let spot = self.partial_spot(&part.name)?;
+        if offset == 0 {
+            match spot.remove_file() {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_error(&e)),
+            }
+            drop(spot.create_new().map_err(|e| io_error(&e))?);
+        }
+        let mut file = match spot.open_read_write() {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(FsError::Changed),
+            Err(e) => return Err(io_error(&e)),
+        };
+        let id = plat::file_id_of(&file);
+        if offset == 0 {
+            part.file_id = id;
+        }
+        // Only the file created then, with no other name, holding exactly what was written so
+        // far, is appended to.
+        let length = file.metadata().map_err(|e| io_error(&e))?.len();
+        if id.is_none() || id != part.file_id || !plat::single_link(&file) || length != offset {
+            return Err(FsError::Changed);
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_error(&e))?;
+        file.write_all(data).map_err(|e| io_error(&e))
+    }
+
+    fn partial_finish(
+        &self,
+        part: &PartialFile,
+        path: &[String],
+        mtime_ms: i64,
+        executable: bool,
+        replace: Option<Expect>,
+        check: PartialCheck<'_>,
+    ) -> Result<Stat, FsError> {
+        let missing = if replace.is_some() {
+            FsError::Changed
+        } else {
+            FsError::NotFound
+        };
+        let target = self.locate(path)?.ok_or(missing)?;
+        let spot = self.partial_spot(&part.name)?;
+        let mut file = match spot.open_read_write() {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(FsError::Io("the part file is gone".into()))
+            }
+            Err(e) => return Err(io_error(&e)),
+        };
+        let id = plat::file_id_of(&file);
+        if id.is_none() || id != part.file_id || !plat::single_link(&file) {
+            return Err(FsError::Io("the part file is not the one written".into()));
+        }
+        // The content is checked through this handle, and the same handle is synced and given
+        // its time before the rename (security review M1).
+        file.seek(SeekFrom::Start(0)).map_err(|e| io_error(&e))?;
+        let mut reader: &File = &file;
+        check(&mut reader)?;
+        self.commit_file(&spot, file, &target, mtime_ms, executable, replace)
+    }
+
+    fn partial_remove(&self, name: &str) -> Result<(), FsError> {
+        match self.partial_spot(name)?.remove_file() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_error(&e)),
+        }
+    }
+
+    fn change_stamp(&self, path: &[String]) -> Option<u64> {
+        self.locate(path).ok()??.change_stamp().ok()?
+    }
 }
 
 #[cfg(test)]
@@ -975,6 +1100,166 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A download in parts on the real file system: appended only at its exact end of the file
+    /// created then, checked through the handle it lands with (a part file changed at the same
+    /// length or replaced by another file never lands), put in place by one rename, refused
+    /// with a name that is not hex, and removed when the root is opened again.
+    #[test]
+    fn a_download_in_parts_is_checked_before_it_lands() {
+        let dir = scratch_root("partial");
+        let local = LocalFs::new(&dir).unwrap();
+        let part_path = dir
+            .join(hangar_drive_protocol::name::RESERVED_ROOT_DIR)
+            .join(TEMP_DIR)
+            .join("dl-00ff.dl");
+        let mut part = PartialFile {
+            name: "00ff".into(),
+            file_id: None,
+        };
+        local.partial_write(&mut part, 0, b"first ").unwrap();
+        assert!(part.file_id.is_some(), "the part file's ID is kept");
+        assert_eq!(
+            local.partial_write(&mut part, 3, b"gap").unwrap_err(),
+            FsError::Changed,
+            "a write that would leave a gap or overlap is refused"
+        );
+        local.partial_write(&mut part, 6, b"second").unwrap();
+        let mut bad = PartialFile {
+            name: "../x".into(),
+            file_id: None,
+        };
+        assert!(local.partial_write(&mut bad, 0, b"x").is_err());
+        let expected = b"first second".to_vec();
+        let mut check = |r: &mut dyn Read| -> Result<(), FsError> {
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).map_err(|e| io_error(&e))?;
+            if got == expected {
+                Ok(())
+            } else {
+                Err(FsError::Changed)
+            }
+        };
+        let path = vec!["file.bin".to_owned()];
+        // Changed at the same length (another program, a disk error): nothing lands.
+        fs::write(&part_path, b"first SECOND").unwrap();
+        assert_eq!(
+            local
+                .partial_finish(&part, &path, 1_700_000_000_000, false, None, &mut check)
+                .unwrap_err(),
+            FsError::Changed
+        );
+        assert!(!dir.join("file.bin").exists(), "a changed part file landed");
+        // Replaced by another file: not the one written.
+        fs::remove_file(&part_path).unwrap();
+        fs::write(&part_path, b"first second").unwrap();
+        assert!(matches!(
+            local.partial_finish(&part, &path, 1_700_000_000_000, false, None, &mut check),
+            Err(FsError::Io(_))
+        ));
+        assert!(!dir.join("file.bin").exists());
+        // Written again as the engine does after a failed check: it lands whole.
+        local.partial_write(&mut part, 0, b"first ").unwrap();
+        local.partial_write(&mut part, 6, b"second").unwrap();
+        let stat = local
+            .partial_finish(&part, &path, 1_700_000_000_000, false, None, &mut check)
+            .unwrap();
+        assert_eq!(stat.size, 12);
+        assert_eq!(fs::read(dir.join("file.bin")).unwrap(), b"first second");
+        assert!(
+            local
+                .partial_finish(&part, &path, 0, false, None, &mut check)
+                .is_err(),
+            "the part file is gone once it landed"
+        );
+        // A part file of an earlier run goes when the root is opened.
+        let mut left = PartialFile {
+            name: "abcd".into(),
+            file_id: None,
+        };
+        local.partial_write(&mut left, 0, b"left over").unwrap();
+        drop(local);
+        let local = LocalFs::new(&dir).unwrap();
+        assert_eq!(
+            local.partial_write(&mut left, 9, b"more").unwrap_err(),
+            FsError::Changed
+        );
+        local.partial_remove("abcd").unwrap();
+        local.partial_remove("abcd").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A part file that got a second name (a hard link from elsewhere, which could change it
+    /// behind the check) is neither appended to nor put in place, on every platform.
+    #[test]
+    fn a_part_file_with_another_name_is_refused() {
+        let dir = scratch_root("partial-link");
+        let local = LocalFs::new(&dir).unwrap();
+        let part_path = dir
+            .join(hangar_drive_protocol::name::RESERVED_ROOT_DIR)
+            .join(TEMP_DIR)
+            .join("dl-0a0b.dl");
+        let mut part = PartialFile {
+            name: "0a0b".into(),
+            file_id: None,
+        };
+        local.partial_write(&mut part, 0, b"first ").unwrap();
+        fs::hard_link(&part_path, dir.join("other-name")).unwrap();
+        assert_eq!(
+            local.partial_write(&mut part, 6, b"second").unwrap_err(),
+            FsError::Changed
+        );
+        let mut check = |_: &mut dyn Read| -> Result<(), FsError> { Ok(()) };
+        assert!(local
+            .partial_finish(&part, &["file.bin".to_owned()], 0, false, None, &mut check)
+            .is_err());
+        assert!(!dir.join("file.bin").exists(), "a linked part file landed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the check before a download in parts lands costs on a real disk: writing 64 MiB in
+    /// 4 MiB parts against reading them back with SHA-256 per chunk. Printed for the record
+    /// (`--nocapture`); the assertion only asks that the check is not slower than the writes
+    /// by far, so a slow machine does not make it flaky.
+    #[test]
+    fn the_check_before_landing_costs_about_one_read_of_the_file() {
+        use sha2::Digest as _;
+        let dir = scratch_root("partial-measure");
+        let local = LocalFs::new(&dir).unwrap();
+        let chunk = vec![7u8; 4 * 1024 * 1024];
+        let mut part = PartialFile {
+            name: "abab".into(),
+            file_id: None,
+        };
+        let started = std::time::Instant::now();
+        for index in 0..16u64 {
+            local
+                .partial_write(&mut part, index * chunk.len() as u64, &chunk)
+                .unwrap();
+        }
+        let written = started.elapsed();
+        let want: [u8; 32] = sha2::Sha256::digest(&chunk).into();
+        let mut checked = std::time::Duration::ZERO;
+        let mut check = |r: &mut dyn Read| -> Result<(), FsError> {
+            let started = std::time::Instant::now();
+            let mut buf = vec![0u8; chunk.len()];
+            for _ in 0..16 {
+                r.read_exact(&mut buf).map_err(|e| io_error(&e))?;
+                let got: [u8; 32] = sha2::Sha256::digest(&buf).into();
+                if got != want {
+                    return Err(FsError::Changed);
+                }
+            }
+            checked = started.elapsed();
+            Ok(())
+        };
+        local
+            .partial_finish(&part, &["big.bin".to_owned()], 0, false, None, &mut check)
+            .unwrap();
+        eprintln!("64 MiB in parts: written in {written:?}, checked in {checked:?}");
+        assert!(checked < written * 4 + std::time::Duration::from_secs(1));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The files in `.hangar-drive/trash/recovered` with their content.

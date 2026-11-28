@@ -202,6 +202,27 @@ impl Spot {
         }
     }
 
+    /// Opens an existing regular file for reading and writing (the part file of a download in
+    /// parts, which is checked through the same handle it lands with).
+    pub(super) fn open_read_write(&self) -> io::Result<File> {
+        let file = self.open(OFlags::RDWR | OFlags::NONBLOCK, Mode::empty())?;
+        regular(file)
+    }
+
+    /// The entry's status change time (`ctime`), which every write and metadata change moves,
+    /// also one that sets the modification time back; `None` if the entry does not exist.
+    pub(super) fn change_stamp(&self) -> Result<Option<u64>, FsError> {
+        match raw_at(self.dir.fd(), &self.name) {
+            Ok(raw) => Ok(Some(
+                (raw.ctime.0 as u64)
+                    .wrapping_mul(1_000_000_000)
+                    .wrapping_add(u64::from(raw.ctime.1)),
+            )),
+            Err(e) if e == Errno::NOENT => Ok(None),
+            Err(e) => Err(fs_error(e)),
+        }
+    }
+
     /// The stat of the entry itself (a link is reported as a link); `None` if it does not exist.
     pub(super) fn stat(&self) -> Result<Option<Stat>, FsError> {
         match raw_at(self.dir.fd(), &self.name) {
@@ -342,6 +363,18 @@ enum Flag {
 /// Whether a flagged rename failed because the kernel or the file system lacks it.
 fn unsupported(e: Errno) -> bool {
     e == Errno::INVAL || e == Errno::NOSYS || e == Errno::NOTSUP || e == Errno::OPNOTSUPP
+}
+
+/// The file ID of an open file, as [`Spot::stat`] reports it.
+pub(super) fn file_id_of(file: &File) -> Option<u128> {
+    raw_fd(file.as_fd()).ok().map(|raw| unix_id(&raw))
+}
+
+/// Whether an open file has no other name: a hard link made to it from elsewhere could change
+/// it behind the check of its content.
+pub(super) fn single_link(file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    file.metadata().is_ok_and(|m| m.nlink() == 1)
 }
 
 /// The handle if it is a regular file.
@@ -555,6 +588,8 @@ struct Raw {
     ino: u64,
     /// Seconds and nanoseconds of the birth time, where the file system reports one.
     birth: Option<(i64, u32)>,
+    /// Seconds and nanoseconds of the status change time (`ctime`).
+    ctime: (i64, u32),
 }
 
 /// The stat of `name` in `dir`, without following a link. On Linux through `statx` with
@@ -601,6 +636,7 @@ fn statx_or(
                 ino: s.stx_ino,
                 birth: (s.stx_mask & StatxFlags::BTIME.bits() != 0)
                     .then_some((s.stx_btime.tv_sec, s.stx_btime.tv_nsec)),
+                ctime: (s.stx_ctime.tv_sec, s.stx_ctime.tv_nsec),
             })
         }
         // A kernel before 4.11 or a sandbox that blocks `statx`: std falls back the same way.
@@ -636,6 +672,7 @@ fn from_stat(s: rustix::fs::Stat) -> Raw {
         dev: s.st_dev as u64,
         ino: s.st_ino as u64,
         birth,
+        ctime: (s.st_ctime as i64, s.st_ctime_nsec as u32),
     }
 }
 
@@ -796,6 +833,7 @@ mod tests {
             dev: 1,
             ino: 2,
             birth: Some((0, 0)),
+            ctime: (0, 0),
         };
         assert_eq!(birth_nanos(&raw), None);
         raw.birth = Some((-1, 0));

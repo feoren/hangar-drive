@@ -22,6 +22,8 @@ use hangar_drive_sync::ports::{Clock, FileSystem, ServerApi};
 type Disks = Rc<RefCell<BTreeMap<PathBuf, Arc<MemFs>>>>;
 
 const START_MS: i64 = 1_795_651_200_000;
+/// The longest a command may wait while every upload hangs for a second on the server.
+const COMMAND_BOUND: Duration = Duration::from_millis(500);
 
 struct World {
     shared: Rc<RefCell<ServerState>>,
@@ -816,4 +818,220 @@ mod rounds {
         assert!(report.published, "the hashed part went out");
         assert!(!report.in_sync, "in sync while files wait for their hash");
     }
+}
+
+/// A server that takes a second per object (measured on a slow server, 2026-11-28): the
+/// engine takes a command within half a second while every upload worker waits for it, a
+/// pause stops new uploads at once while those in flight finish, and after the resume the
+/// upload ends with every object sent once. The bound ([`COMMAND_BOUND`]) is about ten times
+/// what a desktop measured (some 50 ms) and half of one upload, so a slow CI runner passes
+/// while a command that waits for an upload still fails.
+#[test]
+fn a_command_is_taken_at_once_while_uploads_hang_on_a_slow_server() {
+    const FILES: usize = 40;
+    let (uploads_tx, uploads_rx) = std::sync::mpsc::channel();
+    let (handle, events) = Engine::spawn(
+        move || {
+            let world = World::new(SharedClock::at(START_MS));
+            let mut core = world.device(1, &SharedKeychain::default(), &MemStore::new());
+            account_with_files(&world, &mut core, FILES);
+            let uploads = world.shared.borrow_mut().enable_parallel_uploads();
+            uploads.lock().delay = Duration::from_millis(1_000);
+            let _ = uploads_tx.send(uploads);
+            SERVER.with(|s| *s.borrow_mut() = Some(Rc::clone(&world.shared)));
+            Ok(core)
+        },
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let uploads = uploads_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Drained in the background, as the app's event thread does.
+    std::thread::spawn(move || for _ in events {});
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while uploads.lock().accepted < 2 {
+        assert!(Instant::now() < deadline, "the upload did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let asked = Instant::now();
+    handle
+        .call(|core| core.pause(hangar_drive_sync::api::PauseDuration::Manual, None))
+        .unwrap()
+        .unwrap();
+    let waited = asked.elapsed();
+    eprintln!("the pause was taken after {waited:?} with every upload worker waiting");
+    assert!(
+        waited < COMMAND_BOUND,
+        "the pause waited {waited:?} for uploads in flight"
+    );
+    let asked = Instant::now();
+    let snapshot = handle.call(|core| core.snapshot()).unwrap();
+    assert!(snapshot.sync.pause.is_some(), "the pause shows");
+    assert!(asked.elapsed() < COMMAND_BOUND);
+
+    // What was in flight finishes; nothing new goes up while paused, and no upload worker
+    // waits idle meanwhile.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let settled = uploads.lock().accepted;
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(
+        uploads.lock().accepted,
+        settled,
+        "uploads went on while paused"
+    );
+    let open = handle.call(|core| core.open_transfer_lanes()).unwrap();
+    assert_eq!(open, 0, "a paused folder keeps upload workers");
+
+    handle.call(|core| core.resume()).unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        assert!(Instant::now() < deadline, "the upload did not finish");
+        let asked = Instant::now();
+        let snapshot = handle.call(|core| core.snapshot()).unwrap();
+        let waited = asked.elapsed();
+        assert!(
+            waited < COMMAND_BOUND,
+            "a command waited {waited:?} during the upload"
+        );
+        if snapshot.folders[0].status == FolderStatus::UpToDate {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let most = handle
+        .call(|_| {
+            SERVER.with(|s| {
+                let s = s.borrow();
+                let s = s.as_ref().unwrap().borrow();
+                s.object_puts.values().copied().max().unwrap_or(0)
+            })
+        })
+        .unwrap();
+    assert_eq!(most, 1, "an object was uploaded twice");
+}
+
+/// Passes that only carry on a long upload read the account feed once per
+/// `CONTINUATION_REFRESH_MS`, not once per slice: each read is a round trip on the engine
+/// thread. A pass after a command still reads it at once.
+#[test]
+fn passes_that_carry_on_an_upload_read_the_feed_only_now_and_then() {
+    const FILES: usize = 60;
+    let world = World::new(SharedClock::at(START_MS));
+    let mut core = world.device(1, &SharedKeychain::default(), &MemStore::new());
+    account_with_files(&world, &mut core, FILES);
+    world.shared.borrow_mut().put_cost = Some(world.clock.cost(100, Duration::ZERO));
+    core.tick();
+    assert!(core.has_more_work());
+    let feed = |world: &World| world.shared.borrow().feed_calls;
+    let before = feed(&world);
+    // Four slices of a second each: within the interval, no feed read.
+    for _ in 0..4 {
+        core.note_continuation();
+        core.tick();
+        assert!(core.has_more_work(), "the upload is still under way");
+    }
+    assert_eq!(feed(&world), before, "a continuation read the feed");
+    // A pass that is no continuation (a command ran) reads it.
+    core.tick();
+    assert_eq!(feed(&world), before + 1);
+    // Past the interval a continuation reads it again.
+    world
+        .clock
+        .advance(hangar_drive_sync::engine::CONTINUATION_REFRESH_MS);
+    core.note_continuation();
+    core.tick();
+    assert_eq!(feed(&world), before + 2);
+    // The upload still finishes with every object sent once.
+    for _ in 0..200 {
+        core.note_continuation();
+        core.tick();
+        if !core.has_more_work() && folder_status(&core.snapshot()) == FolderStatus::UpToDate {
+            let (most, _, _) =
+                world.objects(&FolderId::from_hex(&core.snapshot().folders[0].id).unwrap());
+            assert_eq!(most, 1, "an object was uploaded twice");
+            return;
+        }
+    }
+    panic!("the upload did not finish");
+}
+
+/// A pass yields to a waiting command before it starts a folder's round (scan, hashing,
+/// downloads, uploads), and the next pass carries on; without a command it works as before.
+#[test]
+fn a_pass_yields_to_a_waiting_command_before_a_round() {
+    const FILES: usize = 30;
+    let world = World::new(SharedClock::at(START_MS));
+    let mut core = world.device(1, &SharedKeychain::default(), &MemStore::new());
+    let folder = account_with_files(&world, &mut core, FILES);
+    let waiting = core.interrupt().raise();
+    core.tick();
+    assert!(core.has_more_work(), "the yielded work is still due");
+    assert_eq!(world.objects(&folder).1, 0, "nothing was uploaded");
+    assert_eq!(world.shared.borrow().head(&folder), None);
+    drop(waiting);
+    for _ in 0..20 {
+        core.tick();
+        if !core.has_more_work() && folder_status(&core.snapshot()) == FolderStatus::UpToDate {
+            assert!(world.shared.borrow().head(&folder).is_some());
+            return;
+        }
+        world.clock.advance(1_000);
+    }
+    panic!("the folder did not get up to date");
+}
+
+/// Live progress: while the rounds of a long upload work, snapshots with fewer bytes left
+/// arrive several times per second, not only once per pass, but no more than the throttle lets
+/// through.
+#[test]
+fn progress_arrives_several_times_per_second_within_a_round() {
+    const FILES: usize = 80;
+    let (handle, events) = Engine::spawn(
+        || {
+            let world = World::new(SharedClock::at(START_MS));
+            let mut core = world.device(1, &SharedKeychain::default(), &MemStore::new());
+            account_with_files(&world, &mut core, FILES);
+            // Each upload takes 120 ms of real time and 50 ms of the budget: a pass of a second
+            // takes about 20 uploads, some 600 ms with four workers.
+            let uploads = world.shared.borrow_mut().enable_parallel_uploads();
+            uploads.lock().delay = Duration::from_millis(120);
+            world.shared.borrow_mut().put_cost = Some(world.clock.cost(50, Duration::ZERO));
+            Ok(core)
+        },
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // Wait for the upload to start.
+    loop {
+        assert!(Instant::now() < deadline, "the upload did not start");
+        if let Ok(BackendEvent::Snapshot { snapshot }) = events.recv_timeout(Duration::from_secs(5))
+        {
+            if matches!(folder_status(&snapshot), FolderStatus::Uploading { .. }) {
+                break;
+            }
+        }
+    }
+    let window = Duration::from_secs(2);
+    let started = Instant::now();
+    let mut left = Vec::new();
+    while started.elapsed() < window {
+        if let Ok(BackendEvent::Snapshot { snapshot }) =
+            events.recv_timeout(Duration::from_millis(100))
+        {
+            left.push(snapshot.sync.bytes_left);
+        }
+    }
+    eprintln!("{} snapshots in {window:?}: {left:?}", left.len());
+    assert!(left.len() >= 6, "too few progress snapshots: {left:?}");
+    assert!(
+        left.len() <= 20,
+        "more snapshots than the throttle allows: {left:?}"
+    );
+    assert!(
+        left.windows(2).all(|w| w[1] <= w[0]) && left.last() < left.first(),
+        "bytes left go down: {left:?}"
+    );
+    drop(handle);
 }

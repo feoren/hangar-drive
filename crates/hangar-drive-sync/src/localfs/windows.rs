@@ -209,6 +209,7 @@ impl Dir {
                         size: record.size,
                         write_time: record.write_time,
                         id: 0,
+                        links: 0,
                     };
                     let mut stat = info.stat();
                     stat.file_id = None;
@@ -244,6 +245,8 @@ struct Info {
     /// The last write time in 100 ns intervals since 1601 (a `FILETIME`).
     write_time: u64,
     id: u128,
+    /// The number of names (hard links) of the file; 0 where the source does not tell.
+    links: u32,
 }
 
 impl Info {
@@ -389,6 +392,31 @@ impl Spot {
         self.dir
             .stat_of(&self.name, false)
             .map_err(|e| io_error(&e))
+    }
+
+    /// Opens an existing file for reading and writing, never through a reparse point (the part
+    /// file of a download in parts, which is checked through the same handle it lands with).
+    pub(super) fn open_read_write(&self) -> io::Result<File> {
+        self.open_file(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+    }
+
+    /// The entry's NTFS `ChangeTime`, which every write and metadata change moves, also one
+    /// that sets the modification time back; `None` if the entry does not exist.
+    pub(super) fn change_stamp(&self) -> Result<Option<u64>, FsError> {
+        let open = nt::Open {
+            access: FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            share: SHARE_ALL,
+            disposition: FILE_OPEN,
+            options: 0,
+            attributes: 0,
+        };
+        match self.dir.open_entry(&self.name, open) {
+            Ok(h) => nt::change_time(h.as_handle())
+                .map(Some)
+                .map_err(|e| io_error(&e)),
+            Err(e) if e.not_found() => Ok(None),
+            Err(e) => Err(io_error(&io::Error::from(e))),
+        }
     }
 
     /// Opens an existing file with `access`, never through a reparse point: a link or a cloud
@@ -698,6 +726,17 @@ fn existing_reserved(root: &Path, parts: &[&str]) -> Option<Dir> {
     Some(dir)
 }
 
+/// The file ID of an open file, as [`Spot::stat`] reports it.
+pub(super) fn file_id_of(file: &File) -> Option<u128> {
+    nt::info(file.as_handle()).ok().map(|info| info.id)
+}
+
+/// Whether an open file has no other name: a hard link made to it from elsewhere could change
+/// it behind the check of its content.
+pub(super) fn single_link(file: &File) -> bool {
+    nt::info(file.as_handle()).is_ok_and(|info| info.links == 1)
+}
+
 /// Empties the reserved `tmp` directory (writes a crash left behind); backups of a replace
 /// move into the quarantine instead (L3). Only plain directories are entered, each through its
 /// handle, so a junction or link put at any level removes nothing outside.
@@ -907,6 +946,12 @@ mod nt {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
     }
 
+    /// The `ChangeTime` of an open entry, in 100 ns intervals since 1601.
+    pub(super) fn change_time(handle: BorrowedHandle<'_>) -> io::Result<u64> {
+        let basic: FILE_BASIC_INFO = query(handle, FileBasicInfo)?;
+        Ok(basic.ChangeTime as u64)
+    }
+
     /// `GetFileInformationByHandleEx` into a plain data structure `T`.
     fn query<T: Copy>(
         handle: BorrowedHandle<'_>,
@@ -993,6 +1038,7 @@ mod nt {
             size: (u64::from(basic.nFileSizeHigh) << 32) | u64::from(basic.nFileSizeLow),
             write_time: (u64::from(write.dwHighDateTime) << 32) | u64::from(write.dwLowDateTime),
             id,
+            links: basic.nNumberOfLinks,
         })
     }
 

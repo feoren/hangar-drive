@@ -69,7 +69,8 @@ use serde::Serialize;
 
 use bytes::Bytes;
 
-use crate::ports::{NetError, ObjectUploader, ServerApi};
+use crate::interrupt::Interrupt;
+use crate::ports::{NetError, ObjectFetcher, ObjectUploader, ServerApi};
 use crate::traffic::{CountingReader, TrafficCounter};
 use crate::upload::{UploadSlots, UPLOAD_WORKERS};
 
@@ -89,6 +90,16 @@ fn max_object() -> u64 {
     hangar_drive_crypto::object::blob_len(hangar_drive_protocol::object::MAX_OBJECT_PLAINTEXT_LEN)
         .map_or(u64::MAX, |n| n as u64)
 }
+
+/// How long a connection may take to open. A reachable server answers a TCP and TLS handshake
+/// in well under a second even on a slow line; a dead address is noticed after this long
+/// instead of the operating system's own limit (about 21 s on Windows).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an idle connection stays in the client's pool: well below the server's own idle
+/// limit (10 s) and the reverse proxy's (90 s), so a request never goes out on a connection the
+/// other side closed meanwhile (reqwest keeps one 90 s by default).
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// When to retry.
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +147,8 @@ pub struct ServerConfig {
     pub timeout: Duration,
     /// Time limit of one read of the event stream ([`EVENT_READ_TIMEOUT`]).
     pub event_read_timeout: Duration,
+    /// How long an idle connection stays in the pool ([`POOL_IDLE_TIMEOUT`]).
+    pub idle_timeout: Duration,
     /// Object uploads of this client at once, across every folder
     /// ([`crate::upload::UPLOAD_WORKERS`]; clamped to [`crate::upload::MAX_UPLOAD_WORKERS`]).
     pub upload_slots: usize,
@@ -153,6 +166,7 @@ impl ServerConfig {
             retry: RetryPolicy::default(),
             timeout: Duration::from_secs(60),
             event_read_timeout: EVENT_READ_TIMEOUT,
+            idle_timeout: POOL_IDLE_TIMEOUT,
             upload_slots: UPLOAD_WORKERS,
         })
     }
@@ -326,10 +340,16 @@ pub struct HttpServer {
     token: Arc<SharedToken>,
     /// Uploads in flight across every uploader of this client (module docs).
     slots: Arc<UploadSlots>,
+    /// Downloads in flight across every fetcher of this client
+    /// ([`crate::download::DOWNLOAD_WORKERS`]).
+    fetch_slots: Arc<UploadSlots>,
     /// The device log length this device verified, sent with the proof (security review H2).
     log_length: Option<u64>,
     /// Payload bytes sent and received (module docs, "Traffic").
     traffic: Arc<TrafficCounter>,
+    /// Commands waiting for the engine thread, whose calls go through this client
+    /// ([`ServerApi::set_interrupt`]).
+    interrupt: Option<Interrupt>,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -389,7 +409,8 @@ impl HttpServer {
             let mut builder = Client::builder()
                 .tls_backend_preconfigured(tls)
                 .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(15))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .pool_idle_timeout(config.idle_timeout)
                 .user_agent(concat!("hangar-drive/", env!("CARGO_PKG_VERSION")));
             builder = match timeout {
                 Some(t) => builder.timeout(t),
@@ -418,12 +439,14 @@ impl HttpServer {
                     .upload_slots
                     .clamp(1, crate::upload::MAX_UPLOAD_WORKERS),
             )),
+            fetch_slots: Arc::new(UploadSlots::new(crate::download::DOWNLOAD_WORKERS)),
             config,
             mismatch,
             identity,
             token: Arc::default(),
             log_length: None,
             traffic: Arc::default(),
+            interrupt: None,
         })
     }
 
@@ -464,6 +487,7 @@ impl HttpServer {
             traffic: &self.traffic,
             token: &self.token,
             retry: self.config.retry,
+            interrupt: self.interrupt.as_ref(),
         }
     }
 
@@ -484,7 +508,11 @@ impl HttpServer {
             Ok(resp) => Ok(resp),
             Err(Failure::Net(e)) => Err(e),
             Err(Failure::Unauthorized(_)) => {
-                // The token ran out: one new proof, then the same request again.
+                // The token ran out: one new proof, then the same request again. A waiting
+                // command goes first; the next pass signs in.
+                if self.interrupt.as_ref().is_some_and(Interrupt::pending) {
+                    return Err(NetError::Interrupted);
+                }
                 self.token.set(None);
                 self.sign_in()?;
                 self.wire()
@@ -676,9 +704,53 @@ impl Failure {
 struct Wire<'a> {
     client: &'a Client,
     mismatch: &'a Mismatch,
-    traffic: &'a TrafficCounter,
+    traffic: &'a Arc<TrafficCounter>,
     token: &'a SharedToken,
     retry: RetryPolicy,
+    /// The engine thread's waiting commands, for a call on that thread; `None` for a worker.
+    interrupt: Option<&'a Interrupt>,
+}
+
+/// How long one slice of a wait between attempts is: a waiting command ends the wait within
+/// about this long.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// Waits `wait` in slices of [`WAIT_SLICE`]; false when a command started waiting meanwhile.
+fn wait_unless_interrupted(wait: Duration, interrupt: Option<&Interrupt>) -> bool {
+    let Some(interrupt) = interrupt else {
+        std::thread::sleep(wait);
+        return true;
+    };
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if interrupt.pending() {
+            return false;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(WAIT_SLICE));
+    }
+}
+
+/// An upload body that counts its bytes as sent while the client reads it for the line, so
+/// the traffic line moves during a long upload instead of jumping once the answer came.
+struct SentBody {
+    bytes: Bytes,
+    at: usize,
+    traffic: Arc<TrafficCounter>,
+}
+
+impl Read for SentBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rest = self.bytes.get(self.at..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        self.at += n;
+        self.traffic.add_sent(n as u64);
+        Ok(n)
+    }
 }
 
 impl Wire<'_> {
@@ -689,9 +761,17 @@ impl Wire<'_> {
             Body::Json(bytes) => req
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(bytes.clone()),
+            // Streamed from the shared buffer, so each attempt counts what it sent, as it goes.
             Body::Bytes(bytes) => req
                 .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(bytes.clone()),
+                .body(reqwest::blocking::Body::sized(
+                    SentBody {
+                        bytes: bytes.clone(),
+                        at: 0,
+                        traffic: Arc::clone(self.traffic),
+                    },
+                    bytes.len() as u64,
+                )),
         };
         if auth {
             if let Some(token) = self.token.get() {
@@ -717,8 +797,9 @@ impl Wire<'_> {
         let mut attempt = 1;
         loop {
             let result = self.request(method, url.clone(), body, auth).send();
-            // An answer means the body went out; a failed attempt counts as nothing sent.
-            if result.is_ok() {
+            // An answer means a JSON body went out; a failed attempt counts as nothing sent. An
+            // upload body counts itself while it is read ([`SentBody`]).
+            if result.is_ok() && matches!(body, Body::Json(_)) {
                 self.traffic.add_sent(body.len());
             }
             let error = match result {
@@ -736,16 +817,28 @@ impl Wire<'_> {
                     if !error.is_transient() || attempt >= retry.attempts.max(1) {
                         return Err(Failure::Net(error));
                     }
-                    std::thread::sleep(wait.unwrap_or_else(|| retry.delay(attempt)).min(retry.max));
+                    let wait = wait.unwrap_or_else(|| retry.delay(attempt)).min(retry.max);
+                    if !wait_unless_interrupted(wait, self.interrupt) {
+                        return Err(Failure::Net(NetError::Interrupted));
+                    }
                     attempt += 1;
                     continue;
+                }
+                // A request that got no answer within the time limit is not sent again: the
+                // server hangs or the line is dead, and every retry would hold the calling
+                // thread (the engine's, for every call but an upload) for another full limit.
+                // The next pass of the loop tries again.
+                Err(e) if e.is_timeout() => {
+                    return Err(Failure::Net(send_error(self.mismatch, &e)))
                 }
                 Err(e) => send_error(self.mismatch, &e),
             };
             if !error.is_transient() || attempt >= retry.attempts.max(1) {
                 return Err(Failure::Net(error));
             }
-            std::thread::sleep(retry.delay(attempt));
+            if !wait_unless_interrupted(retry.delay(attempt), self.interrupt) {
+                return Err(Failure::Net(NetError::Interrupted));
+            }
             attempt += 1;
         }
     }
@@ -804,12 +897,55 @@ impl ObjectUploader for HttpUploader {
             traffic: &self.traffic,
             token: &self.token,
             retry: self.retry,
+            interrupt: None,
         };
         let resp = wire
             .send(&Method::PUT, &url, &path, &Body::Bytes(blob), true, true)
             .map_err(|f| f.into_net(&self.traffic))?;
         let bytes = read_limited(resp, MAX_JSON, &self.traffic)?;
         serde_json::from_slice(&bytes).map_err(|e| NetError::Protocol(e.to_string()))
+    }
+}
+
+/// Object downloads from worker threads beside an [`HttpServer`] ([`crate::download`]): the
+/// same connection pool, TLS verifier, session token and traffic counter, and slots of their
+/// own per account connection.
+pub struct HttpFetcher {
+    client: Client,
+    base: Url,
+    mismatch: Arc<Mismatch>,
+    traffic: Arc<TrafficCounter>,
+    token: Arc<SharedToken>,
+    slots: Arc<UploadSlots>,
+    retry: RetryPolicy,
+}
+
+impl std::fmt::Debug for HttpFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpFetcher")
+            .field("url", &self.base.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectFetcher for HttpFetcher {
+    fn get_object(&self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError> {
+        // Held until the body is read, so the slots count downloads still under way.
+        let _slot = self.slots.acquire();
+        let path = api::object_path(folder, id);
+        let url = endpoint(&self.base, &path, None);
+        let wire = Wire {
+            client: &self.client,
+            mismatch: &self.mismatch,
+            traffic: &self.traffic,
+            token: &self.token,
+            retry: self.retry,
+            interrupt: None,
+        };
+        let resp = wire
+            .send(&Method::GET, &url, &path, &Body::None, true, true)
+            .map_err(|f| f.into_net(&self.traffic))?;
+        read_limited(resp, max_object(), &self.traffic)
     }
 }
 
@@ -1154,6 +1290,26 @@ impl ServerApi for HttpServer {
         self.log_length = Some(length);
     }
 
+    fn set_interrupt(&mut self, interrupt: Interrupt) {
+        self.interrupt = Some(interrupt);
+    }
+
+    fn fetcher(&mut self) -> Result<Option<Arc<dyn ObjectFetcher>>, NetError> {
+        // The workers never sign in themselves, so the session is there before they start.
+        if self.token.get().is_none() {
+            self.sign_in()?;
+        }
+        Ok(Some(Arc::new(HttpFetcher {
+            client: self.client.clone(),
+            base: self.config.url.clone(),
+            mismatch: Arc::clone(&self.mismatch),
+            traffic: Arc::clone(&self.traffic),
+            token: Arc::clone(&self.token),
+            slots: Arc::clone(&self.fetch_slots),
+            retry: self.config.retry,
+        })))
+    }
+
     fn uploader(&mut self) -> Result<Option<Arc<dyn ObjectUploader>>, NetError> {
         // The workers never sign in themselves, so the session is there before they start.
         if self.token.get().is_none() {
@@ -1192,6 +1348,25 @@ mod tests {
             base.join("/api/v1/health").unwrap().as_str(),
             "https://example.org/api/v1/health"
         );
+    }
+
+    /// The traffic line moves while an upload body goes out, not once its answer came.
+    #[test]
+    fn an_upload_body_counts_its_bytes_as_they_are_read() {
+        let traffic = Arc::new(TrafficCounter::default());
+        let mut body = SentBody {
+            bytes: Bytes::from(vec![7u8; 100_000]),
+            at: 0,
+            traffic: Arc::clone(&traffic),
+        };
+        let mut buf = vec![0u8; 30_000];
+        assert_eq!(body.read(&mut buf).unwrap(), 30_000);
+        assert_eq!(traffic.totals().sent, 30_000, "counted as it is read");
+        let mut rest = Vec::new();
+        body.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest.len(), 70_000);
+        assert_eq!(traffic.totals().sent, 100_000);
+        assert_eq!(body.read(&mut buf).unwrap(), 0);
     }
 
     #[test]

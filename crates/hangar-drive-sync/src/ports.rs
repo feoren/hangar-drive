@@ -122,6 +122,21 @@ pub struct Stat {
     pub executable: bool,
 }
 
+/// The part file of a download in parts ([`FileSystem::partial_write`]): its name (lowercase
+/// hex) and the file ID it got when it was created, which every later write and the finish
+/// check, so a file put in its place is never taken for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartialFile {
+    /// The name, lowercase hex.
+    pub name: String,
+    /// The file ID of the part file, set when it is created.
+    pub file_id: Option<u128>,
+}
+
+/// The check [`FileSystem::partial_finish`] runs over the part file's content, read from its
+/// start through the handle it then lands with.
+pub type PartialCheck<'a> = &'a mut dyn FnMut(&mut dyn std::io::Read) -> Result<(), FsError>;
+
 /// One entry of a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
@@ -258,6 +273,53 @@ pub trait FileSystem: Sync {
     fn volume_bytes(&self) -> Option<u64> {
         None
     }
+    /// Whether this root keeps downloads in parts across rounds ([`Self::partial_write`]), so
+    /// a large file need not arrive within one round.
+    fn partial_supported(&self) -> bool {
+        false
+    }
+    /// Appends `data` at `offset` to the part file `part` in the reserved directory. Offset 0
+    /// starts it anew and sets `part.file_id`; any other offset must be the file's current
+    /// length, and the file must still be the one created then (its file ID, and no other
+    /// name), else [`FsError::Changed`], so a file never gets a gap or another file's bytes.
+    fn partial_write(
+        &self,
+        part: &mut PartialFile,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let _ = (part, offset, data);
+        Err(FsError::Io("downloads in parts are not supported".into()))
+    }
+    /// Puts the finished part file at `path` as [`Self::write_atomic`] puts its temporary
+    /// file: the same checks of `replace`, modification time and execute flag, one rename.
+    /// Before, `check` reads the whole content through the very handle the file lands with; its
+    /// error ends the finish and nothing lands. A part file that is gone or not the one created
+    /// is an [`FsError::Io`]. The part file is gone afterwards when this succeeds.
+    fn partial_finish(
+        &self,
+        part: &PartialFile,
+        path: &[String],
+        mtime_ms: i64,
+        executable: bool,
+        replace: Option<Expect>,
+        check: PartialCheck<'_>,
+    ) -> Result<Stat, FsError> {
+        let _ = (part, path, mtime_ms, executable, replace, check);
+        Err(FsError::Io("downloads in parts are not supported".into()))
+    }
+    /// Removes the part file of download `name`; one that is gone is no error.
+    fn partial_remove(&self, name: &str) -> Result<(), FsError> {
+        let _ = name;
+        Ok(())
+    }
+    /// A stamp that every change of the entry moves, its content included, also a write that
+    /// keeps size and modification time (the status change time); `None` when the platform
+    /// cannot tell or the entry does not exist.
+    fn change_stamp(&self, path: &[String]) -> Option<u64> {
+        let _ = path;
+        None
+    }
 }
 
 impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
@@ -326,6 +388,34 @@ impl<T: FileSystem + Send + ?Sized> FileSystem for std::sync::Arc<T> {
     }
     fn volume_bytes(&self) -> Option<u64> {
         (**self).volume_bytes()
+    }
+    fn partial_supported(&self) -> bool {
+        (**self).partial_supported()
+    }
+    fn partial_write(
+        &self,
+        part: &mut PartialFile,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        (**self).partial_write(part, offset, data)
+    }
+    fn partial_finish(
+        &self,
+        part: &PartialFile,
+        path: &[String],
+        mtime_ms: i64,
+        executable: bool,
+        replace: Option<Expect>,
+        check: PartialCheck<'_>,
+    ) -> Result<Stat, FsError> {
+        (**self).partial_finish(part, path, mtime_ms, executable, replace, check)
+    }
+    fn partial_remove(&self, name: &str) -> Result<(), FsError> {
+        (**self).partial_remove(name)
+    }
+    fn change_stamp(&self, path: &[String]) -> Option<u64> {
+        (**self).change_stamp(path)
     }
 }
 
@@ -422,6 +512,12 @@ pub enum NetError {
     /// device, never on the code alone (`engine`, "reported removed").
     #[error("the server says this device was removed")]
     DeviceRemoved(Option<LogPage>),
+    /// The call gave up before its next attempt because a command waits for the engine thread
+    /// ([`crate::interrupt::Interrupt`]): a wait for `Retry-After`, a backoff or a sign-in
+    /// after an expired session. Nothing of the call took effect beyond what an earlier
+    /// attempt did; the next pass tries again.
+    #[error("the call gave way to a waiting command")]
+    Interrupted,
 }
 
 impl NetError {
@@ -437,7 +533,7 @@ impl NetError {
     /// Whether a retry later may succeed.
     pub fn is_transient(&self) -> bool {
         match self {
-            NetError::Unreachable => true,
+            NetError::Unreachable | NetError::Interrupted => true,
             NetError::Server(body) => matches!(
                 body.code,
                 ErrorCode::RateLimited | ErrorCode::Internal | ErrorCode::Unknown
@@ -534,6 +630,11 @@ pub trait ServerApi {
     /// (`ProofRequest::log_length`), so a server that answers "removed" sends the log from there
     /// (security review H2). Implementations without sessions ignore it.
     fn set_known_log_length(&mut self, _length: u64) {}
+
+    /// The commands waiting for the engine thread: a wait between attempts (`Retry-After`, a
+    /// backoff) and a sign-in after an expired session give way to them
+    /// ([`NetError::Interrupted`]). The default ignores it.
+    fn set_interrupt(&mut self, _interrupt: crate::interrupt::Interrupt) {}
     /// An uploader for worker threads ([`ObjectUploader`]), so several objects go up at once
     /// beside this connection; `None` sends every object through [`ServerApi::put_object`] on
     /// the calling thread. An implementation with sessions signs in first, so the workers find a
@@ -541,10 +642,26 @@ pub trait ServerApi {
     fn uploader(&mut self) -> Result<Option<std::sync::Arc<dyn ObjectUploader>>, NetError> {
         Ok(None)
     }
+
+    /// A fetcher for worker threads beside this connection ([`ObjectFetcher`]); `None` when
+    /// objects are fetched only through [`Self::get_object`] (the default).
+    fn fetcher(&mut self) -> Result<Option<std::sync::Arc<dyn ObjectFetcher>>, NetError> {
+        Ok(None)
+    }
+
     /// Called once the uploads of an [`ObjectUploader`] from this connection have all
     /// answered: an implementation that keeps them apart until then (the in-memory server of the
     /// tests) takes them in, so every later call sees them. Nothing to do for the real server.
     fn settle_uploads(&mut self) {}
+}
+
+/// `GET /folders/{folder}/objects/{id}` from worker threads (parallel downloads,
+/// [`crate::download`]). Like an [`ObjectUploader`] it shares the session of the connection it
+/// came from and never signs in: an expired token answers `unauthorized`, and the caller fetches
+/// that object again through [`ServerApi::get_object`].
+pub trait ObjectFetcher: Send + Sync {
+    /// Fetches one sealed object.
+    fn get_object(&self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError>;
 }
 
 /// `PUT /folders/{folder}/objects/{id}` from worker threads (parallel uploads, ADR 0001,

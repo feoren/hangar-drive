@@ -581,3 +581,128 @@ fn the_uploader_shares_the_session_retries_a_busy_slot_and_never_signs_in() {
     assert_eq!(totals.sent, bodies as u64);
     assert_eq!(totals.received, received as u64);
 }
+
+/// A server that takes the connection and never answers (a hung server) costs one time limit,
+/// not one per retry: the engine thread waits on such a call, and the next pass tries again
+/// anyway. Before, four attempts and their backoff held it four times as long.
+#[test]
+fn a_request_that_times_out_is_not_tried_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for tcp in listener.incoming() {
+            let Ok(tcp) = tcp else { continue };
+            *counted.lock().unwrap() += 1;
+            held.push(tcp);
+        }
+    });
+    let mut config = ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+    config.timeout = Duration::from_millis(300);
+    let mut server = HttpServer::new(config, None).unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(server.check_health().unwrap_err(), NetError::Unreachable);
+    let took = started.elapsed();
+    assert_eq!(
+        *connections.lock().unwrap(),
+        1,
+        "the request was sent again"
+    );
+    assert!(
+        took < Duration::from_millis(1_500),
+        "the call took {took:?}"
+    );
+}
+
+/// A busy server asks to come back in 5 s (`Retry-After`): the wait gives way to a command
+/// that starts waiting for the engine thread, so the call ends with `Interrupted` at once
+/// instead of after the wait, and nothing is sent again.
+#[test]
+fn a_retry_after_wait_gives_way_to_a_waiting_command() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { continue };
+            if read_request(&mut tcp).is_none() {
+                continue;
+            }
+            *counted.lock().unwrap() += 1;
+            let body = r#"{"code":"rate_limited"}"#;
+            let _ = write!(
+                tcp,
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 5\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = tcp.flush();
+        }
+    });
+    let config = ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+    let mut server = HttpServer::new(config, None).unwrap();
+    let interrupt = hangar_drive_sync::interrupt::Interrupt::default();
+    server.set_interrupt(interrupt.clone());
+    let raiser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let waiting = interrupt.raise();
+        std::thread::sleep(Duration::from_secs(2));
+        drop(waiting);
+    });
+    let started = std::time::Instant::now();
+    assert_eq!(server.check_health().unwrap_err(), NetError::Interrupted);
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(1_000),
+        "the call took {took:?}"
+    );
+    assert_eq!(*requests.lock().unwrap(), 1, "the request was sent again");
+    raiser.join().unwrap();
+}
+
+/// The client gives up a connection that stayed idle longer than its pool limit, so it never
+/// sends on one the server (10 s) or a proxy closed meanwhile: after the limit the next
+/// request opens a new connection instead of reusing the old one.
+#[test]
+fn an_idle_connection_is_not_reused_after_the_pool_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { continue };
+            *counted.lock().unwrap() += 1;
+            std::thread::spawn(move || {
+                // Keep-alive: answers every request on the connection until it closes.
+                while read_request(&mut tcp).is_some() {
+                    let _ = write!(
+                        tcp,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{HEALTH}",
+                        HEALTH.len()
+                    );
+                    let _ = tcp.flush();
+                }
+            });
+        }
+    });
+    let mut config = ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+    config.idle_timeout = Duration::from_millis(300);
+    let mut server = HttpServer::new(config, None).unwrap();
+    server.check_health().unwrap();
+    server.check_health().unwrap();
+    assert_eq!(
+        *connections.lock().unwrap(),
+        1,
+        "a busy connection is reused"
+    );
+    std::thread::sleep(Duration::from_millis(900));
+    server.check_health().unwrap();
+    assert_eq!(
+        *connections.lock().unwrap(),
+        2,
+        "an idle connection past the limit was reused"
+    );
+}

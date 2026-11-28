@@ -38,7 +38,8 @@ use zeroize::Zeroizing;
 
 use crate::ports::{
     ChunkList, Clock, EntryType, Expect, FileSystem, FsError, Keychain, KeychainError, ListEntry,
-    NetError, ObjectUploader, SaveBatch, ServerApi, Stat, Store, StoreError, StoredFolder,
+    NetError, ObjectUploader, PartialCheck, PartialFile, SaveBatch, ServerApi, Stat, Store,
+    StoreError, StoredFolder,
 };
 use crate::tree::{ContentKey, Node, TreeDelta};
 
@@ -254,6 +255,11 @@ struct MemFsState {
     volume: Option<u64>,
     /// Paths changed since the last [`MemFs::take_events`], as a watcher would report them.
     events: Vec<Vec<String>>,
+    /// Bytes read from files so far ([`MemFs::bytes_read`]).
+    bytes_read: u64,
+    /// The part files of downloads in parts ([`FileSystem::partial_write`]) with their file
+    /// IDs, by name.
+    partials: BTreeMap<String, (Vec<u8>, u128)>,
 }
 
 /// A sync root in memory (module docs).
@@ -268,6 +274,46 @@ pub struct MemFs {
 }
 
 impl MemFs {
+    /// Bytes read from files so far, for tests that count how often a file is read.
+    pub fn bytes_read(&self) -> u64 {
+        self.lock().bytes_read
+    }
+
+    /// The part files of downloads in parts and their lengths, for tests.
+    pub fn partial_files(&self) -> Vec<(String, u64)> {
+        self.lock()
+            .partials
+            .iter()
+            .map(|(name, (data, _))| (name.clone(), data.len() as u64))
+            .collect()
+    }
+
+    /// Changes one byte of a part file, keeping its length and file ID (another program or a
+    /// disk error), for tests.
+    pub fn tamper_partial(&self, name: &str) {
+        if let Some((data, _)) = self.lock().partials.get_mut(name) {
+            if let Some(last) = data.last_mut() {
+                *last ^= 0xff;
+            }
+        }
+    }
+
+    /// Changes a file in place, keeping its size, modification time and file ID (a writer that
+    /// keeps its time stamp, a mapped file), for tests.
+    pub fn overwrite_in_place(&self, path: &[String], data: &[u8]) {
+        let key = self.key(path);
+        if let Some(entry) = self.lock().entries.get_mut(&key) {
+            entry.data = data.to_vec();
+        }
+    }
+
+    /// Cuts a part file to `len` bytes, keeping its file ID, for tests.
+    pub fn truncate_partial(&self, name: &str, len: usize) {
+        if let Some((data, _)) = self.lock().partials.get_mut(name) {
+            data.truncate(len);
+        }
+    }
+
     /// An empty root. `case_insensitive` behaves like NTFS and APFS by default.
     pub fn new(case_insensitive: bool) -> Self {
         Self {
@@ -530,7 +576,7 @@ impl FileSystem for MemFs {
         if let Some(cost) = cost {
             cost.pay();
         }
-        let s = self.lock();
+        let mut s = self.lock();
         let key = self.key(path);
         if s.locked.contains(&key) {
             return Err(FsError::Locked);
@@ -546,6 +592,7 @@ impl FileSystem for MemFs {
         }
         let n = buf.len().min(e.data.len() - start);
         buf[..n].copy_from_slice(&e.data[start..start + n]);
+        s.bytes_read = s.bytes_read.saturating_add(n as u64);
         Ok(n)
     }
 
@@ -728,6 +775,83 @@ impl FileSystem for MemFs {
 
     fn volume_bytes(&self) -> Option<u64> {
         self.lock().volume
+    }
+
+    fn partial_supported(&self) -> bool {
+        true
+    }
+
+    fn partial_write(
+        &self,
+        part: &mut PartialFile,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let mut s = self.lock();
+        if s.full {
+            return Err(FsError::DiskFull);
+        }
+        if offset == 0 {
+            s.next_id += 1;
+            let id = s.next_id;
+            s.partials.insert(part.name.clone(), (data.to_vec(), id));
+            part.file_id = Some(id);
+            return Ok(());
+        }
+        match s.partials.get_mut(&part.name) {
+            Some((bytes, id)) if bytes.len() as u64 == offset && Some(*id) == part.file_id => {
+                bytes.extend_from_slice(data);
+                Ok(())
+            }
+            _ => Err(FsError::Changed),
+        }
+    }
+
+    fn partial_finish(
+        &self,
+        part: &PartialFile,
+        path: &[String],
+        mtime_ms: i64,
+        executable: bool,
+        replace: Option<Expect>,
+        check: PartialCheck<'_>,
+    ) -> Result<Stat, FsError> {
+        let (data, id) = self
+            .lock()
+            .partials
+            .get(&part.name)
+            .cloned()
+            .ok_or_else(|| FsError::Io("the part file is gone".into()))?;
+        if Some(id) != part.file_id {
+            return Err(FsError::Io("the part file is not the one written".into()));
+        }
+        check(&mut data.as_slice())?;
+        let result = self.write_atomic(
+            path,
+            &mut |w| w.write_all(&data).map_err(|e| FsError::Io(e.to_string())),
+            mtime_ms,
+            executable,
+            replace,
+        );
+        if result.is_ok() {
+            self.lock().partials.remove(&part.name);
+        }
+        result
+    }
+
+    fn change_stamp(&self, path: &[String]) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let s = self.lock();
+        let e = s.entries.get(&self.key(path))?;
+        // What a status change time tracks: any change of the content or the metadata.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (&e.data, e.mtime_ms, e.executable, e.file_id).hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn partial_remove(&self, name: &str) -> Result<(), FsError> {
+        self.lock().partials.remove(name);
+        Ok(())
     }
 }
 
@@ -1000,6 +1124,8 @@ pub struct ServerState {
     pairing: BTreeMap<PairingId, Option<PairingRequest>>,
     /// Calls served, for the tests.
     pub calls: u64,
+    /// Reads of the account feed served, for the tests.
+    pub feed_calls: u64,
     /// How often `get_object` served each object, for the tests.
     pub object_gets: BTreeMap<ObjectId, u64>,
     /// How often `put_object` was called for each object, for the tests.
@@ -1020,6 +1146,9 @@ pub struct ServerState {
     /// Uploads from worker threads ([`Self::enable_parallel_uploads`]); `None`: every upload
     /// goes through [`MemServer`]'s `put_object` on the engine thread.
     pub parallel_uploads: Option<Arc<MemUploads>>,
+    /// Downloads from worker threads ([`Self::enable_parallel_downloads`]); `None`: every
+    /// download goes through [`MemServer`]'s `get_object` on the engine thread.
+    pub parallel_downloads: Option<Arc<MemDownloads>>,
 }
 
 /// The uploads of [`MemUploader`]s, shared between worker threads and the [`ServerState`],
@@ -1056,6 +1185,72 @@ pub struct MemUploadState {
     pub max_in_flight: usize,
     in_flight: usize,
     landed: Vec<(FolderId, ObjectId, Vec<u8>)>,
+}
+
+/// The downloads of [`MemFetcher`]s: a copy of the server's objects that worker threads can
+/// read, kept current whenever a fetcher is handed out ([`ServerState::enable_parallel_downloads`]).
+#[derive(Debug, Default)]
+pub struct MemDownloads(Mutex<MemDownloadState>);
+
+impl MemDownloads {
+    /// The state, for the tests to set faults and read counters.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, MemDownloadState> {
+        // Counters only; one written by a thread that panicked is still whole.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Faults and counters of the parallel downloads of the in-memory server.
+#[derive(Debug, Default)]
+pub struct MemDownloadState {
+    /// Real time each download takes, so the downloads of the workers overlap.
+    pub delay: std::time::Duration,
+    /// The next this many downloads answer `rate_limited`.
+    pub rate_limited: u64,
+    /// Downloads served so far, by object.
+    pub fetched: BTreeMap<ObjectId, u64>,
+    /// The most downloads in flight at once.
+    pub max_in_flight: usize,
+    in_flight: usize,
+    objects: BTreeMap<(FolderId, ObjectId), Vec<u8>>,
+}
+
+/// A fetcher of the in-memory server for worker threads ([`ServerState::parallel_downloads`]).
+#[derive(Debug)]
+struct MemFetcher {
+    downloads: Arc<MemDownloads>,
+    cost: Option<WorkCost>,
+}
+
+impl crate::ports::ObjectFetcher for MemFetcher {
+    fn get_object(&self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError> {
+        let (verdict, delay) = {
+            let mut s = self.downloads.lock();
+            s.in_flight += 1;
+            s.max_in_flight = s.max_in_flight.max(s.in_flight);
+            let verdict = if s.rate_limited > 0 {
+                s.rate_limited -= 1;
+                Err(refuse(ErrorCode::RateLimited))
+            } else {
+                *s.fetched.entry(*id).or_default() += 1;
+                s.objects
+                    .get(&(*folder, *id))
+                    .cloned()
+                    .ok_or(refuse(ErrorCode::NotFound))
+            };
+            (verdict, s.delay)
+        };
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        if let Some(cost) = &self.cost {
+            cost.pay();
+        }
+        self.downloads.lock().in_flight -= 1;
+        verdict
+    }
 }
 
 /// An uploader of the in-memory server for worker threads ([`ServerState::parallel_uploads`]).
@@ -1145,6 +1340,7 @@ impl ServerState {
             folders: BTreeMap::new(),
             pairing: BTreeMap::new(),
             calls: 0,
+            feed_calls: 0,
             object_gets: BTreeMap::new(),
             object_puts: BTreeMap::new(),
             put_log: Vec::new(),
@@ -1154,6 +1350,30 @@ impl ServerState {
             get_cost: None,
             forget_puts: false,
             parallel_uploads: None,
+            parallel_downloads: None,
+        }
+    }
+
+    /// Hands out fetchers for worker threads from now on; returns their shared state.
+    pub fn enable_parallel_downloads(&mut self) -> Arc<MemDownloads> {
+        Arc::clone(
+            self.parallel_downloads
+                .get_or_insert_with(|| Arc::new(MemDownloads::default())),
+        )
+    }
+
+    /// Copies the objects for the fetchers of worker threads.
+    fn mirror_downloads(&self) {
+        let Some(downloads) = &self.parallel_downloads else {
+            return;
+        };
+        let mut d = downloads.lock();
+        for (folder, f) in &self.folders {
+            for (id, blob) in &f.objects {
+                d.objects
+                    .entry((*folder, *id))
+                    .or_insert_with(|| blob.clone());
+            }
         }
     }
 
@@ -1573,7 +1793,8 @@ impl ServerApi for MemServer {
     }
 
     fn feed(&mut self, after: u64) -> Result<FeedPage, NetError> {
-        let s = self.enter()?;
+        let mut s = self.enter()?;
+        s.feed_calls += 1;
         let entries: Vec<FeedEntry> = s
             .feed
             .iter()
@@ -1691,6 +1912,22 @@ impl ServerApi for MemServer {
 
     fn settle_uploads(&mut self) {
         self.shared.borrow_mut().settle_uploads();
+    }
+
+    fn fetcher(&mut self) -> Result<Option<Arc<dyn crate::ports::ObjectFetcher>>, NetError> {
+        // Without parallel downloads this is no call to the server, so tests that count calls
+        // see the same numbers as before.
+        if self.shared.borrow().parallel_downloads.is_none() {
+            return Ok(None);
+        }
+        let s = self.enter()?;
+        s.mirror_downloads();
+        Ok(s.parallel_downloads.as_ref().map(|downloads| {
+            Arc::new(MemFetcher {
+                downloads: Arc::clone(downloads),
+                cost: s.get_cost.clone(),
+            }) as Arc<dyn crate::ports::ObjectFetcher>
+        }))
     }
 
     fn get_object(&mut self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError> {
