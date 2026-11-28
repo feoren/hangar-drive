@@ -43,10 +43,9 @@ fn available_bytes(path: &Path) -> Option<u64> {
     }
     // SAFETY: statvfs returned 0, so it initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    #[allow(clippy::useless_conversion)]
-    let blocks = u64::try_from(stat.f_bavail).ok()?;
-    #[allow(clippy::useless_conversion)]
-    let size = u64::try_from(stat.f_frsize).ok()?;
+    // The field types differ by platform (u32 on macOS, u64 on Linux); both widen to u64.
+    #[allow(clippy::unnecessary_cast)]
+    let (blocks, size) = (stat.f_bavail as u64, stat.f_frsize as u64);
     blocks.checked_mul(size)
 }
 
