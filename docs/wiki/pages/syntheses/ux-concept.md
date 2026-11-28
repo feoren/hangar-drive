@@ -4,7 +4,7 @@ type: synthesis
 tags: [ux, ui, onboarding, tray, conflicts, restore, devices, settings, accessibility, i18n, plurals, re-anchor]
 sources: ["[[threat-model-and-crypto-design]]", "[[sync-prior-art-research]]", "[[recycle-bin-measurement]]"]
 created: 2026-11-26
-updated: 2026-11-27
+updated: 2026-11-28
 ---
 
 # UX concept of the desktop app
@@ -687,9 +687,9 @@ The tray shows one state for the whole app, the most urgent across all folders. 
 |                                                                  |
 |  Ordner                                              [list|grid] |
 |  [folder] Hangar Drive    %USERPROFILE%\Hangar Drive   Aktuell [...] |
-|                                                         2,4 GB   |
+|                                         1.234 Dateien · 2,4 GB   |
 |  [folder] Fotos           D:\Fotos         120 Dateien hoch... [...] |
-|                                                        86,3 GB   |
+|                                       18.406 Dateien · 86,3 GB   |
 |  + Ordner hinzufügen                                             |
 |                                                                  |
 |  {used} von {quota} auf deinem Server belegt  (only above 80 %)  |
@@ -703,6 +703,31 @@ The tray shows one state for the whole app, the most urgent across all folders. 
   build number, as in the settings) and carries the outlined `version.beta` badge in the accent
   color while the major version is 0, the same rule as Hangar (`versionParts`). Its line keeps its
   height before the answer arrives or if it never does, so the name never moves.
+- **Traffic line.** [Design, owner 2026-11-28, after Hangar's system bar] Left of the status,
+  only while there is traffic: two small tiles, "↑" upload and "↓" download, each with the
+  sparkline of the last minute as its background and the current rate on top ("↑ 5,2 MB/s",
+  decimal units through `Intl.NumberFormat` with `megabyte-per-second` and so on, cached per
+  language and precision, `src/main/traffic.ts`). Upload is drawn in `--traffic-up` (the app's
+  green), download in `--traffic-down` (the blue of Hangar's accent); the arrows tell them apart
+  as well, so color is never alone. Both sparklines share one scale (at least 100 kB/s, so a
+  trickle stays low), the newest reading at the right edge, sliding in over the second like in
+  Hangar. The tooltip holds both rates and the totals since the start
+  (`traffic.session`); screen readers get the group name `traffic.label` and the same three
+  sentences, never a live region. A minute in which both directions stay below 1000 B/s
+  (`QUIET_RATE`, the event stream's keep-alive and the feed poll stay below it) hides the line, so
+  an idle connection shows nothing. The tiles have fixed widths, so the header does not shift.
+  Data path: `HttpServer` counts the payload bytes of every request body sent and every response
+  body read, also the event stream's, on a shared `TrafficCounter` of two atomics
+  (`crates/hangar-drive-sync/src/traffic.rs`, `engine::counted_server_factory`); headers are not
+  counted, contents and paths never reach it. A sampler thread of the shell
+  (`src-tauri/src/traffic.rs`) reads the counter once a second, without the engine thread, keeps
+  the last 60 rates (`TrafficMeter`) and sends `{tick, up, down, sent, received}` on its own
+  channel `hangar-drive://traffic` to the main window, only while the window is visible and not
+  minimized and the last minute was not quiet. The window keeps the readings outside React state
+  (`src/main/trafficStore.ts`, `useSyncExternalStore`), so only the line renders for them; a
+  reading whose tick does not follow the last one (the window was hidden, or the shell stayed
+  silent through a quiet minute) fetches the last minute with `get_traffic` instead of guessing
+  the gap.
 - **Main menu.** [Design, owner 2026-11-27] The same component and behaviour as Hangar's app
   menu (`src/ui/AppMenu.tsx`, keyboard logic in `src/ui/menuNav.ts`): a panel below the button
   with "Datei", "Ansicht" and "Hilfe" (`menu.file`, `menu.view`, `menu.help`), each opening a
@@ -733,13 +758,16 @@ The tray shows one state for the whole app, the most urgent across all folders. 
   buttons. Banners are the only place where problems appear in the window, so the person never
   has to search.
 - **Folder rows.** [Design] Name, full path (muted, truncated in the middle, full path as tooltip
-  and accessible name), status in words with the folder's size on this disk below it ("2,4 GB",
-  decimal units through `formatSize`, also at the end of the accessible name; nothing before the
-  first scan, so a new folder never reads "0 B"), and a row menu. The size is the sum of the file
-  sizes in the engine's local tree, the one the scan already holds (`FolderSync::local_bytes`), so
-  the disk is not walked again; it counts files only, not the folder's own marker. A file count is
-  left out on purpose: during a sync the status already counts files, and two counts in one row
-  read as noise. The state is also a color, never alone: the folder icon and the status are green
+  and accessible name), status in words with the folder's number of files and size on this disk
+  below it ("1.234 Dateien · 2,4 GB", `folder.files` with the plural forms of each language and
+  localized numbers, decimal units through `formatSize`, also at the end of the accessible name),
+  and a row menu. Each part is left out while unknown (`fileCount` and `bytes` are null before the
+  first scan, and an older shell sends no `fileCount`), so a new folder never reads "0 B"; with
+  neither known the line is empty. The size is the sum of the file sizes in the engine's local
+  tree, the one the scan already holds (`FolderSync::local_bytes`), so the disk is not walked
+  again; it counts files only, not the folder's own marker. The file count was left out at first
+  (two counts in one row during a sync), and added on the owner's request of 2026-11-28; it sits
+  in the muted second line, apart from the status. The state is also a color, never alone: the folder icon and the status are green
   (`--ok`) when the folder is up to date and the server answers, red (`--error`) when it stopped
   (every reason of `folder.reason.*`), neutral while syncing, paused or offline. A segmented
   switch next to "Ordner" (`main.view`, "Liste" and "Kacheln", `aria-pressed`) shows the same rows
@@ -1828,6 +1856,11 @@ is the kind of small mistake that makes an app feel careless. [Design]
 | `menu.quit` | {app} beenden | Quit {app} |
 | `version.beta` | beta | beta |
 | `main.status.offline` | Offline | Offline |
+| `traffic.label` | Netzwerkverkehr | Network traffic |
+| `traffic.up` | Hochladen: {rate} | Upload: {rate} |
+| `traffic.down` | Herunterladen: {rate} | Download: {rate} |
+| `traffic.session` | Seit dem Start: {sent} hochgeladen, {received} heruntergeladen | Since start: {sent} uploaded, {received} downloaded |
+| `folder.files` | {count} Datei / {count} Dateien | {count} file / {count} files |
 | `main.view` | Ansicht | View |
 | `main.view.list` | Liste | List |
 | `main.view.grid` | Kacheln | Grid |

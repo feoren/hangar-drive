@@ -6,7 +6,7 @@ sources: ["[[sync-prior-art-research]]", "[[threat-model-and-crypto-design]]", "
 status: accepted
 superseded_by:
 created: 2026-11-26
-updated: 2026-11-27
+updated: 2026-11-28
 ---
 
 # ADR 0001: Foundation
@@ -3890,3 +3890,419 @@ none of this applies to it.
 - Map `ErrorKind::RecoveryPending` from `resetDevice`: explain that a recovery is not finished
   and that resetting may lose the account for good; offer "Reset anyway", which calls
   `resetDeviceDiscardingRecovery` after a native confirmation.
+
+## Amendment 2026-11-28: the engine stays responsive during long work
+
+**Finding (release 0.1.0, Windows, own server over HTTPS).** After the setup with two folders of
+about 1,600 files the window stayed empty. The engine thread was inside one sync pass for
+minutes (`FolderSync::round` -> `upload` -> `ServerApi::put_object`), while two
+`EngineHandle::call(|core| core.snapshot())` waited for it. Cause: `Engine::spawn` ran
+`EngineCore::tick`, and each tick ran a whole round per folder (scan with every hash, every
+upload, the commit, every download) before it took the next command or sent a snapshot. The loop
+also took only one command per pass and paused for the full tick interval even with work left.
+
+**Decision: a work budget per pass.** `engine::WORK_BUDGET_MS` (1 s of `Clock` time) is shared by
+the folders that run a round, each with at least 250 ms (`FolderSettings::work_budget_ms`, set by
+the engine per pass; direct callers of `FolderSync::round` and the round inside `revert` run
+without one). A round stops at a clean point once the budget is spent and reports
+`RoundReport::more`; every phase still does at least one unit, and a phase that starts after the
+budget is spent still gets a quarter of it, so a round whose scan and plan took the budget moves
+the transfer on.
+- **Hashing:** the scan hashes in batches of at most 32 files or 64 MiB and checks the budget
+  between batches. Files left over wait for the next scan: a file the local tree knows keeps its
+  known version (`recheck`); a new file stays out of the tree (`deferred`, path and size); the
+  next scan lists both again, also a partial one. A file the synced tree knows by item is always
+  hashed, since leaving it out would read as a local delete. A remote file at the path of a
+  waiting new file does not keep it from waiting (see "Follow-up review" below). A large first
+  scan therefore publishes in several commits, each a valid tree.
+- **Uploads:** checked before each object but the first. A cut ends the publish with
+  `PublishFailure::Yielded` before the commit: nothing half is committed, and the round saves
+  and returns. A side commit is signed (and takes a counter value) before the head's upload, so
+  a cut there skips one counter value, as a lost compare-and-swap already does; harmless, since
+  counters only need to grow. The next round plans and encodes again (directory
+  nodes and manifests have keyed IDs from their plaintext, so they get the same IDs) and asks
+  the server what it lacks, so nothing is uploaded twice. Objects uploaded without a commit are
+  kept by the server for 24 hours (`retention.rs`, "young uploads"), which covers a cut, an
+  offline phase or an end of the app in between. Stages of a publish too large for one commit
+  are whole commits each, as before.
+- **Downloads:** checked before each file but the first, next to the existing bound of 1 GiB per
+  round; a file is written atomically and is not split.
+- **The loop:** when the last pass reports more work it does not pause, runs every waiting
+  command (not one per pass) and starts the next pass. The thread sends the stored state as a
+  first `BackendEvent::Snapshot` before the first pass (`EngineCore::first_snapshot`).
+
+**Snapshot.** `sync.bytesLeft` was always 0 and now carries the bytes left: during an upload the
+exact bytes of the objects the server still lacks (`FolderSync::upload_left`), otherwise the size
+of the local files whose content the synced tree lacks, plus the size of the remote files whose
+content is not on this disk, plus the new files that wait for their hash; renames and new times
+count nothing. The upload count of a folder and `pendingFiles` include the new files that wait
+for their hash, so a large first scan never reads as up to date. The upload count falls only with
+a commit (the synced tree follows then), so during one upload `bytesLeft` is what moves from
+snapshot to snapshot. `lastSync` is set only by a pass that was not cut and ends in sync. New
+field `folders[].fileCount` (`Option<u64>`, JSON `"fileCount": number | null`): the files of the
+folder on this disk, directories and the folder's marker not counted, plus the new files that
+wait for their hash, so the number does not jump during a large first scan; `null` before the
+first scan, like `bytes`, which now counts the waiting files' bytes as well.
+
+**Network calls.** Every request of `HttpServer` has a connect timeout of 15 s and a request
+timeout of 60 s (head and every read of the body; reqwest 0.13 blocking), with at most four
+attempts and a bounded backoff; the event stream uses its own read timeout of 75 s. No single
+call blocks without bound.
+
+**Not split yet.** The pull of a folder's delta and of the head's tree (the tree check walks the
+tree's objects; the plaintext cache makes a repeated walk cheap, but a cut needs the paged pull
+state to keep it, which today only a lost connection does), re-anchoring after an older state,
+and a person's restores (`publish_tree`) still run to their end within one pass. A single file of
+several GiB is hashed, sealed or written whole. These are follow-up work.
+
+**Follow-up review of the budget (security review, same day).**
+- **H1 (high): a waiting new file and a server item at its path ended in "cannot sync" for good.**
+  The scan decided against the remote tree before the pull (a new folder starts with an empty
+  remote tree); the download then met the file on disk (`Exists`, nothing lost) and the item
+  stayed in `cannot_sync`: on a join of a large non-empty folder files stayed unsynced for good,
+  later changes did not arrive, and the folder still said in sync. Now `apply_plan` leaves every
+  item of the plan at the path of a waiting new file (comparison key per name) alone in that
+  round, with its subtree, and reports `more`; once the file is hashed the merge sees both, as
+  without a budget. This holds after every pull of the round, also the one after a lost
+  compare-and-swap, and keeps the budget during a join instead of hashing every overlapping file
+  at once. Tests: `rounds::a_join_with_the_budget_leaves_no_file_unsynced`,
+  `rounds::edits_after_a_join_with_the_budget_reach_both_devices`,
+  `rounds::a_new_file_waiting_for_its_hash_meets_a_remote_file_of_its_name` (both versions kept,
+  one as the conflict copy), control `rounds::a_join_without_the_budget_leaves_no_file_unsynced`.
+- **L1: a cut round could report in sync.** `RoundReport::in_sync` is false while files wait for
+  their hash or the round was cut; the engine sets `lastSync` only for a pass without a cut. Test:
+  `rounds::a_round_with_files_waiting_for_their_hash_is_not_in_sync`.
+- **L2: a server that keeps nothing drove the loop without a pause.** A server that answers
+  `put_object` but keeps listing the objects as missing made every pass cut and ask for the next
+  one at once. The upload remembers what it sent before a cut (`cut_sent`); when the next upload
+  finds one of those missing again, its cut does not set `more`, so the loop keeps its pause.
+  Test: `a_server_that_keeps_nothing_does_not_drive_the_loop_without_a_pause`
+  (`ServerState::forget_puts`).
+
+**Snapshots after commands and cheap snapshots.**
+- After the waiting commands the loop sends a changed snapshot right away
+  (`EngineCore::changed_snapshot`), before the pass, which may work for its whole budget, so a
+  pause, a resume or a paused folder shows at once. Test:
+  `a_command_shows_in_a_snapshot_before_the_next_pass`.
+- A folder's numbers (upload and download counts, bytes left, files and bytes on disk) are kept
+  with a `folder::SummaryKey` and computed again only when it changes: the editions of the local,
+  synced and remote trees (`Tree::edition`, a process-wide unique number set by every insert and
+  remove, equal for a tree and its unchanged clones), whether the local tree is known, the
+  folder's state, the waiting files, the upload's bytes left and the cannot-sync list. A snapshot
+  of an unchanged folder of 100,000 files walks no tree. Test:
+  `a_snapshot_of_an_unchanged_folder_walks_no_tree` (`EngineCore::folder_sums_computed`), and
+  `the_file_count_serializes_and_follows_the_disk`.
+
+**Tests** (`tests/engine_budget.rs`, with the test hooks `memory::SharedClock`, `WorkCost`,
+`ServerState::put_cost`, `get_cost`, `object_puts` and `MemFs::set_read_cost`):
+`the_engine_answers_and_reports_progress_during_a_large_upload` (engine thread with the app's
+5 s pause: commands answered within 1.5 s during the upload, progress snapshots with falling
+`bytesLeft`, every object uploaded once),
+`an_upload_cut_off_by_the_end_of_the_app_resumes_after_a_restart` (no commit after the first
+pass, the restarted engine finishes, every object once, the server holds exactly the committed
+tree), `a_large_first_scan_hashes_in_slices_and_commits_every_file` and
+`a_large_download_writes_files_in_slices`. All four fail with the budget switched off.
+
+**Second performance review: rounds that cost only what they do (same day).** An analysis found
+that the budget made every cut round repeat the whole preamble of its upload, and that idle
+rounds cost a pull, a scan and several saves per folder every 5 s. Changes (`folder.rs`,
+`engine.rs`, `watch.rs`):
+- **A: a cut upload goes on.** A round cut during its upload keeps the plan and its encoding
+  (`PendingPublish`), valid while the editions of the three trees, the frontier, the remote root
+  and the writable generation are unchanged and nothing was stored outside a round (a person's
+  action drops it in `FolderSync::save`). Each upload keeps its queue across rounds
+  (`UploadJob`, keyed by the encoded root and the writable generation): the next round asks the
+  server only about what the last round sent (the L2 check, now one small query), and before the
+  upload reports done the server is asked about every candidate again unless that ask was in this
+  round, since it deletes uploads no commit names after a day. Objects found present or sent
+  during the uploads under way (`known_present`) are not asked about again by an upload of a
+  new plan; that ask before the commit covers them. A scan with no reported path and nothing
+  waiting reads nothing. The upload phase ends at the round's budget, but never before a quarter
+  of the folder's share and at least 250 ms (`UPLOAD_FLOOR_MS`) have passed in it, fixed once
+  per round for all uploads of the round; the engine shares the pass budget only among the
+  folders that run a round. Nothing is committed half: every upload and its final ask finish
+  before `content()`, signing and sending. Measured in
+  `a_cut_upload_goes_on_without_asking_about_every_object_again` (60 files, 121 objects, 13
+  passes): 362 object IDs asked in 14 queries and one delta pull, against 1,694 IDs and a pull
+  per pass before.
+- **C: intermediate commits.** Once an upload sent `FolderSettings::stage_bytes` (256 MiB) or
+  `stage_objects` (8,192 objects) since its last one, and at least `stage_interval_ms` (30 s,
+  within the server's 30 commits per device and minute) after it, it commits the server's tree
+  plus the files whose every chunk is on the server, with the directories they need
+  (`stage_ready`, a single walk; a name that collides by any of its keys waits), through the
+  existing `publish_stage`. A file still uploading never shows. This runs before the side commit
+  and the final commit. When the disk held the head before fully, the sync base moves to the
+  stage, so the final commit needs no side commit; a folder never fully synced keeps none. Other
+  devices see a large first upload grow, and the 24 hour collection of uncommitted uploads no
+  longer makes a first upload of more than a day start over. Tests:
+  `rounds::a_large_upload_commits_as_it_goes_and_the_other_device_sees_a_part` (40 files, six
+  commits, the other device saw 8, 16, 24 and 32 files) and
+  `rounds::a_restart_after_an_intermediate_commit_goes_on` (no conflict copy, every object once).
+- **F: idle folders are skipped.** With `FolderSettings::pull_on_demand` (set by the engine) a
+  round pulls only when the change feed reported a head other than this device's frontier
+  (`FolderSync::note_remote_head`, also a lower one, so an older state is noticed), at start,
+  after a failed pass or round, after a feed read from its start or a changed log, and hourly
+  with the full scan. `FolderSync::wants_round` skips a folder whose last round ended in sync with
+  nothing reported, waiting or stored since; it still reads the root marker each pass, since no
+  watcher reports its loss. `save()` writes nothing when no row and no metadata byte changed.
+  Tests: `an_idle_folder_costs_only_the_feed` (20 idle passes: 20 calls, no pull, no save),
+  `a_head_the_feed_reports_is_pulled_in_the_next_pass`,
+  `a_head_the_feed_missed_is_pulled_within_the_hour`.
+- **N: the watcher wakes the loop.** Every watcher event rings a `watch::Waker`; the engine thread
+  runs a pass `WAKE_DEBOUNCE_MS` (400 ms) after the first event of a burst instead of after its
+  5 s pause. A command still runs a pass at once. The watchers hold a sender of the loop's
+  channel, so the last `EngineHandle` ends the thread with a stop message. Test:
+  `a_change_on_disk_wakes_the_engine_before_its_pause` (synced after about 430 ms with a 120 s
+  pause).
+- **H: read order.** The queue holds chunks by path and chunk index, then sealed nodes and
+  manifests; chunks the disk cannot produce come first, so a changed disk ends the upload early.
+  Test: `rounds::chunks_go_up_in_path_and_chunk_order`.
+
+Every new test except the feed pull fails with its change taken out (the feed pull is a guard
+that also held when every round pulled). Not done: the store has no batch in its trait, so the
+chunk list and cache writes are not grouped into one transaction yet (`SqliteStore::batch` is
+generic and cannot be called through `dyn Store`).
+
+**Security review of the client changes (same day).**
+- **MEDIUM 1: a file rewritten every second drove the device into the server's commit limit.**
+  With the watcher's wake-up every change made a commit; past 30 per device and minute the
+  server refused and the client's wait held the engine thread for every folder. Now the commits
+  of a folder's rounds are paced by a bucket of `PUBLISH_BURST` (3) that refills by one every
+  `PUBLISH_INTERVAL_MS` (5 s, `FolderSettings::publish_interval_ms`): the first changes after a
+  quiet spell go out at once, a stream of changes makes one commit per 5 s. Only the commit
+  waits (`PublishFailure::Held`, after the upload and its last ask, before the side commit):
+  the round keeps its plan, ends without `more` and not in sync, nothing of the plan reaches the
+  disk, and the folder's rounds wait until `FolderSync::hold_until` unless a pull is due or
+  files wait for their hash; the loop wakes for it (`EngineCore::next_due_in`). A bucket rather
+  than a fixed gap, so a clock that stands still (tests) or a few quick actions are not held.
+  All rounds of the device share
+  `DEVICE_COMMITS_PER_MINUTE` (20) commit calls per minute, intermediate, side and repair commits
+  and refused calls included (`FolderSettings::commit_allowance`, `FolderSync::round_commits`);
+  an intermediate commit keeps one for the final commit. The person's actions (restores, undo)
+  are not held. Files younger than a few seconds are not deferred: the interval already bounds
+  the commits, and a deferral would need its own rules for files that never settle. Tests:
+  `a_file_rewritten_all_the_time_makes_few_commits` (60 changes in 30 s: at most 9 commits, the
+  first at once; 60 before, 20 with the device budget alone),
+  `the_folders_of_a_device_share_one_commit_budget` (four folders, one minute: at most 20; 56
+  with the folders' pacing alone).
+- **LOW 2:** `codec::remember_uploaded` caches plaintexts best effort; the first failure (an
+  index volume near its reserve) ends the caching for the call, the object IDs stay mandatory.
+  Before, every round uploaded, failed there and started over. Test:
+  `index::tests::a_full_index_volume_does_not_stop_remembering_an_upload`.
+- **LOW 3:** files that wait for their hash (`deferred`, `recheck`) are hashed first, so a
+  folder that keeps changing in front of them in path order cannot starve them, and the round
+  leaves remote items at a waiting path alone with `more` only when its scan hashed something.
+  Test: `rounds::files_waiting_for_their_hash_are_not_starved_by_constant_changes`.
+- **INFO:** `SqliteStore::batch` was used only by its own test and an outer rollback after
+  `save_folder` would have left `FolderSync`'s saved metadata and deltas out of step with the
+  index; it is removed, and `save_folder`, `delete_folder` and `retain_cache` use plain
+  transactions again (the savepoints were only for nesting in a batch).
+
+## Amendment 2026-11-28: upload throughput of the server
+
+A first sync of many small files was bound by the server, not by the network: every file is
+at least two objects (manifest and chunk), and an analysis of the upload path found one hard
+limit and several costs that ran under the database's global write lock. The changes below
+raise the throughput without weakening any guarantee of the threat model: the server is not
+trusted by the devices (end-to-end encryption, signed commits and logs), but protects itself
+against abuse by an account or device (quota, budgets, disk reserve, rate limits) and keeps its
+own integrity (a committed row always has its file, nothing confirmed is lost on power
+failure). Code in `server/`; tests in `server/tests/upload_throughput.rs`,
+`server/tests/deploy_files.rs` and unit tests in the named modules.
+
+- **Upload rate configurable, exact `Retry-After`.** `Scope::UploadAccount` allowed 1200
+  uploads per minute and account, so at most 10 small files a second. The operator now sets it
+  with `HANGAR_DRIVE_UPLOADS_PER_MINUTE` (default 1200 unchanged, accepted 60 to 12000; the
+  upper bound is about what one disk sustains at three flushes per stored object, more would
+  only let one account queue work in front of the others). The per token and per device call
+  limits (`CallToken`, `CallDevice`) become `max(3000, uploads + 1800)`, so one device can use
+  the configured rate and still make its other calls; with the default this is the 3000 they
+  always had. The limits for unknown tokens (`CallIp`, `CallNet`) and every sign-in limit are
+  unchanged. A refused call now carries the seconds until the refusing fixed window ends
+  (`ratelimit::Denied`, `RateLimiter::check` and `blocked`; a key refused by a full table waits
+  for the oldest window of that table) in `Retry-After`, instead of a flat 60, also for failed
+  proofs and device log appends (the day budget of adds included). Refusals that clear within
+  moments ask for a short wait: a busy upload slot 1 s, a folder whose directory is still being
+  removed and an upload that raced a folder removal 2 s (`error::RETRY_SOON_S`). Refusals
+  without a window that ends (a busy heavy slot, a session route called without a session) keep
+  60. Security: the counters, keys and order of the checks are the same; only the number in the
+  header is now true, which tells an attacker nothing he could not measure. High values of the
+  upload rate only make sense with few trusted accounts, since every upload goes through the one
+  database write path and one account at a high rate slows the others (`docs/self-hosting.md`).
+- **The file goes in place outside the write lock** (`service::objects::store`). Before, the
+  upload took `BEGIN IMMEDIATE`, checked, inserted the row, renamed the staged file into place
+  and flushed the directory, and only then committed: every upload of the server waited behind
+  one directory flush, and on Linux the flush of a directory is a full journal commit. Now,
+  under the object's stripe lock: (1) read-only checks (first the account's count of folder
+  removals, then folder retired, folder being removed by a tombstone, the object already has a
+  row, the quota has room), where the held check is mandatory, since otherwise an upload could
+  rename a file over the file of an object that has a row; (2) the disk reserve, then the
+  rename and the directory flush, outside any database transaction; (3) one write transaction
+  that repeats every check (removals, retired, held, quota, budget, disk reserve) and inserts
+  the row. Any refusal or error in (3), and a failed install, removes the file again before the
+  stripe lock is released. Steps (1) to (3) run in a task of their own (`store_locked` under
+  `tokio::spawn`) that owns the stripe guard: a request whose connection drops cannot release
+  the stripe while a file is being put in place or removed (follow-up review LOW 3). The task
+  also owns the account's upload slot (`app::OwnedUploadSlot`), so a dropped request cannot let
+  more than `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` uploads of one account into this step.
+  - *Invariant "a committed row has its file":* the file is durable before the row commits, as
+    before. The garbage collection (`remove_object_files`) and the orphan sweep
+    (`sweep_orphan_files`) remove a file only under the same stripe lock and only when no row
+    exists, so they wait for an upload in flight and then see its row. Object rows are inserted
+    only by this function, under the stripe, so no row can appear between (1) and (3); should
+    one appear anyway, the file is left to it (`Recorded::Held`).
+  - *A folder deleted whole between (1) and (3)* (follow-up review MEDIUM 1): folder
+    directories are removed without stripe locks (garbage collection of a retired or
+    never-committed folder, `purge retained`, the operator's `purge folder`), which could take
+    the new file with them. The first version compared only the folder row (1) saw; a folder
+    that did not exist in (1), was made by another upload and was then purged was missed, and
+    (3) made it again and committed a row whose file was gone (reproduced by the review). Now:
+    every transaction that deletes folders of an account raises `accounts.folder_removals`
+    (migration 0006, `usage::count_folder_removal`) and leaves a tombstone that goes only after
+    the directory is removed (`purge folder` now writes one too, in the same commit; a tombstone
+    of a failed removal is cleared by the garbage collection's next try). (1) reads the count
+    before it looks at the folder; (3) reads it again. A removal committed after that first read
+    changes the count and (3) refuses (`removal_raced`); a removal committed before it either
+    still has its tombstone, which (1) and the folder creation in (3) refuse, or removed its
+    directory before this file went in place. `purge account` deletes the account row, which
+    (3) sees as a missing count. A per-folder lock in memory was considered (the review's first
+    suggestion) but not chosen: the database counter needs no lock across the garbage
+    collection's transaction and its later file removal, and it also holds should a removal
+    ever run in another process.
+  - *How (3) refuses after a changed count* (follow-up LOW 2): the folder (1) saw is still the
+    same row (key and creation time; SQLite may hand a deleted folder's key to a new row, both
+    are equal only if the clock went back by more than the folder's age): the upload goes on, a
+    removal of another folder costs nothing. Tombstone present, another row with the ID, (1) saw
+    no folder, or the account gone: `rate_limited` with `Retry-After: 2`, the device tries
+    again. The folder (1) saw is gone without a tombstone: if it had a head (only an operator
+    purge removes such a folder), `folder_retired`, so the device stops instead of making the
+    operator's deleted folder again; if it never had a head, `rate_limited` with 2 s, because
+    the garbage collection also deletes a never-committed folder without objects a day after
+    it was made (a device that uploaded without committing and slept), and the device's retry
+    makes the folder again (acceptance review). `folder_identity` reads `head_pk IS NOT NULL`
+    for this; the equality check stays on key and creation time.
+  - *Crash between (2) and the commit:* a file without a row, removed by the orphan sweep once
+    it is an hour old, as before for a crash between file and row. A file is never removed when
+    the commit's outcome is unknown. A dropped connection no longer interrupts the steps.
+  - *Cost of a refusal:* a refusal in (3) now costs a rename, a directory flush and a delete;
+    the read-only checks in (1) refuse the common cases (held, retired, over quota) before
+    that, and uploads stay rate limited. The budget is charged only in (3), as before.
+  - Tests: `an_upload_refused_after_its_file_went_in_place_leaves_no_file` (budget),
+    `a_disk_that_fills_while_the_file_goes_in_place_refuses_and_removes_it`,
+    `a_second_upload_of_an_object_never_replaces_its_file` (a second upload with other bytes
+    waits at the stripe and never installs), `concurrent_uploads_of_one_object_store_it_once`,
+    `the_orphan_sweep_waits_for_an_upload_in_flight`,
+    `a_folder_deleted_while_the_file_goes_in_place_refuses_the_upload` (a committed folder:
+    `folder_retired`, the folder not made again),
+    `a_never_committed_folder_collected_during_the_upload_asks_to_retry`, `a_folder_made_after_the_check_and_purged_refuses_the_upload`,
+    `a_folder_made_after_the_check_and_collected_refuses_the_upload` (`purge retained`),
+    `a_folder_still_being_removed_refuses_for_a_moment`,
+    `a_removal_of_another_folder_does_not_stop_an_upload`,
+    `a_busy_upload_slot_asks_to_retry_in_a_second`,
+    `an_upload_finishes_after_its_connection_dropped`. Removing the held check in (1), the
+    removal count check in (3), the task around the steps or the committed distinction makes
+    the respective tests fail (checked by mutation).
+  - **Not done: `synchronous=NORMAL` for the upload transaction.** In WAL mode it would keep
+    the database consistent (frames are written in order, so a later durable `FULL` commit
+    makes every earlier one durable), but a confirmed upload could be lost on power failure,
+    and the device would only learn of it at its next commit (`missing_objects`). The pragma
+    is per connection, so it would have to be switched on a pooled connection and back. With
+    the rename and the directory flush out of the write lock, the WAL flush of the commit is
+    the one flush left under it; its saving does not outweigh a weaker promise.
+- **`objects/missing` in one statement.** It ran one `SELECT` per ID (up to 4096 per call).
+  Now the IDs travel as one JSON array of hex strings into `json_each`, as in the commit call,
+  and the statement returns the positions of those without a row (`NOT EXISTS` on the unique
+  index `(folder_pk, object_id)`), sorted, so the answer keeps the request's order. The text is
+  static, nothing of the request becomes SQL. Test:
+  `missing_answers_a_full_list_in_request_order` (4096 IDs, held ones spread over the list).
+- **SQLite pragmas** (`db.rs`): `cache_size` 16 MiB per connection (`-16384`, SQLite's default
+  is 2 MiB), so the object and reference indexes of a large account stay in memory; at most 8
+  connections make 128 MiB, which `mem_limit: 1g` holds beside the four heavy slots' bodies
+  (comment in `docker-compose.yml`). `journal_size_limit` 64 MiB, so one large commit no longer
+  leaves a WAL of its largest size on disk for good. `synchronous=FULL` and `secure_delete`
+  stay. Test: `every_connection_has_the_cache_and_wal_limits`.
+- **First orphan sweep an hour after the start** (`retention::sweep_due`,
+  `FIRST_SWEEP_DELAY_MS`): it walked every object directory right at the start, competing for
+  the disk with the first uploads of a new server; now it runs an hour after the start and then
+  daily, by the server's clock (a clock that steps back delays it). Files without a row stay at
+  most an hour longer, which costs only disk space. Tests:
+  `the_first_sweep_waits_an_hour_and_then_runs_daily`,
+  `the_first_file_sweep_runs_an_hour_after_the_start` (with the manual clock).
+- **New object directories flushed into their parents** (`store::FsStore::install`). The rename
+  was flushed in its directory, but a directory created for it (account, folder, the two fan-out
+  levels) was not flushed into its parent, so after a power failure the directory entry, and
+  with it a confirmed object, could be missing. Now every directory the install creates is
+  flushed into its parent once, when it is made, under a store-wide lock that also makes an
+  install which finds its directory present wait until its creator has flushed it. Existing
+  directories cost nothing extra; a new fan-out directory costs one flush, at most 65,792 per
+  folder over its life. Windows skips directory flushes (NTFS journals the metadata). Test:
+  `new_directories_are_flushed_into_their_parents_once` (counts the flushes, so it runs on
+  every platform).
+- **Smaller points.** The staging file is written through a 256 KiB buffer instead of one write
+  per body frame (`STAGING_BUFFER` in `http/handlers.rs`); limits and timeouts are unchanged,
+  and the flush and `sync_all` still happen before any lock. 256 KiB rather than 1 MiB because
+  every upload in flight holds one (8 per account by default) inside the container's memory
+  limit. `docker-compose.yml` sets the new variable and rotates the logs (`json-file`, 10 MB,
+  5 files). `docs/self-hosting.md` gains a section for Nginx Proxy Manager (the server's network
+  with one fixed address, the advanced configuration with `proxy_request_buffering off`,
+  `client_max_body_size 100m`, timeouts and the event stream location, finding the address to
+  trust from the `operator warning`, diagnosis with the `ms` of the upload route, the data
+  folder on an SSD).
+
+**Expected effect** (not measured on a Linux host yet; the development machine is Windows,
+where directory flushes are skipped and the main gain does not show): uploads of different
+objects no longer queue behind each other's directory flush, so the write lock is held for the
+checks, the insert and the WAL flush only, and with SSDs the server reaches the configured rate
+instead of about one directory flush per upload. The `missing` call costs one statement instead
+of up to 4096. A measurement on Linux (uploads per second with 1, 4 and 8 parallel uploads,
+before and after) is open.
+
+### Parallel uploads on the device
+
+The device sent one object at a time (`FolderSync::run_job`): every object waited for the round
+trip and the server's flushes of the one before, so a first sync of many small files left the
+line idle although the server takes `HANGAR_DRIVE_UPLOADS_PER_ACCOUNT` (default 8) uploads of an
+account at once. Code in `crates/hangar-drive-sync/src/upload.rs` and `folder.rs`; tests in
+`crates/hangar-drive-sync/tests/parallel_uploads.rs`, the HTTP side in `tests/http.rs`.
+
+- **Design.** `ServerApi::uploader` hands out an `ObjectUploader` (`Send + Sync`) for worker
+  threads beside the `&mut ServerApi` of the engine thread. The upload loop is split into
+  dispatch and booking (`FolderSync::dispatch`, `fill`, `collect`, `finish`): the engine thread
+  pops objects in the queue's read order (path, chunk index, so the disk is still read mostly
+  from front to back), draws each chunk's nonce from the round's entropy source and hands the
+  object to a `Lane`; the workers (scoped threads) read the chunk, seal it and send it. Results
+  are booked on the engine thread exactly as before (`sent`, `sent_round`, `known_present`, bytes
+  left, stage counters), and the loop returns only once nothing is in flight, so the next
+  round's check of what was sent, the final missing query before the commit and the
+  intermediate commits work as before. Without an uploader (test doubles, `upload_workers` 1,
+  a queue of one object) the same loop runs inline through `ServerApi::put_object`.
+- **Cap.** `FolderSettings::upload_workers`, default `UPLOAD_WORKERS` = 4, clamped to
+  `MAX_UPLOAD_WORKERS` = 8 (the server's default per account): 4 keep the line busy across
+  the round trip and leave slots for another device of the account. Folders run one after the
+  other in a pass, so parallelism lives at one level; in addition `HttpServer` holds
+  `UploadSlots` (a semaphore, `ServerConfig::upload_slots`, default 4) shared by every uploader
+  it hands out, so uploads of several folders can never exceed the cap together.
+- **Stops.** The deadline of the round's upload phase, a stage that is due and the first
+  failure stop dispatching; objects in flight finish and are booked, then the loop reports
+  `Yielded`, `StageDue` or the error as before. A chunk that no longer seals marks its content
+  for a new hash (`mark_rehash`) as before. Engine commands wait at most for the objects in
+  flight (bounded by the request timeout), not for the rest of the queue.
+- **Busy slots and sessions.** The HTTP client retries `429` with `Retry-After` inside the
+  request (at most `RetryPolicy::max`, 8 s; the server says 1 s for a busy slot), on the worker
+  thread only. Still refused, the object is queued again and the upload goes on with one object
+  less at once; only one object at a time that is still refused ends the round as before
+  (reported as offline, no 60 s stall of the pass). Workers never sign in: a `401` comes back
+  as `unauthorized` and the engine thread sends that object again through `put_object`, which
+  signs in and renews the token the uploaders share (`SharedToken`).
+- **Copies and traffic.** Request bodies are `bytes::Bytes` (already in the lock file through
+  reqwest): a sealed chunk moves into the request without a copy and a retry sends the same
+  buffer. The uploaders count on the client's shared `TrafficCounter` (atomics), so the traffic
+  line sees parallel uploads as before.
+- **Randomness.** Nonces are drawn in dispatch order on the engine thread
+  (`object::NONCE_LEN`, now public), so the entropy source is never shared between threads
+  and seeded tests stay reproducible. The in-memory server offers an uploader only after
+  `ServerState::enable_parallel_uploads`; the seeded simulation and the tests that watch the
+  order of uploads keep one thread.
+- **Measured** (`parallel_uploads_take_less_wall_time`, debug build, Windows, in-memory
+  server with 5 ms per upload, 126 objects, whole round including scan and hashing): one at a
+  time 3.4 s, four workers 1.4 s. Not measured against a real server over a network yet.
