@@ -31,6 +31,17 @@
 //!   client keeps the pin of the key it was shown ([`ServerApi::seen_pin`]), for the server key
 //!   number the person compares with the server CLI; it never connects with that key on its
 //!   own (ADR 0001, section 6, "Pin rotation").
+//! - **Parallel uploads:** [`ServerApi::uploader`] hands out an [`HttpUploader`] that shares
+//!   this client's connection pool, session token and traffic counter, so worker threads can
+//!   send objects beside the engine thread. Every uploader of one client takes one of its
+//!   [`UploadSlots`] per request ([`crate::upload::UPLOAD_WORKERS`] by default), so uploads of
+//!   several folders together stay within the cap. An uploader never signs in: a `401` comes
+//!   back as `unauthorized`, and the engine thread sends that object again through
+//!   [`ServerApi::put_object`], which signs in and renews the shared token.
+//! - **Traffic:** the payload bytes of every request body that was sent and of every response
+//!   body read (also the event stream's) are added to a shared [`TrafficCounter`]
+//!   ([`HttpServer::with_traffic`]), which the app shell reads without the engine thread. Headers
+//!   are not counted; contents and paths never reach the counter.
 
 use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -56,7 +67,11 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::ports::{NetError, ServerApi};
+use bytes::Bytes;
+
+use crate::ports::{NetError, ObjectUploader, ServerApi};
+use crate::traffic::{CountingReader, TrafficCounter};
+use crate::upload::{UploadSlots, UPLOAD_WORKERS};
 
 /// Largest JSON answer the client reads.
 const MAX_JSON: u64 = 16 * 1024 * 1024;
@@ -121,6 +136,9 @@ pub struct ServerConfig {
     pub timeout: Duration,
     /// Time limit of one read of the event stream ([`EVENT_READ_TIMEOUT`]).
     pub event_read_timeout: Duration,
+    /// Object uploads of this client at once, across every folder
+    /// ([`crate::upload::UPLOAD_WORKERS`]; clamped to [`crate::upload::MAX_UPLOAD_WORKERS`]).
+    pub upload_slots: usize,
 }
 
 impl ServerConfig {
@@ -135,6 +153,7 @@ impl ServerConfig {
             retry: RetryPolicy::default(),
             timeout: Duration::from_secs(60),
             event_read_timeout: EVENT_READ_TIMEOUT,
+            upload_slots: UPLOAD_WORKERS,
         })
     }
 }
@@ -303,9 +322,14 @@ pub struct HttpServer {
     events: Client,
     mismatch: Arc<Mismatch>,
     identity: Option<SessionIdentity>,
-    token: Option<SessionToken>,
+    /// The session token, shared with the uploaders this client handed out.
+    token: Arc<SharedToken>,
+    /// Uploads in flight across every uploader of this client (module docs).
+    slots: Arc<UploadSlots>,
     /// The device log length this device verified, sent with the proof (security review H2).
     log_length: Option<u64>,
+    /// Payload bytes sent and received (module docs, "Traffic").
+    traffic: Arc<TrafficCounter>,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -313,15 +337,44 @@ impl std::fmt::Debug for HttpServer {
         f.debug_struct("HttpServer")
             .field("url", &self.config.url.as_str())
             .field("pinned", &self.config.pin.is_some())
-            .field("signed_in", &self.token.is_some())
+            .field("signed_in", &self.token.get().is_some())
             .finish_non_exhaustive()
     }
 }
 
+/// The session token of one client and its uploaders.
+#[derive(Default)]
+struct SharedToken(Mutex<Option<SessionToken>>);
+
+impl SharedToken {
+    fn lock(&self) -> MutexGuard<'_, Option<SessionToken>> {
+        // A plain value; one written by a thread that panicked is still whole.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn get(&self) -> Option<SessionToken> {
+        self.lock().clone()
+    }
+
+    fn set(&self, token: Option<SessionToken>) {
+        *self.lock() = token;
+    }
+}
+
+/// A request body. Reference counted, so a retry sends the same buffer again without a copy.
 enum Body {
     None,
-    Json(Vec<u8>),
-    Bytes(Vec<u8>),
+    Json(Bytes),
+    Bytes(Bytes),
+}
+
+impl Body {
+    fn len(&self) -> u64 {
+        match self {
+            Body::None => 0,
+            Body::Json(bytes) | Body::Bytes(bytes) => bytes.len() as u64,
+        }
+    }
 }
 
 impl HttpServer {
@@ -360,12 +413,29 @@ impl HttpServer {
         Ok(Self {
             client: build(Some(config.timeout))?,
             events: build(Some(config.event_read_timeout))?,
+            slots: Arc::new(UploadSlots::new(
+                config
+                    .upload_slots
+                    .clamp(1, crate::upload::MAX_UPLOAD_WORKERS),
+            )),
             config,
             mismatch,
             identity,
-            token: None,
+            token: Arc::default(),
             log_length: None,
+            traffic: Arc::default(),
         })
+    }
+
+    /// Counts this client's traffic on `traffic`, shared with whoever shows it.
+    pub fn with_traffic(mut self, traffic: Arc<TrafficCounter>) -> Self {
+        self.traffic = traffic;
+        self
+    }
+
+    /// The counter of this client's traffic.
+    pub fn traffic(&self) -> Arc<TrafficCounter> {
+        Arc::clone(&self.traffic)
     }
 
     /// The server ID learnt at the last sign-in or account creation.
@@ -383,36 +453,18 @@ impl HttpServer {
     }
 
     fn send_error(&self, e: &reqwest::Error) -> NetError {
-        // The mismatch flag stays set until a request succeeds, so the server key number can
-        // still be shown after a later failure; it explains only a failure of the TLS handshake
-        // itself (security review, info). A timeout or a refused connection after a mismatch is
-        // "unreachable", not another "the server identifies itself differently".
-        if !is_tls_failure(e) {
-            return NetError::Unreachable;
-        }
-        if self.mismatch.seen().is_some() {
-            return NetError::PinMismatch;
-        }
-        NetError::Tls(e.to_string())
+        send_error(&self.mismatch, e)
     }
 
-    fn request(&self, method: &Method, url: Url, body: &Body, auth: bool) -> RequestBuilder {
-        let mut req = self.client.request(method.clone(), url);
-        req = match body {
-            Body::None => req,
-            Body::Json(bytes) => req
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(bytes.clone()),
-            Body::Bytes(bytes) => req
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(bytes.clone()),
-        };
-        if auth {
-            if let Some(token) = &self.token {
-                req = req.bearer_auth(token.expose_base64url().as_str());
-            }
+    /// The parts of this client one request needs, borrowed.
+    fn wire(&self) -> Wire<'_> {
+        Wire {
+            client: &self.client,
+            mismatch: &self.mismatch,
+            traffic: &self.traffic,
+            token: &self.token,
+            retry: self.config.retry,
         }
-        req
     }
 
     /// Sends with retries; returns the response of a 2xx answer or the server's error.
@@ -424,47 +476,21 @@ impl HttpServer {
         body: Body,
         auth: bool,
     ) -> Result<Response, NetError> {
-        if auth && self.token.is_none() {
+        if auth && self.token.get().is_none() {
             self.sign_in()?;
         }
         let url = endpoint(&self.config.url, path, after);
-        let retry = self.config.retry;
-        let mut signed_in_again = false;
-        let mut attempt = 1;
-        loop {
-            let result = self.request(&method, url.clone(), &body, auth).send();
-            let error = match result {
-                Ok(resp) if resp.status().is_success() => {
-                    // A connection that passed the handshake ends an earlier mismatch.
-                    self.mismatch.set(None);
-                    return Ok(resp);
-                }
-                Ok(resp)
-                    if resp.status() == StatusCode::UNAUTHORIZED && auth && !signed_in_again =>
-                {
-                    // The token ran out: one new proof, then the same request again.
-                    self.token = None;
-                    self.sign_in()?;
-                    signed_in_again = true;
-                    continue;
-                }
-                Ok(resp) => {
-                    let wait = retry_after(&resp);
-                    let error = removed_only_on_proof(path, error_of(resp));
-                    if !error.is_transient() || attempt >= retry.attempts.max(1) {
-                        return Err(error);
-                    }
-                    std::thread::sleep(wait.unwrap_or_else(|| retry.delay(attempt)).min(retry.max));
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) => self.send_error(&e),
-            };
-            if !error.is_transient() || attempt >= retry.attempts.max(1) {
-                return Err(error);
+        match self.wire().send(&method, &url, path, &body, auth, true) {
+            Ok(resp) => Ok(resp),
+            Err(Failure::Net(e)) => Err(e),
+            Err(Failure::Unauthorized(_)) => {
+                // The token ran out: one new proof, then the same request again.
+                self.token.set(None);
+                self.sign_in()?;
+                self.wire()
+                    .send(&method, &url, path, &body, auth, false)
+                    .map_err(|f| f.into_net(&self.traffic))
             }
-            std::thread::sleep(retry.delay(attempt));
-            attempt += 1;
         }
     }
 
@@ -477,7 +503,7 @@ impl HttpServer {
         auth: bool,
     ) -> Result<T, NetError> {
         let resp = self.send(method, path, after, body, auth)?;
-        let bytes = read_limited(resp, MAX_JSON)?;
+        let bytes = read_limited(resp, MAX_JSON, &self.traffic)?;
         serde_json::from_slice(&bytes).map_err(|e| NetError::Protocol(e.to_string()))
     }
 
@@ -549,7 +575,7 @@ impl HttpServer {
             false,
         )?;
         self.config.server = Some(challenge.server);
-        self.token = Some(session.token);
+        self.token.set(Some(session.token));
         Ok(())
     }
 
@@ -559,7 +585,7 @@ impl HttpServer {
         &mut self,
         mut on_sequence: impl FnMut(u64) -> bool,
     ) -> Result<(), NetError> {
-        if self.token.is_none() {
+        if self.token.get().is_none() {
             self.sign_in()?;
         }
         let url = endpoint(&self.config.url, api::EVENTS_PATH, None);
@@ -567,18 +593,24 @@ impl HttpServer {
             .events
             .get(url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
-        if let Some(token) = &self.token {
+        if let Some(token) = self.token.get() {
             req = req.bearer_auth(token.expose_base64url().as_str());
         }
         let resp = req.send().map_err(|e| self.send_error(&e))?;
         if !resp.status().is_success() {
             if resp.status() == StatusCode::UNAUTHORIZED {
-                self.token = None;
+                self.token.set(None);
             }
-            return Err(removed_only_on_proof(api::EVENTS_PATH, error_of(resp)));
+            return Err(removed_only_on_proof(
+                api::EVENTS_PATH,
+                error_of(resp, &self.traffic),
+            ));
         }
         self.mismatch.set(None);
-        parse_sse(BufReader::new(resp), &mut on_sequence)
+        parse_sse(
+            BufReader::new(CountingReader::new(resp, &self.traffic)),
+            &mut on_sequence,
+        )
     }
 
     /// [`HttpServer::listen_events`] for as long as `keep_going` says: a stream that ends, stays
@@ -619,6 +651,168 @@ impl HttpServer {
     }
 }
 
+/// What a failed request of [`Wire::send`] ended with.
+enum Failure {
+    /// `401` on an authenticated request whose caller renews the session itself.
+    Unauthorized(Box<Response>),
+    /// Any other failure, after the retries.
+    Net(NetError),
+}
+
+impl Failure {
+    /// The error for the caller; the body of a `401` is read and counted like any other.
+    fn into_net(self, traffic: &TrafficCounter) -> NetError {
+        match self {
+            Failure::Net(e) => e,
+            Failure::Unauthorized(resp) => {
+                let _ = read_limited(*resp, MAX_ERROR_BODY, traffic);
+                NetError::Server(ErrorBody::new(api::ErrorCode::Unauthorized))
+            }
+        }
+    }
+}
+
+/// The parts one request needs: shared by [`HttpServer`] and its [`HttpUploader`]s.
+struct Wire<'a> {
+    client: &'a Client,
+    mismatch: &'a Mismatch,
+    traffic: &'a TrafficCounter,
+    token: &'a SharedToken,
+    retry: RetryPolicy,
+}
+
+impl Wire<'_> {
+    fn request(&self, method: &Method, url: Url, body: &Body, auth: bool) -> RequestBuilder {
+        let mut req = self.client.request(method.clone(), url);
+        req = match body {
+            Body::None => req,
+            Body::Json(bytes) => req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(bytes.clone()),
+            Body::Bytes(bytes) => req
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(bytes.clone()),
+        };
+        if auth {
+            if let Some(token) = self.token.get() {
+                req = req.bearer_auth(token.expose_base64url().as_str());
+            }
+        }
+        req
+    }
+
+    /// Sends with retries of transient failures, honouring `Retry-After` (at most
+    /// [`RetryPolicy::max`]); with `renew`, a `401` of an authenticated request ends at once
+    /// with [`Failure::Unauthorized`], so the caller can sign in again.
+    fn send(
+        &self,
+        method: &Method,
+        url: &Url,
+        path: &str,
+        body: &Body,
+        auth: bool,
+        renew: bool,
+    ) -> Result<Response, Failure> {
+        let retry = self.retry;
+        let mut attempt = 1;
+        loop {
+            let result = self.request(method, url.clone(), body, auth).send();
+            // An answer means the body went out; a failed attempt counts as nothing sent.
+            if result.is_ok() {
+                self.traffic.add_sent(body.len());
+            }
+            let error = match result {
+                Ok(resp) if resp.status().is_success() => {
+                    // A connection that passed the handshake ends an earlier mismatch.
+                    self.mismatch.set(None);
+                    return Ok(resp);
+                }
+                Ok(resp) if resp.status() == StatusCode::UNAUTHORIZED && auth && renew => {
+                    return Err(Failure::Unauthorized(Box::new(resp)));
+                }
+                Ok(resp) => {
+                    let wait = retry_after(&resp);
+                    let error = removed_only_on_proof(path, error_of(resp, self.traffic));
+                    if !error.is_transient() || attempt >= retry.attempts.max(1) {
+                        return Err(Failure::Net(error));
+                    }
+                    std::thread::sleep(wait.unwrap_or_else(|| retry.delay(attempt)).min(retry.max));
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => send_error(self.mismatch, &e),
+            };
+            if !error.is_transient() || attempt >= retry.attempts.max(1) {
+                return Err(Failure::Net(error));
+            }
+            std::thread::sleep(retry.delay(attempt));
+            attempt += 1;
+        }
+    }
+}
+
+/// The error of a request that got no answer.
+fn send_error(mismatch: &Mismatch, e: &reqwest::Error) -> NetError {
+    // The mismatch flag stays set until a request succeeds, so the server key number can
+    // still be shown after a later failure; it explains only a failure of the TLS handshake
+    // itself (security review, info). A timeout or a refused connection after a mismatch is
+    // "unreachable", not another "the server identifies itself differently".
+    if !is_tls_failure(e) {
+        return NetError::Unreachable;
+    }
+    if mismatch.seen().is_some() {
+        return NetError::PinMismatch;
+    }
+    NetError::Tls(e.to_string())
+}
+
+/// Object uploads from worker threads beside an [`HttpServer`] (module docs, "Parallel
+/// uploads"): the same connection pool, TLS verifier, session token, traffic counter and upload
+/// slots.
+pub struct HttpUploader {
+    client: Client,
+    base: Url,
+    mismatch: Arc<Mismatch>,
+    traffic: Arc<TrafficCounter>,
+    token: Arc<SharedToken>,
+    slots: Arc<UploadSlots>,
+    retry: RetryPolicy,
+}
+
+impl std::fmt::Debug for HttpUploader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpUploader")
+            .field("url", &self.base.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectUploader for HttpUploader {
+    fn put_object(
+        &self,
+        folder: &FolderId,
+        id: &ObjectId,
+        blob: Bytes,
+    ) -> Result<UploadResponse, NetError> {
+        // Held until the answer is read, so the slots count uploads the server still works on.
+        let _slot = self.slots.acquire();
+        let path = api::object_path(folder, id);
+        let url = endpoint(&self.base, &path, None);
+        let wire = Wire {
+            client: &self.client,
+            mismatch: &self.mismatch,
+            traffic: &self.traffic,
+            token: &self.token,
+            retry: self.retry,
+        };
+        let resp = wire
+            .send(&Method::PUT, &url, &path, &Body::Bytes(blob), true, true)
+            .map_err(|f| f.into_net(&self.traffic))?;
+        let bytes = read_limited(resp, MAX_JSON, &self.traffic)?;
+        serde_json::from_slice(&bytes).map_err(|e| NetError::Protocol(e.to_string()))
+    }
+}
+
 /// Whether a failed request failed in TLS: a `rustls` error in its source chain (also inside
 /// nested I/O errors), or a message that names a certificate or TLS. A timeout never is one.
 fn is_tls_failure(e: &reqwest::Error) -> bool {
@@ -651,7 +845,7 @@ fn holds_rustls_error(error: &(dyn std::error::Error + 'static)) -> bool {
 
 fn json<T: Serialize>(value: &T) -> Result<Body, NetError> {
     serde_json::to_vec(value)
-        .map(Body::Json)
+        .map(|v| Body::Json(Bytes::from(v)))
         .map_err(|e| NetError::Protocol(e.to_string()))
 }
 
@@ -687,9 +881,9 @@ fn removed_only_on_proof(path: &str, error: NetError) -> NetError {
 /// log entries (a few hundred bytes each, in base64url), far more than any other error body.
 const MAX_ERROR_BODY: u64 = 1024 * 1024;
 
-fn error_of(resp: Response) -> NetError {
+fn error_of(resp: Response, traffic: &TrafficCounter) -> NetError {
     let status = resp.status();
-    match read_limited(resp, MAX_ERROR_BODY)
+    match read_limited(resp, MAX_ERROR_BODY, traffic)
         .ok()
         .and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok())
     {
@@ -704,12 +898,13 @@ fn error_of(resp: Response) -> NetError {
     }
 }
 
-fn read_limited(resp: Response, limit: u64) -> Result<Vec<u8>, NetError> {
+fn read_limited(resp: Response, limit: u64, traffic: &TrafficCounter) -> Result<Vec<u8>, NetError> {
     if resp.content_length().is_some_and(|n| n > limit) {
         return Err(NetError::Protocol("the answer is too large".into()));
     }
     let mut out = Vec::new();
-    resp.take(limit + 1)
+    CountingReader::new(resp, traffic)
+        .take(limit + 1)
         .read_to_end(&mut out)
         .map_err(|_| NetError::Unreachable)?;
     if out.len() as u64 > limit {
@@ -903,7 +1098,7 @@ impl ServerApi for HttpServer {
             Method::PUT,
             &api::object_path(folder, id),
             None,
-            Body::Bytes(blob.to_vec()),
+            Body::Bytes(Bytes::copy_from_slice(blob)),
             true,
         )
     }
@@ -916,7 +1111,7 @@ impl ServerApi for HttpServer {
             Body::None,
             true,
         )?;
-        read_limited(resp, max_object())
+        read_limited(resp, max_object(), &self.traffic)
     }
 
     fn commit(
@@ -957,6 +1152,22 @@ impl ServerApi for HttpServer {
 
     fn set_known_log_length(&mut self, length: u64) {
         self.log_length = Some(length);
+    }
+
+    fn uploader(&mut self) -> Result<Option<Arc<dyn ObjectUploader>>, NetError> {
+        // The workers never sign in themselves, so the session is there before they start.
+        if self.token.get().is_none() {
+            self.sign_in()?;
+        }
+        Ok(Some(Arc::new(HttpUploader {
+            client: self.client.clone(),
+            base: self.config.url.clone(),
+            mismatch: Arc::clone(&self.mismatch),
+            traffic: Arc::clone(&self.traffic),
+            token: Arc::clone(&self.token),
+            slots: Arc::clone(&self.slots),
+            retry: self.config.retry,
+        })))
     }
 }
 

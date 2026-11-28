@@ -190,7 +190,14 @@ pub struct Tree {
     nodes: BTreeMap<ItemId, Node>,
     children: BTreeMap<ItemId, BTreeSet<ItemId>>,
     dirty: BTreeSet<ItemId>,
+    /// Changes with every insert or remove to a number no other tree of this process had
+    /// ([`Tree::edition`]); 0 for a tree that was never changed, which is empty.
+    edition: u64,
 }
+
+/// The source of [`Tree::edition`]: unique in the process, so two trees with one edition are
+/// a tree and its clone, or two empty trees.
+static NEXT_EDITION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl PartialEq for Tree {
     fn eq(&self, other: &Self) -> bool {
@@ -214,6 +221,17 @@ impl Tree {
         }
         tree.dirty.clear();
         tree
+    }
+
+    /// A number that names this content: equal for a tree and its unchanged clones, new after
+    /// every change. Lets a caller keep sums over a tree until it changes, instead of walking it
+    /// again for every snapshot.
+    pub fn edition(&self) -> u64 {
+        self.edition
+    }
+
+    fn touch(&mut self) {
+        self.edition = NEXT_EDITION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of items.
@@ -262,6 +280,7 @@ impl Tree {
         self.children.entry(node.parent).or_default().insert(id);
         self.nodes.insert(id, node);
         self.dirty.insert(id);
+        self.touch();
     }
 
     /// Removes a node (not its children) and returns it.
@@ -269,6 +288,7 @@ impl Tree {
         let node = self.nodes.remove(id)?;
         self.unlink(&node.parent, id);
         self.dirty.insert(*id);
+        self.touch();
         Some(node)
     }
 
@@ -526,6 +546,16 @@ impl Tree {
     /// Counts files and directories.
     pub fn count_files(&self) -> usize {
         self.nodes.values().filter(|n| !n.is_dir()).count()
+    }
+
+    /// The number of files and the sum of their sizes, in one pass.
+    pub fn file_stats(&self) -> (u64, u64) {
+        self.nodes
+            .values()
+            .filter_map(|n| n.kind.file())
+            .fold((0u64, 0u64), |(files, bytes), f| {
+                (files.saturating_add(1), bytes.saturating_add(f.size))
+            })
     }
 
     /// The sum of the file sizes (directories have none).

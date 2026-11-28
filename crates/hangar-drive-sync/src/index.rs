@@ -294,7 +294,7 @@ impl SqliteStore {
     /// Deletes the rows of `table` of `folder` whose `column` is not in `keep`. Table and
     /// column names come only from the fixed calls in [`Store::retain_cache`].
     fn retain_rows(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &Connection,
         table: &str,
         column: &str,
         folder: &FolderId,
@@ -380,7 +380,7 @@ impl SqliteStore {
     }
 
     fn write_delta(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &Connection,
         folder: &FolderId,
         tree: i64,
         delta: &TreeDelta,
@@ -562,8 +562,11 @@ impl Store for SqliteStore {
     ) -> Result<Option<ChunkList>, StoreError> {
         let row: Option<(Option<i64>, Vec<u8>)> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT generation, chunks FROM chunks WHERE folder = ?1 AND content = ?2",
+            )
+            .map_err(db)?
+            .query_row(
                 params![folder.as_bytes().as_slice(), content.0.as_slice()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -599,16 +602,17 @@ impl Store for SqliteStore {
         }
         self.space.ensure(bytes.len())?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO chunks (folder, content, generation, chunks)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    folder.as_bytes().as_slice(),
-                    content.0.as_slice(),
-                    list.generation.map(i64::from),
-                    bytes
-                ],
             )
+            .map_err(db)?
+            .execute(params![
+                folder.as_bytes().as_slice(),
+                content.0.as_slice(),
+                list.generation.map(i64::from),
+                bytes
+            ])
             .map_err(db)?;
         Ok(())
     }
@@ -620,8 +624,9 @@ impl Store for SqliteStore {
     ) -> Result<Option<ObjectId>, StoreError> {
         let row: Option<Vec<u8>> = self
             .conn
+            .prepare_cached("SELECT id FROM objects WHERE folder = ?1 AND digest = ?2")
+            .map_err(db)?
             .query_row(
-                "SELECT id FROM objects WHERE folder = ?1 AND digest = ?2",
                 params![folder.as_bytes().as_slice(), digest.as_slice()],
                 |r| r.get(0),
             )
@@ -638,22 +643,24 @@ impl Store for SqliteStore {
         id: &ObjectId,
     ) -> Result<(), StoreError> {
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO objects (folder, digest, id) VALUES (?1, ?2, ?3)",
-                params![
-                    folder.as_bytes().as_slice(),
-                    digest.as_slice(),
-                    id.as_bytes().as_slice()
-                ],
             )
+            .map_err(db)?
+            .execute(params![
+                folder.as_bytes().as_slice(),
+                digest.as_slice(),
+                id.as_bytes().as_slice()
+            ])
             .map_err(db)?;
         Ok(())
     }
 
     fn plaintext(&self, folder: &FolderId, id: &ObjectId) -> Result<Option<Vec<u8>>, StoreError> {
         self.conn
+            .prepare_cached("SELECT data FROM plaintexts WHERE folder = ?1 AND id = ?2")
+            .map_err(db)?
             .query_row(
-                "SELECT data FROM plaintexts WHERE folder = ?1 AND id = ?2",
                 params![folder.as_bytes().as_slice(), id.as_bytes().as_slice()],
                 |r| r.get(0),
             )
@@ -669,14 +676,15 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         self.space.ensure(plaintext.len())?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "INSERT OR REPLACE INTO plaintexts (folder, id, data) VALUES (?1, ?2, ?3)",
-                params![
-                    folder.as_bytes().as_slice(),
-                    id.as_bytes().as_slice(),
-                    plaintext
-                ],
             )
+            .map_err(db)?
+            .execute(params![
+                folder.as_bytes().as_slice(),
+                id.as_bytes().as_slice(),
+                plaintext
+            ])
             .map_err(db)?;
         Ok(())
     }
@@ -908,6 +916,31 @@ mod tests {
             crate::error::SyncError::from(StoreError::DiskFull).code(),
             crate::error::ErrorKind::DiskFull
         );
+    }
+
+    /// Security review of the client changes, LOW 2: a full index volume keeps the plaintexts
+    /// of an upload out of the cache, but the publish goes on with the object IDs remembered.
+    #[test]
+    fn a_full_index_volume_does_not_stop_remembering_an_upload() {
+        fn full(_: &Path) -> (Option<u64>, Option<u64>) {
+            (Some(100 * 1024 * 1024), Some(1 << 40))
+        }
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.space = SpaceGuard::new(Some(PathBuf::from("index")));
+        store.space.probe = full;
+        let folder = FolderId::from_bytes([1; 16]);
+        let oid = ObjectId::from_bytes([7; 32]);
+        let encoded = crate::codec::Encoded {
+            root: oid,
+            sealed: std::collections::BTreeMap::new(),
+            digests: [(oid, [3; 32])].into_iter().collect(),
+            plaintexts: [(oid, b"plain".to_vec())].into_iter().collect(),
+            reachable: [oid].into_iter().collect(),
+            chunks: std::collections::BTreeMap::new(),
+        };
+        crate::codec::remember_uploaded(&encoded, &folder, &mut store).unwrap();
+        assert_eq!(store.object_for(&folder, &[3; 32]).unwrap(), Some(oid));
+        assert!(store.plaintext(&folder, &oid).unwrap().is_none());
     }
 
     #[test]

@@ -176,6 +176,10 @@ pub struct Encoded {
     pub sealed: BTreeMap<ObjectId, Vec<u8>>,
     /// Plaintext digests of the sealed objects, to cache once they are uploaded.
     pub digests: BTreeMap<ObjectId, [u8; 32]>,
+    /// Plaintexts of the sealed objects, to cache once they are uploaded: without them the
+    /// next publish downloads every node and manifest this device just uploaded to walk the
+    /// parent's reachable set ([`reachable`]).
+    pub plaintexts: BTreeMap<ObjectId, Vec<u8>>,
     /// Every object reachable from the root: nodes, manifests and chunks.
     pub reachable: BTreeSet<ObjectId>,
     /// Chunks per content of the tree's files.
@@ -218,6 +222,7 @@ fn encode_with(
         root: ObjectId::from_bytes([0; 32]),
         sealed: BTreeMap::new(),
         digests: BTreeMap::new(),
+        plaintexts: BTreeMap::new(),
         reachable: BTreeSet::new(),
         chunks: BTreeMap::new(),
     };
@@ -344,6 +349,7 @@ fn put_object(
                 .writable()?
                 .seal(kind, plaintext, &mut DynEntropy(entropy))?;
             out.digests.insert(sealed.id, digest);
+            out.plaintexts.insert(sealed.id, plaintext.to_vec());
             out.sealed.insert(sealed.id, sealed.blob);
             sealed.id
         }
@@ -852,7 +858,16 @@ pub fn cached_reachable(
     Ok(seen)
 }
 
-/// Remembers that the server now holds the sealed objects of `encoded`.
+/// Remembers that the server now holds the sealed objects of `encoded`, and caches their
+/// plaintexts as [`fetch_plaintext`] would after a download. The ID of each is the keyed hash
+/// of exactly that plaintext, so the cache entry is as trustworthy as one opened from the
+/// server; the folder's cache cleanup (`retain_cache` via [`cached_reachable`]) bounds it.
+///
+/// Only the object IDs must be written: without them the next encoding seals and uploads the
+/// same objects again. The plaintexts are a cache that spares a download later, so caching them
+/// is best effort: the first failure (an index volume near its reserve answers
+/// [`StoreError::DiskFull`]) ends it for this call, and the publish goes on (security review of
+/// the client changes, LOW 2: before, every round uploaded, failed here and started over).
 pub fn remember_uploaded(
     encoded: &Encoded,
     folder: &FolderId,
@@ -860,6 +875,11 @@ pub fn remember_uploaded(
 ) -> Result<(), StoreError> {
     for (id, digest) in &encoded.digests {
         store.put_object_for(folder, digest, id)?;
+    }
+    for (id, plaintext) in &encoded.plaintexts {
+        if store.put_plaintext(folder, id, plaintext).is_err() {
+            break;
+        }
     }
     Ok(())
 }

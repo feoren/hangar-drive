@@ -110,9 +110,15 @@ const LOCAL_DEVICE_LABEL: &str = "local";
 pub struct LocalFs {
     root: PathBuf,
     tolerance_ms: i64,
-    /// File IDs of directories below the root as the index knows them (L1).
-    dirs: Arc<Mutex<BTreeMap<Vec<String>, u128>>>,
+    /// File IDs of directories below the root as the index knows them (L1). The map sits in an
+    /// `Arc` of its own, so every operation takes a snapshot by cloning that `Arc` under the
+    /// lock (O(1)) instead of copying the whole map; the rare writers copy on write
+    /// ([`Arc::make_mut`]) or swap the `Arc` ([`FileSystem::expect_directories`]).
+    dirs: Arc<Mutex<Arc<DirIds>>>,
 }
+
+/// File IDs of directories below the root, by path.
+type DirIds = BTreeMap<Vec<String>, u128>;
 
 fn io_error(e: &io::Error) -> FsError {
     #[cfg(windows)]
@@ -216,7 +222,7 @@ impl LocalFs {
         let me = Self {
             root,
             tolerance_ms,
-            dirs: Arc::new(Mutex::new(BTreeMap::new())),
+            dirs: Arc::new(Mutex::new(Arc::new(BTreeMap::new()))),
         };
         me.clean_reserved();
         Ok(me)
@@ -246,9 +252,11 @@ impl LocalFs {
         Ok(out)
     }
 
-    /// The file IDs of the directories below the root as the index knows them (L1).
-    fn expected(&self) -> BTreeMap<Vec<String>, u128> {
-        self.dirs.lock().map(|d| d.clone()).unwrap_or_default()
+    /// The file IDs of the directories below the root as the index knows them (L1): a snapshot
+    /// as of this call, as the copy of the map was before, so a change after the call does not
+    /// alter the IDs one operation checks against.
+    fn expected(&self) -> Arc<DirIds> {
+        self.dirs.lock().map(|d| Arc::clone(&d)).unwrap_or_default()
     }
 
     /// The place of `path` after the name checks and the check of every directory on the way
@@ -456,6 +464,7 @@ impl LocalFs {
 
     fn move_dir_ids(&self, from: &[String], to: &[String]) {
         if let Ok(mut dirs) = self.dirs.lock() {
+            let dirs = Arc::make_mut(&mut dirs);
             let moved: Vec<(Vec<String>, u128)> = dirs
                 .iter()
                 .filter(|(k, _)| k.starts_with(from))
@@ -684,7 +693,7 @@ impl FileSystem for LocalFs {
         spot.create_dir().map_err(|e| io_error(&e))?;
         if let Some(id) = spot.dir_id() {
             if let Ok(mut dirs) = self.dirs.lock() {
-                dirs.insert(path.to_vec(), id);
+                Arc::make_mut(&mut dirs).insert(path.to_vec(), id);
             }
         }
         Ok(())
@@ -823,7 +832,7 @@ impl FileSystem for LocalFs {
         let spot = self.spot(path)?;
         spot.remove_dir()?;
         if let Ok(mut dirs) = self.dirs.lock() {
-            dirs.retain(|k, _| !k.starts_with(path));
+            Arc::make_mut(&mut dirs).retain(|k, _| !k.starts_with(path));
         }
         Ok(())
     }
@@ -847,8 +856,10 @@ impl FileSystem for LocalFs {
     }
 
     fn expect_directories(&self, ids: Vec<(Vec<String>, u128)>) {
+        // Built outside the lock, then swapped in: snapshots taken before keep the old map.
+        let ids: Arc<DirIds> = Arc::new(ids.into_iter().collect());
         if let Ok(mut dirs) = self.dirs.lock() {
-            *dirs = ids.into_iter().collect();
+            *dirs = ids;
         }
     }
 

@@ -456,3 +456,128 @@ fn a_later_timeout_is_not_reported_as_a_pin_mismatch() {
     assert_eq!(server.check_health().unwrap_err(), NetError::PinMismatch);
     assert_eq!(server.check_health().unwrap_err(), NetError::Unreachable);
 }
+
+/// The traffic line counts payload bytes only: every request body that went out and every
+/// response body read, on the counter the app shares with the client.
+#[test]
+fn the_traffic_counter_counts_request_and_response_bodies() {
+    let challenge = r#"{"server":"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e","challenge":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","expires_in_secs":60}"#;
+    let session =
+        r#"{"token":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","expires_in_secs":3600}"#;
+    let stored = r#"{"stored":true}"#;
+    let blob = "sealed-object-bytes";
+    let answers = [challenge, session, stored, blob];
+    let (port, seen) = script_server(answers.iter().map(|body| ("200 OK", *body)).collect());
+    let config = one_attempt(ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap());
+    let identity = SessionIdentity {
+        account: AccountId::from_bytes([1; 16]),
+        device: DeviceId::from_bytes([2; 16]),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
+    };
+    let traffic = Arc::new(hangar_drive_sync::traffic::TrafficCounter::default());
+    let mut server = HttpServer::new(config, Some(identity))
+        .unwrap()
+        .with_traffic(Arc::clone(&traffic));
+    let folder = FolderId::from_bytes([4; 16]);
+    let id = hangar_drive_protocol::ids::ObjectId::from_bytes([5; 32]);
+    assert!(
+        server
+            .put_object(&folder, &id, b"0123456789")
+            .unwrap()
+            .stored
+    );
+    assert_eq!(server.get_object(&folder, &id).unwrap(), blob.as_bytes());
+
+    let sent: usize = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            request
+                .split_once("\r\n\r\n")
+                .map_or(0, |(_, body)| body.len())
+        })
+        .sum();
+    let received: usize = answers.iter().map(|body| body.len()).sum();
+    let totals = traffic.totals();
+    assert_eq!(totals.sent, sent as u64);
+    assert_eq!(totals.received, received as u64);
+    assert!(totals.sent >= 10, "the object's body is counted");
+    assert!(Arc::ptr_eq(&server.traffic(), &traffic));
+}
+
+/// The uploader for worker threads shares the client's session and traffic counter, retries a
+/// busy slot (`429`) and never signs in itself: an expired session comes back as
+/// `unauthorized` for the engine thread to renew.
+#[test]
+fn the_uploader_shares_the_session_retries_a_busy_slot_and_never_signs_in() {
+    let challenge = r#"{"server":"5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e","challenge":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc","expires_in_secs":60}"#;
+    let session =
+        r#"{"token":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","expires_in_secs":3600}"#;
+    let busy = r#"{"code":"rate_limited"}"#;
+    let stored = r#"{"stored":true}"#;
+    let expired = r#"{"code":"unauthorized"}"#;
+    let answers = vec![
+        ("200 OK", challenge),
+        ("200 OK", session),
+        ("429 Too Many Requests", busy),
+        ("200 OK", stored),
+        ("401 Unauthorized", expired),
+    ];
+    let received: usize = answers.iter().map(|(_, body)| body.len()).sum();
+    let (port, seen) = script_server(answers);
+    let mut config = ServerConfig::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+    config.retry = RetryPolicy {
+        attempts: 3,
+        base: Duration::from_millis(10),
+        max: Duration::from_millis(50),
+    };
+    let identity = SessionIdentity {
+        account: AccountId::from_bytes([1; 16]),
+        device: DeviceId::from_bytes([2; 16]),
+        prover: Box::new(|_, _, _, _, _| Signature::from_bytes([3; 64])),
+    };
+    let traffic = Arc::new(hangar_drive_sync::traffic::TrafficCounter::default());
+    let mut server = HttpServer::new(config, Some(identity))
+        .unwrap()
+        .with_traffic(Arc::clone(&traffic));
+    // Handing out an uploader signs in first, so the workers find a token.
+    let uploader = server
+        .uploader()
+        .unwrap()
+        .expect("the HTTP client has an uploader");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    let folder = FolderId::from_bytes([4; 16]);
+    let id = hangar_drive_protocol::ids::ObjectId::from_bytes([5; 32]);
+    let blob = bytes::Bytes::from_static(b"0123456789");
+    // From another thread, as the workers send.
+    let sent = std::thread::scope(|scope| {
+        scope
+            .spawn(|| uploader.put_object(&folder, &id, blob.clone()))
+            .join()
+            .unwrap()
+    });
+    assert!(sent.unwrap().stored, "the busy slot was retried");
+    let err = uploader.put_object(&folder, &id, blob.clone()).unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::Unauthorized));
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 5, "the uploader did not sign in again");
+    let token = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+    for put in &requests[2..] {
+        assert!(put.starts_with("PUT /api/v1/folders/"));
+        assert!(
+            put.contains(&format!("Bearer {token}")) || put.contains(&format!("bearer {token}"))
+        );
+        assert!(
+            put.ends_with("0123456789"),
+            "the same body on every attempt"
+        );
+    }
+    let bodies: usize = requests
+        .iter()
+        .map(|r| r.split_once("\r\n\r\n").map_or(0, |(_, body)| body.len()))
+        .sum();
+    let totals = traffic.totals();
+    assert_eq!(totals.sent, bodies as u64);
+    assert_eq!(totals.received, received as u64);
+}

@@ -2088,6 +2088,7 @@ dependencies = [
 name = "hangar-drive-sync"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dirs 7.0.0",
  "hangar-drive-crypto",
  "hangar-drive-protocol",

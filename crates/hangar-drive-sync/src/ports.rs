@@ -534,6 +534,36 @@ pub trait ServerApi {
     /// (`ProofRequest::log_length`), so a server that answers "removed" sends the log from there
     /// (security review H2). Implementations without sessions ignore it.
     fn set_known_log_length(&mut self, _length: u64) {}
+    /// An uploader for worker threads ([`ObjectUploader`]), so several objects go up at once
+    /// beside this connection; `None` sends every object through [`ServerApi::put_object`] on
+    /// the calling thread. An implementation with sessions signs in first, so the workers find a
+    /// token. The default has none.
+    fn uploader(&mut self) -> Result<Option<std::sync::Arc<dyn ObjectUploader>>, NetError> {
+        Ok(None)
+    }
+    /// Called once the uploads of an [`ObjectUploader`] from this connection have all
+    /// answered: an implementation that keeps them apart until then (the in-memory server of the
+    /// tests) takes them in, so every later call sees them. Nothing to do for the real server.
+    fn settle_uploads(&mut self) {}
+}
+
+/// `PUT /folders/{folder}/objects/{id}` from worker threads (parallel uploads, ADR 0001,
+/// amendment "upload throughput of the server"). The server allows a few uploads per account
+/// at once (`HANGAR_DRIVE_UPLOADS_PER_ACCOUNT`); one upload at a time leaves the line idle for a
+/// round trip and the server's flushes per object.
+///
+/// An uploader shares the session of the connection it came from but never signs in itself: an
+/// expired token answers `unauthorized`, and the caller sends that object again through
+/// [`ServerApi::put_object`], which signs in and renews the token for the uploader as well.
+pub trait ObjectUploader: Send + Sync {
+    /// Uploads one sealed object. `blob` is reference counted, so a retry sends it again
+    /// without a copy.
+    fn put_object(
+        &self,
+        folder: &FolderId,
+        id: &ObjectId,
+        blob: bytes::Bytes,
+    ) -> Result<UploadResponse, NetError>;
 }
 
 // ------------------------------------------------------------------------------------------

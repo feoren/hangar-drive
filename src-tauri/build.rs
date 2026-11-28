@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 /// Every command of src/commands.rs; lib.rs registers the same list.
 const COMMANDS: &[&str] = &[
     "get_snapshot",
+    "get_traffic",
     "read_clipboard_text",
     "check_invite",
     "inspect_link",
@@ -243,8 +244,23 @@ fn main() {
         .windows_attributes(windows)
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
     println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+    delay_load_common_controls();
     if let Err(error) = tauri_build::try_build(attributes) {
         panic!("Tauri build failed: {error:#}");
+    }
+}
+
+/// The confirmation dialog (confirm.rs) imports `TaskDialogIndirect`, which exists in Common
+/// Controls 6 alone. The app binary gets that version through its manifest (tauri-build embeds it),
+/// but the unit test binary has none, binds the system's comctl32 5 and Windows refuses to start it
+/// (STATUS_ENTRYPOINT_NOT_FOUND) before a single test runs. Loading comctl32 only at its first call
+/// fixes both: tests never call it, and the app then resolves it through its manifest as before.
+fn delay_load_common_controls() {
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|target| target == "msvc");
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|target| target == "windows");
+    if windows && msvc {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:comctl32.dll");
+        println!("cargo:rustc-link-lib=delayimp");
     }
 }
 

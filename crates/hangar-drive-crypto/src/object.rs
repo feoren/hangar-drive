@@ -39,7 +39,8 @@ const LABEL_OBJECT_KEY: &[u8] = b"hangar-drive/v1/object-key";
 const LABEL_OBJECT_ID: &[u8] = b"hangar-drive/v1/object-id";
 const LABEL_OBJECT: &[u8] = b"hangar-drive/v1/object";
 const OBJECT_VERSION: u8 = 1;
-const NONCE_LEN: usize = 24;
+/// Bytes of the random nonce one seal draws from its entropy source (XChaCha20-Poly1305).
+pub const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 /// Bytes of the clear header: version, generation, type, nonce.
 pub const OBJECT_HEADER_LEN: usize = 1 + 4 + 1 + NONCE_LEN;

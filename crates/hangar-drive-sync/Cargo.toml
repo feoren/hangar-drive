@@ -65,6 +65,12 @@ rustls-platform-verifier = "0.7"
 # Parses the server's end entity certificate to read its SubjectPublicKeyInfo for the pin.
 # ISC (equivalent to MIT, see above), the rustls project; already pulled by rustls.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
+# Reference counted byte buffers for upload bodies: a sealed chunk moves into the request
+# without a copy, and a retry of a 4 MiB chunk sends the same buffer again instead of copying it
+# per attempt. MIT, tokio-rs; already in the lock file through reqwest, whose blocking `Body`
+# takes it directly, so no crate is added. The alternative, a sized reader body, streams through
+# reqwest's body thread in small copies and cannot be retried without rebuilding it.
+bytes = "1"
 # The platform's config directory for the local index (`%APPDATA%`, `~/Library/Application
 # Support`, `~/.config`). MIT OR Apache-2.0, already in the app's tree through Tauri.
 dirs = "7"

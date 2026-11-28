@@ -10,12 +10,24 @@
 //!   window, autostart, file dialogs, printing, QR drawing) are the app's, not the engine's.
 //! - Between commands the thread runs [`EngineCore::tick`]: account refresh, pending removal
 //!   steps (N1), watcher events, the hourly full scan, one round per folder, open pairing offers.
-//!   Every change of the snapshot is sent as [`BackendEvent::Snapshot`].
+//!   Every change of the snapshot is sent as [`BackendEvent::Snapshot`], and the stored state
+//!   once when the thread starts, before the first pass.
+//! - A pass works for about [`WORK_BUDGET_MS`]: hashing, uploads and downloads stop at a clean
+//!   point once it is spent (nothing committed half, nothing uploaded twice), and the loop
+//!   then runs every waiting command and the next pass without its pause. A single file or
+//!   object (hashed, sealed or written whole) and a single network call with its timeout can
+//!   run longer; the pull of the server's commits and trees, re-anchoring and a person's
+//!   restores are not split yet (ADR 0001, amendment "the engine stays responsive").
+//! - A folder with nothing to do is skipped ([`FolderSync::wants_round`]): its commits are pulled
+//!   only when the change feed names a new head, at start, after an error and hourly. A local
+//!   change wakes the loop through the watcher ([`crate::watch::Waker`]) after
+//!   [`WAKE_DEBOUNCE_MS`], instead of waiting for the loop's pause.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use hangar_drive_crypto::devicelog::LogDevice;
 use hangar_drive_crypto::folder_keys::{FolderEntry, FolderList};
@@ -44,8 +56,9 @@ use crate::http::{HttpServer, ServerConfig, SessionIdentity};
 use crate::names::LabelWords;
 use crate::ports::{Clock, FileSystem, FsError, Keychain, NetError, ServerApi, Store};
 use crate::removal::{accept_removed_heads, complete_pending, remove_devices, JobCtx};
+use crate::traffic::TrafficCounter;
 use crate::tree::{NodeKind, Tree, ROOT};
-use crate::watch::{ChangeSource, FolderWatcher};
+use crate::watch::{ChangeSource, FolderWatcher, Waker};
 
 const ENGINE_KEY: &str = "engine";
 /// A full scan of every folder at least this often (ADR 0001, section 3).
@@ -82,6 +95,25 @@ pub const REMOVAL_PROBE_MS: i64 = 60 * 60 * 1000;
 /// The server CLI command that prints the server key number (`server/src/main.rs`), shown in
 /// the comparison dialog (UX 8.3).
 pub const SERVER_NUMBER_COMMAND: &str = "hangar-drive-server server-key-number";
+/// The work budget of one loop pass, shared by the folders' rounds: hashing, uploads and
+/// downloads stop at a clean point once it is spent, and the next pass carries on right after
+/// the commands that came in meanwhile, so the window never waits long for an answer.
+pub const WORK_BUDGET_MS: i64 = 1000;
+/// The least budget one folder's round gets when several folders share a pass.
+const MIN_FOLDER_BUDGET_MS: i64 = 250;
+/// How long the loop waits after a watcher event before its pass, so a burst of events (a file
+/// written in parts, a folder copied in) becomes one pass.
+pub const WAKE_DEBOUNCE_MS: u64 = 400;
+/// Commits the device's rounds send per minute at most, over all folders: safely below the
+/// server's limit of 30 per device and minute, whose wait would otherwise hold the engine
+/// thread for every folder (security review of the client changes, MEDIUM 1).
+pub const DEVICE_COMMITS_PER_MINUTE: u32 = 20;
+const MINUTE_MS: i64 = 60 * 1000;
+
+thread_local! {
+    /// Counts [`EngineCore::sums`] computations on this thread ([`EngineCore::folder_sums_computed`]).
+    static SUMS_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Builds the sync root (and its watcher) for a local path.
 pub type FsFactory =
@@ -113,8 +145,15 @@ pub fn real_root_check() -> RootCheck {
 
 /// The real server: [`HttpServer`].
 pub fn real_server_factory() -> ServerFactory {
-    Box::new(|config, identity| {
-        Ok(Box::new(HttpServer::new(config.clone(), identity)?) as Box<dyn ServerApi>)
+    counted_server_factory(Arc::default())
+}
+
+/// The real server, with every connection's payload bytes counted on `traffic`, which the app
+/// reads for its traffic line without the engine thread ([`crate::traffic`]).
+pub fn counted_server_factory(traffic: Arc<TrafficCounter>) -> ServerFactory {
+    Box::new(move |config, identity| {
+        let server = HttpServer::new(config.clone(), identity)?.with_traffic(Arc::clone(&traffic));
+        Ok(Box::new(server) as Box<dyn ServerApi>)
     })
 }
 
@@ -285,6 +324,22 @@ struct LocalFolder {
     /// Files the last rounds could not write for lack of space, with their sizes: the window
     /// shows "disk full" with what they need until they are written or the folder is in sync.
     disk_full: BTreeMap<ItemId, u64>,
+    /// The window's numbers of the folder with the key they were computed for
+    /// ([`EngineCore::sums`]): a snapshot walks the trees only after they changed.
+    sums: std::cell::RefCell<Option<(crate::folder::SummaryKey, FolderSums)>>,
+}
+
+/// The window's numbers of one folder, all from one walk of its trees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FolderSums {
+    /// Files to upload (with new files that wait for their hash).
+    up: u64,
+    /// Files to download.
+    down: u64,
+    /// Bytes still to transfer ([`EngineCore::bytes_left`]).
+    bytes_left: u64,
+    /// Files and bytes on this disk ([`FolderSync::local_stats`]).
+    stats: Option<(u64, u64)>,
 }
 
 /// Failed rounds in a row after which a folder's error is shown: a single failure (a head that
@@ -450,6 +505,18 @@ pub struct EngineCore {
     recovery_pending: bool,
     /// The loop tries a pending recovery again from this time on.
     recovery_retry_at: i64,
+    /// The work budget of one loop pass ([`WORK_BUDGET_MS`]); `None` lets every round run to
+    /// its end.
+    work_budget_ms: Option<i64>,
+    /// The last pass stopped a round at its budget: the loop runs the next one right away.
+    more_work: bool,
+    /// Rung by the folders' watchers to wake the engine thread ([`Engine::spawn`]).
+    waker: Option<Waker>,
+    /// Every folder pulls in the next pass that reaches the server: at start and after a pass
+    /// that failed (the change feed may have been missed meanwhile).
+    pull_all: bool,
+    /// When the rounds of the last minute sent their commits ([`DEVICE_COMMITS_PER_MINUTE`]).
+    commit_times: VecDeque<i64>,
 }
 
 fn hex_id<T: std::fmt::Display>(id: &T) -> String {
@@ -574,7 +641,14 @@ impl EngineCore {
             server_candidate: None,
             recovery_pending: false,
             recovery_retry_at: 0,
+            work_budget_ms: Some(WORK_BUDGET_MS),
+            more_work: false,
+            waker: None,
+            pull_all: true,
+            commit_times: VecDeque::new(),
         };
+        core.folder_settings.pull_on_demand = true;
+        core.folder_settings.publish_interval_ms = crate::folder::PUBLISH_INTERVAL_MS;
         // A marker that does not read cannot be finished; it must not keep the app from
         // starting either (the key stays in the keychain).
         core.recovery_pending = core.pending_recovery().ok().flatten().is_some();
@@ -639,6 +713,9 @@ impl EngineCore {
             }
         };
         let (fs, watcher) = (self.ports.fs)(Path::new(path))?;
+        if let (Some(watcher), Some(waker)) = (&watcher, &self.waker) {
+            watcher.set_waker(waker.clone());
+        }
         self.folders.insert(
             id,
             LocalFolder {
@@ -650,6 +727,7 @@ impl EngineCore {
                 failed_rounds: 0,
                 last_error: None,
                 disk_full: BTreeMap::new(),
+                sums: std::cell::RefCell::new(None),
             },
         );
         Ok(())
@@ -659,9 +737,56 @@ impl EngineCore {
         self.ports.clock.now_ms()
     }
 
+    /// How long until a folder's held publish is due ([`FolderSync::hold_until`]), so the loop
+    /// wakes for it instead of waiting for its whole pause.
+    pub fn next_due_in(&self) -> Option<Duration> {
+        let now = self.now();
+        self.folders
+            .values()
+            .filter_map(|f| f.sync.hold_until())
+            // A time already passed is taken by the next pass; counting it would spin the loop
+            // for a folder that does not run (a paused one).
+            .filter(|at| *at > now)
+            .min()
+            .map(|at| Duration::from_millis(u64::try_from(at.saturating_sub(now)).unwrap_or(0)))
+    }
+
+    /// Lets every folder's watcher, also of folders added later, wake the engine thread.
+    pub fn set_waker(&mut self, waker: Waker) {
+        for folder in self.folders.values() {
+            if let Some(watcher) = &folder.watcher {
+                watcher.set_waker(waker.clone());
+            }
+        }
+        self.waker = Some(waker);
+    }
+
     /// Takes the events collected since the last call.
     pub fn take_events(&mut self) -> Vec<BackendEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// The snapshot as an event when it differs from the last one sent; the engine thread
+    /// calls it after commands, before the next pass.
+    pub fn changed_snapshot(&mut self) -> Option<BackendEvent> {
+        let snapshot = self.snapshot();
+        if self.last_snapshot.as_ref() == Some(&snapshot) {
+            return None;
+        }
+        self.last_snapshot = Some(snapshot.clone());
+        Some(BackendEvent::Snapshot {
+            snapshot: Box::new(snapshot),
+        })
+    }
+
+    /// The snapshot of the stored state as an event, sent once when the engine thread starts,
+    /// before the first pass; later passes send only a changed snapshot.
+    pub fn first_snapshot(&mut self) -> BackendEvent {
+        let snapshot = self.snapshot();
+        self.last_snapshot = Some(snapshot.clone());
+        BackendEvent::Snapshot {
+            snapshot: Box::new(snapshot),
+        }
     }
 
     // -- The loop ---------------------------------------------------------------------------
@@ -680,6 +805,7 @@ impl EngineCore {
 
     /// One pass of the control loop (module docs). Returns the events for the window.
     pub fn tick(&mut self) -> Vec<BackendEvent> {
+        self.more_work = false;
         self.tick_recovery();
         // While the server reports this device as removed, sync stays stopped and the device
         // only signs in again now and then (security review H2).
@@ -705,7 +831,10 @@ impl EngineCore {
                         None => self.note_removal_report(),
                     }
                 }
-                Err(e) => self.note_net(&e),
+                Err(e) => {
+                    self.pull_all = true;
+                    self.note_net(&e);
+                }
             }
             if self.account.is_some() && self.persisted.removal_report != report {
                 let _ = self.save();
@@ -941,6 +1070,17 @@ impl EngineCore {
             self.poll_offer(&id);
         }
         self.note_folder_list();
+        // Which folders pull in this pass: those whose head the feed reports, or every one
+        // after a start, a failed pass, a feed read again from its start or a changed log.
+        let pull_all =
+            std::mem::take(&mut self.pull_all) || refresh.feed_reset || refresh.log_changed;
+        for (id, folder) in self.folders.iter_mut() {
+            if pull_all {
+                folder.sync.request_pull();
+            } else if let Some(sequence) = refresh.folder_heads.get(id) {
+                folder.sync.note_remote_head(*sequence);
+            }
+        }
         if self.paused() {
             return Ok(());
         }
@@ -969,16 +1109,10 @@ impl EngineCore {
                 }
             }
         }
-        let ids: Vec<FolderId> = self.folders.keys().copied().collect();
         let mut all_in_sync = true;
-        for id in ids {
-            let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut())
-            else {
-                return Ok(());
-            };
-            let Some(folder) = self.folders.get_mut(&id) else {
-                continue;
-            };
+        let mut hourly_folders: BTreeSet<FolderId> = BTreeSet::new();
+        let mut running: Vec<FolderId> = Vec::new();
+        for (id, folder) in self.folders.iter_mut() {
             if let Some(watcher) = &folder.watcher {
                 let changes = watcher.drain(Duration::ZERO);
                 if changes.rescan {
@@ -987,15 +1121,49 @@ impl EngineCore {
                     folder.sync.note_changes(changes.paths);
                 }
             }
-            let hourly = now - folder.last_full_scan >= FULL_SCAN_INTERVAL_MS;
-            if hourly {
+            if now - folder.last_full_scan >= FULL_SCAN_INTERVAL_MS {
+                // The hourly full scan and pull: they find a change the watcher or the change
+                // feed did not report.
                 folder.sync.request_full_scan();
+                folder.sync.request_pull();
                 folder.last_full_scan = now;
                 // The quarantine is cleaned with every hourly scan, not only when the app
                 // starts (security review, info), so an app that runs for weeks keeps no file
                 // past its 30 days.
                 folder.fs.housekeeping(now);
+                hourly_folders.insert(*id);
             }
+            if folder.sync.wants_round(&*folder.fs, now) {
+                running.push(*id);
+            } else {
+                // Nothing to do: no scan, no pull, no save (finding F of the second
+                // performance review). A paused or stopped folder is not in sync.
+                all_in_sync &= folder.sync.quiet();
+            }
+        }
+        // The pass's budget is shared by the folders that run a round, each with a floor, so
+        // one pass stays near the budget however many folders there are; an idle folder takes
+        // no share from one that uploads.
+        let sharing = running.len().max(1) as i64;
+        self.folder_settings.work_budget_ms = self
+            .work_budget_ms
+            .map(|b| (b / sharing).max(b.min(MIN_FOLDER_BUDGET_MS)));
+        for id in running {
+            let (Some(account), Some(server)) = (self.account.as_mut(), self.server.as_mut())
+            else {
+                return Ok(());
+            };
+            let Some(folder) = self.folders.get_mut(&id) else {
+                continue;
+            };
+            let hourly = hourly_folders.contains(&id);
+            // The device's commits of the last minute leave this round its allowance.
+            let clock_now = self.ports.clock.now_ms();
+            self.commit_times
+                .retain(|at| (0..MINUTE_MS).contains(&(clock_now - at)));
+            let used = u32::try_from(self.commit_times.len()).unwrap_or(u32::MAX);
+            self.folder_settings.commit_allowance =
+                Some(DEVICE_COMMITS_PER_MINUTE.saturating_sub(used));
             // The head before the round still holds what another device deletes in it.
             let head_before = folder.sync.view().frontier().map(|e| e.commit);
             let mut cx = Ctx {
@@ -1008,7 +1176,12 @@ impl EngineCore {
                 entropy: &mut *self.ports.entropy,
                 settings: &self.folder_settings,
             };
-            let report = match folder.sync.round(&mut cx) {
+            let result = folder.sync.round(&mut cx);
+            let sent_at = self.ports.clock.now_ms();
+            for _ in 0..folder.sync.round_commits() {
+                self.commit_times.push_back(sent_at);
+            }
+            let report = match result {
                 Ok(r) => {
                     folder.failed_rounds = 0;
                     folder.last_error = None;
@@ -1031,6 +1204,7 @@ impl EngineCore {
                 }
             };
             all_in_sync &= report.in_sync;
+            self.more_work |= report.more;
             Self::note_disk_full(folder, &report);
             let name = folder.sync.meta().name.clone();
             let folder_id = hex_id(&id);
@@ -1154,7 +1328,8 @@ impl EngineCore {
             self.remote_deletes
                 .retain(|id, _| shown.contains(id.as_str()));
         }
-        if all_in_sync {
+        // A pass cut at its budget is not a full sync, even when every finished part agrees.
+        if all_in_sync && !self.more_work {
             self.last_sync = Some(now);
         }
         self.run_restore_jobs();
@@ -1226,7 +1401,7 @@ impl EngineCore {
                 reason: StopReasonApi::Missing,
             },
             FolderState::Active => {
-                let (up, down) = Self::pending(f);
+                let FolderSums { up, down, .. } = Self::sums(f);
                 if up > 0 {
                     FolderStatus::Uploading { count: up }
                 } else if down > 0 {
@@ -1238,6 +1413,34 @@ impl EngineCore {
         }
     }
 
+    /// The window's numbers of a folder: kept with the folder's [`crate::folder::SummaryKey`]
+    /// and computed again only when it changed, so a snapshot of an unchanged folder of 100,000
+    /// files does not walk its trees.
+    fn sums(f: &LocalFolder) -> FolderSums {
+        let key = f.sync.summary_key();
+        if let Some((cached, sums)) = &*f.sums.borrow() {
+            if *cached == key {
+                return *sums;
+            }
+        }
+        let (up, down) = Self::pending(f);
+        let sums = FolderSums {
+            up,
+            down,
+            bytes_left: Self::bytes_left(f),
+            stats: f.sync.local_stats(),
+        };
+        SUMS_COMPUTED.with(|n| n.set(n.get().saturating_add(1)));
+        *f.sums.borrow_mut() = Some((key, sums));
+        sums
+    }
+
+    /// How often this thread computed the numbers of a folder anew ([`Self::sums`]), for tests
+    /// that check a snapshot of an unchanged folder walks no tree.
+    pub fn folder_sums_computed() -> u64 {
+        SUMS_COMPUTED.with(|n| n.get())
+    }
+
     fn pending(f: &LocalFolder) -> (u64, u64) {
         let (local, synced, remote) = (f.sync.local(), f.sync.synced(), f.sync.remote());
         let files = |t: &Tree, other: &Tree| {
@@ -1246,10 +1449,41 @@ impl EngineCore {
                 .count() as u64
         };
         let skip = f.sync.cannot_sync().len() as u64;
+        let (waiting, _) = f.sync.deferred();
         (
-            files(local, synced),
+            files(local, synced).saturating_add(waiting),
             files(remote, synced).saturating_sub(skip),
         )
+    }
+
+    /// Bytes still to transfer for a folder: what the current upload has left
+    /// ([`FolderSync::upload_left`], exact once the server said what it lacks), else the size of
+    /// the local files whose content the synced tree does not have yet, plus the size of the
+    /// remote files whose content is not on this disk yet. A rename or a new time alone moves no
+    /// content and counts nothing.
+    fn bytes_left(f: &LocalFolder) -> u64 {
+        if f.sync.state() != FolderState::Active {
+            return 0;
+        }
+        let skip = f.sync.cannot_sync();
+        let new_content = |t: &Tree, other: &Tree| -> u64 {
+            t.iter()
+                .filter(|(id, _)| !skip.contains_key(id))
+                .filter_map(|(id, n)| {
+                    let v = n.kind.file()?;
+                    let known = other.get(id).and_then(|o| o.kind.file()).map(|o| o.content);
+                    (known != Some(v.content)).then_some(v.size)
+                })
+                .fold(0u64, u64::saturating_add)
+        };
+        let (local, synced, remote) = (f.sync.local(), f.sync.synced(), f.sync.remote());
+        let (_, waiting) = f.sync.deferred();
+        let up = f
+            .sync
+            .upload_left()
+            .unwrap_or_else(|| new_content(local, synced))
+            .saturating_add(waiting);
+        up.saturating_add(new_content(remote, synced))
     }
 
     /// The banner of a folder whose rounds keep failing: the full quota, the server's full disk
@@ -1278,12 +1512,14 @@ impl EngineCore {
         let mut warnings = Vec::new();
         let mut folders = Vec::new();
         let mut pending_files = 0;
+        let mut bytes_left = 0u64;
         let mut conflicts = 0u64;
         let mut names = 0u64;
         for (id, f) in &self.folders {
             let meta = f.sync.meta();
-            let (up, down) = Self::pending(f);
-            pending_files += up + down;
+            let sums = Self::sums(f);
+            pending_files += sums.up + sums.down;
+            bytes_left = bytes_left.saturating_add(sums.bytes_left);
             folders.push(Folder {
                 id: hex_id(id),
                 name: meta.name.clone(),
@@ -1291,7 +1527,8 @@ impl EngineCore {
                 status: Self::folder_status(f),
                 freeze_days: None,
                 not_synced_count: meta.not_synced.len() as u64,
-                bytes: f.sync.local_bytes(),
+                bytes: sums.stats.map(|(_, bytes)| bytes),
+                file_count: sums.stats.map(|(files, _)| files),
             });
             match f.sync.state() {
                 FolderState::Stopped(StopReason::MarkerMissing) => {
@@ -1500,7 +1737,7 @@ impl EngineCore {
                 connection: self.connection,
                 pause: self.persisted.paused_until.map(|until| Pause { until }),
                 pending_files,
-                bytes_left: 0,
+                bytes_left,
                 last_sync: self.last_sync,
                 last_file: self.last_file.clone(),
                 waiting_metered: 0,
@@ -4306,6 +4543,18 @@ impl EngineCore {
         self.folder_settings.max_tree_depth = max_depth;
     }
 
+    /// Sets the work budget of one loop pass ([`WORK_BUDGET_MS`]; smaller in tests, `None`
+    /// for passes that run every round to its end).
+    pub fn set_work_budget(&mut self, budget_ms: Option<i64>) {
+        self.work_budget_ms = budget_ms;
+    }
+
+    /// Whether the last pass stopped a round at its budget, so the next pass should follow
+    /// right away instead of after the loop's pause.
+    pub fn has_more_work(&self) -> bool {
+        self.more_work
+    }
+
     /// Removes a device (`removeDevice`): removal and rotation, re-seal, barriers (N1), and the
     /// heads of the removed device the barriers cover (N2) as a suspect warning source.
     pub fn remove_device(&mut self, device: &str) -> Result<usize, SyncError> {
@@ -4641,10 +4890,33 @@ fn activity_id(entry: &ActivityEntry) -> &str {
 
 type Job = Box<dyn FnOnce(&mut EngineCore) + Send>;
 
+/// What the engine thread receives.
+enum Msg {
+    /// A command.
+    Job(Job),
+    /// A watcher saw a change: a pass after [`WAKE_DEBOUNCE_MS`].
+    Wake,
+    /// The last handle is gone: the thread ends.
+    Stop,
+}
+
+/// The sending side shared by every clone of a handle. The watchers hold a sender too (for
+/// their wake-ups), so the channel never disconnects while the engine runs; the last handle
+/// ends the thread with [`Msg::Stop`] instead.
+struct HandleInner {
+    jobs: Sender<Msg>,
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        let _ = self.jobs.send(Msg::Stop);
+    }
+}
+
 /// Sends commands to the engine thread.
 #[derive(Clone)]
 pub struct EngineHandle {
-    jobs: Sender<Job>,
+    inner: Arc<HandleInner>,
 }
 
 impl std::fmt::Debug for EngineHandle {
@@ -4660,10 +4932,11 @@ impl EngineHandle {
         command: impl FnOnce(&mut EngineCore) -> T + Send + 'static,
     ) -> Result<T, SyncError> {
         let (tx, rx) = channel();
-        self.jobs
-            .send(Box::new(move |core| {
+        self.inner
+            .jobs
+            .send(Msg::Job(Box::new(move |core| {
                 let _ = tx.send(command(core));
-            }))
+            })))
             .map_err(|_| SyncError::Stopped)?;
         rx.recv().map_err(|_| SyncError::Stopped)
     }
@@ -4675,12 +4948,15 @@ pub struct Engine;
 
 impl Engine {
     /// Starts the engine thread. `make` builds the core on the thread (so its ports never cross
-    /// threads); `tick` is the pause between loop passes when no command arrives.
+    /// threads); `tick` is the pause between loop passes when no command and no change on disk
+    /// arrives. A command runs a pass right after it; a watcher event runs one after
+    /// [`WAKE_DEBOUNCE_MS`].
     pub fn spawn(
         make: impl FnOnce() -> Result<EngineCore, SyncError> + Send + 'static,
         tick: Duration,
     ) -> Result<(EngineHandle, Receiver<BackendEvent>), SyncError> {
-        let (jobs, job_rx) = channel::<Job>();
+        let (jobs, job_rx) = channel::<Msg>();
+        let wake_tx = jobs.clone();
         let (event_tx, events) = channel();
         let (ready_tx, ready_rx) = channel();
         std::thread::Builder::new()
@@ -4696,12 +4972,69 @@ impl Engine {
                         return;
                     }
                 };
+                core.set_waker(Waker::new(move || {
+                    // The engine is gone once nobody receives.
+                    let _ = wake_tx.send(Msg::Wake);
+                }));
+                // The window gets the stored state before the first pass scans or uploads
+                // anything.
+                if event_tx.send(core.first_snapshot()).is_err() {
+                    return;
+                }
+                let debounce = Duration::from_millis(WAKE_DEBOUNCE_MS);
+                // When a pass is due for a watcher event, counted from the first event of a
+                // burst, so a long burst cannot hold the pass back.
+                let mut wake_at: Option<Instant> = None;
                 loop {
-                    match job_rx.recv_timeout(tick) {
-                        Ok(job) => job(&mut core),
-                        Err(RecvTimeoutError::Timeout) => {}
+                    // With work left from the last pass the loop does not pause: it takes the
+                    // commands that came in meanwhile and goes on.
+                    let wait = if core.has_more_work() {
+                        Duration::ZERO
+                    } else {
+                        let due = core.next_due_in().map_or(tick, |d| d.min(tick));
+                        wake_at.map_or(due, |at| {
+                            at.saturating_duration_since(Instant::now()).min(due)
+                        })
+                    };
+                    let (first, mut pass) = match job_rx.recv_timeout(wait) {
+                        Ok(msg) => (Some(msg), false),
+                        Err(RecvTimeoutError::Timeout) => (None, true),
                         Err(RecvTimeoutError::Disconnected) => return,
+                    };
+                    // Every command that is waiting runs before the next pass, not one per pass.
+                    let mut ran = false;
+                    for msg in first
+                        .into_iter()
+                        .chain(std::iter::from_fn(|| job_rx.try_recv().ok()))
+                    {
+                        match msg {
+                            Msg::Job(job) => {
+                                job(&mut core);
+                                ran = true;
+                            }
+                            Msg::Wake => {
+                                wake_at.get_or_insert_with(|| Instant::now() + debounce);
+                            }
+                            Msg::Stop => return,
+                        }
                     }
+                    // What the commands changed (a pause, a resumed folder) is shown before the
+                    // pass, which may work for its whole budget.
+                    if ran {
+                        if let Some(event) = core.changed_snapshot() {
+                            if event_tx.send(event).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    // A command runs a pass at once; a wake waits for its debounce.
+                    pass |= ran
+                        || core.has_more_work()
+                        || wake_at.is_some_and(|at| Instant::now() >= at);
+                    if !pass {
+                        continue;
+                    }
+                    wake_at = None;
                     for event in core.tick() {
                         if event_tx.send(event).is_err() {
                             return;
@@ -4711,7 +5044,12 @@ impl Engine {
             })
             .map_err(|_| SyncError::Stopped)?;
         ready_rx.recv().map_err(|_| SyncError::Stopped)??;
-        Ok((EngineHandle { jobs }, events))
+        Ok((
+            EngineHandle {
+                inner: Arc::new(HandleInner { jobs }),
+            },
+            events,
+        ))
     }
 }
 

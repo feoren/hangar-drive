@@ -23,16 +23,19 @@ mod qr;
 mod settings;
 mod state;
 mod texts;
+mod traffic;
 mod tray;
 mod updater;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hangar_drive_sync::engine::{
-    real_fs_factory, real_root_check, real_server_factory, Engine, EngineCore, EngineHandle,
+    counted_server_factory, real_fs_factory, real_root_check, Engine, EngineCore, EngineHandle,
     EnginePorts, EngineSettings,
 };
 use hangar_drive_sync::error::SyncError;
+use hangar_drive_sync::traffic::TrafficCounter;
 use tauri::{AppHandle, Manager as _, Url, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_deep_link::DeepLinkExt as _;
@@ -45,8 +48,12 @@ const ENGINE_TICK: Duration = Duration::from_secs(5);
 /// The argument the autostart entry passes, so a start at sign-in stays in the tray.
 const AUTOSTART_ARG: &str = "--autostart";
 
-/// The engine with the real ports, built on the engine thread.
-fn open_engine(settings: EngineSettings) -> Result<EngineCore, SyncError> {
+/// The engine with the real ports, built on the engine thread; its server connections count
+/// their traffic on `traffic` for the traffic line.
+fn open_engine(
+    settings: EngineSettings,
+    traffic: Arc<TrafficCounter>,
+) -> Result<EngineCore, SyncError> {
     let index =
         settings::index_path().ok_or(SyncError::NotSetUp("no config folder on this system"))?;
     let store = hangar_drive_sync::index::SqliteStore::open(&index)?;
@@ -56,7 +63,7 @@ fn open_engine(settings: EngineSettings) -> Result<EngineCore, SyncError> {
         clock: Box::new(hangar_drive_sync::ports::SystemClock),
         entropy: Box::new(hangar_drive_crypto::OsEntropy),
         fs: real_fs_factory(),
-        server: real_server_factory(),
+        server: counted_server_factory(traffic),
         roots: real_root_check(),
     };
     EngineCore::open(ports, settings)
@@ -88,6 +95,20 @@ fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
         return;
     }
     api.prevent_close();
+    // Hiding inside this callback deadlocks on Windows: the event loop is still handling the
+    // close message with the window's state locked, and `hide` waits for that same lock (seen
+    // in a hung build, 2026-11-28). From another thread the call is only queued and runs once
+    // the callback has returned. A blocking thread rather than an async worker, because the
+    // first close also writes the settings file.
+    let window = window.clone();
+    drop(tauri::async_runtime::spawn_blocking(move || {
+        hide_to_tray(&window)
+    }));
+}
+
+/// Hides the main window after a close; the first time, a notification says the app keeps
+/// running in the tray.
+fn hide_to_tray(window: &tauri::Window) {
     if let Err(error) = window.hide() {
         eprintln!("hangar-drive: window not hidden: {error}");
     }
@@ -173,34 +194,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tz_offset_minutes: tz,
         camera: false,
     };
-    let (engine, receiver) = match Engine::spawn(move || open_engine(engine_settings), ENGINE_TICK)
-    {
-        Ok((engine, receiver)) => (Ok(engine), Some(receiver)),
-        Err(error) => {
-            eprintln!("hangar-drive: the sync engine did not start: {error}");
-            (Err(error.to_string()), None)
-        }
-    };
-    let set_up = engine.as_ref().is_ok_and(is_set_up);
-    let shell = Shell::new(engine, tz, settings_path, stored);
-    // Autostart is on by default (ux-concept 3, 11), applied once; a release build only, so a
-    // development build never registers itself to start at sign-in.
-    if !cfg!(debug_assertions) && !lock(&shell.settings).autostart_applied {
-        if let Err(error) = handle.autolaunch().enable() {
-            eprintln!("hangar-drive: autostart not enabled: {error}");
-        }
-        lock(&shell.settings).autostart_applied = true;
-        let _ = shell.save_settings();
-    }
+    let traffic = traffic::Traffic::default();
+    let counter = traffic.counter();
+    let shell = Shell::starting(tz, settings_path, stored);
+    let slot = shell.engine_slot();
     app.manage(shell);
     app.manage(deeplink::Pending::default());
     app.manage(tray::TrayState::default());
     app.manage(print::PrintPage::default());
+    app.manage(traffic);
     build_main_window(app)?;
     tray::create(&handle)?;
-    if let Some(receiver) = receiver {
-        events::forward(handle.clone(), receiver);
-    }
+    traffic::spawn(handle.clone());
 
     // `hangar-drive://` links: registered for this user on Windows and Linux (macOS through
     // the bundle's Info.plist); a release build only, so a development build never takes the
@@ -225,12 +230,73 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // A start at sign-in stays in the tray once the device is set up; every other start, and
-    // every start before the setup is done, shows the window (ux-concept 3).
+    // every start before the setup is done, shows the window (ux-concept 3). Only the start at
+    // sign-in needs the engine for that, so every other start shows the window right away.
     let autostarted = std::env::args().any(|a| a == AUTOSTART_ARG);
-    if !autostarted || !set_up || started_with_link {
+    let shown = !autostarted || started_with_link;
+    if shown {
         tray::show_main_window(&handle);
     }
+    start_engine(handle, slot, engine_settings, counter, !shown);
     Ok(())
+}
+
+/// Opens the engine on a thread of its own, after the window and the tray exist: opening reads
+/// the index from disk and the identity from the keychain, which can take seconds (a slow
+/// disk, a keychain that asks), and the first paint must not wait for that. Commands wait for
+/// the engine in [`state::EngineSlot`]; the window gets its first snapshot as an event.
+fn start_engine(
+    app: AppHandle,
+    slot: Arc<state::EngineSlot>,
+    settings: EngineSettings,
+    counter: Arc<TrafficCounter>,
+    show_unless_set_up: bool,
+) {
+    let fallback = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("hangar-drive-open".into())
+        .spawn(move || {
+            let guard = state::OpenGuard(Arc::clone(&slot));
+            apply_autostart_default(&app);
+            match Engine::spawn(move || open_engine(settings, counter), ENGINE_TICK) {
+                Ok((engine, receiver)) => {
+                    // The forwarder listens before a command can make the engine send.
+                    events::forward(app.clone(), receiver);
+                    let set_up = is_set_up(&engine);
+                    slot.set(Ok(engine));
+                    if show_unless_set_up && !set_up {
+                        tray::show_main_window(&app);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("hangar-drive: the sync engine did not start: {error}");
+                    slot.set(Err(error.to_string()));
+                    if show_unless_set_up {
+                        tray::show_main_window(&app);
+                    }
+                }
+            }
+            drop(guard);
+        });
+    if let Err(error) = spawned {
+        eprintln!("hangar-drive: the engine thread not started: {error}");
+        fallback.set(Err(error.to_string()));
+    }
+}
+
+/// Autostart is on by default (ux-concept 3, 11), applied once; a release build only, so a
+/// development build never registers itself to start at sign-in. It writes to the registry and
+/// the settings file, so it runs on the opener thread, not on the setup path.
+fn apply_autostart_default(app: &AppHandle) {
+    let shell = app.state::<Shell>();
+    if cfg!(debug_assertions) || lock(&shell.settings).autostart_applied {
+        return;
+    }
+    if let Err(error) = app.autolaunch().enable() {
+        eprintln!("hangar-drive: autostart not enabled: {error}");
+    }
+    lock(&shell.settings).autostart_applied = true;
+    let _ = shell.save_settings();
 }
 
 /// Starts the app and returns once it quits. With [`cleanup::ARG`] (the uninstaller) it only

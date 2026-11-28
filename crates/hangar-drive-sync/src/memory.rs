@@ -5,7 +5,9 @@
 //! - [`MemServer`]: the server API over one shared [`ServerState`], with the server's checks
 //!   from `hangar-drive-crypto` (log batches, commit signatures, compare-and-swap, side commits,
 //!   reference deltas) and fault injection (offline, lost replies, small pages, refused commits,
-//!   a server key other than the pinned one).
+//!   a server key other than the pinned one). With [`ServerState::enable_parallel_uploads`] it
+//!   also hands out an uploader for worker threads ([`MemUploads`]), off by default so the
+//!   seeded simulation and the tests that watch the order of uploads stay on one thread.
 //! - [`MemStore`]: the local index; clones share the data, so a "restarted" device reads what
 //!   the previous instance wrote.
 //! - [`ManualClock`], [`SeededRandom`], [`MemKeychain`].
@@ -15,7 +17,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hangar_drive_crypto::commit::SignedCommit;
 use hangar_drive_crypto::devicelog::AccountState;
@@ -35,7 +38,7 @@ use zeroize::Zeroizing;
 
 use crate::ports::{
     ChunkList, Clock, EntryType, Expect, FileSystem, FsError, Keychain, KeychainError, ListEntry,
-    NetError, SaveBatch, ServerApi, Stat, Store, StoreError, StoredFolder,
+    NetError, ObjectUploader, SaveBatch, ServerApi, Stat, Store, StoreError, StoredFolder,
 };
 use crate::tree::{ContentKey, Node, TreeDelta};
 
@@ -62,6 +65,60 @@ impl ManualClock {
 impl Clock for ManualClock {
     fn now_ms(&self) -> i64 {
         *self.0.borrow()
+    }
+}
+
+/// A clock the test moves by hand that can cross threads (the engine thread, the hashing
+/// workers); [`WorkCost`] moves it as work is done. Clones share the time.
+#[derive(Debug, Clone, Default)]
+pub struct SharedClock(Arc<AtomicI64>);
+
+impl SharedClock {
+    /// A clock at `now_ms`.
+    pub fn at(now_ms: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(now_ms)))
+    }
+
+    /// Moves the clock forward.
+    pub fn advance(&self, ms: i64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// A cost that moves this clock by `ms` per unit of work and sleeps `sleep` in real time.
+    pub fn cost(&self, ms: i64, sleep: std::time::Duration) -> WorkCost {
+        WorkCost {
+            clock: self.clone(),
+            ms,
+            sleep,
+        }
+    }
+}
+
+impl Clock for SharedClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// What one unit of work (an object upload, a file read) costs in a test: time on a
+/// [`SharedClock`], which a work budget sees, and optionally real time, so a test can watch the
+/// engine thread while it works.
+#[derive(Debug, Clone)]
+pub struct WorkCost {
+    /// The clock the cost moves.
+    pub clock: SharedClock,
+    /// Milliseconds per unit.
+    pub ms: i64,
+    /// Real time per unit.
+    pub sleep: std::time::Duration,
+}
+
+impl WorkCost {
+    fn pay(&self) {
+        self.clock.advance(self.ms);
+        if !self.sleep.is_zero() {
+            std::thread::sleep(self.sleep);
+        }
     }
 }
 
@@ -204,6 +261,10 @@ struct MemFsState {
 pub struct MemFs {
     state: Mutex<MemFsState>,
     case_insensitive: bool,
+    /// What each read costs ([`MemFs::set_read_cost`]).
+    read_cost: Mutex<Option<WorkCost>>,
+    /// Rung on every change a simulated person makes, like the real watcher's callback.
+    waker: Mutex<Option<crate::watch::Waker>>,
 }
 
 impl MemFs {
@@ -218,6 +279,34 @@ impl MemFs {
                 ..MemFsState::default()
             }),
             case_insensitive,
+            read_cost: Mutex::new(None),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Rings `waker` on every later change a simulated person makes (the engine's wake-up).
+    pub fn set_user_waker(&self, waker: crate::watch::Waker) {
+        match self.waker.lock() {
+            Ok(mut guard) => *guard = Some(waker),
+            Err(poisoned) => *poisoned.into_inner() = Some(waker),
+        }
+    }
+
+    fn ring(&self) {
+        let waker = match self.waker.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Makes every read of file content cost `cost` (hashing and sealing read the files).
+    pub fn set_read_cost(&self, cost: Option<WorkCost>) {
+        match self.read_cost.lock() {
+            Ok(mut guard) => *guard = cost,
+            Err(poisoned) => *poisoned.into_inner() = cost,
         }
     }
 
@@ -261,6 +350,7 @@ impl MemFs {
         let ok = self.user_write_inner(path, data);
         if ok {
             self.event(path);
+            self.ring();
         }
         ok
     }
@@ -300,12 +390,20 @@ impl MemFs {
 
     /// Creates a directory.
     pub fn user_mkdir(&self, path: &[String]) -> bool {
-        self.create_dir(path).is_ok()
+        let ok = self.create_dir(path).is_ok();
+        if ok {
+            self.ring();
+        }
+        ok
     }
 
     /// Renames or moves an entry with everything below it.
     pub fn user_rename(&self, from: &[String], to: &[String]) -> bool {
-        self.rename(from, to).is_ok()
+        let ok = self.rename(from, to).is_ok();
+        if ok {
+            self.ring();
+        }
+        ok
     }
 
     /// Deletes a file or a directory with everything below it.
@@ -317,6 +415,8 @@ impl MemFs {
         }
         s.entries.retain(|k, _| !k.starts_with(&key));
         s.events.push(path.to_vec());
+        drop(s);
+        self.ring();
         true
     }
 
@@ -423,6 +523,13 @@ impl FileSystem for MemFs {
     }
 
     fn read_at(&self, path: &[String], offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let cost = match self.read_cost.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(cost) = cost {
+            cost.pay();
+        }
         let s = self.lock();
         let key = self.key(path);
         if s.locked.contains(&key) {
@@ -895,6 +1002,109 @@ pub struct ServerState {
     pub calls: u64,
     /// How often `get_object` served each object, for the tests.
     pub object_gets: BTreeMap<ObjectId, u64>,
+    /// How often `put_object` was called for each object, for the tests.
+    pub object_puts: BTreeMap<ObjectId, u64>,
+    /// Every `put_object` in the order it came, for the tests.
+    pub put_log: Vec<ObjectId>,
+    /// `missing_objects` calls and the IDs they asked about, for the tests.
+    pub missing_queries: u64,
+    /// See [`Self::missing_queries`].
+    pub missing_ids: u64,
+    /// What each `put_object` costs, for tests of the work budget.
+    pub put_cost: Option<WorkCost>,
+    /// What each `get_object` costs, for tests of the work budget.
+    pub get_cost: Option<WorkCost>,
+    /// While set, `put_object` answers "stored" but keeps nothing, so `missing_objects` keeps
+    /// listing the objects (a hostile or broken server).
+    pub forget_puts: bool,
+    /// Uploads from worker threads ([`Self::enable_parallel_uploads`]); `None`: every upload
+    /// goes through [`MemServer`]'s `put_object` on the engine thread.
+    pub parallel_uploads: Option<Arc<MemUploads>>,
+}
+
+/// The uploads of [`MemUploader`]s, shared between worker threads and the [`ServerState`],
+/// which takes in what landed at its next call ([`ServerState::settle_uploads`]).
+#[derive(Debug, Default)]
+pub struct MemUploads(Mutex<MemUploadState>);
+
+impl MemUploads {
+    /// The state, for the tests to set faults and read counters.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, MemUploadState> {
+        // Counters only; one written by a thread that panicked is still whole.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Faults and counters of the parallel uploads of the in-memory server.
+#[derive(Debug, Default)]
+pub struct MemUploadState {
+    /// Real time each upload takes, so the uploads of the workers overlap.
+    pub delay: std::time::Duration,
+    /// After this many accepted uploads, every further one fails as unreachable.
+    pub fail_after: Option<u64>,
+    /// The next this many uploads answer `rate_limited` (a busy upload slot).
+    pub rate_limited: u64,
+    /// The next this many uploads answer `unauthorized` (an expired session).
+    pub unauthorized: u64,
+    /// Uploads accepted so far.
+    pub accepted: u64,
+    /// Uploads answered `rate_limited` so far.
+    pub refused: u64,
+    /// The most uploads in flight at once.
+    pub max_in_flight: usize,
+    in_flight: usize,
+    landed: Vec<(FolderId, ObjectId, Vec<u8>)>,
+}
+
+/// An uploader of the in-memory server for worker threads ([`ServerState::parallel_uploads`]).
+#[derive(Debug)]
+struct MemUploader {
+    uploads: Arc<MemUploads>,
+    cost: Option<WorkCost>,
+}
+
+impl ObjectUploader for MemUploader {
+    fn put_object(
+        &self,
+        folder: &FolderId,
+        id: &ObjectId,
+        blob: bytes::Bytes,
+    ) -> Result<UploadResponse, NetError> {
+        let (verdict, delay) = {
+            let mut s = self.uploads.lock();
+            s.in_flight += 1;
+            s.max_in_flight = s.max_in_flight.max(s.in_flight);
+            let verdict = if s.unauthorized > 0 {
+                s.unauthorized -= 1;
+                Err(refuse(ErrorCode::Unauthorized))
+            } else if s.rate_limited > 0 {
+                s.rate_limited -= 1;
+                s.refused += 1;
+                Err(refuse(ErrorCode::RateLimited))
+            } else if s.fail_after.is_some_and(|n| s.accepted >= n) {
+                Err(NetError::Unreachable)
+            } else if hangar_drive_crypto::object::object_header(&blob).is_none() {
+                Err(refuse(ErrorCode::BadRequest))
+            } else {
+                s.accepted += 1;
+                Ok(())
+            };
+            (verdict, s.delay)
+        };
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        if let Some(cost) = &self.cost {
+            cost.pay();
+        }
+        let mut s = self.uploads.lock();
+        s.in_flight -= 1;
+        verdict?;
+        s.landed.push((*folder, *id, blob.to_vec()));
+        Ok(UploadResponse { stored: true })
+    }
 }
 
 impl ServerState {
@@ -936,6 +1146,43 @@ impl ServerState {
             pairing: BTreeMap::new(),
             calls: 0,
             object_gets: BTreeMap::new(),
+            object_puts: BTreeMap::new(),
+            put_log: Vec::new(),
+            missing_queries: 0,
+            missing_ids: 0,
+            put_cost: None,
+            get_cost: None,
+            forget_puts: false,
+            parallel_uploads: None,
+        }
+    }
+
+    /// Hands out uploaders for worker threads from now on; returns their shared state.
+    pub fn enable_parallel_uploads(&mut self) -> Arc<MemUploads> {
+        Arc::clone(
+            self.parallel_uploads
+                .get_or_insert_with(|| Arc::new(MemUploads::default())),
+        )
+    }
+
+    /// Takes in what the uploaders of worker threads sent, as `put_object` would have.
+    pub fn settle_uploads(&mut self) {
+        let Some(uploads) = self.parallel_uploads.clone() else {
+            return;
+        };
+        let landed = std::mem::take(&mut uploads.lock().landed);
+        for (folder, id, blob) in landed {
+            *self.object_puts.entry(id).or_default() += 1;
+            self.put_log.push(id);
+            if self.forget_puts {
+                continue;
+            }
+            self.folders
+                .entry(folder)
+                .or_default()
+                .objects
+                .entry(id)
+                .or_insert(blob);
         }
     }
 
@@ -1096,11 +1343,14 @@ impl MemServer {
 
     /// The shared state.
     pub fn state(&self) -> std::cell::RefMut<'_, ServerState> {
-        self.shared.borrow_mut()
+        let mut s = self.shared.borrow_mut();
+        s.settle_uploads();
+        s
     }
 
     fn enter(&self) -> Result<std::cell::RefMut<'_, ServerState>, NetError> {
         let mut s = self.shared.borrow_mut();
+        s.settle_uploads();
         s.calls += 1;
         if !s.online {
             return Err(NetError::Unreachable);
@@ -1388,7 +1638,9 @@ impl ServerApi for MemServer {
         folder: &FolderId,
         ids: &[ObjectId],
     ) -> Result<Vec<ObjectId>, NetError> {
-        let s = self.enter()?;
+        let mut s = self.enter()?;
+        s.missing_queries += 1;
+        s.missing_ids += ids.len() as u64;
         let f = s.folders.get(folder);
         Ok(ids
             .iter()
@@ -1403,9 +1655,18 @@ impl ServerApi for MemServer {
         id: &ObjectId,
         blob: &[u8],
     ) -> Result<UploadResponse, NetError> {
+        let cost = self.shared.borrow().put_cost.clone();
+        if let Some(cost) = cost {
+            cost.pay();
+        }
         let mut s = self.enter()?;
+        *s.object_puts.entry(*id).or_default() += 1;
+        s.put_log.push(*id);
         if hangar_drive_crypto::object::object_header(blob).is_none() {
             return Err(refuse(ErrorCode::BadRequest));
+        }
+        if s.forget_puts {
+            return Ok(UploadResponse { stored: true });
         }
         let f = s.folders.entry(*folder).or_default();
         let stored = !f.objects.contains_key(id);
@@ -1413,7 +1674,30 @@ impl ServerApi for MemServer {
         Ok(UploadResponse { stored })
     }
 
+    fn uploader(&mut self) -> Result<Option<Arc<dyn ObjectUploader>>, NetError> {
+        // Without parallel uploads this is no call to the server, so tests that count calls
+        // see the same numbers as before.
+        if self.shared.borrow().parallel_uploads.is_none() {
+            return Ok(None);
+        }
+        let s = self.enter()?;
+        Ok(s.parallel_uploads.as_ref().map(|uploads| {
+            Arc::new(MemUploader {
+                uploads: Arc::clone(uploads),
+                cost: s.put_cost.clone(),
+            }) as Arc<dyn ObjectUploader>
+        }))
+    }
+
+    fn settle_uploads(&mut self) {
+        self.shared.borrow_mut().settle_uploads();
+    }
+
     fn get_object(&mut self, folder: &FolderId, id: &ObjectId) -> Result<Vec<u8>, NetError> {
+        let cost = self.shared.borrow().get_cost.clone();
+        if let Some(cost) = cost {
+            cost.pay();
+        }
         let mut s = self.enter()?;
         *s.object_gets.entry(*id).or_default() += 1;
         s.folders

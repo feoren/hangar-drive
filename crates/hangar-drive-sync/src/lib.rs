@@ -11,9 +11,9 @@
 //! | Folder loop | [`folder`] (scan, pull and verify, merge, publish with compare-and-swap and side commit, apply, re-anchor, restore, barrier) |
 //! | Account | [`account`] (log, epochs, rings, records, counter), [`removal`] (removal as a resumable job, N1, N2 and H1), [`recovery`] (the recovery device's one append) |
 //! | Rules | [`paging`] (every paged list, M1), [`roots`] (which folders may be sync roots, M4), [`links`] (invite, pairing and recovery links) |
-//! | Objects | [`codec`] (trees to objects and back), [`chunker`] (4 MiB chunks, parallel hashing with backpressure) |
+//! | Objects | [`codec`] (trees to objects and back), [`chunker`] (4 MiB chunks, parallel hashing with backpressure), [`upload`] (parallel object uploads) |
 //! | Ports | [`ports`] (file system, server API, store, clock, randomness, keychain) |
-//! | Real ports | [`localfs`] (`\\?\` paths, name checks, directories on the way, atomic writes without replacing, locked files, 8.3), [`trash`] (recycle bin and quarantine for incoming deletes), [`watch`] (`notify` 9), [`index`] (SQLite), [`http`] (reqwest, rustls, SPKI pin, SSE) |
+//! | Real ports | [`localfs`] (`\\?\` paths, name checks, directories on the way, atomic writes without replacing, locked files, 8.3), [`trash`] (recycle bin and quarantine for incoming deletes), [`watch`] (`notify` 9), [`index`] (SQLite), [`http`] (reqwest, rustls, SPKI pin, SSE), [`traffic`] (byte counts of the connection) |
 //! | Test ports | [`memory`] |
 //! | App API | [`engine`] (thread, commands, events), [`api`] (the window's types), [`error`] |
 //!
@@ -83,6 +83,8 @@ pub mod recovery;
 pub mod removal;
 pub mod roots;
 pub mod space;
+pub mod traffic;
 pub mod trash;
 pub mod tree;
+pub mod upload;
 pub mod watch;

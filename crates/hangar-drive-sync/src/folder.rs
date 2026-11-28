@@ -19,7 +19,7 @@
 //! Everything a round changes is written to the [`Store`] in one batch at the end of each step,
 //! so a restart resumes from the last step and never takes a missing file for a delete.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hangar_drive_crypto::commit::{
     ChainEntry, Commit, CommitContent, DeltaDigest, FolderView, RemovedHead, SignedCommit,
@@ -52,6 +52,8 @@ use crate::ports::{
     SaveBatch, ServerApi, Stat, Store,
 };
 use crate::tree::{ContentKey, FileVersion, NameIndex, Node, NodeKind, Tree, ROOT};
+use crate::upload::{draw_nonce, Done, Lane, Outcome, Payload, Work, UPLOAD_WORKERS};
+use bytes::Bytes;
 
 /// Name of the root marker inside the reserved directory.
 pub const MARKER_NAME: &str = "marker";
@@ -77,6 +79,28 @@ pub const FRESH_FILES_CAP: usize = 20_000;
 pub const HISTORY_CACHE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// How soon a folder stopped as too large tries again after a change in it.
 const TOO_LARGE_RETRY_MS: i64 = 60 * 1000;
+/// Bytes an upload sends before it commits the files that are complete so far (an intermediate
+/// commit, [`FolderSettings::stage_bytes`]): other devices see a large first upload grow, and the
+/// server's collection, which deletes uploads no commit names after a day
+/// (`server/src/service/retention.rs`), never takes what went up before.
+pub const STAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// Objects an upload sends before an intermediate commit, for many small files
+/// ([`FolderSettings::stage_objects`]).
+pub const STAGE_OBJECTS: usize = 8192;
+/// The least time between two intermediate commits of a folder
+/// ([`FolderSettings::stage_interval_ms`]), well within the server's limit of commits per device
+/// and minute.
+pub const STAGE_INTERVAL_MS: i64 = 30_000;
+/// The least time the upload phase of a round gets once it starts, also when the folder's share
+/// of the pass is small (several folders share it) or its scan spent it.
+const UPLOAD_FLOOR_MS: i64 = 250;
+/// The least time between two publishes of the engine's rounds of one folder
+/// ([`FolderSettings::publish_interval_ms`]).
+pub const PUBLISH_INTERVAL_MS: i64 = 5_000;
+/// Commits a folder's rounds may make at once before [`PUBLISH_INTERVAL_MS`] paces them.
+pub const PUBLISH_BURST: u32 = 3;
+/// Upload jobs a folder keeps across rounds: the publish's own and those of its stages.
+const MAX_UPLOAD_JOBS: usize = 4;
 
 /// The path of the root marker.
 pub fn marker_path() -> Vec<String> {
@@ -108,6 +132,40 @@ pub struct FolderSettings {
     pub max_tree_depth: usize,
     /// The most commits one pull reads ([`MAX_PULL_COMMITS`]; smaller in tests).
     pub max_pull_commits: usize,
+    /// The work budget of one round in milliseconds of [`Clock`] time, or `None` for a round
+    /// that runs to its end. Hashing, uploads and downloads stop at a clean point once it is
+    /// spent and the next round carries on ([`RoundReport::more`]), so the engine thread stays
+    /// responsive during a large first upload. The engine sets it; direct callers that expect
+    /// a whole round (tests, restores) leave it unset.
+    pub work_budget_ms: Option<i64>,
+    /// Bytes an upload sends before it commits the complete files so far ([`STAGE_BYTES`];
+    /// smaller in tests).
+    pub stage_bytes: u64,
+    /// Objects an upload sends before it commits the complete files so far
+    /// ([`STAGE_OBJECTS`]).
+    pub stage_objects: usize,
+    /// The least time between two intermediate commits ([`STAGE_INTERVAL_MS`]; 0 in tests).
+    pub stage_interval_ms: i64,
+    /// How often a round of this folder commits at most, after a burst of
+    /// [`PUBLISH_BURST`] commits: one more per interval ([`PUBLISH_INTERVAL_MS`] in the engine,
+    /// 0 for direct callers: no limit). A file rewritten every second (a log, a database)
+    /// otherwise made a commit per change and ran into the server's commit limit per device,
+    /// whose wait then held the engine thread for every folder (security review of the client
+    /// changes, MEDIUM 1). Only the commit waits; the upload goes on. The first changes after a
+    /// quiet spell go out at once; the person's actions (restores, undo) are not held.
+    pub publish_interval_ms: i64,
+    /// Commits the next round may send, the device's share of the server's limit left over all
+    /// folders, intermediate and side commits included; `None`: no limit. The engine sets it
+    /// per round.
+    pub commit_allowance: Option<u32>,
+    /// Pull the folder's commits only when asked ([`FolderSync::request_pull`],
+    /// [`FolderSync::note_remote_head`]) instead of in every round. The engine sets it and asks
+    /// when the change feed names a new head of the folder, at start, after a lost connection or
+    /// an error, and every hour; direct callers of [`FolderSync::round`] pull in every round.
+    pub pull_on_demand: bool,
+    /// Objects one upload sends at once ([`UPLOAD_WORKERS`]; at most
+    /// [`crate::upload::MAX_UPLOAD_WORKERS`], 1 sends one at a time on the round's thread).
+    pub upload_workers: usize,
 }
 
 impl Default for FolderSettings {
@@ -123,6 +181,14 @@ impl Default for FolderSettings {
             max_tree_items: codec::MAX_TREE_ITEMS,
             max_tree_depth: codec::MAX_TREE_DEPTH,
             max_pull_commits: MAX_PULL_COMMITS,
+            work_budget_ms: None,
+            stage_bytes: STAGE_BYTES,
+            stage_objects: STAGE_OBJECTS,
+            stage_interval_ms: STAGE_INTERVAL_MS,
+            publish_interval_ms: 0,
+            commit_allowance: None,
+            pull_on_demand: false,
+            upload_workers: UPLOAD_WORKERS,
         }
     }
 }
@@ -410,6 +476,15 @@ pub struct RoundReport {
     /// Heads of removed devices this round found without a barrier; the folder stopped with
     /// [`StopReason::RemovedHeads`] and the app asks the person (security review H1).
     pub removed_heads: Vec<RemovedHeadRec>,
+    /// The round stopped at its work budget ([`FolderSettings::work_budget_ms`]) or at the
+    /// download bound of a round with work left: the next round should follow right away.
+    pub more: bool,
+    /// Commit calls the round sent (intermediate, side and repair commits included), for the
+    /// engine's commit budget of the device.
+    pub commits: u32,
+    /// The round held its publish back until this time ([`FolderSettings::publish_interval_ms`],
+    /// [`FolderSettings::commit_allowance`]); the engine wakes for it.
+    pub held_until: Option<i64>,
 }
 
 /// What a person's action (a restore, "keep this") changed in the folder: every item it
@@ -577,6 +652,187 @@ pub struct FolderSync {
     /// it are the ones whose deletes the next plan sees, for naming the writing device. Not
     /// stored: after a restart the held deletes keep the devices they were stored with.
     applied_timeline: usize,
+    /// The work budget of the running round ([`FolderSettings::work_budget_ms`]); `None`
+    /// outside a round and for a round without a budget. Not stored.
+    budget: Option<Budget>,
+    /// Bytes the current upload still has to send, while one is under way or stopped at the
+    /// budget; the window shows them as what is left. Not stored.
+    upload_left: Option<u64>,
+    /// New files a scan left unhashed when the budget was spent, with their sizes; the next
+    /// scan lists their directories again, also in a partial scan, and the snapshot counts
+    /// them as files still to upload. Not stored: a restart scans in full.
+    deferred: BTreeMap<Vec<String>, u64>,
+    /// Known files a scan left unhashed when the budget was spent: they keep their known
+    /// version, and the next scan lists their directories again. Not stored.
+    recheck: BTreeSet<Vec<String>>,
+    /// Uploads under way, kept across rounds ([`UploadJob`]), newest last. Not stored.
+    jobs: Vec<UploadJob>,
+    /// Objects the server held or received during the uploads under way: a new upload (the plan
+    /// changed while the last one ran) asks only for the others, and asks for every candidate
+    /// again before its commit. Cleared with every finished publish. Not stored.
+    known_present: BTreeSet<ObjectId>,
+    /// A publish the budget cut, continued by the next round while nothing it was planned from
+    /// changed ([`PendingPublish`]). Not stored: a restart plans and asks again.
+    pending: Option<PendingPublish>,
+    /// Counts the rounds and the person's publishes, so an upload knows whether its last ask of
+    /// the server was in the running one. Not stored.
+    round_seq: u64,
+    /// When the upload phase of the running round ends ([`FolderSync::upload_deadline`]).
+    upload_until: Option<i64>,
+    /// When this device last made an intermediate commit of a large upload. Not stored.
+    last_stage_ms: Option<i64>,
+    /// The next round pulls the server's commits (with [`FolderSettings::pull_on_demand`]). Set
+    /// at start, by the engine and after a failed round. Not stored.
+    pull_due: bool,
+    /// The last round ended with disk, server and synced tree in agreement, and nothing was
+    /// stored outside a round since; [`FolderSync::wants_round`] skips such a folder. Not stored.
+    quiet: bool,
+    /// A round runs: its own saves are no change by the person. Not stored.
+    in_round: bool,
+    /// The metadata as last written, so a save without a change writes nothing. Not stored.
+    saved_meta: Option<Vec<u8>>,
+    /// The last scan hashed at least one file: a round that leaves remote items alone for files
+    /// waiting for their hash asks for the next round at once only then, so a scan that made no
+    /// progress does not drive the loop without its pause (security review of the client
+    /// changes, LOW 3). Not stored.
+    hashed_in_scan: bool,
+    /// The commits a round of this folder may still make at once, and when the bucket was last
+    /// filled ([`FolderSettings::publish_interval_ms`]). Not stored.
+    publish_tokens: u32,
+    publish_filled_ms: Option<i64>,
+    /// A held publish waits until then; the folder's rounds wait as well, unless a pull is due.
+    /// Not stored.
+    hold_until: Option<i64>,
+    /// The running round holds publishes by the interval and the allowance (a round of the
+    /// loop, not one the person's undo runs). Not stored.
+    gated: bool,
+    /// Commits the running round may still send (`None`: no limit), and the ones it sent.
+    commits_left: Option<u32>,
+    commits_sent: u32,
+    /// The commit calls of the last round, also of one that failed ([`Self::round_commits`]).
+    round_commits: u32,
+    /// The running round stopped at its budget somewhere ([`RoundReport::more`]). Not stored.
+    cut: bool,
+}
+
+/// The objects one upload still has to send, kept across rounds, so a round cut at its budget
+/// goes on where it stopped instead of asking the server about every object again (finding A of
+/// the second performance review). Not stored.
+#[derive(Debug)]
+struct UploadJob {
+    /// The root of the encoded tree the upload is for.
+    root: ObjectId,
+    /// The writable generation its chunks are sealed under.
+    generation: u32,
+    /// A digest of the candidates it was made for.
+    candidates: [u8; 32],
+    /// Objects still to send, in read order: chunks the disk cannot produce first (they end
+    /// the upload at once), then chunks by path and chunk index, then sealed nodes and
+    /// manifests.
+    queue: VecDeque<ObjectId>,
+    /// The bytes of each queued object.
+    sizes: BTreeMap<ObjectId, u64>,
+    /// Where each queued chunk lives on disk: path, chunk index and content.
+    sources: BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)>,
+    /// Bytes still to send.
+    left: u64,
+    /// Objects sent in round `sent_round`: the next round asks whether the server kept them.
+    sent: Vec<ObjectId>,
+    sent_round: u64,
+    /// Bytes and objects sent since the last intermediate commit.
+    since_stage: (u64, usize),
+    /// The round whose ask covered every candidate; in any other round the upload asks again
+    /// before it reports done, since the server deletes uploads no commit names after a day.
+    asked_round: u64,
+    /// The server lost objects this upload sent (a hostile or broken server): its cuts do not
+    /// ask for an immediate next round, so the loop keeps its pause (security review of the
+    /// budget, L2).
+    stalled: bool,
+}
+
+/// How a staged upload stopped.
+enum UploadStep {
+    /// Every candidate is on the server.
+    Done,
+    /// Enough went up for an intermediate commit; these objects are still queued.
+    StageDue(BTreeSet<ObjectId>),
+}
+
+/// Why an upload loop stops dispatching ([`FolderSync::dispatch`]).
+enum Stop {
+    /// Every candidate is on the server.
+    Done,
+    /// Enough went up for an intermediate commit.
+    Stage,
+    /// The round's upload deadline passed.
+    Yield,
+    /// A chunk is no longer what the disk holds.
+    Changed,
+    /// A failure to report.
+    Error(PublishFailure),
+}
+
+impl Stop {
+    /// Sets `stop` to `next` unless it already holds a failure: a failure of an object still in
+    /// flight replaces an ordinary end, and the first failure is the one reported.
+    fn halt(stop: &mut Option<Stop>, next: Stop) {
+        if !matches!(stop, Some(Stop::Changed | Stop::Error(_))) {
+            *stop = Some(next);
+        }
+    }
+}
+
+/// A publish whose upload the budget cut: the plan and its encoding, reused by the next round
+/// while the key matches, so that round goes on uploading without planning and sealing again.
+#[derive(Debug)]
+struct PendingPublish {
+    key: PendingKey,
+    plan: Plan,
+    encoded: Option<Encoded>,
+}
+
+/// What a pending publish was planned from: the three trees (their editions change with every
+/// insert and remove), the server's head and root, and the writable generation. Anything else a
+/// plan reads is changed by the person's actions, which store outside a round and drop the
+/// pending publish ([`FolderSync::save`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingKey {
+    trees: (u64, u64, u64),
+    frontier: Option<CommitId>,
+    remote_root: Option<ObjectId>,
+    generation: Option<u32>,
+}
+
+/// What the window's numbers of a folder depend on ([`FolderSync::summary_key`]): equal keys
+/// give equal counts and sizes, so the engine keeps them until the key changes instead of
+/// walking every tree for each snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryKey {
+    trees: (u64, u64, u64),
+    local_known: bool,
+    state: FolderState,
+    deferred: (u64, u64),
+    upload_left: Option<u64>,
+    cannot_sync: Vec<ItemId>,
+}
+
+/// The work budget of one round, in [`Clock`] time.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    /// When the round's budget ends.
+    until: i64,
+    /// The whole budget of the round.
+    slice: i64,
+}
+
+impl Budget {
+    /// When a phase that starts at `now` has to stop: at the end of the round's budget, but
+    /// never before a quarter of the budget has passed in the phase itself, so a round whose
+    /// scan and plan already took the budget still moves the transfer on instead of doing one
+    /// object per round.
+    fn phase_until(self, now: i64) -> i64 {
+        self.until.max(now.saturating_add(self.slice / 4))
+    }
 }
 
 /// What the next scan reads from the disk.
@@ -663,6 +919,12 @@ pub fn room_for(size: u64, free: Option<u64>, volume: Option<u64>) -> bool {
 /// read right before that file.
 const ROUND_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The bytes and files of one hash batch: the scan checks the round's work budget between
+/// batches ([`FolderSettings::work_budget_ms`]). 64 MiB take well under a second on a usual
+/// disk; a single larger file is a batch of its own and is not split.
+const HASH_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const HASH_BATCH_FILES: usize = 32;
+
 /// Plaintext a write keeps of chunks its manifest names again later, so a repeated chunk ID is
 /// fetched and opened once while memory stays bounded (16 chunks of 4 MiB); beyond it, the chunk
 /// is fetched again.
@@ -678,6 +940,12 @@ struct FsDisk<'a> {
     dirty: &'a mut BTreeMap<ItemId, Option<u128>>,
     /// Bytes fetched in this apply run ([`ROUND_DOWNLOAD_BYTES`]).
     downloaded: u64,
+    /// The clock, for the round's work budget.
+    clock: &'a dyn Clock,
+    /// When this apply run stops starting new downloads (the round's work budget).
+    until: Option<i64>,
+    /// A download was left for the next round, by the byte bound or the budget.
+    cut: bool,
 }
 
 impl FsDisk<'_> {
@@ -729,7 +997,12 @@ impl DiskActions for FsDisk<'_> {
         if !room_for(size, self.fs.free_bytes(), self.fs.volume_bytes()) {
             return Err(ActionError::DiskFull);
         }
-        if self.downloaded > 0 && self.downloaded.saturating_add(size) > ROUND_DOWNLOAD_BYTES {
+        // At least one file per run, so every round moves the download on; a single file is
+        // not split (it is written atomically), so it may run past the budget.
+        let over_bytes = self.downloaded.saturating_add(size) > ROUND_DOWNLOAD_BYTES;
+        let over_time = self.until.is_some_and(|u| self.clock.now_ms() >= u);
+        if self.downloaded > 0 && (over_bytes || over_time) {
+            self.cut = true;
             return Err(ActionError::Unavailable);
         }
         // How often each chunk is still to come, so a repeated one is kept until its last use.
@@ -876,6 +1149,13 @@ enum PublishFailure {
     HeadMoved,
     /// The local disk changed under the upload: scan again.
     LocalChanged,
+    /// The round's work budget is spent part way through an upload. Nothing was committed;
+    /// what went up stays on the server (uploads without a commit are kept for a day) and the
+    /// next round's missing-objects query skips it.
+    Yielded,
+    /// Everything is uploaded, but the commit waits ([`FolderSettings::publish_interval_ms`],
+    /// [`FolderSettings::commit_allowance`]) until [`FolderSync::hold_until`].
+    Held,
     /// Any other error.
     Error(SyncError),
 }
@@ -922,6 +1202,29 @@ impl FolderSync {
             rehash: BTreeSet::new(),
             local_known: false,
             applied_timeline: 0,
+            budget: None,
+            upload_left: None,
+            deferred: BTreeMap::new(),
+            recheck: BTreeSet::new(),
+            jobs: Vec::new(),
+            known_present: BTreeSet::new(),
+            pending: None,
+            round_seq: 0,
+            upload_until: None,
+            last_stage_ms: None,
+            pull_due: true,
+            quiet: false,
+            in_round: false,
+            saved_meta: None,
+            hashed_in_scan: false,
+            publish_tokens: PUBLISH_BURST,
+            publish_filled_ms: None,
+            hold_until: None,
+            gated: false,
+            commits_left: None,
+            commits_sent: 0,
+            round_commits: 0,
+            cut: false,
         }
     }
 
@@ -944,6 +1247,7 @@ impl FolderSync {
             meta.discarded.iter().copied().collect(),
         )?;
         let local = Tree::from_nodes(stored.local);
+        let saved_meta = Some(stored.meta.clone());
         Ok(Some(Self {
             folder,
             remote: Tree::from_nodes(stored.remote),
@@ -959,6 +1263,29 @@ impl FolderSync {
             local,
             applied_timeline: meta.timeline.len(),
             meta,
+            budget: None,
+            upload_left: None,
+            deferred: BTreeMap::new(),
+            recheck: BTreeSet::new(),
+            jobs: Vec::new(),
+            known_present: BTreeSet::new(),
+            pending: None,
+            round_seq: 0,
+            upload_until: None,
+            last_stage_ms: None,
+            pull_due: true,
+            quiet: false,
+            in_round: false,
+            saved_meta,
+            hashed_in_scan: false,
+            publish_tokens: PUBLISH_BURST,
+            publish_filled_ms: None,
+            hold_until: None,
+            gated: false,
+            commits_left: None,
+            commits_sent: 0,
+            round_commits: 0,
+            cut: false,
         }))
     }
 
@@ -967,16 +1294,38 @@ impl FolderSync {
         self.meta.marks = self.view.marks().iter().map(|(k, v)| (*k, *v)).collect();
         self.meta.discarded = self.view.discarded().iter().copied().collect();
         let meta = serde_json::to_vec(&self.meta).map_err(|e| SyncError::Corrupt(e.to_string()))?;
-        let batch = SaveBatch {
+        let mut batch = SaveBatch {
             remote: self.remote.take_delta(),
             synced: self.synced.take_delta(),
             local: self.local.take_delta(),
             file_ids: std::mem::take(&mut self.file_ids_dirty)
                 .into_iter()
                 .collect(),
-            meta: Some(meta),
+            meta: None,
         };
+        let meta_changed = self.saved_meta.as_deref() != Some(meta.as_slice());
+        let rows = [&batch.remote, &batch.synced, &batch.local]
+            .iter()
+            .any(|d| !d.upsert.is_empty() || !d.remove.is_empty())
+            || !batch.file_ids.is_empty();
+        // A round saves after every step; most of them change nothing in an idle folder, and
+        // an unchanged state is not written again (finding F of the second performance review).
+        if !meta_changed && !rows {
+            return Ok(());
+        }
+        if meta_changed {
+            batch.meta = Some(meta.clone());
+        }
         store.save_folder(&self.folder, &batch)?;
+        if meta_changed {
+            self.saved_meta = Some(meta);
+        }
+        // A change stored outside a round is the person's action (a decision, a restore, a
+        // pause): the next round plans again and is not skipped.
+        if !self.in_round {
+            self.quiet = false;
+            self.pending = None;
+        }
         Ok(())
     }
 
@@ -1104,6 +1453,21 @@ impl FolderSync {
         self.local_known.then(|| self.local.file_bytes())
     }
 
+    /// The files of the folder on this disk and their bytes, in one pass: the local tree plus
+    /// the new files the last scan left unhashed at its budget ([`Self::deferred`]), so the
+    /// numbers do not jump during a large first scan. None until the tree shows the disk.
+    pub fn local_stats(&self) -> Option<(u64, u64)> {
+        if !self.local_known {
+            return None;
+        }
+        let (files, bytes) = self.local.file_stats();
+        let (waiting, waiting_bytes) = self.deferred();
+        Some((
+            files.saturating_add(waiting),
+            bytes.saturating_add(waiting_bytes),
+        ))
+    }
+
     /// The verified chain.
     pub fn view(&self) -> &FolderView {
         &self.view
@@ -1129,6 +1493,71 @@ impl FolderSync {
     /// The next scan reads every directory (hourly, or after the watcher lost events).
     pub fn request_full_scan(&mut self) {
         self.scan_scope = ScanScope::Full;
+    }
+
+    /// The next round pulls the server's commits (with [`FolderSettings::pull_on_demand`]).
+    pub fn request_pull(&mut self) {
+        self.pull_due = true;
+    }
+
+    /// The change feed reports `sequence` as the folder's head on the server: the next round
+    /// pulls unless that is the head this device already has (its own commit, say). A sequence
+    /// below this device's is pulled as well, so an older state is noticed.
+    pub fn note_remote_head(&mut self, sequence: u64) {
+        if self.view.frontier().map(|f| f.sequence) != Some(sequence) {
+            self.pull_due = true;
+        }
+    }
+
+    /// Whether a round now has anything to do. A folder whose last round ended in sync, with no
+    /// change on disk reported since, no head on the server to pull, nothing waiting (hashes,
+    /// an upload, a repair) and nothing stored by the person since, is skipped by the engine
+    /// (finding F of the second performance review). The root marker is still read every time
+    /// (one small read), since no watcher reports its loss and a round stops the folder then. A
+    /// paused or stopped folder's round does nothing either, except a folder stopped as too
+    /// large that may try again.
+    pub fn wants_round(&self, fs: &dyn FileSystem, now: i64) -> bool {
+        // A held commit waits for its time; a head to pull, or files still waiting for their
+        // hash, come in between (the scan goes on while the commit waits).
+        if self.hold_until.is_some_and(|at| now < at)
+            && !self.pull_due
+            && self.deferred.is_empty()
+            && self.recheck.is_empty()
+        {
+            return false;
+        }
+        match self.meta.state {
+            FolderState::Active => {
+                !self.quiet
+                    || self.pull_due
+                    || self.meta.full_next
+                    || self.pending.is_some()
+                    || !self.deferred.is_empty()
+                    || !self.recheck.is_empty()
+                    || !self.rehash.is_empty()
+                    || !matches!(&self.scan_scope, ScanScope::Paths(p) if p.is_empty())
+                    || !self.marker_ok(fs)
+            }
+            FolderState::Stopped(StopReason::LocalTooLarge) => self.retry_too_large(now),
+            _ => false,
+        }
+    }
+
+    /// The commit calls the last round sent, also when it failed, for the engine's commit
+    /// budget of the device.
+    pub fn round_commits(&self) -> u32 {
+        self.round_commits
+    }
+
+    /// When a held publish of this folder is due ([`RoundReport::held_until`]).
+    pub fn hold_until(&self) -> Option<i64> {
+        self.hold_until
+    }
+
+    /// Whether the folder is active and its last round ended in sync with nothing changed
+    /// since: a skipped round of it counts as in sync.
+    pub fn quiet(&self) -> bool {
+        self.meta.state == FolderState::Active && self.quiet
     }
 
     /// Pauses or resumes.
@@ -1260,8 +1689,108 @@ impl FolderSync {
 
     // -- The round --------------------------------------------------------------------------
 
-    /// One round of the control loop (module docs).
+    /// One round of the control loop (module docs). With a work budget
+    /// ([`FolderSettings::work_budget_ms`]) the round may stop early at a clean point:
+    /// between hash batches, between two object uploads before the commit, or between two
+    /// downloaded files. Then [`RoundReport::more`] is set and the next round carries on from
+    /// what is stored and what the server already holds; nothing is committed half.
     pub fn round(&mut self, cx: &mut Ctx<'_>) -> Result<RoundReport, SyncError> {
+        self.round_with(cx, cx.settings.work_budget_ms, true)
+    }
+
+    /// [`Self::round`] with the budget `budget_ms` (`None`: to its end).
+    fn round_with(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        budget_ms: Option<i64>,
+        gated: bool,
+    ) -> Result<RoundReport, SyncError> {
+        let now = cx.clock.now_ms();
+        self.budget = budget_ms.map(|ms| {
+            let slice = ms.max(1);
+            Budget {
+                until: now.saturating_add(slice),
+                slice,
+            }
+        });
+        self.cut = false;
+        self.round_seq = self.round_seq.wrapping_add(1);
+        self.upload_until = None;
+        self.in_round = true;
+        self.gated = gated;
+        self.commits_left = if gated {
+            cx.settings.commit_allowance
+        } else {
+            None
+        };
+        self.commits_sent = 0;
+        let result = self.round_inner(cx);
+        self.gated = false;
+        self.commits_left = None;
+        self.round_commits = std::mem::take(&mut self.commits_sent);
+        self.in_round = false;
+        self.budget = None;
+        let more = std::mem::take(&mut self.cut);
+        match result {
+            Ok(mut report) => {
+                report.more |= more;
+                // Files waiting for their hash, or a round cut short, are not in sync yet.
+                report.in_sync &= !report.more && self.deferred.is_empty();
+                if !report.more {
+                    self.upload_left = None;
+                }
+                self.quiet = report.in_sync;
+                report.commits = self.round_commits;
+                report.held_until = self.hold_until;
+                Ok(report)
+            }
+            Err(e) => {
+                self.upload_left = None;
+                self.quiet = false;
+                self.pull_due = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Bytes the current upload still has to send, while one is under way or waits for the
+    /// next round ([`FolderSettings::work_budget_ms`]); `None` when no upload is pending.
+    pub fn upload_left(&self) -> Option<u64> {
+        self.upload_left
+    }
+
+    /// The key of the window's numbers of this folder ([`SummaryKey`]).
+    pub fn summary_key(&self) -> SummaryKey {
+        SummaryKey {
+            trees: (
+                self.local.edition(),
+                self.synced.edition(),
+                self.remote.edition(),
+            ),
+            local_known: self.local_known,
+            state: self.meta.state,
+            deferred: self.deferred(),
+            upload_left: self.upload_left,
+            cannot_sync: self.meta.cannot_sync.keys().copied().collect(),
+        }
+    }
+
+    /// New files the last scan left unhashed at its budget: how many and their bytes. They are
+    /// not in the local tree yet, so without them a large first scan reads as up to date.
+    pub fn deferred(&self) -> (u64, u64) {
+        let bytes = self
+            .deferred
+            .values()
+            .fold(0u64, |s, b| s.saturating_add(*b));
+        (self.deferred.len() as u64, bytes)
+    }
+
+    /// Whether the round's budget is spent at `until` (no budget: never).
+    fn spent(cx: &Ctx<'_>, until: Option<i64>) -> bool {
+        until.is_some_and(|u| cx.clock.now_ms() >= u)
+    }
+
+    fn round_inner(&mut self, cx: &mut Ctx<'_>) -> Result<RoundReport, SyncError> {
         let mut report = RoundReport::default();
         if self.meta.state == FolderState::Stopped(StopReason::LocalTooLarge) {
             if !self.retry_too_large(cx.clock.now_ms()) {
@@ -1287,13 +1816,20 @@ impl FolderSync {
         if self.meta.state != FolderState::Active {
             return Ok(report);
         }
-        match self.pull(cx) {
-            Ok(n) => report.pulled = n,
-            Err(e) if e.is_offline() => {
-                report.offline = true;
-                return Ok(report);
+        // With pulls on demand, a round pulls only when the change feed named a new head (or
+        // at start, after an error, hourly); a missed feed entry is caught by the hourly pull.
+        if !cx.settings.pull_on_demand || self.pull_due {
+            match self.pull(cx) {
+                Ok(n) => {
+                    report.pulled = n;
+                    self.pull_due = false;
+                }
+                Err(e) if e.is_offline() => {
+                    report.offline = true;
+                    return Ok(report);
+                }
+                Err(e) => return self.stop_on(e, cx.store),
             }
-            Err(e) => return self.stop_on(e, cx.store),
         }
         if self.meta.state == FolderState::Stopped(StopReason::RemovedHeads) {
             report.removed_heads = self.meta.removed_heads.clone();
@@ -1304,11 +1840,20 @@ impl FolderSync {
         // server's live set may not match the tree, so it is repaired now with the same tree
         // and a full delta, without waiting for a local change (ADR 0001, amendment "reference
         // deltas bound to the tree").
-        if self.meta.full_next && self.meta.state == FolderState::Active {
+        if self.meta.full_next
+            && self.meta.state == FolderState::Active
+            && self.commits_left != Some(0)
+        {
             match self.repair(cx) {
                 Ok(()) => report.published = true,
                 Err(PublishFailure::Error(e)) if e.is_offline() => {
                     report.offline = true;
+                    self.save(cx.store)?;
+                    return Ok(report);
+                }
+                // `more` comes from the upload's cut (`self.cut`), which a stalled upload does
+                // not set.
+                Err(PublishFailure::Yielded) => {
                     self.save(cx.store)?;
                     return Ok(report);
                 }
@@ -1319,8 +1864,15 @@ impl FolderSync {
         self.save(cx.store)?;
         let attempts = cx.settings.max_publish_attempts.max(1);
         let mut planned: Option<Plan> = None;
+        // The publish the last round's budget cut, while nothing it was planned from changed:
+        // its upload goes on without a new plan, encoding and ask (finding A).
+        let mut resumed = self.take_pending(cx);
+        self.hold_until = None;
         for _ in 0..attempts {
-            let p = self.plan_round(cx, &mut report)?;
+            let (p, mut encoded) = match resumed.take() {
+                Some(pending) => (pending.plan, pending.encoded),
+                None => (self.plan_round(cx, &mut report)?, None),
+            };
             if !p.publish {
                 planned = Some(p);
                 break;
@@ -1335,7 +1887,7 @@ impl FolderSync {
                 self.save(cx.store)?;
                 return Ok(report);
             }
-            match self.publish(cx, &p) {
+            match self.publish(cx, &p, &mut encoded) {
                 Ok(()) => {
                     report.published = true;
                     self.note_deletes(cx.clock.now_ms(), &p.local_deletes);
@@ -1359,6 +1911,23 @@ impl FolderSync {
                 Err(PublishFailure::LocalChanged) => {
                     self.request_full_scan();
                     self.scan(cx)?;
+                }
+                // Stopped at the budget before the commit: the next round goes on with this
+                // plan, its encoding and its upload's queue while nothing changed, and plans,
+                // encodes and asks again otherwise; it uploads nothing twice. `more` comes from
+                // the upload's cut (`self.cut`), which a stalled upload does not set.
+                Err(PublishFailure::Yielded) => {
+                    self.keep_pending(cx, p, encoded);
+                    self.save(cx.store)?;
+                    return Ok(report);
+                }
+                // Uploaded, but the commit is not due yet: the round ends without `more` and
+                // not in sync, nothing of the plan reaches the disk, and the next round at
+                // `hold_until` commits the kept plan (MEDIUM 1).
+                Err(PublishFailure::Held) => {
+                    self.keep_pending(cx, p, encoded);
+                    self.save(cx.store)?;
+                    return Ok(report);
                 }
                 Err(PublishFailure::Error(e)) if e.is_offline() => {
                     report.offline = true;
@@ -1728,6 +2297,19 @@ impl FolderSync {
     }
 
     fn scan(&mut self, cx: &mut Ctx<'_>) -> Result<(), SyncError> {
+        // Nothing to read: no path reported since the last scan and nothing left waiting. The
+        // walk would take every directory from the index and build the same tree again, which
+        // costs a pass over the whole folder in every round of a long upload.
+        let nothing_reported = matches!(&self.scan_scope, ScanScope::Paths(p) if p.is_empty());
+        if nothing_reported
+            && self.local_known
+            && self.deferred.is_empty()
+            && self.recheck.is_empty()
+            && self.rehash.is_empty()
+        {
+            self.note_local_deletes(cx.clock.now_ms());
+            return Ok(());
+        }
         self.expect_directories(cx.fs);
         self.recover_parked(cx.fs)?;
         let reader = cx.account.folder_reader(&self.folder)?;
@@ -1737,12 +2319,23 @@ impl FolderSync {
         // 1. Walk: list every directory in a full scan; in a partial one only the directories
         // the watcher named (with their ancestors) and new ones, and take the rest from the
         // index.
+        // Files the last scan left unhashed at its budget are listed again here, and hashed
+        // first below.
+        let waited: BTreeSet<Vec<String>> = self
+            .deferred
+            .keys()
+            .chain(self.recheck.iter())
+            .cloned()
+            .collect();
+        self.hashed_in_scan = false;
+        let deferred = std::mem::take(&mut self.deferred);
+        let recheck = std::mem::take(&mut self.recheck);
         let relist =
             match std::mem::replace(&mut self.scan_scope, ScanScope::Paths(BTreeSet::new())) {
                 ScanScope::Full => None,
                 ScanScope::Paths(paths) => {
                     let mut set = BTreeSet::new();
-                    for path in paths {
+                    for path in paths.into_iter().chain(deferred.into_keys()).chain(recheck) {
                         for len in 0..=path.len() {
                             set.insert(path[..len].to_vec());
                         }
@@ -1921,11 +2514,22 @@ impl FolderSync {
         let mut jobs = Vec::new();
         let mut job_items = Vec::new();
         let mut versions: BTreeMap<ItemId, FileVersion> = BTreeMap::new();
+        // Per job: whether the budget may leave it for the next scan. A file the local tree
+        // knows keeps its known version meanwhile; a new file stays out of the tree, which only
+        // delays its upload. A file the synced or the remote tree knows (by item or, for a
+        // join, by path) is always hashed: leaving it out would read as a local delete.
+        let mut deferrable: Vec<bool> = Vec::new();
         for (item, path, stat) in &items {
             if stat.kind != EntryType::File {
                 continue;
             }
             let prev = self.local.get(item).and_then(|n| n.kind.file()).copied();
+            // A remote file at the same path does not keep a new file from waiting: the remote
+            // tree may be older than the next pull, so `apply_plan` leaves every remote item at
+            // a waiting path alone until the file is hashed (security review of the budget,
+            // H1).
+            let may_wait =
+                prev.is_some() || (!self.synced.contains(item) && !self.remote.contains(item));
             let same_id = self.file_ids.get(item).copied() == stat.file_id
                 || stat.file_id.is_none()
                 || !self.file_ids.contains_key(item);
@@ -1941,6 +2545,7 @@ impl FolderSync {
                         generation: newest,
                     });
                     job_items.push((*item, prev, *stat));
+                    deferrable.push(may_wait);
                     continue;
                 }
             }
@@ -1965,12 +2570,78 @@ impl FolderSync {
                 generation,
             });
             job_items.push((*item, prev, *stat));
+            deferrable.push(may_wait);
         }
 
-        // 4. Hash, in parallel with backpressure.
-        let results = hash_many(cx.fs, &jobs, reader.all_keys(), cx.settings.hash_threads);
+        // Files that waited since an earlier scan go first: in path order a folder that keeps
+        // changing (a log, a database) would fill the first batch, the only one a spent budget
+        // still hashes, in every scan, and the files that wait would starve (LOW 3).
+        if !waited.is_empty() {
+            let mut order: Vec<usize> = (0..jobs.len()).collect();
+            order.sort_by_key(|i| !waited.contains(&jobs[*i].path));
+            jobs = order.iter().map(|i| jobs[*i].clone()).collect();
+            job_items = order.iter().map(|i| job_items[*i]).collect();
+            deferrable = order.iter().map(|i| deferrable[*i]).collect();
+        }
+        self.hashed_in_scan = !jobs.is_empty();
+
+        // 4. Hash, in parallel with backpressure, in batches so the round's work budget is
+        // checked between them. `None`: left for the next scan.
+        let until = self.budget.map(|b| b.phase_until(cx.clock.now_ms()));
+        let threads = cx.settings.hash_threads;
+        let mut results: Vec<Option<Result<crate::chunker::Hashed, ChunkError>>> =
+            Vec::with_capacity(jobs.len());
+        let mut start = 0;
+        while start < jobs.len() {
+            let mut end = start;
+            let mut bytes = 0u64;
+            while end < jobs.len()
+                && (end == start || (bytes < HASH_BATCH_BYTES && end - start < HASH_BATCH_FILES))
+            {
+                bytes = bytes.saturating_add(job_items[end].2.size);
+                end += 1;
+            }
+            let batch = hash_many(cx.fs, &jobs[start..end], reader.all_keys(), threads);
+            results.extend(batch.into_iter().map(Some));
+            start = end;
+            if start < jobs.len() && Self::spent(cx, until) {
+                let must: Vec<HashJob> = (start..jobs.len())
+                    .filter(|i| !deferrable[*i])
+                    .map(|i| jobs[i].clone())
+                    .collect();
+                let mut hashed = hash_many(cx.fs, &must, reader.all_keys(), threads).into_iter();
+                for (index, (job, may_wait)) in
+                    jobs[start..].iter().zip(&deferrable[start..]).enumerate()
+                {
+                    if *may_wait {
+                        let (_, prev, stat) = &job_items[start + index];
+                        if prev.is_some() {
+                            self.recheck.insert(job.path.clone());
+                        } else {
+                            self.deferred.insert(job.path.clone(), stat.size);
+                        }
+                        results.push(None);
+                    } else {
+                        results.push(hashed.next());
+                    }
+                }
+                self.cut = true;
+                break;
+            }
+        }
         let mut rehash: Vec<usize> = Vec::new();
         for (index, ((item, prev, stat), result)) in job_items.iter().zip(results).enumerate() {
+            let Some(result) = result else {
+                // Left for the next scan: the known version stays meanwhile, and an unchanged
+                // file that waits for a new hash stays marked for it.
+                if let Some(v) = prev {
+                    versions.insert(*item, *v);
+                    if rehash_contents.contains(&v.content) {
+                        self.rehash.insert(v.content);
+                    }
+                }
+                continue;
+            };
             match result {
                 Ok(hashed) => {
                     let content = ContentKey::of_chunks(&hashed.chunks);
@@ -2141,8 +2812,13 @@ impl FolderSync {
             }
         }
         self.file_ids = file_ids;
-        // Local deletes: remember when each was first seen.
-        let now = cx.clock.now_ms();
+        self.note_local_deletes(cx.clock.now_ms());
+        self.local_known = true;
+        Ok(())
+    }
+
+    /// Local deletes: remembers when each was first seen.
+    fn note_local_deletes(&mut self, now: i64) {
         let deleted: BTreeSet<ItemId> = self
             .synced
             .ids()
@@ -2153,8 +2829,6 @@ impl FolderSync {
         for id in deleted {
             self.meta.deleted_seen.entry(id).or_insert(now);
         }
-        self.local_known = true;
-        Ok(())
     }
 
     // -- Pull -------------------------------------------------------------------------------
@@ -2330,9 +3004,224 @@ impl FolderSync {
         Ok(codec::reachable(&root, crypto, cx.store, cx.server)?)
     }
 
-    /// Uploads every object of `encoded` the server lacks: sealed nodes and manifests, and
-    /// chunks read from the disk. A chunk that does not seal to its ID marks its content for
-    /// the next scan to hash again ([`FolderSync::rehash`]).
+    /// When a gated round may commit its publish, if not now: the folder's bucket of
+    /// [`PUBLISH_BURST`] commits refills by one per [`FolderSettings::publish_interval_ms`], and
+    /// every commit waits while the device's allowance is used up.
+    fn publish_hold(&mut self, cx: &Ctx<'_>) -> Option<i64> {
+        if !self.gated {
+            return None;
+        }
+        let now = cx.clock.now_ms();
+        let interval = cx.settings.publish_interval_ms;
+        if self.commits_left == Some(0) {
+            return Some(now.saturating_add(interval.max(1_000)));
+        }
+        if interval <= 0 {
+            return None;
+        }
+        if let Some(at) = self.publish_filled_ms {
+            if now < at {
+                // The clock went back: count from now instead of holding until it caught up.
+                self.publish_filled_ms = Some(now);
+            } else {
+                let steps = (now - at) / interval;
+                if steps > 0 {
+                    let gained = u32::try_from(steps).unwrap_or(u32::MAX);
+                    self.publish_tokens = self
+                        .publish_tokens
+                        .saturating_add(gained)
+                        .min(PUBLISH_BURST);
+                    self.publish_filled_ms = if self.publish_tokens >= PUBLISH_BURST {
+                        None
+                    } else {
+                        Some(at.saturating_add(steps.saturating_mul(interval)))
+                    };
+                }
+            }
+        }
+        if self.publish_tokens > 0 {
+            return None;
+        }
+        Some(
+            self.publish_filled_ms
+                .unwrap_or(now)
+                .saturating_add(interval),
+        )
+    }
+
+    /// What a pending publish is valid for now ([`PendingKey`]).
+    fn pending_key(&self, cx: &Ctx<'_>) -> PendingKey {
+        PendingKey {
+            trees: (
+                self.local.edition(),
+                self.synced.edition(),
+                self.remote.edition(),
+            ),
+            frontier: self.view.frontier().map(|f| f.commit),
+            remote_root: self.meta.remote_root,
+            generation: cx.account.newest_generation(&self.folder).map(|g| g.0),
+        }
+    }
+
+    /// The publish the last round's budget cut, when nothing it was planned from changed since.
+    fn take_pending(&mut self, cx: &Ctx<'_>) -> Option<PendingPublish> {
+        let pending = self.pending.take()?;
+        (pending.key == self.pending_key(cx)).then_some(pending)
+    }
+
+    /// Keeps a publish the budget cut for the next round, keyed by the state after this round
+    /// (which includes its own intermediate commits).
+    fn keep_pending(&mut self, cx: &Ctx<'_>, plan: Plan, encoded: Option<Encoded>) {
+        self.pending = Some(PendingPublish {
+            key: self.pending_key(cx),
+            plan,
+            encoded,
+        });
+    }
+
+    /// When the upload phase of the running round ends: at the round's budget, but never before
+    /// a quarter of the folder's share, and at least [`UPLOAD_FLOOR_MS`], has passed in the
+    /// phase, so a round whose scan took the budget, or a folder with a small share of a pass,
+    /// still moves its upload on. Fixed once per round: the uploads of a publish, its stages and
+    /// its side commit share it.
+    fn upload_deadline(&mut self, cx: &Ctx<'_>) -> Option<i64> {
+        let budget = self.budget?;
+        let floor = (budget.slice / 4).max(UPLOAD_FLOOR_MS.min(budget.slice));
+        let now = cx.clock.now_ms();
+        Some(
+            *self
+                .upload_until
+                .get_or_insert_with(|| budget.until.max(now.saturating_add(floor))),
+        )
+    }
+
+    /// Asks the server which of `ids` it lacks, in queries of the protocol's size.
+    fn ask_missing(
+        cx: &mut Ctx<'_>,
+        folder: &FolderId,
+        ids: &[ObjectId],
+    ) -> Result<Vec<ObjectId>, NetError> {
+        let mut missing = Vec::new();
+        for batch in ids.chunks(hangar_drive_protocol::api::MAX_MISSING_QUERY) {
+            missing.extend(cx.server.missing_objects(folder, batch)?);
+        }
+        Ok(missing)
+    }
+
+    /// A digest of an upload's candidates, to tell whether a kept job was made for them.
+    fn candidates_digest(candidates: &BTreeSet<ObjectId>) -> [u8; 32] {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        for id in candidates {
+            hash.update(id.as_bytes());
+        }
+        hash.finalize().into()
+    }
+
+    /// The objects of `missing` in read order with their sizes, where each chunk lives on
+    /// disk, and their bytes (finding H: chunks by path and chunk index, so a file is read from
+    /// its start to its end, not in the order of the IDs). Chunks the disk cannot produce come
+    /// first, so a changed disk ends the upload before anything else is sent; sealed nodes and
+    /// manifests come last.
+    #[allow(clippy::type_complexity)]
+    fn queue_for(
+        encoded: &Encoded,
+        disk: &Tree,
+        missing: &[ObjectId],
+    ) -> (
+        Vec<ObjectId>,
+        BTreeMap<ObjectId, u64>,
+        BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)>,
+        u64,
+    ) {
+        let wanted: BTreeSet<ObjectId> = missing.iter().copied().collect();
+        let mut sources: BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)> = BTreeMap::new();
+        let mut sizes: BTreeMap<ObjectId, u64> = BTreeMap::new();
+        for (item, node) in disk.iter() {
+            let Some(v) = node.kind.file() else {
+                continue;
+            };
+            let Some(chunks) = encoded.chunks.get(&v.content) else {
+                continue;
+            };
+            if !chunks
+                .iter()
+                .any(|c| wanted.contains(c) && !sources.contains_key(c))
+            {
+                continue;
+            }
+            let Some(path) = disk.path(item) else {
+                continue;
+            };
+            for (index, chunk) in chunks.iter().enumerate() {
+                if !wanted.contains(chunk) || sources.contains_key(chunk) {
+                    continue;
+                }
+                let start =
+                    (index as u64).saturating_mul(hangar_drive_protocol::object::CHUNK_SIZE);
+                sizes.insert(
+                    *chunk,
+                    v.size
+                        .saturating_sub(start)
+                        .min(hangar_drive_protocol::object::CHUNK_SIZE),
+                );
+                sources.insert(*chunk, (path.clone(), index as u64, v.content));
+            }
+        }
+        let mut unknown = Vec::new();
+        let mut chunks: Vec<(&Vec<String>, u64, ObjectId)> = Vec::new();
+        let mut sealed = Vec::new();
+        for id in &wanted {
+            if let Some(blob) = encoded.sealed.get(id) {
+                sizes.insert(*id, blob.len() as u64);
+                sealed.push(*id);
+            } else if let Some((path, index, _)) = sources.get(id) {
+                chunks.push((path, *index, *id));
+            } else {
+                unknown.push(*id);
+            }
+        }
+        chunks.sort();
+        let order: Vec<ObjectId> = unknown
+            .into_iter()
+            .chain(chunks.into_iter().map(|(_, _, id)| id))
+            .chain(sealed)
+            .collect();
+        let left = order
+            .iter()
+            .map(|id| sizes.get(id).copied().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        (order, sizes, sources, left)
+    }
+
+    /// Puts `ids` back at the front of the job's queue, in read order.
+    fn requeue(job: &mut UploadJob, encoded: &Encoded, disk: &Tree, ids: &[ObjectId]) {
+        let queued: BTreeSet<ObjectId> = job.queue.iter().copied().collect();
+        let ids: Vec<ObjectId> = ids
+            .iter()
+            .filter(|id| !queued.contains(id))
+            .copied()
+            .collect();
+        let (order, sizes, sources, left) = Self::queue_for(encoded, disk, &ids);
+        job.sizes.extend(sizes);
+        job.sources.extend(sources);
+        job.left = job.left.saturating_add(left);
+        for id in order.into_iter().rev() {
+            job.queue.push_front(id);
+        }
+    }
+
+    /// Keeps a job for later rounds; the oldest beyond [`MAX_UPLOAD_JOBS`] goes.
+    fn store_job(&mut self, job: UploadJob) {
+        self.jobs.push(job);
+        if self.jobs.len() > MAX_UPLOAD_JOBS {
+            self.jobs.remove(0);
+        }
+    }
+
+    /// Uploads every object of `encoded` among `candidates` the server lacks: sealed nodes and
+    /// manifests, and chunks read from the disk. A chunk that does not seal to its ID marks its
+    /// content for the next scan to hash again ([`FolderSync::rehash`]).
     fn upload(
         &mut self,
         cx: &mut Ctx<'_>,
@@ -2341,58 +3230,444 @@ impl FolderSync {
         candidates: &BTreeSet<ObjectId>,
         disk: &Tree,
     ) -> Result<(), PublishFailure> {
-        let ids: Vec<ObjectId> = candidates.iter().copied().collect();
-        let mut missing = Vec::new();
-        for batch in ids.chunks(hangar_drive_protocol::api::MAX_MISSING_QUERY) {
-            missing.extend(cx.server.missing_objects(&self.folder, batch)?);
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        // Where each chunk of the new tree lives on disk.
-        let mut sources: BTreeMap<ObjectId, (Vec<String>, u64, ContentKey)> = BTreeMap::new();
-        for (item, node) in disk.iter() {
-            let Some(v) = node.kind.file() else {
-                continue;
-            };
-            let Some(chunks) = encoded.chunks.get(&v.content) else {
-                continue;
-            };
-            let Some(path) = disk.path(item) else {
-                continue;
-            };
-            for (index, chunk) in chunks.iter().enumerate() {
-                sources
-                    .entry(*chunk)
-                    .or_insert_with(|| (path.clone(), index as u64, v.content));
+        self.upload_part(cx, crypto, encoded, candidates, disk, false)
+            .map(|_| ())
+    }
+
+    /// [`Self::upload`], kept across rounds in an [`UploadJob`]: the server is asked once which
+    /// candidates it lacks, a later round goes on with the queue (after asking whether the
+    /// server kept what the last round sent), and before the upload reports done the server is
+    /// asked about every candidate again unless that ask was in this round, since it deletes
+    /// uploads no commit names after a day. With `stage`, it stops with
+    /// [`UploadStep::StageDue`] once enough went up for an intermediate commit.
+    fn upload_part(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        encoded: &Encoded,
+        candidates: &BTreeSet<ObjectId>,
+        disk: &Tree,
+        stage: bool,
+    ) -> Result<UploadStep, PublishFailure> {
+        let generation = crypto.writable_generation().0;
+        let digest = Self::candidates_digest(candidates);
+        let kept = self
+            .jobs
+            .iter()
+            .position(|j| j.root == encoded.root && j.generation == generation);
+        let mut job = match kept {
+            Some(index) => {
+                let mut job = self.jobs.remove(index);
+                if job.candidates != digest {
+                    // The parent moved on (an intermediate commit): what is no candidate any
+                    // more is on the server already, and a new candidate is found by the ask
+                    // before the upload reports done.
+                    job.queue.retain(|id| candidates.contains(id));
+                    job.left = job
+                        .queue
+                        .iter()
+                        .map(|id| job.sizes.get(id).copied().unwrap_or(0))
+                        .fold(0u64, u64::saturating_add);
+                    job.candidates = digest;
+                    job.asked_round = 0;
+                }
+                job
             }
-        }
-        for id in &missing {
-            if let Some(blob) = encoded.sealed.get(id) {
-                cx.server.put_object(&self.folder, id, blob)?;
-                continue;
+            None => {
+                // Objects an upload under way already found on the server, or sent, are not
+                // asked about again now; the ask before the commit covers them.
+                let ask: Vec<ObjectId> = candidates
+                    .iter()
+                    .filter(|id| !self.known_present.contains(id))
+                    .copied()
+                    .collect();
+                let carried = ask.len() < candidates.len();
+                let missing = Self::ask_missing(cx, &self.folder, &ask)?;
+                let lacking: BTreeSet<ObjectId> = missing.iter().copied().collect();
+                self.known_present
+                    .extend(ask.iter().filter(|id| !lacking.contains(id)).copied());
+                let (order, sizes, sources, left) = Self::queue_for(encoded, disk, &missing);
+                UploadJob {
+                    root: encoded.root,
+                    generation,
+                    candidates: digest,
+                    queue: order.into(),
+                    sizes,
+                    sources,
+                    left,
+                    sent: Vec::new(),
+                    sent_round: self.round_seq,
+                    since_stage: (0, 0),
+                    asked_round: if carried { 0 } else { self.round_seq },
+                    stalled: false,
+                }
             }
-            let Some((path, index, content)) = sources.get(id) else {
-                // A chunk this device cannot produce: the disk changed, scan again.
-                return Err(PublishFailure::LocalChanged);
+        };
+        let result = self.run_job(cx, crypto, encoded, candidates, disk, stage, &mut job);
+        match &result {
+            // The disk changed: the next scan and plan start a new upload.
+            Err(PublishFailure::LocalChanged) => {}
+            _ => self.store_job(job),
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_job(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        encoded: &Encoded,
+        candidates: &BTreeSet<ObjectId>,
+        disk: &Tree,
+        stage: bool,
+        job: &mut UploadJob,
+    ) -> Result<UploadStep, PublishFailure> {
+        // Did the server keep what the last round sent? One that lists it as missing again
+        // keeps nothing (a hostile or broken server): it is sent again, but the upload's cuts
+        // no longer ask for an immediate next round (security review of the budget, L2).
+        if job.sent_round != self.round_seq && !job.sent.is_empty() {
+            let lost = Self::ask_missing(cx, &self.folder, &job.sent)?;
+            job.sent.clear();
+            job.stalled = !lost.is_empty();
+            for id in &lost {
+                self.known_present.remove(id);
+            }
+            Self::requeue(job, encoded, disk, &lost);
+        }
+        let until = self.upload_deadline(cx);
+        self.upload_left = Some(job.left);
+        let width = cx
+            .settings
+            .upload_workers
+            .clamp(1, crate::upload::MAX_UPLOAD_WORKERS);
+        // Worker threads pay off only with more than one object to send.
+        let uploader = if width > 1 && job.queue.len() > 1 {
+            cx.server.uploader()?
+        } else {
+            None
+        };
+        let fs: &dyn FileSystem = cx.fs;
+        let keys = crypto.writable().ok();
+        let folder = self.folder;
+        let result = std::thread::scope(|scope| {
+            let mut lane = match uploader {
+                // No more workers than objects to send: a small upload starts few threads.
+                Some(uploader) => {
+                    let workers = width.min(job.queue.len());
+                    Lane::workers(scope, workers, uploader, fs, keys, folder)
+                }
+                None => Lane::inline(fs, keys, folder),
             };
-            let sealed = match crate::chunker::seal_chunk(
-                cx.fs,
-                path,
-                *index,
-                id,
-                crypto.writable().map_err(SyncError::from)?,
-                cx.entropy,
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    self.mark_rehash(cx, crypto, *content, &missing, &sources)?;
-                    return Err(PublishFailure::LocalChanged);
+            let result = self.dispatch(
+                cx, crypto, encoded, candidates, disk, stage, job, until, &mut lane,
+            );
+            // Nothing is in flight once `dispatch` returns: the workers end and the scope joins.
+            lane.close();
+            result
+        });
+        cx.server.settle_uploads();
+        result
+    }
+
+    /// The upload loop of [`Self::run_job`] (module [`crate::upload`]): dispatches objects in
+    /// the queue's order while the lane has room, books every result as it comes, and stops
+    /// dispatching at the first reason to stop (done, a stage due, the deadline, a changed disk,
+    /// an error). It returns only once nothing is in flight, so what went up is booked exactly
+    /// as by one upload at a time: `sent` for the next round's check, `known_present`, the bytes
+    /// left and the stage counters.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        encoded: &Encoded,
+        candidates: &BTreeSet<ObjectId>,
+        disk: &Tree,
+        stage: bool,
+        job: &mut UploadJob,
+        until: Option<i64>,
+        lane: &mut Lane<'_>,
+    ) -> Result<UploadStep, PublishFailure> {
+        let mut dispatched = 0usize;
+        let mut stop: Option<Stop> = None;
+        let mut unsealable: Vec<ObjectId> = Vec::new();
+        loop {
+            if stop.is_none() {
+                stop = self.fill(
+                    cx,
+                    crypto,
+                    encoded,
+                    candidates,
+                    disk,
+                    stage,
+                    job,
+                    until,
+                    lane,
+                    &mut dispatched,
+                );
+            }
+            let Some(done) = lane.next() else {
+                // `fill` either dispatched or named a reason to stop; nothing else empties the
+                // lane, so a missing reason is a broken invariant, reported as an error.
+                let stop = stop.unwrap_or(Stop::Error(PublishFailure::Error(SyncError::Invalid(
+                    "the upload stopped without a reason",
+                ))));
+                return self.finish(cx, crypto, job, stop, &unsealable);
+            };
+            self.collect(cx, job, lane, done, &mut stop, &mut unsealable);
+        }
+    }
+
+    /// Dispatches objects while the lane has room; returns why it stopped dispatching for good,
+    /// or `None` while it waits for objects in flight.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        encoded: &Encoded,
+        candidates: &BTreeSet<ObjectId>,
+        disk: &Tree,
+        stage: bool,
+        job: &mut UploadJob,
+        until: Option<i64>,
+        lane: &mut Lane<'_>,
+        dispatched: &mut usize,
+    ) -> Option<Stop> {
+        while lane.in_flight() < lane.width() {
+            if job.queue.is_empty() {
+                // The ask before the upload reports done waits for every answer, so it sees
+                // what is still in flight as sent.
+                if lane.in_flight() > 0 {
+                    return None;
+                }
+                if job.asked_round != self.round_seq {
+                    let all: Vec<ObjectId> = candidates.iter().copied().collect();
+                    let missing = match Self::ask_missing(cx, &self.folder, &all) {
+                        Ok(missing) => missing,
+                        Err(e) => return Some(Stop::Error(e.into())),
+                    };
+                    job.asked_round = self.round_seq;
+                    if !missing.is_empty() {
+                        for id in &missing {
+                            self.known_present.remove(id);
+                        }
+                        Self::requeue(job, encoded, disk, &missing);
+                        self.upload_left = Some(job.left);
+                        continue;
+                    }
+                }
+                return Some(Stop::Done);
+            }
+            if stage && self.stage_due(cx, job) {
+                return Some(Stop::Stage);
+            }
+            // Checked before each object but the first, so every round moves the upload on.
+            if *dispatched > 0 && Self::spent(cx, until) {
+                return Some(Stop::Yield);
+            }
+            let id = job.queue.pop_front()?;
+            let payload = if let Some(blob) = encoded.sealed.get(&id) {
+                Payload::Sealed(Bytes::copy_from_slice(blob))
+            } else {
+                let Some((path, index, _)) = job.sources.get(&id) else {
+                    // A chunk this device cannot produce: the disk changed, scan again.
+                    return Some(Stop::Changed);
+                };
+                if let Err(e) = crypto.writable() {
+                    job.queue.push_front(id);
+                    return Some(Stop::Error(SyncError::from(e).into()));
+                }
+                let nonce = match draw_nonce(cx.entropy) {
+                    Ok(nonce) => nonce,
+                    Err(e) => {
+                        job.queue.push_front(id);
+                        return Some(Stop::Error(SyncError::from(e).into()));
+                    }
+                };
+                Payload::Chunk {
+                    path: path.clone(),
+                    index: *index,
+                    nonce,
                 }
             };
-            cx.server.put_object(&self.folder, id, &sealed.blob)?;
+            lane.submit(Work { id, payload }, &mut *cx.server);
+            *dispatched += 1;
         }
-        Ok(())
+        None
+    }
+
+    /// Books one result of the lane.
+    fn collect(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        job: &mut UploadJob,
+        lane: &mut Lane<'_>,
+        done: Done,
+        stop: &mut Option<Stop>,
+        unsealable: &mut Vec<ObjectId>,
+    ) {
+        let id = done.id;
+        let (blob, mut error) = match done.outcome {
+            Outcome::Sent => {
+                self.book_sent(job, id);
+                return;
+            }
+            Outcome::Unsealable => {
+                unsealable.push(id);
+                Stop::halt(stop, Stop::Changed);
+                return;
+            }
+            Outcome::Failed { blob, error } => (blob, error),
+        };
+        if error.code() == Some(ErrorCode::Unauthorized) && !blob.is_empty() {
+            // The session ran out under a worker, which never signs in: this connection signs
+            // in again, which renews the token for the workers as well.
+            match cx.server.put_object(&self.folder, &id, &blob) {
+                Ok(_) => {
+                    self.book_sent(job, id);
+                    return;
+                }
+                Err(e) => error = e,
+            }
+        }
+        job.queue.push_front(id);
+        // The client already waited as `Retry-After` asked. Still refused: other uploads of the
+        // account hold the server's slots (another device, a folder of the account), so this
+        // upload goes on with one object less at once instead of failing the round; one object
+        // at a time that is still refused is an error as before.
+        if error.code() == Some(ErrorCode::RateLimited) && lane.narrow() {
+            return;
+        }
+        Stop::halt(stop, Stop::Error(error.into()));
+    }
+
+    /// Books an object the server now holds, as one upload at a time did.
+    fn book_sent(&mut self, job: &mut UploadJob, id: ObjectId) {
+        let size = job.sizes.get(&id).copied().unwrap_or(0);
+        job.left = job.left.saturating_sub(size);
+        job.since_stage.0 = job.since_stage.0.saturating_add(size);
+        job.since_stage.1 = job.since_stage.1.saturating_add(1);
+        if job.sent_round != self.round_seq {
+            job.sent.clear();
+            job.sent_round = self.round_seq;
+        }
+        job.sent.push(id);
+        self.known_present.insert(id);
+        self.upload_left = Some(job.left);
+    }
+
+    /// The result of an upload loop that stopped with nothing in flight.
+    fn finish(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        job: &mut UploadJob,
+        stop: Stop,
+        unsealable: &[ObjectId],
+    ) -> Result<UploadStep, PublishFailure> {
+        match stop {
+            Stop::Done => {
+                self.upload_left = None;
+                Ok(UploadStep::Done)
+            }
+            Stop::Stage => Ok(UploadStep::StageDue(job.queue.iter().copied().collect())),
+            Stop::Yield => {
+                // A stalled upload waits for the loop's pause instead of running without one.
+                self.cut |= !job.stalled;
+                Err(PublishFailure::Yielded)
+            }
+            Stop::Changed => {
+                let queued: Vec<ObjectId> =
+                    unsealable.iter().chain(job.queue.iter()).copied().collect();
+                for id in unsealable {
+                    if let Some((_, _, content)) = job.sources.get(id) {
+                        let content = *content;
+                        self.mark_rehash(cx, crypto, content, &queued, &job.sources)?;
+                    }
+                }
+                Err(PublishFailure::LocalChanged)
+            }
+            Stop::Error(e) => Err(e),
+        }
+    }
+
+    /// Whether the upload sent enough since its last intermediate commit for the next one, and
+    /// the last one is long enough ago.
+    fn stage_due(&self, cx: &Ctx<'_>, job: &UploadJob) -> bool {
+        let volume = job.since_stage.0 >= cx.settings.stage_bytes
+            || job.since_stage.1 >= cx.settings.stage_objects;
+        let now = cx.clock.now_ms();
+        // An intermediate commit leaves at least one commit of the device's allowance for the
+        // final one.
+        volume
+            && self.commits_left.is_none_or(|n| n >= 2)
+            && self
+                .last_stage_ms
+                .is_none_or(|at| !(0..cx.settings.stage_interval_ms).contains(&(now - at)))
+    }
+
+    /// Uploads what the plan's tree adds to `parent`, committing the files complete so far
+    /// whenever enough went up ([`FolderSettings::stage_bytes`], finding C): each intermediate
+    /// commit is the server's tree plus whole files whose every chunk is on the server, with the
+    /// directories they need ([`stage_ready`]); a file still uploading never shows. Other devices
+    /// see a large first upload grow, and what went up is named by a commit long before the
+    /// server's collection would delete it. `parent` follows each intermediate commit.
+    fn upload_in_stages(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        p: &Plan,
+        encoded: &Encoded,
+        parent: &mut BTreeSet<ObjectId>,
+    ) -> Result<(), PublishFailure> {
+        let limit = delta_limit(cx.settings.max_delta_ids);
+        loop {
+            let added: BTreeSet<ObjectId> = encoded.reachable.difference(parent).copied().collect();
+            let queued = match self.upload_part(cx, crypto, encoded, &added, &p.disk, true)? {
+                UploadStep::Done => return Ok(()),
+                UploadStep::StageDue(queued) => queued,
+            };
+            let ready = |content: &ContentKey| {
+                encoded
+                    .chunks
+                    .get(content)
+                    .is_some_and(|chunks| chunks.iter().all(|c| !queued.contains(c)))
+            };
+            let before = self.view.frontier().map(|f| f.commit);
+            if let Some(stage) = stage_ready(&self.remote, &p.merged, encoded, limit / 2, &ready) {
+                self.publish_stage(cx, crypto, &stage, &p.disk)?;
+                self.last_stage_ms = Some(cx.clock.now_ms());
+                // The disk held the head before fully, and the stage adds whole files from the
+                // disk: the disk holds the stage as well, so the final commit needs no side
+                // commit on the older head. A folder never fully synced keeps no base.
+                if self
+                    .meta
+                    .sync_base
+                    .is_some_and(|b| Some(b.entry.commit) == before)
+                {
+                    if let (Some(frontier), Some(root)) =
+                        (self.view.frontier(), self.meta.remote_root)
+                    {
+                        self.meta.sync_base = Some(SyncBase {
+                            entry: ChainRec::from(frontier),
+                            root,
+                        });
+                    }
+                }
+                self.save(cx.store)?;
+                *parent = self.reachable_of(self.meta.remote_root, crypto, cx)?;
+                // The stage's own upload is done; only this publish's job is kept.
+                let root = encoded.root;
+                self.jobs.retain(|j| j.root == root);
+            }
+            // Nothing complete to commit yet (one large file still going up): the next stage
+            // comes after the next volume.
+            if let Some(job) = self.jobs.iter_mut().find(|j| j.root == encoded.root) {
+                job.since_stage = (0, 0);
+            }
+        }
     }
 
     /// Marks `failed` for the next scan to hash again. When its chunks were hashed under an
@@ -2530,23 +3805,61 @@ impl FolderSync {
         Ok(())
     }
 
-    fn publish(&mut self, cx: &mut Ctx<'_>, p: &Plan) -> Result<(), PublishFailure> {
+    /// Publishes the plan's tree. `slot` holds its encoding: one a cut round kept, or `None` to
+    /// encode now; it keeps the encoding afterwards for a round that is cut again.
+    fn publish(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        p: &Plan,
+        slot: &mut Option<Encoded>,
+    ) -> Result<(), PublishFailure> {
         let chain_generation = self.view.frontier().map(|f| f.generation);
         let crypto = cx.account.folder_crypto(&self.folder, chain_generation)?;
+        let mut encoded = match slot.take() {
+            Some(encoded) => encoded,
+            None => codec::encode(&p.merged, &crypto, cx.store, cx.entropy)?,
+        };
+        let result = self.publish_encoded(cx, &crypto, p, &mut encoded);
+        *slot = Some(encoded);
+        if result.is_ok() && self.gated {
+            self.publish_tokens = self.publish_tokens.saturating_sub(1);
+            self.publish_filled_ms.get_or_insert(cx.clock.now_ms());
+        }
+        if result.is_ok() {
+            // Everything is committed: the uploads' state starts afresh with the next change.
+            self.jobs.clear();
+            self.known_present.clear();
+        }
+        result
+    }
+
+    fn publish_encoded(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        crypto: &FolderCrypto,
+        p: &Plan,
+        encoded: &mut Encoded,
+    ) -> Result<(), PublishFailure> {
         let limit = delta_limit(cx.settings.max_delta_ids);
-        let mut encoded = codec::encode(&p.merged, &crypto, cx.store, cx.entropy)?;
-        let mut parent = self.reachable_of(self.meta.remote_root, &crypto, cx)?;
+        let mut parent = self.reachable_of(self.meta.remote_root, crypto, cx)?;
         // Too many changes for one commit, as a diff and as the full set: publish valid
         // intermediate trees first, each the server's tree plus whole new files and their new
         // directories (open point B). Half the limit for the new objects leaves room for the
         // old versions a stage drops.
         while !fits_one_commit(&parent, &encoded.reachable, limit) {
-            let Some(stage) = stage_tree(&self.remote, &p.merged, &encoded, limit / 2) else {
+            let Some(stage) = stage_tree(&self.remote, &p.merged, encoded, limit / 2) else {
                 return Err(SyncError::Invalid("too many changes for one commit").into());
             };
-            self.publish_stage(cx, &crypto, &stage, &p.disk)?;
-            encoded = codec::encode(&p.merged, &crypto, cx.store, cx.entropy)?;
-            parent = self.reachable_of(self.meta.remote_root, &crypto, cx)?;
+            self.publish_stage(cx, crypto, &stage, &p.disk)?;
+            *encoded = codec::encode(&p.merged, crypto, cx.store, cx.entropy)?;
+            parent = self.reachable_of(self.meta.remote_root, crypto, cx)?;
+        }
+        // A large upload goes out with intermediate commits of the files complete so far, before
+        // the side commit and the commit of the whole tree (finding C).
+        self.upload_in_stages(cx, crypto, p, encoded, &mut parent)?;
+        if let Some(due) = self.publish_hold(cx) {
+            self.hold_until = Some(due);
+            return Err(PublishFailure::Held);
         }
 
         // A side commit when the server moved on since the last fully synced head.
@@ -2557,8 +3870,8 @@ impl FolderSync {
             .filter(|b| frontier.is_some_and(|f| f.commit != b.entry.commit));
         let mut side: Option<(SignedCommit, ReferenceDelta)> = None;
         if let (Some(base), Some(_)) = (side_base, frontier) {
-            if let Ok(side_enc) = codec::encode(&p.disk, &crypto, cx.store, cx.entropy) {
-                let base_reach = self.reachable_of(Some(base.root), &crypto, cx)?;
+            if let Ok(side_enc) = codec::encode(&p.disk, crypto, cx.store, cx.entropy) {
+                let base_reach = self.reachable_of(Some(base.root), crypto, cx)?;
                 // A side commit's delta is always a diff against its base. One that would not
                 // fit one commit is left out: the merge commit alone loses nothing, as with an
                 // expired base.
@@ -2566,10 +3879,10 @@ impl FolderSync {
                     diff_delta(&base_reach, &side_enc.reachable, limit)
                 {
                     let side_added: BTreeSet<ObjectId> = side_delta.added.iter().copied().collect();
-                    self.upload(cx, &crypto, &side_enc, &side_added, &p.disk)?;
+                    self.upload(cx, crypto, &side_enc, &side_added, &p.disk)?;
                     codec::remember_uploaded(&side_enc, &self.folder, cx.store)
                         .map_err(SyncError::from)?;
-                    let content = self.content(cx, &crypto, side_enc.root, side_digest)?;
+                    let content = self.content(cx, crypto, side_enc.root, side_digest)?;
                     let commit = Commit::side(
                         *cx.account.id(),
                         self.folder,
@@ -2583,9 +3896,9 @@ impl FolderSync {
         }
         let root = self.commit_encoded(
             cx,
-            &crypto,
+            crypto,
             &p.merged,
-            &encoded,
+            encoded,
             &parent,
             frontier,
             side.as_ref(),
@@ -2644,6 +3957,11 @@ impl FolderSync {
                 delta: d.clone(),
             }),
         };
+        // Every call counts against the server's limit, also one it refuses.
+        self.commits_sent = self.commits_sent.saturating_add(1);
+        if let Some(left) = &mut self.commits_left {
+            *left = left.saturating_sub(1);
+        }
         let response = match cx.server.commit(&self.folder, &request) {
             Ok(r) => r,
             Err(e) if e.code() == Some(ErrorCode::HeadMoved) => {
@@ -2717,6 +4035,34 @@ impl FolderSync {
             }
         }
         skip.extend(self.meta.cannot_sync.keys().copied());
+        // A remote item at the path of a new file that waits for its hash is left alone this
+        // round: written now it would meet the file on disk (`Exists`) and stay in the
+        // cannot-sync list for good, or come back as a needless conflict copy. Once the file is
+        // hashed the merge sees both (security review of the budget, H1).
+        if !self.deferred.is_empty() {
+            let key = |path: &[String]| -> Vec<String> {
+                path.iter()
+                    .map(|n| hangar_drive_protocol::name::case_key(n))
+                    .collect()
+            };
+            let waiting: BTreeSet<Vec<String>> = self.deferred.keys().map(|p| key(p)).collect();
+            let at_waiting: Vec<ItemId> = p
+                .merged
+                .iter()
+                .filter(|(id, _)| !p.disk.contains(id))
+                .filter(|(id, _)| {
+                    p.merged
+                        .path(id)
+                        .is_some_and(|path| waiting.contains(&key(&path)))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in at_waiting {
+                skip.extend(p.merged.subtree(&id));
+                // Next round at once only while the scan moves on (LOW 3).
+                report.more |= self.hashed_in_scan;
+            }
+        }
         self.expect_directories(cx.fs);
         skip.extend(
             self.meta
@@ -2749,8 +4095,14 @@ impl FolderSync {
             file_ids: &mut self.file_ids,
             dirty: &mut self.file_ids_dirty,
             downloaded: 0,
+            clock: cx.clock,
+            until: self.budget.map(|b| b.phase_until(now)),
+            cut: false,
         };
         let result = apply(&p.merged, &mut work, &mut self.synced, &skip, &mut disk);
+        if disk.cut {
+            report.more = true;
+        }
         report.applied = result.done.len();
         // Incoming file deletes carried out, for the window of the incoming guard.
         let carried = result
@@ -2880,7 +4232,9 @@ impl FolderSync {
             local_deletes: Vec::new(),
             skip: BTreeSet::new(),
         };
-        match self.publish(cx, &p) {
+        // A person's publish asks the server afresh, as a new round does.
+        self.round_seq = self.round_seq.wrapping_add(1);
+        match self.publish(cx, &p, &mut None) {
             Ok(()) => {
                 self.last_action = Some(change);
                 if !dropped.is_empty() {
@@ -2899,6 +4253,10 @@ impl FolderSync {
                 hangar_drive_protocol::api::ErrorBody::new(ErrorCode::HeadMoved),
             ))),
             Err(PublishFailure::LocalChanged) => Err(SyncError::Invalid("the disk changed")),
+            // A person's action runs outside a round, without a budget, so it never yields.
+            Err(PublishFailure::Yielded) => Err(SyncError::Invalid("the upload was cut off")),
+            // Not gated either.
+            Err(PublishFailure::Held) => Err(SyncError::Invalid("the commit was held")),
             Err(PublishFailure::Error(e)) => Err(e),
         }
     }
@@ -2988,7 +4346,9 @@ impl FolderSync {
     /// the disk until its round), then a new commit puts the items `undo` names back in their
     /// state before the action. Nothing of the history is removed.
     pub fn revert(&mut self, cx: &mut Ctx<'_>, undo: &UndoState) -> Result<(), SyncError> {
-        let report = self.round(cx)?;
+        // A whole round: the undo must come after every local change, so no budget cuts it.
+        // The person's undo is not held by the interval or the allowance.
+        let report = self.round_with(cx, None, false)?;
         if report.offline {
             return Err(SyncError::Net(NetError::Unreachable));
         }
@@ -3753,6 +5113,142 @@ pub fn stage_tree(remote: &Tree, target: &Tree, encoded: &Encoded, budget: usize
         staged += 1;
     }
     (staged > 0).then_some(stage)
+}
+
+/// One intermediate commit of a large upload (finding C of the second performance review): the
+/// server's tree `remote` plus the files of `target` whose content is `ready` (every chunk on the
+/// server) and that `remote` lacks or holds with other content, in path order, each with the
+/// directories it needs, until their objects reach `budget`. Like [`stage_tree`], every stage is
+/// a whole tree: no file without its content, no item without its parents, no name twice in a
+/// directory; moves, renames, deletes and directories without a new file wait for the commit of
+/// `target` itself. Unlike [`stage_tree`] it walks the tree once instead of copying it for every
+/// file, since it runs every few hundred MiB of a first upload of any size; a name that
+/// collides with one in the directory by any of its keys (a broader test than a collision)
+/// waits for that commit too.
+///
+/// `None` when no file is ready or nothing fits the budget.
+pub fn stage_ready(
+    remote: &Tree,
+    target: &Tree,
+    encoded: &Encoded,
+    budget: usize,
+    ready: &dyn Fn(&ContentKey) -> bool,
+) -> Option<Tree> {
+    use hangar_drive_protocol::name::{case_key, fold_key, upper_key};
+    let keys = |name: &str| -> [String; 4] {
+        [
+            name.to_owned(),
+            case_key(name),
+            fold_key(name),
+            upper_key(name),
+        ]
+    };
+    let mut stage = remote.clone();
+    // The root's directory node changes with the first staged file.
+    let mut spent = 1usize;
+    let mut staged = 0usize;
+    // Directories whose node this stage already changes, each counted once.
+    let mut touched: BTreeSet<ItemId> = BTreeSet::new();
+    // The name keys of the entries of each directory that takes a new entry, built once.
+    let mut taken: BTreeMap<ItemId, BTreeSet<String>> = BTreeMap::new();
+    let ancestors = |tree: &Tree, mut at: ItemId| -> Vec<ItemId> {
+        let mut out = Vec::new();
+        while at != ROOT {
+            let Some(dir) = tree.get(&at) else {
+                break;
+            };
+            out.push(at);
+            at = dir.parent;
+        }
+        out
+    };
+    let mut files: Vec<(Vec<String>, ItemId)> = target
+        .iter()
+        .filter(|(id, n)| {
+            n.kind.file().is_some_and(|v| ready(&v.content))
+                && remote.get(id).is_none_or(|old| old.kind != n.kind)
+        })
+        .filter_map(|(id, _)| Some((target.path(id)?, *id)))
+        .collect();
+    files.sort();
+    for (_, id) in files {
+        let Some(node) = target.get(&id) else {
+            continue;
+        };
+        let Some(version) = node.kind.file() else {
+            continue;
+        };
+        let cost = encoded.chunks.get(&version.content).map_or(1, Vec::len) + 1;
+        match remote.get(&id) {
+            Some(old) if old.is_dir() => continue,
+            Some(old) => {
+                // New content at the place the server knows.
+                let above: Vec<ItemId> = ancestors(&stage, old.parent)
+                    .into_iter()
+                    .filter(|d| !touched.contains(d))
+                    .collect();
+                let extra = cost + above.len();
+                if spent + extra > budget {
+                    break;
+                }
+                let mut changed = old.clone();
+                changed.kind = node.kind;
+                stage.insert(id, changed);
+                touched.extend(above);
+                spent += extra;
+            }
+            None => {
+                // The new file and the directories it needs, from the top down.
+                let mut chain: Vec<(ItemId, Node)> = Vec::new();
+                let mut at = node.parent;
+                while at != ROOT && !stage.contains(&at) {
+                    let Some(dir) = target.get(&at) else {
+                        break;
+                    };
+                    chain.push((at, dir.clone()));
+                    at = dir.parent;
+                }
+                if at != ROOT && !stage.get(&at).is_some_and(Node::is_dir) {
+                    continue;
+                }
+                // Only the topmost new entry joins an existing directory; the ones below it
+                // go into directories this stage creates.
+                let top_name = chain.last().map_or(&node.name, |(_, dir)| &dir.name);
+                let names = taken.entry(at).or_insert_with(|| {
+                    stage
+                        .children(&at)
+                        .filter_map(|c| stage.get(c))
+                        .flat_map(|n| keys(&n.name))
+                        .collect()
+                });
+                let top_keys = keys(top_name);
+                if top_keys.iter().any(|k| names.contains(k)) {
+                    continue;
+                }
+                let above: Vec<ItemId> = ancestors(&stage, at)
+                    .into_iter()
+                    .filter(|d| !touched.contains(d))
+                    .collect();
+                let extra = cost + chain.len() + above.len();
+                if spent + extra > budget {
+                    break;
+                }
+                names.extend(top_keys);
+                for (dir_id, dir) in chain.into_iter().rev() {
+                    stage.insert(dir_id, dir);
+                    touched.insert(dir_id);
+                }
+                stage.insert(id, node.clone());
+                touched.extend(above);
+                spent += extra;
+            }
+        }
+        staged += 1;
+    }
+    if staged == 0 || stage.check().is_err() {
+        return None;
+    }
+    Some(stage)
 }
 
 /// Puts item `item` of `old` (with its subtree) into `current` at its old place (ADR 0001,

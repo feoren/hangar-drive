@@ -19,6 +19,8 @@ use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager as _, Runtime, Wry};
 
+use crate::state::lock;
+
 include!(concat!(env!("OUT_DIR"), "/tray_icons.rs"));
 
 pub const TRAY_ID: &str = "main";
@@ -132,9 +134,146 @@ pub struct MenuIds {
 }
 
 /// The tray's state between updates.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TrayState {
     pub ids: Mutex<MenuIds>,
+    /// The model last handed to [`apply`] with its sequence number; the same model again is
+    /// not drawn twice, and only the newest one is drawn.
+    requested: Mutex<Requested>,
+    /// What the tray shows (the model and the icon size), touched on the main thread only.
+    drawn: Mutex<Option<(TrayModel, u32)>>,
+    /// The native items of the drawn menu in [`menu_plan`] order, for a change of labels.
+    native: Mutex<Vec<NativeItem>>,
+}
+
+impl TrayState {
+    /// Whether `model` differs from the one last handed over, and if so, takes it as the new
+    /// one. The window sends a model for every snapshot, mostly an unchanged one; rebuilding
+    /// the native menu for each made the tray flicker and cost the main thread every time.
+    ///
+    /// Returns the model's sequence number. Two `update_tray` calls can reach the main thread
+    /// in the other order than they passed here (security review LOW 4), so the draw checks
+    /// [`TrayState::is_newest`] and an overtaken older model is never drawn over a newer one.
+    pub fn changes(&self, model: &TrayModel) -> Option<u64> {
+        let mut requested = lock(&self.requested);
+        if requested.model.as_ref() == Some(model) {
+            return None;
+        }
+        requested.seq += 1;
+        requested.model = Some(model.clone());
+        Some(requested.seq)
+    }
+
+    /// Whether `seq` is the newest model handed over, the only one worth drawing.
+    pub fn is_newest(&self, seq: u64) -> bool {
+        lock(&self.requested).seq == seq
+    }
+
+    /// After a failed draw of `seq`: what the tray shows is unknown, so the same model again
+    /// is drawn rather than skipped. A newer model already on its way is left alone.
+    fn forget(&self, seq: u64) {
+        let mut requested = lock(&self.requested);
+        if requested.seq == seq {
+            requested.model = None;
+        }
+    }
+}
+
+/// The newest model handed over and its sequence number (0 before the first).
+#[derive(Default)]
+struct Requested {
+    seq: u64,
+    model: Option<TrayModel>,
+}
+
+/// A native item of the drawn menu; separators carry no text.
+enum NativeItem {
+    Item(MenuItem<Wry>),
+    Submenu(Submenu<Wry>),
+    Separator,
+}
+
+impl NativeItem {
+    fn set_text(&self, text: &str) -> tauri::Result<()> {
+        match self {
+            NativeItem::Item(item) => item.set_text(text),
+            NativeItem::Submenu(submenu) => submenu.set_text(text),
+            NativeItem::Separator => Ok(()),
+        }
+    }
+}
+
+/// How the drawn menu becomes the next one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MenuPlan {
+    /// Nothing in the menu changed (only the tooltip or the icon, if anything).
+    Keep,
+    /// Same items, new labels: (index in depth-first order, label). A count of files that
+    /// moves while syncing changes only a label, and relabeling keeps an open menu open.
+    Relabel(Vec<(usize, String)>),
+    /// The items themselves changed.
+    Rebuild,
+}
+
+/// Compares the drawn menu with the next one. Items match when their kind, id and children
+/// match; `isDefault` and `muted` are not drawn natively, so they never force a rebuild.
+pub fn menu_plan(drawn: Option<&[TrayMenuItem]>, next: &[TrayMenuItem]) -> MenuPlan {
+    fn walk(
+        old: &[TrayMenuItem],
+        new: &[TrayMenuItem],
+        index: &mut usize,
+        labels: &mut Vec<(usize, String)>,
+    ) -> bool {
+        if old.len() != new.len() {
+            return false;
+        }
+        for (a, b) in old.iter().zip(new) {
+            let at = *index;
+            *index += 1;
+            let label = match (a, b) {
+                (TrayMenuItem::Separator, TrayMenuItem::Separator) => continue,
+                (TrayMenuItem::Label { label: x, .. }, TrayMenuItem::Label { label: y, .. }) => {
+                    (x, y)
+                }
+                (
+                    TrayMenuItem::Action {
+                        id: i, label: x, ..
+                    },
+                    TrayMenuItem::Action {
+                        id: j, label: y, ..
+                    },
+                ) if i == j => (x, y),
+                (
+                    TrayMenuItem::Submenu { label: x, items: c },
+                    TrayMenuItem::Submenu { label: y, items: d },
+                ) => {
+                    if x != y {
+                        labels.push((at, y.clone()));
+                    }
+                    if !walk(c, d, index, labels) {
+                        return false;
+                    }
+                    continue;
+                }
+                _ => return false,
+            };
+            if label.0 != label.1 {
+                labels.push((at, label.1.clone()));
+            }
+        }
+        true
+    }
+    let Some(old) = drawn else {
+        return MenuPlan::Rebuild;
+    };
+    let mut labels = Vec::new();
+    if !walk(old, next, &mut 0, &mut labels) {
+        MenuPlan::Rebuild
+    } else if labels.is_empty() {
+        MenuPlan::Keep
+    } else {
+        MenuPlan::Relabel(labels)
+    }
 }
 
 fn clean(text: &str, max: usize, keep_newlines: bool) -> String {
@@ -323,59 +462,109 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The native items of `items`; `native` collects them in [`menu_plan`] order (an item, then
+/// the children of a submenu).
 fn build_items(
     app: &AppHandle,
     items: &[TrayMenuItem],
+    native: &mut Vec<NativeItem>,
 ) -> tauri::Result<Vec<Box<dyn IsMenuItem<Wry>>>> {
     let mut out: Vec<Box<dyn IsMenuItem<Wry>>> = Vec::new();
     for item in items {
         match item {
             TrayMenuItem::Label { label, .. } => {
-                out.push(Box::new(MenuItem::new(app, label, false, None::<&str>)?));
+                let item = MenuItem::new(app, label, false, None::<&str>)?;
+                native.push(NativeItem::Item(item.clone()));
+                out.push(Box::new(item));
             }
-            TrayMenuItem::Separator => out.push(Box::new(PredefinedMenuItem::separator(app)?)),
+            TrayMenuItem::Separator => {
+                native.push(NativeItem::Separator);
+                out.push(Box::new(PredefinedMenuItem::separator(app)?));
+            }
             TrayMenuItem::Action { id, label, .. } => {
-                out.push(Box::new(MenuItem::with_id(
-                    app,
-                    id.as_str(),
-                    label,
-                    true,
-                    None::<&str>,
-                )?));
+                let item = MenuItem::with_id(app, id.as_str(), label, true, None::<&str>)?;
+                native.push(NativeItem::Item(item.clone()));
+                out.push(Box::new(item));
             }
             TrayMenuItem::Submenu { label, items } => {
-                let children = build_items(app, items)?;
+                let at = native.len();
+                native.push(NativeItem::Separator);
+                let children = build_items(app, items, native)?;
                 let refs: Vec<&dyn IsMenuItem<Wry>> = children.iter().map(|c| c.as_ref()).collect();
-                out.push(Box::new(Submenu::with_items(app, label, true, &refs)?));
+                let submenu = Submenu::with_items(app, label, true, &refs)?;
+                native[at] = NativeItem::Submenu(submenu.clone());
+                out.push(Box::new(submenu));
             }
         }
     }
     Ok(out)
 }
 
-/// Draws a checked model: icon, tooltip and menu, on the main thread.
-pub fn apply(app: &AppHandle, model: TrayModel, ids: MenuIds) -> tauri::Result<()> {
-    if let Ok(mut current) = app.state::<TrayState>().ids.lock() {
-        *current = ids;
-    }
+/// Draws a checked model on the main thread, touching only what changed against the drawn one:
+/// labels are set on the existing items where only they changed, the menu is rebuilt only when
+/// its items changed, tooltip and icon only when they differ. `seq` is the number
+/// [`TrayState::changes`] gave the model; a model that a newer one overtook is skipped, and its
+/// ids are taken only together with its menu.
+pub fn apply(app: &AppHandle, seq: u64, model: TrayModel, ids: MenuIds) -> tauri::Result<()> {
     let handle = app.clone();
     app.run_on_main_thread(move || {
+        let state = handle.state::<TrayState>();
+        if !state.is_newest(seq) {
+            return;
+        }
         let Some(tray) = handle.tray_by_id(TRAY_ID) else {
             return;
         };
+        *lock(&state.ids) = ids;
+        let mut drawn = lock(&state.drawn);
+        let mut native = lock(&state.native);
+        let size = icon_size(scale(&handle));
+        let before = drawn.as_ref();
+        let mut plan = menu_plan(before.map(|(m, _)| m.menu.as_slice()), &model.menu);
+        if let MenuPlan::Relabel(labels) = &plan {
+            if labels.iter().any(|(at, _)| *at >= native.len()) {
+                plan = MenuPlan::Rebuild;
+            }
+        }
         let result = (|| -> tauri::Result<()> {
-            let items = build_items(&handle, &model.menu)?;
-            let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|c| c.as_ref()).collect();
-            let menu = Menu::with_items(&handle, &refs)?;
-            tray.set_menu(Some(menu))?;
-            tray.set_tooltip(Some(&model.tooltip))?;
-            if let Some(icon) = image(model.icon, scale(&handle)) {
-                tray.set_icon(Some(icon))?;
+            match plan {
+                MenuPlan::Keep => {}
+                MenuPlan::Relabel(labels) => {
+                    for (at, label) in labels {
+                        if let Some(item) = native.get(at) {
+                            item.set_text(&label)?;
+                        }
+                    }
+                }
+                MenuPlan::Rebuild => {
+                    let mut fresh = Vec::new();
+                    let items = build_items(&handle, &model.menu, &mut fresh)?;
+                    let refs: Vec<&dyn IsMenuItem<Wry>> =
+                        items.iter().map(|c| c.as_ref()).collect();
+                    let menu = Menu::with_items(&handle, &refs)?;
+                    tray.set_menu(Some(menu))?;
+                    *native = fresh;
+                }
+            }
+            if before.map(|(m, _)| m.tooltip.as_str()) != Some(model.tooltip.as_str()) {
+                tray.set_tooltip(Some(&model.tooltip))?;
+            }
+            if before.map(|(m, s)| (m.icon, *s)) != Some((model.icon, size)) {
+                if let Some(icon) = image(model.icon, scale(&handle)) {
+                    tray.set_icon(Some(icon))?;
+                }
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            eprintln!("hangar-drive: tray not updated: {error}");
+        match result {
+            Ok(()) => *drawn = Some((model, size)),
+            Err(error) => {
+                // Unknown what the tray shows now: the next model draws everything again.
+                *drawn = None;
+                native.clear();
+                state.forget(seq);
+                eprintln!("hangar-drive: tray not updated: {error}");
+            }
         }
     })
 }
@@ -449,6 +638,112 @@ mod tests {
             json!({ "icon": "x", "tooltip": "", "menu": [] })
         )
         .is_err());
+    }
+
+    fn menu(value: serde_json::Value) -> Vec<TrayMenuItem> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn the_same_model_is_handed_over_once() {
+        let state = TrayState::default();
+        let first = model(json!([{ "type": "separator" }]));
+        assert!(state.changes(&first).is_some());
+        assert!(
+            state.changes(&first.clone()).is_none(),
+            "an unchanged model is skipped"
+        );
+        let mut other = first.clone();
+        other.tooltip = "Hangar Drive: syncing".into();
+        assert!(state.changes(&other).is_some());
+        assert!(state.changes(&first).is_some(), "going back is a change");
+    }
+
+    // Security review LOW 4: model A passes `changes` before B, but A's draw reaches the main
+    // thread after B's. A is skipped there, so the tray ends on B, and B again stays skipped
+    // as unchanged because B is what the tray shows.
+    #[test]
+    fn an_overtaken_model_is_never_drawn_over_a_newer_one() {
+        let state = TrayState::default();
+        let a = model(json!([{ "type": "separator" }]));
+        let mut b = a.clone();
+        b.tooltip = "Hangar Drive: syncing".into();
+        let seq_a = state.changes(&a).unwrap();
+        let seq_b = state.changes(&b).unwrap();
+        // The main thread runs B's draw first, then A's.
+        assert!(state.is_newest(seq_b), "B is drawn");
+        assert!(!state.is_newest(seq_a), "A arrives late and is skipped");
+        assert!(state.changes(&b).is_none(), "the tray shows B already");
+        // A failed draw of an overtaken model leaves the newer one alone ...
+        state.forget(seq_a);
+        assert!(state.changes(&b).is_none());
+        // ... and a failed draw of the newest lets the same model through again.
+        state.forget(seq_b);
+        let again = state.changes(&b).unwrap();
+        assert!(state.is_newest(again));
+    }
+
+    #[test]
+    fn only_changed_labels_are_set_and_new_items_rebuild_the_menu() {
+        let drawn = menu(json!([
+            { "type": "label", "label": "Syncing 3 files", "muted": false },
+            { "type": "separator" },
+            { "type": "action", "id": "openApp", "label": "Open", "isDefault": true },
+            { "type": "submenu", "label": "Pause", "items": [
+                { "type": "action", "id": "pause:hour", "label": "For 1 hour", "isDefault": false }
+            ] },
+            { "type": "action", "id": "quit", "label": "Quit", "isDefault": false }
+        ]));
+        assert_eq!(menu_plan(None, &drawn), MenuPlan::Rebuild);
+        assert_eq!(menu_plan(Some(&drawn), &drawn), MenuPlan::Keep);
+
+        let mut counted = drawn.clone();
+        counted[0] = TrayMenuItem::Label {
+            label: "Syncing 2 files".into(),
+            muted: true,
+        };
+        counted[4] = TrayMenuItem::Action {
+            id: "quit".into(),
+            label: "Beenden".into(),
+            is_default: true,
+        };
+        // Index 5 is the action after the submenu (3) and its one child (4).
+        assert_eq!(
+            menu_plan(Some(&drawn), &counted),
+            MenuPlan::Relabel(vec![(0, "Syncing 2 files".into()), (5, "Beenden".into())])
+        );
+        let TrayMenuItem::Submenu { items, .. } = &mut counted[3] else {
+            panic!("submenu");
+        };
+        items[0] = TrayMenuItem::Action {
+            id: "pause:hour".into(),
+            label: "1 Stunde".into(),
+            is_default: false,
+        };
+        assert_eq!(
+            menu_plan(Some(&drawn), &counted),
+            MenuPlan::Relabel(vec![
+                (0, "Syncing 2 files".into()),
+                (4, "1 Stunde".into()),
+                (5, "Beenden".into())
+            ])
+        );
+
+        let mut resumed = drawn.clone();
+        resumed[3] = TrayMenuItem::Action {
+            id: "resume".into(),
+            label: "Resume".into(),
+            is_default: false,
+        };
+        assert_eq!(menu_plan(Some(&drawn), &resumed), MenuPlan::Rebuild);
+        let mut other_id = drawn.clone();
+        other_id[2] = TrayMenuItem::Action {
+            id: "showProblem".into(),
+            label: "Open".into(),
+            is_default: true,
+        };
+        assert_eq!(menu_plan(Some(&drawn), &other_id), MenuPlan::Rebuild);
+        assert_eq!(menu_plan(Some(&drawn), &drawn[..4]), MenuPlan::Rebuild);
     }
 
     const ALL: [TrayIcon; 6] = [

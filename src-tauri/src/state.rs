@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use hangar_drive_sync::api::Snapshot;
 use hangar_drive_sync::engine::{EngineCore, EngineHandle};
@@ -62,8 +62,63 @@ impl Places {
     }
 }
 
+/// The engine handle, filled once the engine opened. The engine opens off the setup path
+/// (lib.rs), so a slow disk or keychain never holds back the window and the tray; a command
+/// that needs the engine before then waits for it on a blocking thread.
+#[derive(Default)]
+pub struct EngineSlot {
+    engine: Mutex<Option<Result<EngineHandle, String>>>,
+    opened: Condvar,
+}
+
+impl EngineSlot {
+    /// Fills the slot once; a later value is ignored, so the guard that reports a vanished
+    /// opener never overwrites a real result.
+    pub fn set(&self, engine: Result<EngineHandle, String>) {
+        let mut slot = lock(&self.engine);
+        if slot.is_none() {
+            *slot = Some(engine);
+            self.opened.notify_all();
+        }
+    }
+
+    /// The engine, waiting until it opened or failed to. Blocks: call it off the async workers.
+    pub fn wait(&self) -> Result<EngineHandle, String> {
+        let mut slot = lock(&self.engine);
+        loop {
+            if let Some(engine) = slot.as_ref() {
+                return engine.clone();
+            }
+            slot = self
+                .opened
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Why the engine did not start, once that is known; `None` while it opens or after it did.
+    pub fn error(&self) -> Option<String> {
+        lock(&self.engine)
+            .as_ref()
+            .and_then(|engine| engine.as_ref().err().cloned())
+    }
+}
+
+/// Fills an [`EngineSlot`] with an error if the opener ends without filling it (a panic on the
+/// way), so no command waits forever.
+pub struct OpenGuard(pub Arc<EngineSlot>);
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.set(Err("the engine opener ended".into()));
+    }
+}
+
 pub struct Shell {
-    engine: Result<EngineHandle, String>,
+    engine: Arc<EngineSlot>,
+    /// A "sync now" waits for the engine on a blocking thread; while one does, another adds
+    /// nothing.
+    nudging: Arc<AtomicBool>,
     pub tz_offset_minutes: i32,
     pub settings_path: Option<PathBuf>,
     pub settings: Mutex<Stored>,
@@ -92,14 +147,28 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shell {
+    /// A shell with an engine that already opened (or failed to), for tests.
+    #[cfg(test)]
     pub fn new(
         engine: Result<EngineHandle, String>,
         tz_offset_minutes: i32,
         settings_path: Option<PathBuf>,
         settings: Stored,
     ) -> Self {
+        let shell = Self::starting(tz_offset_minutes, settings_path, settings);
+        shell.engine.set(engine);
+        shell
+    }
+
+    /// A shell whose engine is still opening; the opener fills [`Shell::engine_slot`].
+    pub fn starting(
+        tz_offset_minutes: i32,
+        settings_path: Option<PathBuf>,
+        settings: Stored,
+    ) -> Self {
         Self {
-            engine,
+            engine: Arc::default(),
+            nudging: Arc::new(AtomicBool::new(false)),
             tz_offset_minutes,
             settings_path,
             settings: Mutex::new(settings),
@@ -116,8 +185,13 @@ impl Shell {
     }
 
     /// Why the engine did not start, for the error report.
-    pub fn engine_error(&self) -> Option<&str> {
-        self.engine.as_ref().err().map(String::as_str)
+    pub fn engine_error(&self) -> Option<String> {
+        self.engine.error()
+    }
+
+    /// Where the opener puts the engine.
+    pub fn engine_slot(&self) -> Arc<EngineSlot> {
+        Arc::clone(&self.engine)
     }
 
     /// The language of the backend texts: the chosen one, or the system's.
@@ -131,16 +205,44 @@ impl Shell {
         &self,
         command: impl FnOnce(&mut EngineCore) -> Result<T, SyncError> + Send + 'static,
     ) -> Result<T, CommandError> {
-        let handle = self
-            .engine
-            .as_ref()
-            .map_err(|e| CommandError::unexpected(format!("the sync engine did not start: {e}")))?
-            .clone();
-        tauri::async_runtime::spawn_blocking(move || handle.call(command))
-            .await
-            .map_err(|e| CommandError::unexpected(e.to_string()))?
-            .map_err(CommandError::from)?
-            .map_err(CommandError::from)
+        let slot = Arc::clone(&self.engine);
+        tauri::async_runtime::spawn_blocking(move || {
+            let handle = slot.wait().map_err(not_started)?;
+            handle
+                .call(command)
+                .map_err(CommandError::from)?
+                .map_err(CommandError::from)
+        })
+        .await
+        .map_err(|e| CommandError::unexpected(e.to_string()))?
+    }
+
+    /// Lets the engine run a pass now without waiting for it: every command is followed by one
+    /// pass of its control loop, and the window learns the outcome from the events. During a
+    /// long round the engine answers only between slices of work, so waiting here would keep
+    /// the button busy that long; a nudge while one is under way adds nothing.
+    pub fn nudge(&self) -> Result<(), CommandError> {
+        if let Some(error) = self.engine.error() {
+            return Err(not_started(error));
+        }
+        if self.nudging.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let slot = Arc::clone(&self.engine);
+        let nudging = Arc::clone(&self.nudging);
+        drop(tauri::async_runtime::spawn_blocking(move || {
+            if let Ok(handle) = slot.wait() {
+                let _ = handle.call(|_| ());
+            }
+            nudging.store(false, Ordering::SeqCst);
+        }));
+        Ok(())
+    }
+
+    /// Whether a nudge still waits for the engine (for tests of the coalescing).
+    #[cfg(test)]
+    pub fn nudge_pending(&self) -> bool {
+        self.nudging.load(Ordering::SeqCst)
     }
 
     pub fn remember_offer(&self, id: String, link: String) {
@@ -164,6 +266,23 @@ impl Shell {
         };
         lock(&self.settings).save(path).map_err(CommandError::from)
     }
+
+    /// [`Shell::save_settings`] for a command: the file is written on a blocking thread from a
+    /// copy taken now, so the async workers never wait on the disk.
+    pub async fn save_settings_off_thread(&self) -> Result<(), CommandError> {
+        let Some(path) = self.settings_path.clone() else {
+            return Err(CommandError::unexpected("no config folder"));
+        };
+        let stored = lock(&self.settings).clone();
+        tauri::async_runtime::spawn_blocking(move || stored.save(&path))
+            .await
+            .map_err(|e| CommandError::unexpected(e.to_string()))?
+            .map_err(CommandError::from)
+    }
+}
+
+fn not_started(error: String) -> CommandError {
+    CommandError::unexpected(format!("the sync engine did not start: {error}"))
 }
 
 /// The language of a choice of the settings: `system` asks the OS.
@@ -241,7 +360,59 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code, "unexpected");
         assert!(error.message.contains("did not start"));
-        assert_eq!(shell.engine_error(), Some("not started"));
+        assert_eq!(shell.engine_error().as_deref(), Some("not started"));
+        assert!(
+            shell.nudge().is_err(),
+            "a nudge says the engine did not start"
+        );
+    }
+
+    // The window and the tray come up before the engine opened: a command waits for the
+    // engine, and the opener's result reaches it.
+    #[test]
+    fn commands_wait_for_an_engine_that_still_opens() {
+        let shell = Shell::starting(0, None, Stored::default());
+        assert_eq!(shell.engine_error(), None, "nothing known while it opens");
+        let slot = shell.engine_slot();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            slot.set(Err("no keychain".into()));
+        });
+        let result = tauri::async_runtime::block_on(shell.engine(|core| Ok(core.snapshot())));
+        opener.join().unwrap();
+        assert!(result.unwrap_err().message.contains("no keychain"));
+        assert_eq!(shell.engine_error().as_deref(), Some("no keychain"));
+    }
+
+    #[test]
+    fn an_opener_that_vanishes_ends_the_wait() {
+        let shell = Shell::starting(0, None, Stored::default());
+        drop(OpenGuard(shell.engine_slot()));
+        assert_eq!(
+            shell.engine_error().as_deref(),
+            Some("the engine opener ended")
+        );
+        // A later result does not replace the first one.
+        shell.engine_slot().set(Err("later".into()));
+        assert_eq!(
+            shell.engine_error().as_deref(),
+            Some("the engine opener ended")
+        );
+    }
+
+    // "Sync now" returns at once; clicks while one waits for the engine add nothing.
+    #[test]
+    fn nudges_return_at_once_and_coalesce() {
+        let shell = Shell::starting(0, None, Stored::default());
+        assert!(shell.nudge().is_ok());
+        assert!(shell.nudge_pending());
+        assert!(shell.nudge().is_ok());
+        shell.engine_slot().set(Err("stopped".into()));
+        let started = std::time::Instant::now();
+        while shell.nudge_pending() && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!shell.nudge_pending(), "the waiting nudge ended");
     }
 
     #[test]

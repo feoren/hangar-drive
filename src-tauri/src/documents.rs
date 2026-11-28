@@ -545,6 +545,7 @@ mod tests {
                 freeze_days: None,
                 not_synced_count: 2,
                 bytes: Some(1_200),
+                file_count: Some(3),
             }],
             activity: Vec::new(),
             warnings: vec![Warning::Suspect {

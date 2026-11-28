@@ -206,6 +206,10 @@ pub struct Folder {
     pub not_synced_count: u64,
     /// The bytes of its files on this disk; None before the first scan.
     pub bytes: Option<u64>,
+    /// The number of its files on this disk (directories do not count); None before the first
+    /// scan. New files a large first scan has not hashed yet count already, so the number does
+    /// not jump while the scan goes on.
+    pub file_count: Option<u64>,
 }
 
 /// What happened to a file.

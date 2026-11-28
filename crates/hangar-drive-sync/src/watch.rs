@@ -5,11 +5,13 @@
 //! lost event is found within the hour even when the platform does not report the loss.
 //!
 //! Events are collected without blocking the watcher's thread; the engine drains them on its
-//! control thread ([`FolderWatcher::drain`]).
+//! control thread ([`FolderWatcher::drain`]). Each event also rings the engine's [`Waker`], so a
+//! local change starts a pass after a short debounce instead of waiting for the loop's pause.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -55,16 +57,67 @@ impl Changes {
     }
 }
 
+/// Wakes the engine loop from another thread (the watcher's). Cheap to clone; ringing it never
+/// blocks, and the engine debounces the rings itself.
+#[derive(Clone)]
+pub struct Waker(Arc<dyn Fn() + Send + Sync>);
+
+impl Waker {
+    /// A waker that calls `wake` on every ring.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    /// Asks the engine loop for a pass soon.
+    pub fn wake(&self) {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waker").finish_non_exhaustive()
+    }
+}
+
+/// The waker a change source rings, set once the engine loop runs.
+type WakerSlot = Arc<Mutex<Option<Waker>>>;
+
+fn ring(slot: &WakerSlot) {
+    let waker = match slot.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+fn set_slot(slot: &WakerSlot, waker: Waker) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = Some(waker),
+        Err(poisoned) => *poisoned.into_inner() = Some(waker),
+    }
+}
+
 /// Anything that reports changes of a sync root: the real watcher, or the event log of the
 /// in-memory file system in tests.
 pub trait ChangeSource {
     /// Every change since the last call, waiting up to `wait` for the first one.
     fn drain(&self, wait: Duration) -> Changes;
+
+    /// Rings `waker` on every later change, so the engine loop wakes for it. A source that
+    /// cannot ring leaves the change to the loop's next regular pass.
+    fn set_waker(&self, _waker: Waker) {}
 }
 
 impl ChangeSource for FolderWatcher {
     fn drain(&self, wait: Duration) -> Changes {
         FolderWatcher::drain(self, wait)
+    }
+
+    fn set_waker(&self, waker: Waker) {
+        set_slot(&self.waker, waker);
     }
 }
 
@@ -85,6 +138,10 @@ impl ChangeSource for std::sync::Arc<crate::memory::MemFs> {
             rescan: false,
         }
     }
+
+    fn set_waker(&self, waker: Waker) {
+        self.set_user_waker(waker);
+    }
 }
 
 enum Raw {
@@ -98,6 +155,7 @@ pub struct FolderWatcher {
     _watcher: RecommendedWatcher,
     events: Receiver<Raw>,
     root: LocalFs,
+    waker: WakerSlot,
 }
 
 impl std::fmt::Debug for FolderWatcher {
@@ -112,6 +170,8 @@ impl FolderWatcher {
     /// Starts watching `root` recursively.
     pub fn start(root: &LocalFs) -> Result<Self, FsError> {
         let (tx, rx) = channel();
+        let waker: WakerSlot = Arc::default();
+        let slot = Arc::clone(&waker);
         let mut watcher =
             notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
                 let raw = match result {
@@ -122,6 +182,7 @@ impl FolderWatcher {
                 };
                 // The receiver is gone only when the engine dropped the watcher.
                 let _ = tx.send(raw);
+                ring(&slot);
             })
             .map_err(|e| FsError::Io(e.to_string()))?;
         watcher
@@ -131,6 +192,7 @@ impl FolderWatcher {
             _watcher: watcher,
             events: rx,
             root: root.clone(),
+            waker,
         })
     }
 

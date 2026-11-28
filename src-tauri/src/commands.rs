@@ -638,7 +638,8 @@ async fn check_then_create(
     if let Some(refusal) = refusal {
         return Ok(Err(refusal));
     }
-    std::fs::create_dir_all(path)?;
+    let path = path.to_path_buf();
+    blocking(move || std::fs::create_dir_all(path).map_err(CommandError::from)).await?;
     Ok(Ok(()))
 }
 
@@ -646,11 +647,23 @@ fn refused(view: FolderRefusalView) -> CommandError {
     CommandError::invalid(format!("the folder is refused: {:?}", view.reason))
 }
 
+/// A file dialog owned by the main window: without an owner Windows may open it behind the app,
+/// where the person waits for a dialog they cannot see.
+fn with_main_parent(
+    app: &AppHandle,
+    dialog: tauri_plugin_dialog::FileDialogBuilder<tauri::Wry>,
+) -> tauri_plugin_dialog::FileDialogBuilder<tauri::Wry> {
+    match app.get_webview_window(crate::tray::MAIN_WINDOW) {
+        Some(window) => dialog.set_parent(&window),
+        None => dialog,
+    }
+}
+
 async fn pick_directory(app: &AppHandle, shell: &Shell) -> Answer<Option<PathBuf>> {
     let _dialog = DialogGuard::enter(&shell.dialog_open)?;
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut dialog = app.dialog().file();
+        let mut dialog = with_main_parent(&app, app.dialog().file());
         if let Some(home) = dirs::home_dir() {
             dialog = dialog.set_directory(home);
         }
@@ -671,7 +684,7 @@ async fn save_dialog(
     let _dialog = DialogGuard::enter(&shell.dialog_open)?;
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut dialog = app.dialog().file().set_file_name(name);
+        let mut dialog = with_main_parent(&app, app.dialog().file()).set_file_name(name);
         if let Some(dir) = directory {
             dialog = dialog.set_directory(dir);
         }
@@ -772,7 +785,32 @@ pub async fn get_snapshot(
             crate::events::emit_open_link(&app, &link.link);
         });
     }
-    fresh_snapshot(&shell).await
+    // The window asks for its first snapshot when it opens. While the engine works through a
+    // long round it answers commands only between slices of work, so the newest snapshot the
+    // engine already sent is the answer here; later ones arrive as events anyway. Only before
+    // the first one is the engine asked (a blank window waited minutes on a large first
+    // upload, 2026-11-28).
+    window_snapshot(&shell).await
+}
+
+/// The snapshot for a window that opens: the newest one the engine sent, kept by the event
+/// thread (`events::forward`), and the engine's own answer only before the first one.
+async fn window_snapshot(shell: &Shell) -> Answer<Snapshot> {
+    let cached = lock(&shell.snapshot).clone();
+    match cached {
+        Some(snapshot) => Ok(snapshot),
+        None => fresh_snapshot(shell).await,
+    }
+}
+
+/// The last minute of network traffic, for a traffic line that missed readings (it opened, or
+/// traffic started again after a quiet minute). Read from the sampler's meter, never from the
+/// engine thread.
+#[tauri::command]
+pub async fn get_traffic(
+    traffic: State<'_, crate::traffic::Traffic>,
+) -> Answer<hangar_drive_sync::traffic::TrafficHistory> {
+    Ok(traffic.history())
 }
 
 /// How long after the first snapshot a start link is sent.
@@ -858,10 +896,14 @@ pub async fn print_recovery_sheet(app: AppHandle, document: SheetDocument) -> An
     .on_navigation(crate::print::may_navigate)
     .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
     .on_page_load(|window, payload| {
+        // The callback runs inside the WebView's event handling; the print dialog is opened
+        // after it returned, so the window finishes its load and paints first.
         if payload.event() == tauri::webview::PageLoadEvent::Finished {
-            if let Err(error) = window.print() {
-                eprintln!("hangar-drive: print dialog not opened: {error}");
-            }
+            drop(tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = window.print() {
+                    eprintln!("hangar-drive: print dialog not opened: {error}");
+                }
+            }));
         }
     })
     .build()?;
@@ -883,19 +925,22 @@ pub async fn save_recovery_file(
         return Ok(SaveResult::Cancelled);
     };
     let snapshot = fresh_snapshot(&shell).await?;
-    if inside_synced_folder(&path, &snapshot) {
-        return Ok(SaveResult::InSyncFolder);
-    }
-    if path
-        .parent()
-        .is_some_and(|dir| crate::platform::in_cloud_folder(dir, &crate::platform::cloud_roots()))
-    {
-        return Ok(SaveResult::InCloudFolder);
-    }
-    write_private(&path, document.text().as_bytes())?;
-    Ok(SaveResult::Saved {
-        path: path_text(&path),
+    let text = document.text();
+    blocking(move || {
+        if inside_synced_folder(&path, &snapshot) {
+            return Ok(SaveResult::InSyncFolder);
+        }
+        if path.parent().is_some_and(|dir| {
+            crate::platform::in_cloud_folder(dir, &crate::platform::cloud_roots())
+        }) {
+            return Ok(SaveResult::InCloudFolder);
+        }
+        write_private(&path, text.as_bytes())?;
+        Ok(SaveResult::Saved {
+            path: path_text(&path),
+        })
     })
+    .await
 }
 
 #[tauri::command]
@@ -1268,17 +1313,32 @@ pub async fn open_folder(
     folder_id: Option<String>,
     path: Option<String>,
 ) -> Answer<()> {
-    let snapshot = fresh_snapshot(&shell).await?;
+    // The folder's place is in the snapshot the window shows; asking the engine would wait for
+    // the end of its current slice of work, which in a long round is many seconds.
+    let snapshot = window_snapshot(&shell).await?;
     let root = folder_path(&snapshot, folder_id.as_deref())
         .ok_or_else(|| CommandError::invalid("unknown folder"))?;
-    match path.filter(|p| !p.is_empty()) {
-        Some(inside) => {
-            let target = checked_inside(&root, &inside)?;
-            crate::platform::reveal(&target, true)?;
+    blocking(move || {
+        match path.filter(|p| !p.is_empty()) {
+            Some(inside) => {
+                let target = checked_inside(&root, &inside)?;
+                crate::platform::reveal(&target, true)?;
+            }
+            None => crate::platform::reveal(&std::fs::canonicalize(&root)?, false)?,
         }
-        None => crate::platform::reveal(&std::fs::canonicalize(&root)?, false)?,
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+}
+
+/// Runs file system and shell work (canonicalizing, the file manager, writing a file) on a
+/// blocking thread, so it never holds an async worker that other commands need.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Answer<T> + Send + 'static,
+) -> Answer<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| CommandError::unexpected(e.to_string()))?
 }
 
 #[tauri::command]
@@ -1294,15 +1354,16 @@ pub async fn resume(shell: State<'_, Shell>) -> Answer<()> {
 }
 
 /// Runs a round now: every command is followed by one pass of the control loop. Version 1
-/// holds no files back for a metered network, so there is nothing else to let go.
+/// holds no files back for a metered network, so there is nothing else to let go. Returns at
+/// once; the outcome arrives as snapshots ([`Shell::nudge`]).
 #[tauri::command]
 pub async fn sync_now(shell: State<'_, Shell>) -> Answer<()> {
-    shell.engine(|_| Ok(())).await
+    shell.nudge()
 }
 
 #[tauri::command]
 pub async fn retry_connection(shell: State<'_, Shell>) -> Answer<()> {
-    shell.engine(|_| Ok(())).await
+    shell.nudge()
 }
 
 #[tauri::command]
@@ -1390,11 +1451,11 @@ async fn join_account_folder(
 /// The files at `place` as the sync would see them (the built-in ignore list skips the rest);
 /// 0 for a place that does not exist yet.
 async fn files_at(place: &Path) -> Answer<u64> {
-    if !place.exists() {
-        return Ok(0);
-    }
     let place = place.to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
+        if !place.exists() {
+            return 0;
+        }
         hangar_drive_sync::roots::count_files(&place, COUNT_LIMIT)
     })
     .await
@@ -1818,12 +1879,14 @@ pub async fn open_storage_settings() -> Answer<()> {
     crate::platform::open_storage_settings().map_err(CommandError::from)
 }
 
+/// The report reads the snapshot the window shows: a report is wanted most when the engine is
+/// stuck in a long round, and asking it would wait for that round.
 async fn report(shell: &Shell) -> String {
-    let snapshot = fresh_snapshot(shell).await.ok();
+    let snapshot = window_snapshot(shell).await.ok();
     crate::documents::error_report(
         env!("CARGO_PKG_VERSION"),
         snapshot.as_ref(),
-        shell.engine_error(),
+        shell.engine_error().as_deref(),
     )
 }
 
@@ -1853,10 +1916,9 @@ pub async fn save_error_report(app: AppHandle, shell: State<'_, Shell>) -> Answe
     else {
         return Ok(SaveResult::Cancelled);
     };
-    std::fs::write(&path, text)?;
-    Ok(SaveResult::Saved {
-        path: path_text(&path),
-    })
+    let shown = path_text(&path);
+    blocking(move || std::fs::write(&path, text).map_err(CommandError::from)).await?;
+    Ok(SaveResult::Saved { path: shown })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1870,16 +1932,19 @@ pub async fn list_conflicts(shell: State<'_, Shell>) -> Answer<Vec<ConflictGroup
 /// Shows the original of a conflict group selected in the file manager, its copies next to it.
 #[tauri::command]
 pub async fn open_conflict(shell: State<'_, Shell>, group_id: String) -> Answer<()> {
-    let snapshot = fresh_snapshot(&shell).await?;
+    let snapshot = window_snapshot(&shell).await?;
     let groups = shell.engine(|core| Ok(core.list_conflicts())).await?;
     let group = groups
-        .iter()
+        .into_iter()
         .find(|g| g.id == group_id)
         .ok_or_else(|| CommandError::invalid("unknown conflict"))?;
     let root = folder_path(&snapshot, Some(&group.folder_id))
         .ok_or_else(|| CommandError::invalid("unknown folder"))?;
-    let target = checked_inside(&root, &group.path)?;
-    crate::platform::reveal(&target, true).map_err(CommandError::from)
+    blocking(move || {
+        let target = checked_inside(&root, &group.path)?;
+        crate::platform::reveal(&target, true).map_err(CommandError::from)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2427,7 +2492,7 @@ pub async fn set_language(shell: State<'_, Shell>, language: String) -> Answer<(
         return Err(CommandError::invalid("unknown language"));
     }
     lock(&shell.settings).language = language;
-    shell.save_settings()
+    shell.save_settings_off_thread().await
 }
 
 /// How the main window lists the folders, kept across restarts.
@@ -2437,7 +2502,7 @@ pub async fn set_folder_view(shell: State<'_, Shell>, view: String) -> Answer<()
         return Err(CommandError::invalid("unknown folder view"));
     }
     lock(&shell.settings).folder_view = view;
-    shell.save_settings()
+    shell.save_settings_off_thread().await
 }
 
 /// Version and build: the build is the `+B` of the version (ADR 0002), absent in a plain
@@ -2467,7 +2532,10 @@ pub async fn update_tray(app: AppHandle, model: crate::tray::TrayModel) -> Answe
     let (model, ids) = model
         .checked()
         .map_err(|e| CommandError::invalid(e.to_string()))?;
-    crate::tray::apply(&app, model, ids).map_err(CommandError::from)
+    let Some(seq) = app.state::<crate::tray::TrayState>().changes(&model) else {
+        return Ok(());
+    };
+    crate::tray::apply(&app, seq, model, ids).map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -2488,6 +2556,7 @@ macro_rules! command_handler {
     () => {
         tauri::generate_handler![
             $crate::commands::get_snapshot,
+            $crate::commands::get_traffic,
             $crate::commands::read_clipboard_text,
             $crate::commands::check_invite,
             $crate::commands::inspect_link,
@@ -2587,6 +2656,7 @@ macro_rules! command_handler {
 #[cfg(test)]
 pub const COMMAND_NAMES: &[&str] = &[
     "get_snapshot",
+    "get_traffic",
     "read_clipboard_text",
     "check_invite",
     "inspect_link",
@@ -2777,8 +2847,8 @@ mod tests {
             serde_json::to_value(about("0.1.0", off)).unwrap(),
             json!({ "version": "0.1.0", "build": null, "updates": false })
         );
-        // A folder row with its size, null before the first scan.
-        let folder = |bytes| hangar_drive_sync::api::Folder {
+        // A folder row with its size and its number of files, null before the first scan.
+        let folder = |bytes: Option<u64>| hangar_drive_sync::api::Folder {
             id: "f".into(),
             name: "Docs".into(),
             path: "C:\\Docs".into(),
@@ -2786,6 +2856,7 @@ mod tests {
             freeze_days: None,
             not_synced_count: 0,
             bytes,
+            file_count: bytes.map(|_| 12),
         };
         assert_eq!(
             serde_json::to_value(folder(Some(2_400))).unwrap(),
@@ -2796,13 +2867,13 @@ mod tests {
                 "status": { "kind": "upToDate" },
                 "freezeDays": null,
                 "notSyncedCount": 0,
-                "bytes": 2400
+                "bytes": 2400,
+                "fileCount": 12
             })
         );
-        assert_eq!(
-            serde_json::to_value(folder(None)).unwrap()["bytes"],
-            json!(null)
-        );
+        let unscanned = serde_json::to_value(folder(None)).unwrap();
+        assert_eq!(unscanned["bytes"], json!(null));
+        assert_eq!(unscanned["fileCount"], json!(null));
         // The suspect warning and the server notices, as src/backend/tauri/decoders.ts reads
         // them (ADR 0001, section 5).
         let suspect = hangar_drive_sync::api::Warning::Suspect {
@@ -2918,6 +2989,28 @@ mod tests {
             Shell::new(Ok(handle), 0, None, crate::settings::Stored::default()),
             events,
         )
+    }
+
+    // A blank window waited minutes for its first snapshot while the engine uploaded
+    // (2026-11-28): with a snapshot already sent, opening the window never waits on the engine.
+    #[test]
+    fn an_open_window_gets_the_sent_snapshot_while_the_engine_is_busy() {
+        let (shell, _events) = engine_shell();
+        let sent = tauri::async_runtime::block_on(fresh_snapshot(&shell)).unwrap();
+        *lock(&shell.snapshot) = Some(sent.clone());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tauri::async_runtime::block_on(shell.engine(|_| {
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(())
+                }))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let started = std::time::Instant::now();
+            let shown = tauri::async_runtime::block_on(window_snapshot(&shell)).unwrap();
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(shown, sent);
+        });
     }
 
     #[test]
