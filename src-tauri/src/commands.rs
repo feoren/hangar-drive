@@ -2452,11 +2452,22 @@ pub async fn renew_recovery_code(shell: State<'_, Shell>) -> Answer<RecoveryCode
 
 #[tauri::command]
 pub async fn get_settings(app: AppHandle, shell: State<'_, Shell>) -> Answer<SettingsView> {
-    Ok(SettingsView {
-        autostart: app.autolaunch().is_enabled().unwrap_or(false),
-        language: lock(&shell.settings).language.clone(),
-        folder_view: lock(&shell.settings).folder_view.clone(),
-    })
+    let autostart = app.autolaunch().is_enabled().unwrap_or(false);
+    Ok(settings_view(&shell, autostart))
+}
+
+/// One lock for both fields: two `lock(..)` temporaries in one struct literal both live until
+/// the end of the expression, so the second waited for the first on the same thread and the
+/// settings stayed locked for good. The event thread then hung on the language of its next
+/// notification, no snapshot reached the window and every snapshot waited for the engine
+/// (installed build, 2026-11-28).
+fn settings_view(shell: &Shell, autostart: bool) -> SettingsView {
+    let settings = lock(&shell.settings);
+    SettingsView {
+        autostart,
+        language: settings.language.clone(),
+        folder_view: settings.folder_view.clone(),
+    }
 }
 
 /// Turning autostart off asks in a native dialog first (security review M4): a page that was
@@ -2754,6 +2765,29 @@ pub const COMMAND_NAMES: &[&str] = &[
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reading_the_settings_leaves_them_unlocked() {
+        let shell = Arc::new(Shell::new(
+            Err("not started".into()),
+            0,
+            None,
+            crate::settings::Stored::default(),
+        ));
+        let (done, finished) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&shell);
+        std::thread::spawn(move || {
+            let view = settings_view(&reader, true);
+            // The event thread takes the same lock for the language of a notification.
+            let _ = reader.language();
+            let _ = done.send(view.folder_view);
+        });
+        let answer = finished.recv_timeout(Duration::from_secs(5));
+        assert!(
+            answer.is_ok(),
+            "reading the settings must not lock them for good"
+        );
+    }
 
     #[test]
     fn arguments_read_as_the_window_sends_them() {
