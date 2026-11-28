@@ -162,6 +162,7 @@ pub fn os_language() -> Option<String> {
 
 /// `path` without the `\\?\` prefix `canonicalize` puts on Windows paths, which the shell API
 /// does not read; other paths unchanged.
+#[cfg(any(windows, test))]
 pub fn plain(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {

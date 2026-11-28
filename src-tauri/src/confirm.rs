@@ -500,6 +500,8 @@ pub fn look_alike_name(language: &str, name: &str, other: &str) -> Confirm {
 }
 
 /// The button a native question starts on, the one Enter and Space press.
+// Only the Windows dialog names both buttons; elsewhere the plugin's dialog decides.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultButton {
     Yes,
@@ -517,10 +519,13 @@ pub fn default_button() -> DefaultButton {
 
 /// The IDs of the two buttons of the Windows question; from 100 on, clear of the common IDs
 /// (`IDOK` 1, `IDCANCEL` 2 ...).
+#[cfg(any(windows, test))]
 const YES_ID: i32 = 100;
+#[cfg(any(windows, test))]
 const NO_ID: i32 = 101;
 
 /// The Windows ID of `button`.
+#[cfg(any(windows, test))]
 fn button_id(button: DefaultButton) -> i32 {
     match button {
         DefaultButton::Yes => YES_ID,
@@ -530,6 +535,7 @@ fn button_id(button: DefaultButton) -> i32 {
 
 /// Whether the Windows question's answer `button` is "yes"; Escape and the title bar's close
 /// button answer `IDCANCEL`, which is "no" like every other value.
+#[cfg(any(windows, test))]
 fn answered_yes(button: i32) -> bool {
     button == button_id(DefaultButton::Yes)
 }

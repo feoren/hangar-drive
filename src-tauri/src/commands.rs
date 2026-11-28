@@ -3944,7 +3944,11 @@ mod tests {
         assert_eq!(safe_dir_name("a/b:c"), "a_b_c");
         assert_eq!(safe_dir_name(".."), "Hangar Drive");
         assert_eq!(safe_dir_name("  "), "Hangar Drive");
+        // The folder path is one of this platform, so the separator is its own.
+        #[cfg(windows)]
         assert_eq!(folder_name_of("C:\\Users\\x\\Hangar Drive"), "Hangar Drive");
+        #[cfg(not(windows))]
+        assert_eq!(folder_name_of("/home/x/Hangar Drive"), "Hangar Drive");
     }
 
     #[test]
