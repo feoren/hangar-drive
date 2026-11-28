@@ -40,6 +40,13 @@ pub async fn ensure_server_id(db: &Db) -> Result<ServerId, sqlx::Error> {
         .ok_or_else(|| sqlx::Error::Protocol("stored server ID has the wrong length".into()))
 }
 
+/// How many accounts the server holds.
+pub async fn count(db: &Db) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(db)
+        .await
+}
+
 /// Creates an invite valid for `days` days and returns it with its expiry. The token is shown
 /// once; the database holds only its hash.
 pub async fn create_invite(

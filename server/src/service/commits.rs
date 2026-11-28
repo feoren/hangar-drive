@@ -591,7 +591,7 @@ async fn commit_call(
 
     // Phase 2, under the write lock.
     let now = app.now_ms();
-    let mut tx = begin_write_on(&mut conn).await?;
+    let mut tx = begin_write_on(&app.db, &mut conn).await?;
     let account = account_by_pk(&mut tx, session.account_pk)
         .await?
         .ok_or(ErrorCode::NotFound)?;

@@ -50,11 +50,18 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Connections served at once; beyond it the server stops accepting until one closes.
 pub const MAX_CONNECTIONS: usize = 4096;
+/// Threads tokio keeps for blocking work at most: file reads and writes of uploads and
+/// downloads, renames and directory flushes. Tokio's default of 512 lies above the process limit
+/// of the Compose files (`pids_limit: 256`), so a burst of file work on a slow disk could make
+/// thread starts fail there, for the database's connection threads as well. Beyond this many,
+/// file work waits in a queue; the disk is the limit then anyway.
+pub const MAX_BLOCKING_THREADS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
-    #[error("data folder {0}: {1}")]
-    DataDir(String, std::io::Error),
+    /// The folder, the error and [`access_hint`].
+    #[error("data folder {0}: {1}{2}")]
+    DataDir(String, std::io::Error, String),
     #[error(transparent)]
     Db(#[from] db::DbError),
     #[error("database: {0}")]
@@ -80,8 +87,9 @@ pub enum LockError {
         "the server is running on this data folder; stop it first (docker compose stop server)"
     )]
     InUse,
-    #[error("data folder lock {0}: {1}")]
-    Io(String, std::io::Error),
+    /// The lock file, the error and [`access_hint`].
+    #[error("data folder lock {0}: {1}{2}")]
+    Io(String, std::io::Error, String),
 }
 
 /// An exclusive lock on `server.lock` in the data folder (finding L5). `serve` holds it for its
@@ -99,7 +107,10 @@ impl DataDirLock {
 
     pub fn acquire(data_dir: &std::path::Path) -> Result<Self, LockError> {
         let path = data_dir.join(Self::FILE);
-        let io = |e: std::io::Error| LockError::Io(path.display().to_string(), e);
+        let io = |e: std::io::Error| {
+            let hint = access_hint(data_dir, &e);
+            LockError::Io(path.display().to_string(), e, hint)
+        };
         std::fs::create_dir_all(data_dir).map_err(io)?;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -114,6 +125,51 @@ impl DataDirLock {
             Err(std::fs::TryLockError::Error(e)) => Err(io(e)),
         }
     }
+}
+
+fn data_dir_error(dir: &std::path::Path, error: std::io::Error) -> StartError {
+    let hint = access_hint(dir, &error);
+    StartError::DataDir(dir.display().to_string(), error, hint)
+}
+
+/// What the operator can do when the server may not write to its data folder: on a NAS the
+/// folder is a bind mount, and the container's user (`user:` in Compose) must own it. Names the
+/// folder's owner and the user the server runs as. Empty for other errors and outside Unix.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn access_hint(dir: &std::path::Path, error: &std::io::Error) -> String {
+    use std::os::unix::fs::MetadataExt;
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return String::new();
+    }
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return String::new();
+    };
+    // SAFETY: geteuid and getegid take no arguments, cannot fail and only read the credentials
+    // of the calling process.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if meta.uid() == uid {
+        format!(
+            ". The folder {} belongs to the user the server runs as ({uid}) but is not \
+             writable for it: allow its owner to write (mode 0700 is enough)",
+            dir.display()
+        )
+    } else {
+        format!(
+            ". The folder {dir} belongs to user {owner}, group {group}, and the server runs as \
+             user {uid}, group {gid}: give the folder to that user (chown -R {uid}:{gid} on the \
+             host folder mounted there, or the NAS's file manager), or run the container as \
+             the folder's owner (user: \"{owner}:{group}\" in Compose)",
+            dir = dir.display(),
+            owner = meta.uid(),
+            group = meta.gid(),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+pub fn access_hint(_dir: &std::path::Path, _error: &std::io::Error) -> String {
+    String::new()
 }
 
 /// What tests replace: the clock, the disk probe and the rate limiter.
@@ -163,14 +219,13 @@ pub async fn open_app(
     config: &Config,
     deps: Deps,
 ) -> Result<(AppState, watch::Sender<bool>), StartError> {
-    prepare_data_dir(&config.data_dir)
-        .map_err(|e| StartError::DataDir(config.data_dir.display().to_string(), e))?;
+    prepare_data_dir(&config.data_dir).map_err(|e| data_dir_error(&config.data_dir, e))?;
     let db = db::connect(&config.database_path()).await?;
     let store = FsStore::open(config.objects_dir(), config.data_dir.join("staging"))
-        .map_err(|e| StartError::DataDir(config.data_dir.display().to_string(), e))?;
+        .map_err(|e| data_dir_error(&config.data_dir, e))?;
     let server_id = service::accounts::ensure_server_id(&db).await?;
     let server_secret = app::load_or_create_secret(&config.data_dir.join("server.secret"))
-        .map_err(|e| StartError::DataDir(config.data_dir.display().to_string(), e))?;
+        .map_err(|e| data_dir_error(&config.data_dir, e))?;
     let store: Arc<dyn store::ObjectStore> = Arc::new(store);
     let store = match deps.store_layer {
         Some(layer) => layer(store),
@@ -221,8 +276,7 @@ pub async fn build(config: &Config, deps: Deps) -> Result<Server, StartError> {
     let lock = DataDirLock::acquire(&config.data_dir)?;
     // Only the serving process clears it, under the lock: an admin command beside it must not
     // remove the temporary files of the server's open database.
-    clear_dir(&config.sqlite_tmp_dir())
-        .map_err(|e| StartError::DataDir(config.data_dir.display().to_string(), e))?;
+    clear_dir(&config.sqlite_tmp_dir()).map_err(|e| data_dir_error(&config.data_dir, e))?;
     let (app, shutdown) = open_app(config, deps).await?;
     if app.disk.available().is_none() {
         tracing::warn!(
@@ -315,27 +369,18 @@ pub async fn serve(
             }
         };
         // Connections per client address (finding M6) and per network (server security review,
-        // LOW 1). A trusted proxy carries many clients over its own address and limits them
-        // itself (`limit_conn` in the proxy examples).
-        let peer_slot = if app.trusted_proxies.iter().any(|n| n.contains(peer.ip())) {
-            None
-        } else {
-            // The network cap only while the slots run short (follow-up review L4): many
-            // honest clients of one provider share a network, and they lock each other out
-            // only when one network could otherwise take what is left.
-            let crowded = slots.available_permits() < MAX_CONNECTIONS / 2;
-            match per_ip.take(
-                http::client_ip::rate_key(Some(peer.ip())),
-                http::client_ip::connection_net_key(Some(peer.ip())),
-                app.concurrency.connections_per_ip,
-                crowded.then(|| app.concurrency.connections_per_net()),
-            ) {
-                Some(slot) => Some(slot),
-                None => {
-                    drop(stream);
-                    continue;
-                }
-            }
+        // LOW 1); a trusted proxy has a higher limit of its own ([`connection_limits`]).
+        let trusted = app.trusted_proxies.iter().any(|n| n.contains(peer.ip()));
+        let crowded = slots.available_permits() < MAX_CONNECTIONS / 2;
+        let (max_ip, max_net) = connection_limits(trusted, &app.concurrency, crowded);
+        let Some(peer_slot) = per_ip.take(
+            http::client_ip::rate_key(Some(peer.ip())),
+            http::client_ip::connection_net_key(Some(peer.ip())),
+            max_ip,
+            max_net,
+        ) else {
+            drop(stream);
+            continue;
         };
         let _ = stream.set_nodelay(true);
         let service = TowerToHyperService::new(tower::Layer::layer(
@@ -382,6 +427,32 @@ pub async fn serve(
     app.db.close().await;
     drop(lock);
     Ok(())
+}
+
+/// Connections a trusted proxy may hold at once: half of [`MAX_CONNECTIONS`]. A proxy carries
+/// many clients over its own address and limits them itself (`limit_conn` in the proxy
+/// examples), so it gets far more than a client; but not all of them (security review of the
+/// server image, MEDIUM): behind a published port every process and container of the host
+/// arrives from the trusted gateway address, and none of them may take every slot.
+pub const TRUSTED_PROXY_CONNECTIONS: u32 = (MAX_CONNECTIONS / 2) as u32;
+
+/// The limits for a new connection: per address, and per network (`None`: counted, not capped).
+/// The network cap applies only while the slots run short (follow-up review L4): many honest
+/// clients of one provider share a network, and they lock each other out only when one network
+/// could otherwise take what is left. A trusted proxy is never capped by its network.
+fn connection_limits(
+    trusted: bool,
+    concurrency: &config::Concurrency,
+    crowded: bool,
+) -> (u32, Option<u32>) {
+    if trusted {
+        (TRUSTED_PROXY_CONNECTIONS, None)
+    } else {
+        (
+            concurrency.connections_per_ip,
+            crowded.then(|| concurrency.connections_per_net()),
+        )
+    }
 }
 
 /// Open connections per client address key and per network key (server security review,
@@ -573,6 +644,40 @@ mod tests {
     }
 
     #[test]
+    fn a_trusted_proxy_gets_a_high_limit_but_never_every_slot() {
+        // Security review of the server image, MEDIUM: behind a published port, every process of
+        // the host arrives from the trusted gateway; it must not take all connection slots.
+        let concurrency = config::Concurrency::default();
+        let (max_ip, max_net) = connection_limits(true, &concurrency, true);
+        assert_eq!(max_net, None);
+        assert!(max_ip > concurrency.connections_per_ip);
+        assert!((max_ip as usize) < MAX_CONNECTIONS);
+        let peers = Arc::new(PeerConnections::default());
+        let gateway = std::net::IpAddr::from([172, 22, 0, 1]);
+        let take = |ip: std::net::IpAddr, (max_ip, max_net): (u32, Option<u32>)| {
+            peers.take(
+                http::client_ip::rate_key(Some(ip)),
+                http::client_ip::connection_net_key(Some(ip)),
+                max_ip,
+                max_net,
+            )
+        };
+        let held: Vec<_> = (0..MAX_CONNECTIONS)
+            .map_while(|_| take(gateway, (max_ip, max_net)))
+            .collect();
+        assert_eq!(held.len(), TRUSTED_PROXY_CONNECTIONS as usize);
+        let other = std::net::IpAddr::from([198, 51, 100, 7]);
+        assert!(
+            take(other, connection_limits(false, &concurrency, true)).is_some(),
+            "a client still connects while the proxy holds its limit"
+        );
+        assert_eq!(
+            connection_limits(false, &concurrency, false),
+            (concurrency.connections_per_ip, None)
+        );
+    }
+
+    #[test]
     fn a_providers_network_is_capped_only_per_24_and_only_when_slots_run_short() {
         // Follow-up review L4: one client of a provider held the cap of its /16, and every
         // other customer of that /16 was locked out.
@@ -605,6 +710,33 @@ mod tests {
             take(std::net::IpAddr::from([100, 64, 7, 99]), None).is_some(),
             "with slots to spare the network is not capped"
         );
+    }
+
+    #[test]
+    fn a_data_folder_the_server_may_not_write_names_its_owner_and_the_user() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/.tmp/server-unit/access-hint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            access_hint(&dir, &other),
+            "",
+            "only for a missing permission"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let hint = access_hint(&dir, &denied);
+        if cfg!(unix) {
+            // The test runs as the folder's owner: the hint says so.
+            assert!(
+                hint.contains("belongs to the user the server runs as"),
+                "{hint}"
+            );
+        } else {
+            assert_eq!(hint, "");
+        }
+        let error = data_dir_error(&dir, denied);
+        assert!(error.to_string().starts_with("data folder "), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

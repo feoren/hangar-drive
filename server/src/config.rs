@@ -84,6 +84,11 @@ pub const DEFAULT_ANOMALY_PERCENT: u32 = 30;
 pub const MIN_BURST_OBJECTS: u64 = 20;
 pub const DEFAULT_RECORD_CAP: u64 = 64 * MIB;
 pub const DEFAULT_HEAVY_REQUESTS: u32 = 4;
+/// At most half the database's connections (security review of the server image, LOW): a
+/// commit holds its connection while it waits for its write turn (`db::begin_write_on`), so
+/// with more heavy calls than that, waiting commits could take every connection and leave none
+/// for the reads of all other calls.
+pub const MAX_HEAVY_REQUESTS: u32 = crate::db::MAX_CONNECTIONS / 2;
 pub const DEFAULT_UPLOADS_PER_ACCOUNT: u32 = 8;
 /// 20 objects a second: every file is at least a manifest and a chunk, so 10 small files a
 /// second, sustained.
@@ -226,6 +231,18 @@ impl IpNet {
     }
 }
 
+/// `10.0.0.1` for a single address, `10.0.0.0/8` for a range (the start log lists them).
+impl std::fmt::Display for IpNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = if self.addr.is_ipv4() { 32 } else { 128 };
+        if self.prefix == max {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.prefix)
+        }
+    }
+}
+
 fn prefix_eq(a: &[u8], b: &[u8], prefix: u8) -> bool {
     let full = usize::from(prefix / 8);
     let rest = prefix % 8;
@@ -273,7 +290,8 @@ pub struct Concurrency {
     pub heavy_requests: u32,
     /// Uploads in flight per account.
     pub uploads_per_account: u32,
-    /// Connections per client address; trusted proxies are exempt.
+    /// Connections per client address; a trusted proxy has a higher limit of its own
+    /// (`TRUSTED_PROXY_CONNECTIONS`).
     pub connections_per_ip: u32,
 }
 
@@ -407,7 +425,12 @@ impl Config {
             limits.record_cap = cap;
         }
         let concurrency = Concurrency {
-            heavy_requests: number(HEAVY_REQUESTS_VAR, DEFAULT_HEAVY_REQUESTS, 1, 1024)?,
+            heavy_requests: number(
+                HEAVY_REQUESTS_VAR,
+                DEFAULT_HEAVY_REQUESTS,
+                1,
+                MAX_HEAVY_REQUESTS,
+            )?,
             uploads_per_account: number(
                 UPLOADS_PER_ACCOUNT_VAR,
                 DEFAULT_UPLOADS_PER_ACCOUNT,
@@ -630,6 +653,22 @@ mod tests {
             config(&[(HEAVY_REQUESTS_VAR, "0")]),
             Err(ConfigError::InvalidNumber(HEAVY_REQUESTS_VAR, _))
         ));
+        // Waiting commits hold a connection each: never more of them than half the pool.
+        assert_eq!(MAX_HEAVY_REQUESTS, crate::db::MAX_CONNECTIONS / 2);
+        const { assert!(DEFAULT_HEAVY_REQUESTS <= MAX_HEAVY_REQUESTS) };
+        let most = MAX_HEAVY_REQUESTS.to_string();
+        assert_eq!(
+            config(&[(HEAVY_REQUESTS_VAR, most.as_str())])
+                .unwrap()
+                .concurrency
+                .heavy_requests,
+            MAX_HEAVY_REQUESTS
+        );
+        let more = (MAX_HEAVY_REQUESTS + 1).to_string();
+        assert!(matches!(
+            config(&[(HEAVY_REQUESTS_VAR, more.as_str())]),
+            Err(ConfigError::InvalidNumber(HEAVY_REQUESTS_VAR, _))
+        ));
         assert_eq!(config(&[]).unwrap().limits.record_cap, 64 * MIB);
     }
 
@@ -778,6 +817,10 @@ mod tests {
         assert!(v6.contains("fd0f::1".parse().unwrap()));
         assert!(!v6.contains("fd10::1".parse().unwrap()));
         assert!(IpNet::parse("not an ip").is_none());
+        // As the start log lists them: an address without its full prefix.
+        assert_eq!(one.to_string(), "192.168.1.7");
+        assert_eq!(net.to_string(), "10.0.0.0/8");
+        assert_eq!(v6.to_string(), "fd00::/12");
     }
 
     #[test]

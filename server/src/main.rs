@@ -58,8 +58,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     init_logging(command == "serve");
+    // Worker threads: one per CPU the container may use (tokio's default, which follows a CPU
+    // quota), or TOKIO_WORKER_THREADS.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(hangar_drive_server::MAX_BLOCKING_THREADS)
         .build()
     {
         Ok(runtime) => runtime,
@@ -126,6 +129,7 @@ async fn serve(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("listening on {addr}"))?;
     let l = config.limits;
+    let free = server.app.disk.available();
     tracing::info!(
         %addr,
         tls = server.is_tls(),
@@ -138,10 +142,27 @@ async fn serve(config: Config) -> Result<()> {
         headroom = l.headroom,
         account_budget = l.account_budget,
         device_budget = l.device_budget,
-        trusted_proxies = config.trusted_proxies.len(),
+        disk_reserve = l.disk_reserve,
+        uploads_per_minute = config.uploads_per_minute,
+        trusted_proxies = %trusted_list(&config),
         public_url = config.public_url.as_deref().unwrap_or_default(),
         "server ready"
     );
+    // What the operator of a host without a terminal (a NAS) would otherwise ask `status` for.
+    match accounts::count(&server.app.db).await {
+        Ok(count) => tracing::info!(
+            accounts = count,
+            disk_free = free.map_or_else(|| "unknown".to_owned(), mib),
+            "data"
+        ),
+        Err(error) => tracing::warn!(%error, "could not count the accounts"),
+    }
+    if free.is_some_and(|f| f < l.disk_reserve) {
+        tracing::warn!(
+            "operator warning: the disk is below its free reserve (HANGAR_DRIVE_DISK_RESERVE); \
+             uploads are refused until space is freed"
+        );
+    }
     first_start_invite(&config, &server.app).await;
     hangar_drive_server::serve(server, listener, shutdown_signal()).await?;
     tracing::info!("stopped");
@@ -164,6 +185,19 @@ async fn first_start_invite(config: &Config, app: &hangar_drive_server::app::App
         Ok(None) => {}
         Err(error) => tracing::warn!(%error, "could not create the first-start invite"),
     }
+}
+
+/// The trusted proxies as configured, or `none`.
+fn trusted_list(config: &Config) -> String {
+    if config.trusted_proxies.is_empty() {
+        return "none".to_owned();
+    }
+    config
+        .trusted_proxies
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
