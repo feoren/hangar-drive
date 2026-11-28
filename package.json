@@ -13,7 +13,8 @@
     "test": "vitest run",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "readme:shots": "node tools/readme-shots/run.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

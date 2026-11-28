@@ -4,6 +4,7 @@ src-tauri
 target
 docs
 tools/*
+!tools/readme-shots/
 pnpm-lock.yaml
 CLAUDE.md
 AGENTS.md
